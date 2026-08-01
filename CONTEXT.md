@@ -254,8 +254,25 @@ _Avoid_: Approval-gated action, wildcard command approval, model decision
 **Knowledge vault**:
 The authorized operator's private, Git-backed Obsidian repository used as a
 connected source of personal knowledge. V1 may change it only through an exact
-approval-gated commit and push.
+approval-gated commit and push from one dedicated clone on the Ubuntu control
+host. The private Git remote, not another local Obsidian clone, is the
+synchronization boundary. V1 searches it locally without an external content
+index and may create or modify only Markdown notes in configured note paths.
 _Avoid_: Durable assistant memory, Google Drive, unrestricted filesystem
+
+**Vault write proposal**:
+The one frozen knowledge-vault change awaiting approval. It includes the exact
+remote base commit, canonical Markdown note paths, complete unified diff, and
+commit metadata. Approval authorizes one commit and normal push of precisely
+that proposal; any base, path, diff, or metadata change invalidates it.
+_Avoid_: Command permission, autonomous note edit, general vault access
+
+**Vault write conflict**:
+A dirty dedicated clone, non-fast-forward state, or concurrent remote change
+that prevents the exact approved vault write. Jarvis does not merge, rebase,
+cherry-pick, force-push, rewrite history, or resolve the conflict autonomously;
+the state requires manual resolution before another vault write.
+_Avoid_: Transient network failure, approved automatic merge
 
 **Connected-service cache**:
 Request-scoped copies of content fetched from Gmail, Google Calendar, Google
