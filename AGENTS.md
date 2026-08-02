@@ -11,3 +11,7 @@ The repo uses the default canonical labels: `needs-triage`, `needs-info`, `ready
 ### Domain docs
 
 This is a single-context repo with root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+
+### Delegated work
+
+Use the project custom agent `luna-worker` for clearly bounded implementation or verification subtasks. Give it the exact objective, scope, expected output, and validation; do not assign unbounded repo-wide work or overlapping write ownership.
