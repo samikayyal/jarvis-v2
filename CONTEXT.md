@@ -100,12 +100,15 @@ _Avoid_: Conversation history, durable assistant memory, audit record
 The local storage on the Ubuntu control host that is authoritative for
 Jarvis-owned operational state, conversation history, durable memory, command
 permissions, and audit references. Ordinary state is not application-encrypted;
-only credential-class secrets that grant external access are encrypted
-separately. Conversation history, durable memory, audit metadata, retrieval
-indexes, and deleted conversations remain plaintext under strict filesystem
-permissions. Credential-class secrets deliberately entered through the secret
-store must not be copied into ordinary state, but an authorized-operator message
-is retained verbatim even when its body contains a credential. OpenAI, Google,
+credential-class secrets that grant external access are stored separately in a
+service-specific plaintext credential-file boundary. Static credentials are
+root-owned; a connector that must rotate a credential owns only its own private
+credential directory. Conversation history,
+durable memory, audit metadata, retrieval indexes, and deleted conversations
+remain plaintext under strict filesystem permissions. Credential-class secrets
+deliberately entered through the credential path must not be copied into ordinary
+state, but an authorized-operator message is retained verbatim even when its body
+contains a credential. OpenAI, Google,
 OpenWA, and other external services are never authoritative stores for this
 state. Deleted conversations reside in a separately permissioned local area
 outside Jarvis-readable paths. Model-provider conversation persistence is
@@ -118,17 +121,21 @@ _Avoid_: OpenWA database, model conversation object, cloud state mirror
 Authorization material whose disclosure grants access to another system, such as
 an OAuth refresh token, API key, webhook secret, private key, or messaging
 authorization material. When deliberately provided through the credential path,
-it is application-encrypted and stored separately from ordinary Jarvis state.
-The verbatim conversation-history rule still applies when such material appears
-inside an authorized-operator message.
+it is stored in a service-specific plaintext credential file outside Jarvis
+state. Static files are root-owned and supplied only to their consuming service;
+a connector that must rotate a credential may own a private `0700` directory and
+`0600` file inaccessible to other Jarvis services. Credential files are excluded
+from source control and routine backups. The verbatim conversation-history rule
+still applies when such material appears inside an authorized-operator message.
 _Avoid_: Conversation content, audit metadata, ordinary state field
 
 **Administrative backup**:
 A versioned local recovery copy stored outside Jarvis-readable paths and restored
 only through a manual administrative process. It is not a cloud synchronization
 target or an authoritative live state store, and it preserves the source data's
-plaintext-or-encrypted classification. Every backup snapshot is retained
-indefinitely and is never permanently removed automatically.
+plaintext classification. Credential files are excluded and must be reprovisioned
+separately after recovery. Every backup snapshot is retained indefinitely and is
+never permanently removed automatically.
 _Avoid_: Jarvis-accessible archive, cloud state mirror, live replica
 
 **Text-only assistant interaction**:
@@ -217,16 +224,30 @@ A terminal action Jarvis refuses without offering an approval choice. It covers
 broad or unresolved destructive targets, control or audit bypass, credential
 extraction or transmission outside the credential path, covert persistence,
 public control exposure, destructive Git history rewriting, and evidence
-concealment. No command permission can authorize it.
+concealment. It also covers activating changes to Jarvis's trust-critical
+components; Jarvis may prepare and test source changes, but deployment is a
+manual administrative action outside Jarvis. No command permission can authorize
+it.
 _Avoid_: Approval-gated action, mandatory-fresh terminal action
+
+**Trust-critical Jarvis component**:
+A component or configuration whose activation can change message admission,
+authorization, approval, audit, credential isolation, connector capabilities,
+host identity, or control-surface exposure. This includes the installed Jarvis
+runtime, capability broker, policy and approval parser, sender allowlist and
+webhook verification, audit service, connectors, credential files and service
+identities, worker CA and registration, service definitions, firewall rules, and
+private-overlay grants. Jarvis may inspect, edit, and test development copies but
+cannot activate them.
+_Avoid_: Every project file, unrelated service, model prompt
 
 **Mandatory-fresh terminal action**:
 An allowed terminal action that must receive exact approval every time and can
 never create or use a session or persistent command permission. In V1 this is
-limited to system-level software installation, removal, or upgrade; changes to
-Jarvis policy, audit, approval, worker, or orchestration components; materially
+limited to system-level software installation, removal, or upgrade; materially
 dynamic shell evaluation that cannot be frozen; and downloading then immediately
-executing code.
+executing code. Activating a trust-critical Jarvis change is manual-only rather
+than mandatory-fresh.
 _Avoid_: Hard-prohibited terminal action, every side-effecting command
 
 **Auto-approval classification (V2)**:
@@ -277,9 +298,10 @@ _Avoid_: Transient network failure, approved automatic merge
 **Connected-service cache**:
 Request-scoped copies of content fetched from Gmail, Google Calendar, Google
 Drive, the knowledge vault, or another connected source. Cached content is
-cleared when the request ends or Jarvis restarts. Only encrypted credentials,
-source identifiers, and non-content synchronization metadata persist; source
-content is fetched again when needed.
+cleared when the request ends or Jarvis restarts. Only source identifiers and
+non-content synchronization metadata persist in ordinary state; credentials live
+separately in the plaintext credential-file boundary, and source content is
+fetched again when needed.
 _Avoid_: Connected-service mirror, durable assistant memory, conversation history
 
 **Request working data**:
@@ -288,6 +310,46 @@ content needed only by an active request. It is discarded when the request
 completes and is not copied into operational state or the audit record. Text
 Jarvis actually sends to the authorized operator is conversation history instead.
 _Avoid_: Conversation history, terminal operational state, audit record
+
+**Orchestration agent**:
+The model-driven planner that interprets an authorized request, selects a host
+or connected-service operation, gathers bounded working data, and creates typed
+proposals. It is never an authorization authority: its output cannot approve an
+action, create a command permission, change policy, access connector credentials,
+or dispatch a side effect without the capability broker.
+_Avoid_: Capability broker, connector, authorization policy
+
+**Capability broker**:
+The deterministic authority that owns admission, policy evaluation, frozen
+pending actions, approval matching, permission matching, replay prevention, and
+side-effect dispatch. It accepts only newly admitted operator controls, invokes
+only narrow connectors, and blocks side effects when required audit evidence
+cannot be recorded. Model output and connected-source content cannot bypass or
+change its decisions.
+_Avoid_: Orchestration agent, model tool router, connector
+
+**Connector**:
+A narrow integration boundary that owns the credential and fixed operation set
+for one external capability, such as Google, OpenWA outbound messaging, the
+knowledge vault, or execution workers. A connector accepts only typed operations
+from the capability broker; it does not expose raw credentials, arbitrary remote
+endpoints, generic shell access, or operations outside the V1 action matrix.
+_Avoid_: Orchestration agent tool, general HTTP client, capability broker
+
+**Public OAuth callback**:
+The sole public Jarvis HTTP endpoint, used only to complete an operator-initiated
+Google OAuth authorization-code flow. It accepts the documented callback fields,
+requires a short-lived single-use state match, hands the code to the Google
+connector, and returns a content-free result. It exposes no message admission,
+assistant control, state, approval, connector, audit, or execution operation.
+_Avoid_: Public Jarvis API, webhook receiver, administrative interface
+
+**Untrusted source content**:
+Text or data retrieved from a connected service, the knowledge vault, terminal
+output, quoted-message context, or another non-control source. It may inform an
+answer but never conveys operator identity, approval, permission, policy, or tool
+authority, even when it contains instruction-like language.
+_Avoid_: Authorized operator control, approval, system policy
 
 **Audit record**:
 The append-only security history of Jarvis activity. It is retained indefinitely,
@@ -325,14 +387,17 @@ _Avoid_: Audit record, conversation history, prompt archive
 **Execution host**:
 A named computer on which Jarvis may evaluate and run terminal actions. V1 has
 two execution hosts: the always-on Ubuntu laptop and the authorized operator's
-Windows laptop when it is available.
+personal Windows laptop when it is available. The orchestration agent selects
+the host from the natural-language request and known host purpose; the operator
+does not need to use a routing command or fixed request prefix.
 _Avoid_: Messaging gateway, messaging engine, connected service
 
 **Default execution host**:
-The Ubuntu execution host used for host-neutral terminal actions when the
-authorized operator does not name a host. An explicit host request takes
-precedence over the default, and an unavailable requested host is never
-silently substituted.
+The Ubuntu execution host selected when the natural-language request does not
+require or clearly refer to the authorized operator's personal Windows laptop.
+Explicit operator intent and task dependencies take precedence over the default.
+When the agent selects an unavailable host, it reports the decision and reason
+and waits for further instruction; it never silently substitutes the other host.
 _Avoid_: Automatic failover host, any available computer
 
 **Working session**:
