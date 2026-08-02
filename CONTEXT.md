@@ -52,6 +52,25 @@ allowlisted personal WhatsApp number. Messages from any other sender must not
 invoke the assistant or disclose access to its connected services.
 _Avoid_: Dedicated account, any WhatsApp sender
 
+**Ingress admission**:
+The durable disposition of one authenticated messaging-gateway event before any
+assistant work begins. It is distinct from request acceptance and dependency
+readiness; rejected or unsupported authenticated events may be acknowledged
+without becoming conversation history or work.
+_Avoid_: Request acceptance, webhook processing job, assistant execution
+
+**Request acceptance**:
+The creation of the single active request from an admitted authorized control
+when Jarvis is idle. A second ordinary message during active work is retained in
+conversation history but is refused rather than queued or joined to that request.
+_Avoid_: Ingress admission, dispatch, queued request
+
+**Dispatch readiness**:
+The availability and identity check for the exact connector or execution host
+immediately before a selected read or action. It never changes ingress
+acknowledgement, creates a queue, or permits host failover.
+_Avoid_: Ingress admission, request acceptance, general service health
+
 **Approval-gated action**:
 A proposed change to a connected service that the assistant may execute only
 after the authorized operator confirms that exact proposal. Approval for one
@@ -134,7 +153,8 @@ A versioned local recovery copy stored outside Jarvis-readable paths and restore
 only through a manual administrative process. It is not a cloud synchronization
 target or an authoritative live state store, and it preserves the source data's
 plaintext classification. Credential files are excluded and must be reprovisioned
-separately after recovery. Every backup snapshot is retained indefinitely and is
+separately, but full diagnostic traces and any credentials contained in their
+payloads are included. Every backup snapshot is retained indefinitely and is
 never permanently removed automatically.
 _Avoid_: Jarvis-accessible archive, cloud state mirror, live replica
 
@@ -268,8 +288,11 @@ deterministically inspectable with its scope, creation time, and lifetime, and
 the authorized operator may revoke it immediately. Permission state contains only
 the exact normalized matching rule, lifetime, creation and authorization
 provenance, and revocation state; it never stores command output or credential
-values. Revocation immediately removes the usable rule while the audit retains
-only redacted lifecycle metadata.
+values. It deliberately binds paths and command structure rather than executable
+or script contents, file metadata, or inherited environment values, so matching
+authority continues across changes to behavior at an allowed path. Revocation
+immediately removes the usable rule while the audit retains only redacted
+lifecycle metadata.
 _Avoid_: Approval-gated action, wildcard command approval, model decision
 
 **Knowledge vault**:
@@ -301,14 +324,16 @@ Drive, the knowledge vault, or another connected source. Cached content is
 cleared when the request ends or Jarvis restarts. Only source identifiers and
 non-content synchronization metadata persist in ordinary state; credentials live
 separately in the plaintext credential-file boundary, and source content is
-fetched again when needed.
+fetched again when needed, while full diagnostic traces retain any captured
+payload indefinitely.
 _Avoid_: Connected-service mirror, durable assistant memory, conversation history
 
 **Request working data**:
 Raw tool results, terminal output, model working context, and other intermediate
 content needed only by an active request. It is discarded when the request
-completes and is not copied into operational state or the audit record. Text
-Jarvis actually sends to the authorized operator is conversation history instead.
+completes and is not copied into operational state or the audit record, but its
+captured payload remains in the full diagnostic trace. Text Jarvis actually sends
+to the authorized operator is conversation history as well.
 _Avoid_: Conversation history, terminal operational state, audit record
 
 **Orchestration agent**:
@@ -366,8 +391,9 @@ target category, approval decision, and outcome, and only that filtered redacted
 view may be exported through Jarvis. Append-only behavior is enforced through
 storage and process permissions; the record is not cryptographically hash-chained
 or independently tamper-evident. If a required event cannot be appended, Jarvis
-blocks every side-effecting action but may continue safe read-only behavior with a
-visible degraded-state warning until manual administration restores the audit.
+blocks every side effect including WhatsApp replies, failures, status responses,
+and warnings; safe reads remain available only through local administration until
+the audit is restored.
 Required events cover inbound admission and authorization; session and request
 lifecycle changes; conversation-history and durable-memory access or mutation;
 connected-service reads; tool proposals and outcomes; approvals and rejections;
@@ -377,12 +403,12 @@ diagnostic telemetry rather than a permanent audit event.
 _Avoid_: Conversation history, model trace, editable activity log
 
 **Diagnostic trace**:
-Short-lived operational telemetry for model and agent runs. It may retain trace
-and span identifiers, timing, model identity, token usage, span type, and
-success-or-failure signals, but excludes model inputs and outputs, message
-bodies, tool arguments, and tool results. Diagnostic traces expire automatically
-after 30 days and are not the security audit record.
-_Avoid_: Audit record, conversation history, prompt archive
+The complete permanent record of model, agent, Codex, connector, and worker run
+payloads and telemetry, including prompts, messages, inputs, outputs, arguments,
+results, terminal data, errors, and any credentials they contain. It is retained
+and backed up indefinitely, never redacted or automatically deleted, accessible
+only through manual administration, and is not the security audit record.
+_Avoid_: Audit record, redacted telemetry, temporary trace
 
 **Execution host**:
 A named computer on which Jarvis may evaluate and run terminal actions. V1 has
