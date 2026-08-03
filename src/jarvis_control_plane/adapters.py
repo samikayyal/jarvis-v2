@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .models import (
     AuditEvidence,
+    ConversationMessage,
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
@@ -88,8 +89,10 @@ class InMemoryDurableStateStore:
 
     def __init__(self) -> None:
         self.claims: dict[tuple[str, str], IngressClaim] = {}
+        self.conversation_messages: dict[tuple[str, str], ConversationMessage] = {}
         self.requests: dict[str, RequestState] = {}
         self.fail_claim = False
+        self.fail_conversation = False
         self.fail_save = False
         self.fail_update = False
         self._lock = threading.RLock()
@@ -101,6 +104,8 @@ class InMemoryDurableStateStore:
         message_id: str,
         event_id: str,
         claimed_at: datetime,
+        conversation_message: ConversationMessage | None = None,
+        disposition: str = "pending_audit",
     ) -> bool:
         with self._lock:
             if self.fail_claim:
@@ -108,13 +113,51 @@ class InMemoryDurableStateStore:
             key = (session_id, message_id)
             if key in self.claims:
                 return False
+            if conversation_message is not None:
+                if self.fail_conversation:
+                    raise StateStoreError("controlled conversation write failure")
+                if (
+                    conversation_message.session_id,
+                    conversation_message.message_id,
+                ) != key:
+                    raise StateStoreError(
+                        "conversation message key does not match claim"
+                    )
+                self.conversation_messages[key] = conversation_message
             self.claims[key] = IngressClaim(
                 session_id=session_id,
                 message_id=message_id,
                 event_id=event_id,
                 claimed_at=claimed_at,
+                disposition=disposition,
             )
             return True
+
+    def update_ingress_disposition(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None:
+        with self._lock:
+            if self.fail_update:
+                raise StateStoreError("controlled ingress disposition update failure")
+            key = (session_id, message_id)
+            claim = self.claims.get(key)
+            if claim is None:
+                raise StateStoreError("ingress claim does not exist")
+            self.claims[key] = IngressClaim(
+                session_id=claim.session_id,
+                message_id=claim.message_id,
+                event_id=claim.event_id,
+                claimed_at=claim.claimed_at,
+                disposition=disposition,
+            )
+
+    def list_conversation_messages(self) -> tuple[ConversationMessage, ...]:
+        with self._lock:
+            return tuple(self.conversation_messages.values())
 
     def save_request(self, request: RequestState) -> None:
         with self._lock:
@@ -164,6 +207,7 @@ class SQLiteDurableStateStore:
                     message_id TEXT NOT NULL,
                     event_id TEXT NOT NULL,
                     claimed_at TEXT NOT NULL,
+                    disposition TEXT NOT NULL DEFAULT 'pending_audit',
                     PRIMARY KEY (session_id, message_id)
                 );
                 CREATE TABLE IF NOT EXISTS request_state (
@@ -181,9 +225,34 @@ class SQLiteDurableStateStore:
                     outcome TEXT,
                     error_code TEXT
                 );
+                CREATE TABLE IF NOT EXISTS conversation_history (
+                    session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK (direction = 'inbound'),
+                    PRIMARY KEY (session_id, message_id)
+                );
                 """
             )
             self.connection.commit()
+            columns = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(ingress_claims)"
+                ).fetchall()
+            }
+            if "disposition" not in columns:
+                self.connection.execute(
+                    """
+                    ALTER TABLE ingress_claims
+                    ADD COLUMN disposition TEXT NOT NULL DEFAULT 'admitted'
+                    """
+                )
+                self.connection.commit()
         except sqlite3.Error as exc:
             raise StateStoreError("could not initialize SQLite state") from exc
 
@@ -194,20 +263,89 @@ class SQLiteDurableStateStore:
         message_id: str,
         event_id: str,
         claimed_at: datetime,
+        conversation_message: ConversationMessage | None = None,
+        disposition: str = "pending_audit",
     ) -> bool:
         try:
             cursor = self.connection.execute(
                 """
-                INSERT INTO ingress_claims(session_id, message_id, event_id, claimed_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO ingress_claims(
+                    session_id, message_id, event_id, claimed_at, disposition
+                )
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, message_id) DO NOTHING
                 """,
-                (session_id, message_id, event_id, ensure_utc(claimed_at).isoformat()),
+                (
+                    session_id,
+                    message_id,
+                    event_id,
+                    ensure_utc(claimed_at).isoformat(),
+                    disposition,
+                ),
             )
+            claimed = cursor.rowcount == 1
+            if claimed and conversation_message is not None:
+                if (
+                    conversation_message.session_id,
+                    conversation_message.message_id,
+                ) != (session_id, message_id):
+                    self.connection.rollback()
+                    raise StateStoreError(
+                        "conversation message key does not match claim"
+                    )
+                self.connection.execute(
+                    """
+                    INSERT INTO conversation_history(
+                        session_id, message_id, event_id, chat_id, sender_id,
+                        text, occurred_at, direction
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_message.session_id,
+                        conversation_message.message_id,
+                        conversation_message.event_id,
+                        conversation_message.chat_id,
+                        conversation_message.sender_id,
+                        conversation_message.text,
+                        ensure_utc(conversation_message.occurred_at).isoformat(),
+                        conversation_message.direction,
+                    ),
+                )
             self.connection.commit()
-            return cursor.rowcount == 1
+            return claimed
+        except StateStoreError:
+            raise
         except sqlite3.Error as exc:
+            try:
+                self.connection.rollback()
+            except sqlite3.Error:
+                pass
             raise StateStoreError("could not claim ingress") from exc
+
+    def update_ingress_disposition(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None:
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE ingress_claims
+                SET disposition = ?
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (disposition, session_id, message_id),
+            )
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                raise StateStoreError("ingress claim does not exist")
+            self.connection.commit()
+        except StateStoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not update ingress disposition") from exc
 
     def save_request(self, request: RequestState) -> None:
         try:
@@ -283,7 +421,7 @@ class SQLiteDurableStateStore:
         try:
             rows = self.connection.execute(
                 """
-                SELECT session_id, message_id, event_id, claimed_at
+                SELECT session_id, message_id, event_id, claimed_at, disposition
                 FROM ingress_claims ORDER BY claimed_at, session_id, message_id
                 """
             ).fetchall()
@@ -295,6 +433,33 @@ class SQLiteDurableStateStore:
                 message_id=row["message_id"],
                 event_id=row["event_id"],
                 claimed_at=datetime.fromisoformat(row["claimed_at"]),
+                disposition=row["disposition"],
+            )
+            for row in rows
+        )
+
+    def list_conversation_messages(self) -> tuple[ConversationMessage, ...]:
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT session_id, message_id, event_id, chat_id, sender_id,
+                       text, occurred_at, direction
+                FROM conversation_history
+                ORDER BY occurred_at, session_id, message_id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not list conversation history") from exc
+        return tuple(
+            ConversationMessage(
+                session_id=row["session_id"],
+                message_id=row["message_id"],
+                event_id=row["event_id"],
+                chat_id=row["chat_id"],
+                sender_id=row["sender_id"],
+                text=row["text"],
+                occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                direction=row["direction"],
             )
             for row in rows
         )

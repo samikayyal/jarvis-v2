@@ -1,4 +1,4 @@
-"""Small ports and errors for the control-plane tracer bullet."""
+"""Small ports and errors for the ticket01/ticket02 control-plane seam."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Protocol
 
 from .models import (
     AuditEvidence,
+    ConversationMessage,
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
@@ -59,7 +60,19 @@ class DurableStateStore(Protocol):
         message_id: str,
         event_id: str,
         claimed_at: datetime,
+        conversation_message: ConversationMessage | None = None,
+        disposition: str = "pending_audit",
     ) -> bool: ...
+
+    def update_ingress_disposition(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None: ...
+
+    def list_conversation_messages(self) -> tuple[ConversationMessage, ...]: ...
 
     def save_request(self, request: RequestState) -> None: ...
 
