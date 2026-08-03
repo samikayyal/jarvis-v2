@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 from .models import (
     AuditEvidence,
+    ConversationMessage,
     InboundMessage,
     OrchestrationRequest,
     OutboundReply,
@@ -370,7 +371,7 @@ class SignedMessageReceiver:
 
         try:
             message = event.decode()
-        except ValueError:
+        except (TypeError, ValueError):
             self._best_effort_audit(
                 kind="inbound_malformed",
                 outcome="rejected",
@@ -404,6 +405,15 @@ class SignedMessageReceiver:
                 message_id=message.message_id,
                 event_id=message.event_id,
                 claimed_at=self.clock.now(),
+                conversation_message=ConversationMessage(
+                    session_id=message.session_id,
+                    message_id=message.message_id,
+                    event_id=message.event_id,
+                    chat_id=message.chat_id,
+                    sender_id=message.sender_id,
+                    text=message.text,
+                    occurred_at=self.clock.now(),
+                ),
             )
         except StateStoreError:
             return ReceiveResult(
@@ -423,10 +433,51 @@ class SignedMessageReceiver:
                 details={"channel": "direct_text", "phase": "admission"},
             )
         except AuditWriteError:
+            try:
+                self.state.update_ingress_disposition(
+                    session_id=message.session_id,
+                    message_id=message.message_id,
+                    disposition="audit_blocked",
+                )
+            except StateStoreError as exc:
+                return ReceiveResult(
+                    status_code=503,
+                    disposition="state_unavailable",
+                    reason=(
+                        "audit evidence was unavailable and the blocked ingress "
+                        f"disposition could not be persisted: {exc}"
+                    ),
+                )
             return ReceiveResult(
                 status_code=202,
                 disposition="audit_blocked",
                 reason="required audit evidence was unavailable",
+            )
+
+        try:
+            self.state.update_ingress_disposition(
+                session_id=message.session_id,
+                message_id=message.message_id,
+                disposition="admitted",
+            )
+        except StateStoreError as exc:
+            self._best_effort_audit(
+                kind="inbound_admission_finalization_failed",
+                event_id=message.event_id,
+                outcome="state_unavailable",
+                actor="transport",
+                details={
+                    "phase": "admission_finalization",
+                    "disposition": "pending_audit",
+                },
+            )
+            return ReceiveResult(
+                status_code=503,
+                disposition="state_unavailable",
+                reason=(
+                    "audit evidence was recorded but the admitted ingress "
+                    f"disposition could not be persisted: {exc}"
+                ),
             )
 
         return self.broker.handle(message)
@@ -442,15 +493,23 @@ class SignedMessageReceiver:
             return "not_direct_message"
         if message.message_type != "text":
             return "unsupported_message_type"
+        if not self._identity_is_resolved(
+            message.sender_id
+        ) or not self._identity_is_resolved(message.chat_id):
+            return "unresolved_identity"
         if message.sender_id != self.config.operator_id:
             return "unauthorized_operator"
         if message.chat_id != self.config.operator_id:
             return "unauthorized_chat"
-        if not message.text.strip():
+        if not isinstance(message.text, str) or not message.text.strip():
             return "blank_text"
         if len(message.text) > self.config.max_text_length:
             return "text_too_large"
         return None
+
+    @staticmethod
+    def _identity_is_resolved(identity: str | None) -> bool:
+        return isinstance(identity, str) and bool(identity.strip())
 
     def _append_audit(
         self,

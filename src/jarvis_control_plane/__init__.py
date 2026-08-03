@@ -20,6 +20,7 @@ from .control_plane import (
 )
 from .models import (
     AuditEvidence,
+    ConversationMessage,
     InboundMessage,
     IngressClaim,
     OrchestrationRequest,
@@ -46,6 +47,7 @@ __all__ = [
     "ControlPlaneError",
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
+    "ConversationMessage",
     "DeterministicCapabilityBroker",
     "DeterministicIdGenerator",
     "FixedClock",

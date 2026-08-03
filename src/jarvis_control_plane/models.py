@@ -1,4 +1,4 @@
-"""Typed envelopes used by the ticket01 control-plane tracer bullet.
+"""Typed envelopes used by the ticket01/ticket02 control-plane seam.
 
 The transport envelope deliberately keeps the exact signed bytes.  The
 receiver verifies those bytes before decoding them into an :class:`InboundMessage`.
@@ -63,12 +63,12 @@ class InboundMessage:
     session_id: str
     event_id: str
     message_id: str
-    sender_id: str
-    chat_id: str
-    chat_type: str
-    message_type: str
-    from_me: bool
-    text: str
+    sender_id: object | None
+    chat_id: object | None
+    chat_type: object | None
+    message_type: object | None
+    from_me: object | None
+    text: object | None
 
     def __post_init__(self) -> None:
         for name in (
@@ -76,16 +76,8 @@ class InboundMessage:
             "session_id",
             "event_id",
             "message_id",
-            "sender_id",
-            "chat_id",
-            "chat_type",
-            "message_type",
         ):
             _non_empty_identifier(getattr(self, name), name)
-        if not isinstance(self.from_me, bool):
-            raise TypeError("from_me must be a boolean")
-        if not isinstance(self.text, str):
-            raise TypeError("text must be a string")
 
     def as_mapping(self) -> dict[str, Any]:
         """Return the stable transport representation used for signing."""
@@ -112,12 +104,6 @@ class InboundMessage:
             "session_id",
             "event_id",
             "message_id",
-            "sender_id",
-            "chat_id",
-            "chat_type",
-            "message_type",
-            "from_me",
-            "text",
         }
         if not required.issubset(payload):
             raise ValueError("event payload is missing required fields")
@@ -127,12 +113,12 @@ class InboundMessage:
                 session_id=payload["session_id"],
                 event_id=payload["event_id"],
                 message_id=payload["message_id"],
-                sender_id=payload["sender_id"],
-                chat_id=payload["chat_id"],
-                chat_type=payload["chat_type"],
-                message_type=payload["message_type"],
-                from_me=payload["from_me"],
-                text=payload["text"],
+                sender_id=payload.get("sender_id"),
+                chat_id=payload.get("chat_id"),
+                chat_type=payload.get("chat_type"),
+                message_type=payload.get("message_type"),
+                from_me=payload.get("from_me"),
+                text=payload.get("text"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("event payload has invalid field types") from exc
@@ -143,18 +129,16 @@ class SignedInboundEvent:
     """A signed transport envelope retaining the exact bytes for verification."""
 
     raw_body: bytes
-    signature: str
+    signature: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.raw_body, bytes):
             raise TypeError("raw_body must be bytes")
-        if not isinstance(self.signature, str) or not self.signature:
-            raise TypeError("signature must be a non-empty string")
+        if self.signature is not None and not isinstance(self.signature, str):
+            raise TypeError("signature must be a string or null")
 
     @classmethod
-    def from_message(
-        cls, message: InboundMessage, secret: bytes
-    ) -> SignedInboundEvent:
+    def from_message(cls, message: InboundMessage, secret: bytes) -> SignedInboundEvent:
         raw_body = _canonical_json(message.as_mapping())
         return cls(raw_body=raw_body, signature=sign_body(raw_body, secret))
 
@@ -166,7 +150,12 @@ class SignedInboundEvent:
         return cls(raw_body=raw_body, signature=sign_body(raw_body, secret))
 
     def verify(self, secret: bytes) -> bool:
-        if not isinstance(secret, bytes) or not secret:
+        if (
+            not isinstance(secret, bytes)
+            or not secret
+            or not isinstance(self.signature, str)
+            or not self.signature
+        ):
             return False
         expected = sign_body(self.raw_body, secret)
         return hmac.compare_digest(expected, self.signature)
@@ -174,9 +163,9 @@ class SignedInboundEvent:
     def decode(self) -> InboundMessage:
         try:
             payload = json.loads(self.raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+            return InboundMessage.from_mapping(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError("signed body is not valid JSON") from exc
-        return InboundMessage.from_mapping(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,11 +176,43 @@ class IngressClaim:
     message_id: str
     event_id: str
     claimed_at: datetime
+    disposition: str = "pending_audit"
 
     def __post_init__(self) -> None:
         for name in ("session_id", "message_id", "event_id"):
             _non_empty_identifier(getattr(self, name), name)
+        _non_empty_identifier(self.disposition, "disposition")
         object.__setattr__(self, "claimed_at", ensure_utc(self.claimed_at))
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationMessage:
+    """Immutable authorized-operator text retained by ingress admission."""
+
+    session_id: str
+    message_id: str
+    event_id: str
+    chat_id: str
+    sender_id: str
+    text: str
+    occurred_at: datetime
+    direction: str = "inbound"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "session_id",
+            "message_id",
+            "event_id",
+            "chat_id",
+            "sender_id",
+            "direction",
+        ):
+            _non_empty_identifier(getattr(self, name), name)
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("conversation text must be non-blank")
+        if self.direction != "inbound":
+            raise ValueError("ticket02 conversation messages must be inbound")
+        object.__setattr__(self, "occurred_at", ensure_utc(self.occurred_at))
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,17 +305,19 @@ class OutboundReply:
         return self.request_id
 
 
-_FORBIDDEN_AUDIT_KEYS = frozenset({
-    "body",
-    "credential",
-    "message_text",
-    "operator_id",
-    "raw_body",
-    "secret",
-    "sender_id",
-    "signature",
-    "text",
-})
+_FORBIDDEN_AUDIT_KEYS = frozenset(
+    {
+        "body",
+        "credential",
+        "message_text",
+        "operator_id",
+        "raw_body",
+        "secret",
+        "sender_id",
+        "signature",
+        "text",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
