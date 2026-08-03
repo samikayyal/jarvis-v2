@@ -19,7 +19,9 @@ def main() -> int:
         check=False,
     )
     if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "uvx ruff format . failed"
+        message = (
+            result.stderr.strip() or result.stdout.strip() or "uvx ruff format . failed"
+        )
         return emit_success(message)
     return emit_success("Ran uvx ruff format .")
 

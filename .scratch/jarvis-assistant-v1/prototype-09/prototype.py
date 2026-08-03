@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from control_grammar import ControlState, Transition, handle_operator_message, handle_system_event, state_dict
+from control_grammar import (
+    ControlState,
+    Transition,
+    handle_operator_message,
+    handle_system_event,
+    state_dict,
+)
 
 
 BOLD = "\033[1m"
@@ -33,7 +39,9 @@ Prototype-only system events:
 """
 
 
-def render(state: ControlState, sender: str, replies: tuple[str, ...], effects: tuple[str, ...]) -> None:
+def render(
+    state: ControlState, sender: str, replies: tuple[str, ...], effects: tuple[str, ...]
+) -> None:
     print("\033[2J\033[H", end="")
     print(f"{BOLD}PROTOTYPE 09 — WhatsApp control interaction{RESET}")
     print(f"{DIM}Throwaway, in memory, no OpenWA or external side effects.{RESET}\n")
@@ -97,7 +105,9 @@ def demo(state: ControlState) -> ControlState:
         print(f"\n{source.title()}: {value}")
         for reply in transition.replies:
             print(f"Jarvis: {reply}")
-    input("\nReference transcript complete. Press Enter to return to the live prototype.")
+    input(
+        "\nReference transcript complete. Press Enter to return to the live prototype."
+    )
     return state
 
 
