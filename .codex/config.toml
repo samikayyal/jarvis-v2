@@ -1,0 +1,11 @@
+[features]
+hooks = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'python "$(git rev-parse --show-toplevel)/.codex/hooks/format_python_on_stop.py"'
+command_windows = 'python "$(git rev-parse --show-toplevel)/.codex/hooks/format_python_on_stop.py"'
+timeout = 120
+statusMessage = "Formatting Python files"
