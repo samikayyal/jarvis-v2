@@ -1,4 +1,4 @@
-"""Receiver and deterministic capability-broker path for ticket01."""
+"""Receiver and deterministic capability-broker path for ticket01/ticket03."""
 
 from __future__ import annotations
 
@@ -89,19 +89,16 @@ class DeterministicCapabilityBroker:
                 kind="request_accepted",
                 event_id=message.event_id,
                 request_id=request.request_id,
+                message_id=message.message_id,
                 outcome="accepted",
                 actor="configured_operator",
+                operation_type="request_lifecycle",
+                target_category="control_plane",
                 details={"phase": "orchestration"},
             )
-        except (StateStoreError, AuditWriteError):
+        except (StateStoreError, AuditWriteError) as admission_error:
             try:
-                blocked = self._transition(
-                    request,
-                    status="blocked",
-                    phase="audit_gate",
-                    outcome="audit_unavailable",
-                    error_code="audit_unavailable",
-                )
+                self.state.delete_request(request.request_id)
             except StateStoreError as transition_error:
                 return ReceiveResult(
                     status_code=202,
@@ -109,15 +106,25 @@ class DeterministicCapabilityBroker:
                     request=request,
                     reason=(
                         "required audit evidence was unavailable and the blocked state "
-                        "could not be persisted: "
+                        "could not be rolled back: "
                         f"{transition_error}"
                     ),
                 )
+            blocked = replace(
+                request,
+                status="blocked",
+                phase="audit_gate",
+                outcome="audit_unavailable",
+                error_code="audit_unavailable",
+            )
             return ReceiveResult(
                 status_code=202,
                 disposition="audit_blocked",
                 request=blocked,
-                reason="required audit evidence was unavailable",
+                reason=(
+                    "required audit evidence was unavailable; the request admission "
+                    f"was rolled back: {admission_error}"
+                ),
             )
 
         orchestration_request = OrchestrationRequest(state=request, text=message.text)
@@ -131,8 +138,11 @@ class DeterministicCapabilityBroker:
                 kind="orchestration_result",
                 event_id=message.event_id,
                 request_id=request.request_id,
+                message_id=message.message_id,
                 outcome=result.outcome,
                 actor="controlled_orchestration",
+                operation_type="orchestration",
+                target_category="control_plane",
                 details={"adapter": result.adapter},
             )
         except (OrchestrationAdapterError, AuditWriteError, ValueError) as exc:
@@ -144,13 +154,16 @@ class DeterministicCapabilityBroker:
                     outcome="orchestration_failed",
                     error_code="orchestration_error",
                 )
-            except StateStoreError as transition_error:
+            except (StateStoreError, AuditWriteError) as transition_error:
                 self._best_effort_audit(
                     kind="orchestration_result",
                     event_id=message.event_id,
                     request_id=request.request_id,
+                    message_id=message.message_id,
                     outcome="failed",
                     actor="controlled_orchestration",
+                    operation_type="orchestration",
+                    target_category="control_plane",
                     details={"result": "failed", "state": "unavailable"},
                 )
                 return ReceiveResult(
@@ -167,8 +180,11 @@ class DeterministicCapabilityBroker:
                 kind="orchestration_result",
                 event_id=message.event_id,
                 request_id=request.request_id,
+                message_id=message.message_id,
                 outcome="failed",
                 actor="controlled_orchestration",
+                operation_type="orchestration",
+                target_category="control_plane",
                 details={"result": "failed"},
             )
             return ReceiveResult(
@@ -193,17 +209,21 @@ class DeterministicCapabilityBroker:
                 request,
                 status="replying",
                 phase="outbound",
-                outcome=result.outcome,
+                outcome="replying",
                 error_code=None,
                 reply_id=reply.reply_id,
             )
-        except StateStoreError as exc:
+        except (StateStoreError, AuditWriteError) as exc:
             self._best_effort_audit(
                 kind="outbound_completion",
                 event_id=message.event_id,
                 request_id=request.request_id,
+                message_id=message.message_id,
                 outcome="not_sent",
                 actor="controlled_outbound",
+                operation_type="outbound_message",
+                target_category="operator_conversation",
+                execution_status="failed",
                 details={"result": "not_sent", "state": "unavailable"},
             )
             return ReceiveResult(
@@ -213,13 +233,117 @@ class DeterministicCapabilityBroker:
                 reason=f"could not persist replying state; outbound was not sent: {exc}",
             )
 
+        side_effect_may_have_happened = False
         try:
+            preflight = getattr(self.outbound, "preflight", None)
+            if not callable(preflight):
+                raise OutboundConnectorError(
+                    "outbound connector does not provide audit-safe preflight"
+                )
+            preflight(reply)
+            # The broker, rather than an adapter implementation, is the
+            # reference-monitor gate.  A plain connector cannot dispatch until
+            # the connector has guaranteed that the send is deterministic and
+            # the bounded outbound-attempt/result admission is recorded.  The
+            # result remains explicitly pending until the connector returns;
+            # pre-dispatch evidence must never claim a successful send.
+            # This batch is the durable dispatch-admission record.  It is
+            # committed atomically before send(), so a later audit outage
+            # cannot erase the fact that dispatch was admitted or justify an
+            # automatic retry.  The result remains explicitly pending until
+            # the connector returns; terminal evidence is an observation of
+            # what happened after this point.
+            self.audit.append_batch(
+                (
+                    self._audit_evidence(
+                        kind="outbound_attempt",
+                        event_id=message.event_id,
+                        request_id=request.request_id,
+                        message_id=message.message_id,
+                        outcome="attempted",
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        details={
+                            "channel": "controlled_outbound",
+                            "destination": "configured_operator",
+                        },
+                    ),
+                    self._audit_evidence(
+                        kind="outbound_result",
+                        event_id=message.event_id,
+                        request_id=request.request_id,
+                        message_id=message.message_id,
+                        outcome="pending",
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        execution_status="pending",
+                        details={
+                            "channel": "controlled_outbound",
+                            "result": "pending",
+                        },
+                    ),
+                )
+            )
             self.outbound.send(reply)
-        except (AuditWriteError, OutboundConnectorError, ValueError) as exc:
-            may_have_sent = (
+            side_effect_may_have_happened = True
+            self._append_audit(
+                kind="outbound_result",
+                event_id=message.event_id,
+                request_id=request.request_id,
+                message_id=message.message_id,
+                outcome="accepted",
+                actor="controlled_outbound",
+                operation_type="outbound_message",
+                target_category="operator_conversation",
+                execution_status="accepted",
+                details={"channel": "controlled_outbound", "result": "accepted"},
+            )
+            completed = self._transition(
+                replying,
+                status="completed",
+                phase="completed",
+                outcome="reply_sent",
+                error_code=None,
+                reply_id=reply.reply_id,
+            )
+        except (
+            AuditWriteError,
+            OutboundConnectorError,
+            StateStoreError,
+            ValueError,
+        ) as exc:
+            may_have_sent = side_effect_may_have_happened or (
                 isinstance(exc, OutboundConnectorError) and exc.may_have_sent
             )
             outcome = "outbound_unknown" if may_have_sent else "outbound_failed"
+            if may_have_sent:
+                self._best_effort_audit(
+                    kind="outbound_result",
+                    event_id=message.event_id,
+                    request_id=request.request_id,
+                    message_id=message.message_id,
+                    outcome="unknown",
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    execution_status="unknown",
+                    details={"channel": "controlled_outbound", "result": "unknown"},
+                )
+            else:
+                self._best_effort_audit(
+                    kind="outbound_result",
+                    event_id=message.event_id,
+                    request_id=request.request_id,
+                    message_id=message.message_id,
+                    outcome="failed",
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    execution_status="failed",
+                    details={"channel": "controlled_outbound", "result": "failed"},
+                )
             try:
                 failed = self._transition(
                     replying,
@@ -229,69 +353,64 @@ class DeterministicCapabilityBroker:
                     error_code="outbound_unknown"
                     if may_have_sent
                     else "outbound_error",
+                    audit=True,
                 )
-            except StateStoreError as transition_error:
-                self._best_effort_audit(
-                    kind="outbound_completion",
-                    event_id=message.event_id,
-                    request_id=request.request_id,
-                    outcome=outcome,
-                    actor="controlled_outbound",
-                    details={"result": outcome, "state": "unavailable"},
+            except (StateStoreError, AuditWriteError) as transition_error:
+                if not may_have_sent:
+                    self._best_effort_audit(
+                        kind="outbound_completion",
+                        event_id=message.event_id,
+                        request_id=request.request_id,
+                        message_id=message.message_id,
+                        outcome=outcome,
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        execution_status=(
+                            "unknown" if outcome == "outbound_unknown" else "failed"
+                        ),
+                        details={"result": outcome, "state": "unavailable"},
+                    )
+                reason = (
+                    f"{str(exc) or 'outbound connector failed'}; the {outcome} "
+                    "state could not be persisted: "
+                    f"{transition_error}"
                 )
+                if may_have_sent and isinstance(exc, StateStoreError):
+                    reason = (
+                        "outbound reply was accepted, but durable completion state "
+                        f"could not be persisted: {exc}; {reason}"
+                    )
                 return ReceiveResult(
                     status_code=202,
                     disposition="unknown" if may_have_sent else "failed",
                     request=replying,
-                    reason=(
-                        f"{str(exc) or 'outbound connector failed'}; the {outcome} "
-                        "state could not be persisted: "
-                        f"{transition_error}"
-                    ),
+                    reply=reply if may_have_sent else None,
+                    reason=reason,
                 )
-            self._best_effort_audit(
-                kind="outbound_completion",
-                event_id=message.event_id,
-                request_id=request.request_id,
-                outcome=outcome,
-                actor="controlled_outbound",
-                details={"result": outcome},
-            )
+            if not may_have_sent:
+                self._best_effort_audit(
+                    kind="outbound_completion",
+                    event_id=message.event_id,
+                    request_id=request.request_id,
+                    message_id=message.message_id,
+                    outcome=outcome,
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    execution_status=(
+                        "unknown" if outcome == "outbound_unknown" else "failed"
+                    ),
+                    details={"result": outcome},
+                )
             return ReceiveResult(
                 status_code=202,
                 disposition="unknown" if may_have_sent else "failed",
                 request=failed,
+                reply=reply if may_have_sent else None,
                 reason=str(exc) or "outbound connector failed",
             )
 
-        try:
-            completed = self._transition(
-                replying,
-                status="completed",
-                phase="completed",
-                outcome="reply_sent",
-                error_code=None,
-                reply_id=reply.reply_id,
-            )
-        except StateStoreError as exc:
-            self._best_effort_audit(
-                kind="outbound_completion",
-                event_id=message.event_id,
-                request_id=request.request_id,
-                outcome="reply_sent",
-                actor="controlled_outbound",
-                details={"result": "reply_sent", "state": "unavailable"},
-            )
-            return ReceiveResult(
-                status_code=202,
-                disposition="unknown",
-                request=replying,
-                reply=reply,
-                reason=(
-                    "outbound reply was accepted, but durable completion state could "
-                    f"not be persisted: {exc}"
-                ),
-            )
         return ReceiveResult(
             status_code=202,
             disposition="completed",
@@ -299,13 +418,37 @@ class DeterministicCapabilityBroker:
             reply=reply,
         )
 
-    def _transition(self, request: RequestState, **changes: object) -> RequestState:
+    def _transition(
+        self,
+        request: RequestState,
+        *,
+        audit: bool = True,
+        **changes: object,
+    ) -> RequestState:
         updated = replace(request, updated_at=self.clock.now(), **changes)
         current = self.state.get_request(request.request_id)
         if current is None:
             self.state.save_request(updated)
         else:
             self.state.update_request(updated)
+        if audit:
+            try:
+                self._append_audit(
+                    kind="request_lifecycle",
+                    event_id=updated.event_id,
+                    request_id=updated.request_id,
+                    message_id=updated.message_id,
+                    outcome=updated.outcome or updated.status,
+                    actor="control_plane",
+                    operation_type="request_lifecycle",
+                    target_category="control_plane",
+                    execution_status=updated.status,
+                    details={"phase": updated.phase, "status": updated.status},
+                )
+            except AuditWriteError:
+                if current is not None:
+                    self.state.update_request(current)
+                raise
         return updated
 
     def _append_audit(
@@ -317,18 +460,61 @@ class DeterministicCapabilityBroker:
         outcome: str,
         actor: str,
         details: dict[str, str],
+        message_id: str | None = None,
+        operation_type: str | None = None,
+        target_category: str | None = None,
+        approval_decision: str | None = None,
+        policy_decision: str | None = None,
+        execution_status: str | None = None,
     ) -> None:
         self.audit.append(
-            AuditEvidence(
-                evidence_id=self.ids.new_id("audit"),
+            self._audit_evidence(
                 kind=kind,
-                occurred_at=self.clock.now(),
                 event_id=event_id,
                 request_id=request_id,
                 outcome=outcome,
                 actor=actor,
                 details=details,
+                message_id=message_id,
+                operation_type=operation_type,
+                target_category=target_category,
+                approval_decision=approval_decision,
+                policy_decision=policy_decision,
+                execution_status=execution_status,
             )
+        )
+
+    def _audit_evidence(
+        self,
+        *,
+        kind: str,
+        event_id: str | None,
+        request_id: str | None,
+        outcome: str,
+        actor: str,
+        details: dict[str, str],
+        message_id: str | None = None,
+        operation_type: str | None = None,
+        target_category: str | None = None,
+        approval_decision: str | None = None,
+        policy_decision: str | None = None,
+        execution_status: str | None = None,
+    ) -> AuditEvidence:
+        return AuditEvidence(
+            evidence_id=self.ids.new_id("audit"),
+            kind=kind,
+            occurred_at=self.clock.now(),
+            event_id=event_id,
+            request_id=request_id,
+            outcome=outcome,
+            actor=actor,
+            details=details,
+            message_id=message_id,
+            operation_type=operation_type or kind,
+            target_category=target_category,
+            approval_decision=approval_decision,
+            policy_decision=policy_decision,
+            execution_status=execution_status,
         )
 
     def _best_effort_audit(self, **kwargs: object) -> None:
@@ -375,6 +561,8 @@ class SignedMessageReceiver:
                 kind="inbound_malformed",
                 outcome="rejected",
                 actor="transport",
+                operation_type="inbound_admission",
+                target_category="messaging_gateway",
                 details={"reason": "malformed_envelope"},
             )
             return ReceiveResult(
@@ -390,12 +578,65 @@ class SignedMessageReceiver:
                 event_id=message.event_id,
                 outcome="rejected",
                 actor="transport",
+                message_id=message.message_id,
+                operation_type="inbound_admission",
+                target_category="messaging_gateway",
                 details={"reason": rejection},
             )
             return ReceiveResult(
                 status_code=204,
                 disposition="rejected",
                 reason=rejection,
+            )
+
+        try:
+            already_claimed = self.state.has_ingress_claim(
+                session_id=message.session_id,
+                message_id=message.message_id,
+            )
+        except StateStoreError:
+            return ReceiveResult(
+                status_code=503,
+                disposition="state_unavailable",
+                reason="durable ingress state was unavailable",
+            )
+        if already_claimed:
+            return ReceiveResult(status_code=204, disposition="duplicate")
+
+        try:
+            self._append_audit(
+                kind="inbound_admitted",
+                event_id=message.event_id,
+                outcome="accepted",
+                actor="configured_operator",
+                message_id=message.message_id,
+                operation_type="inbound_admission",
+                target_category="messaging_gateway",
+                details={"channel": "direct_text", "phase": "admission"},
+            )
+        except AuditWriteError:
+            try:
+                claim_reserved = self.state.claim_ingress(
+                    session_id=message.session_id,
+                    message_id=message.message_id,
+                    event_id=message.event_id,
+                    claimed_at=self.clock.now(),
+                )
+            except StateStoreError:
+                return ReceiveResult(
+                    status_code=503,
+                    disposition="state_unavailable",
+                    reason=(
+                        "required audit evidence was unavailable and the durable "
+                        "replay claim could not be preserved"
+                    ),
+                )
+            if not claim_reserved:
+                return ReceiveResult(status_code=204, disposition="duplicate")
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason="required audit evidence was unavailable",
             )
 
         try:
@@ -413,21 +654,6 @@ class SignedMessageReceiver:
             )
         if not claimed:
             return ReceiveResult(status_code=204, disposition="duplicate")
-
-        try:
-            self._append_audit(
-                kind="inbound_admitted",
-                event_id=message.event_id,
-                outcome="accepted",
-                actor="configured_operator",
-                details={"channel": "direct_text", "phase": "admission"},
-            )
-        except AuditWriteError:
-            return ReceiveResult(
-                status_code=202,
-                disposition="audit_blocked",
-                reason="required audit evidence was unavailable",
-            )
 
         return self.broker.handle(message)
 
@@ -461,6 +687,12 @@ class SignedMessageReceiver:
         details: dict[str, str],
         event_id: str | None = None,
         request_id: str | None = None,
+        message_id: str | None = None,
+        operation_type: str | None = None,
+        target_category: str | None = None,
+        approval_decision: str | None = None,
+        policy_decision: str | None = None,
+        execution_status: str | None = None,
     ) -> None:
         self.audit.append(
             AuditEvidence(
@@ -472,6 +704,12 @@ class SignedMessageReceiver:
                 outcome=outcome,
                 actor=actor,
                 details=details,
+                message_id=message_id,
+                operation_type=operation_type or kind,
+                target_category=target_category,
+                approval_decision=approval_decision,
+                policy_decision=policy_decision,
+                execution_status=execution_status,
             )
         )
 

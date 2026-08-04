@@ -1,12 +1,14 @@
-"""Small ports and errors for the control-plane tracer bullet."""
+"""Small ports and errors for the ticket01/ticket03 control-plane seam."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 
 from .models import (
     AuditEvidence,
+    AuditFilter,
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
@@ -44,9 +46,17 @@ class OutboundConnectorError(ControlPlaneError):
 
 
 class AuditBoundary(Protocol):
-    """Append-only redacted audit boundary."""
+    """Append-only redacted audit boundary and safe local read surface."""
 
     def append(self, evidence: AuditEvidence) -> None: ...
+
+    def append_batch(self, evidence: Sequence[AuditEvidence]) -> None: ...
+
+    def safe_view(
+        self, query: AuditFilter | None = None
+    ) -> tuple[AuditEvidence, ...]: ...
+
+    def export_json(self, query: AuditFilter | None = None) -> str: ...
 
 
 class DurableStateStore(Protocol):
@@ -61,7 +71,13 @@ class DurableStateStore(Protocol):
         claimed_at: datetime,
     ) -> bool: ...
 
+    def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
+
+    def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
+
     def save_request(self, request: RequestState) -> None: ...
+
+    def delete_request(self, request_id: str) -> bool: ...
 
     def update_request(self, request: RequestState) -> None: ...
 
@@ -79,7 +95,9 @@ class OrchestrationAdapter(Protocol):
 
 
 class OutboundConnector(Protocol):
-    """Closed outbound messaging capability."""
+    """Closed outbound capability with a side-effect-free admission check."""
+
+    def preflight(self, reply: OutboundReply) -> None: ...
 
     def send(self, reply: OutboundReply) -> None: ...
 

@@ -1,4 +1,4 @@
-"""Ticket01 signed-message control-plane tracer bullet."""
+"""Ticket01 signed-message seam with the ticket03 audit boundary."""
 
 from .adapters import (
     ControlledOrchestrationAdapter,
@@ -20,6 +20,7 @@ from .control_plane import (
 )
 from .models import (
     AuditEvidence,
+    AuditFilter,
     InboundMessage,
     IngressClaim,
     OrchestrationRequest,
@@ -40,6 +41,7 @@ from .ports import (
 
 __all__ = [
     "AuditEvidence",
+    "AuditFilter",
     "AuditWriteError",
     "ControlPlane",
     "ControlPlaneConfig",

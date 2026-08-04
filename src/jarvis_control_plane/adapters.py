@@ -1,4 +1,4 @@
-"""Controlled local adapters used by the ticket01 seam.
+"""Controlled local adapters used by the ticket01/ticket03 seam.
 
 No class in this module opens a network connection.  SQLite is used for the
 durable local state/audit test boundary; the orchestration and outbound
@@ -12,13 +12,15 @@ import json
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 from .models import (
     AuditEvidence,
+    AuditFilter,
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
@@ -116,6 +118,16 @@ class InMemoryDurableStateStore:
             )
             return True
 
+    def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
+        with self._lock:
+            if self.fail_claim:
+                raise StateStoreError("controlled ingress claim failure")
+            return (session_id, message_id) in self.claims
+
+    def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
+        with self._lock:
+            return self.claims.pop((session_id, message_id), None) is not None
+
     def save_request(self, request: RequestState) -> None:
         with self._lock:
             if self.fail_save:
@@ -131,6 +143,10 @@ class InMemoryDurableStateStore:
             if request.request_id not in self.requests:
                 raise StateStoreError("request identifier does not exist")
             self.requests[request.request_id] = request
+
+    def delete_request(self, request_id: str) -> bool:
+        with self._lock:
+            return self.requests.pop(request_id, None) is not None
 
     def get_request(self, request_id: str) -> RequestState | None:
         with self._lock:
@@ -209,6 +225,30 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("could not claim ingress") from exc
 
+    def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
+        try:
+            row = self.connection.execute(
+                """
+                SELECT 1 FROM ingress_claims
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (session_id, message_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not inspect ingress claim") from exc
+        return row is not None
+
+    def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
+        try:
+            cursor = self.connection.execute(
+                "DELETE FROM ingress_claims WHERE session_id = ? AND message_id = ?",
+                (session_id, message_id),
+            )
+            self.connection.commit()
+            return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not release ingress claim") from exc
+
     def save_request(self, request: RequestState) -> None:
         try:
             self.connection.execute(
@@ -259,6 +299,17 @@ class SQLiteDurableStateStore:
             raise
         except sqlite3.Error as exc:
             raise StateStoreError("could not update request state") from exc
+
+    def delete_request(self, request_id: str) -> bool:
+        try:
+            cursor = self.connection.execute(
+                "DELETE FROM request_state WHERE request_id = ?",
+                (request_id,),
+            )
+            self.connection.commit()
+            return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not delete request state") from exc
 
     def get_request(self, request_id: str) -> RequestState | None:
         try:
@@ -340,38 +391,214 @@ def _request_from_row(row: sqlite3.Row) -> RequestState:
     )
 
 
+class _ReadOnlyAuditRecords(Sequence[AuditEvidence]):
+    """A snapshot that cannot mutate the append-only in-memory store."""
+
+    def __init__(self, records: Sequence[AuditEvidence]) -> None:
+        self._records = tuple(records)
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> AuditEvidence | tuple[AuditEvidence, ...]:
+        return self._records[index]
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __iter__(self) -> Iterator[AuditEvidence]:
+        return iter(self._records)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Sequence):
+            return tuple(self) == tuple(other)
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return repr(list(self._records))
+
+
+def _resolve_audit_filter(
+    query: AuditFilter | None,
+    filters: dict[str, object],
+) -> AuditFilter:
+    if query is not None and filters:
+        raise TypeError("pass either an AuditFilter or filter keyword arguments")
+    if query is not None:
+        return query
+    aliases = {
+        "operation": "operation_type",
+        "target": "target_category",
+        "approval": "approval_decision",
+        "policy": "policy_decision",
+        "date": "on_date",
+    }
+    for alias, canonical in aliases.items():
+        if alias in filters:
+            if canonical in filters:
+                raise TypeError(f"pass only one of {alias} and {canonical}")
+            filters[canonical] = filters.pop(alias)
+    return AuditFilter(**filters)  # type: ignore[arg-type]
+
+
+def _export_audit_json(records: Sequence[AuditEvidence]) -> str:
+    return json.dumps(
+        [record.as_safe_mapping() for record in records],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 class InMemoryAuditBoundary:
     """Append-only redacted audit fake with deterministic failure injection."""
 
     def __init__(
         self, *, fail: bool = False, fail_on_append: int | None = None
     ) -> None:
-        self.records: list[AuditEvidence] = []
+        self._records: list[AuditEvidence] = []
+        self._evidence_ids: set[str] = set()
         self.fail = fail
         self.fail_on_append = fail_on_append
 
     def append(self, evidence: AuditEvidence) -> None:
-        next_number = len(self.records) + 1
-        if self.fail or (
-            self.fail_on_append is not None and next_number == self.fail_on_append
+        self.append_batch((evidence,))
+
+    def append_batch(self, evidence: Sequence[AuditEvidence]) -> None:
+        records = tuple(evidence)
+        if any(not isinstance(record, AuditEvidence) for record in records):
+            raise TypeError("audit boundary accepts only AuditEvidence")
+        identifiers = [record.evidence_id for record in records]
+        if len(set(identifiers)) != len(identifiers) or any(
+            identifier in self._evidence_ids for identifier in identifiers
+        ):
+            raise AuditWriteError("duplicate audit evidence identifier")
+        if self.fail:
+            raise AuditWriteError("controlled audit append failure")
+        first_number = len(self._records) + 1
+        last_number = first_number + len(records) - 1
+        if (
+            records
+            and self.fail_on_append is not None
+            and first_number <= self.fail_on_append <= last_number
         ):
             raise AuditWriteError("controlled audit append failure")
-        self.records.append(evidence)
+        self._records.extend(records)
+        self._evidence_ids.update(identifiers)
+
+    @property
+    def records(self) -> _ReadOnlyAuditRecords:
+        """Return a read-only snapshot retained for ticket01 compatibility."""
+
+        return _ReadOnlyAuditRecords(self._records)
+
+    def safe_view(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> tuple[AuditEvidence, ...]:
+        resolved = _resolve_audit_filter(query, filters)
+        records = tuple(record for record in self._records if resolved.matches(record))
+        return records[: resolved.limit] if resolved.limit is not None else records
+
+    def inspect(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> tuple[AuditEvidence, ...]:
+        """Alias for the local administration safe inspection view."""
+
+        return self.safe_view(query, **filters)
+
+    def export_json(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> str:
+        return _export_audit_json(self.safe_view(query, **filters))
+
+    def export(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> str:
+        """Export only the filtered redacted view as deterministic JSON."""
+
+        return self.export_json(query, **filters)
 
 
 class SQLiteAuditBoundary:
-    """Append-only SQLite audit adapter sharing a local connection when desired."""
+    """Append-only SQLite audit adapter with a safe local read surface.
+
+    The append-only contract is protected at two local layers: SQLite triggers
+    reject row updates/deletes even from another connection, and the adapter's
+    connection authorizer rejects direct mutation attempts made through a
+    connection shared with ticket01's state seam.
+    """
+
+    _AUDIT_COLUMNS: ClassVar[dict[str, tuple[str, int, int]]] = {
+        "evidence_id": ("TEXT", 0, 1),
+        "kind": ("TEXT", 1, 0),
+        "occurred_at": ("TEXT", 1, 0),
+        "event_id": ("TEXT", 0, 0),
+        "request_id": ("TEXT", 0, 0),
+        "message_id": ("TEXT", 0, 0),
+        "operation_type": ("TEXT", 0, 0),
+        "target_category": ("TEXT", 0, 0),
+        "approval_decision": ("TEXT", 0, 0),
+        "policy_decision": ("TEXT", 0, 0),
+        "execution_status": ("TEXT", 0, 0),
+        "outcome": ("TEXT", 1, 0),
+        "actor": ("TEXT", 1, 0),
+        "details_json": ("TEXT", 1, 0),
+        "redacted": ("INTEGER", 1, 0),
+    }
+    _AUDIT_TABLE_SQL_VARIANTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            (
+                "create table audit_evidence ( evidence_id text primary key, "
+                "kind text not null, occurred_at text not null, event_id text, "
+                "request_id text, message_id text, operation_type text, "
+                "target_category text, approval_decision text, "
+                "policy_decision text, execution_status text, outcome text not null, "
+                "actor text not null, details_json text not null, "
+                "redacted integer not null check (redacted = 1) )"
+            ),
+            (
+                "create table audit_evidence ( evidence_id text primary key, "
+                "kind text not null, occurred_at text not null, event_id text, "
+                "request_id text, outcome text not null, actor text not null, "
+                "details_json text not null, redacted integer not null "
+                "check (redacted = 1) )"
+            ),
+        }
+    )
+    _AUDIT_TRIGGERS: ClassVar[dict[str, str]] = {
+        "audit_evidence_no_update": (
+            "create trigger audit_evidence_no_update before update on audit_evidence "
+            "begin select raise(abort, 'audit evidence is append-only'); end"
+        ),
+        "audit_evidence_no_delete": (
+            "create trigger audit_evidence_no_delete before delete on audit_evidence "
+            "begin select raise(abort, 'audit evidence is append-only'); end"
+        ),
+    }
 
     def __init__(self, database: str | Path | sqlite3.Connection = ":memory:") -> None:
+        if isinstance(database, sqlite3.Connection) and database.in_transaction:
+            raise AuditWriteError(
+                "caller-owned SQLite connection has an uncommitted transaction"
+            )
         self._owns_connection = not isinstance(database, sqlite3.Connection)
-        self.connection = (
+        self._connection = (
             database
             if isinstance(database, sqlite3.Connection)
             else sqlite3.connect(str(database))
         )
-        self.connection.row_factory = sqlite3.Row
+        self._connection.row_factory = sqlite3.Row
+        self._append_transaction_active = False
         try:
-            self.connection.execute(
+            self._connection.execute("PRAGMA recursive_triggers = ON")
+            self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_evidence (
                     evidence_id TEXT PRIMARY KEY,
@@ -379,6 +606,12 @@ class SQLiteAuditBoundary:
                     occurred_at TEXT NOT NULL,
                     event_id TEXT,
                     request_id TEXT,
+                    message_id TEXT,
+                    operation_type TEXT,
+                    target_category TEXT,
+                    approval_decision TEXT,
+                    policy_decision TEXT,
+                    execution_status TEXT,
                     outcome TEXT NOT NULL,
                     actor TEXT NOT NULL,
                     details_json TEXT NOT NULL,
@@ -386,65 +619,334 @@ class SQLiteAuditBoundary:
                 )
                 """
             )
-            self.connection.commit()
+            existing_columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(audit_evidence)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("message_id", "TEXT"),
+                ("operation_type", "TEXT"),
+                ("target_category", "TEXT"),
+                ("approval_decision", "TEXT"),
+                ("policy_decision", "TEXT"),
+                ("execution_status", "TEXT"),
+            ):
+                if column not in existing_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE audit_evidence ADD COLUMN {column} {definition}"
+                    )
+            self._connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS audit_evidence_occurred_at
+                    ON audit_evidence(occurred_at, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_request_id
+                    ON audit_evidence(request_id, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_operation_type
+                    ON audit_evidence(operation_type, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_target_category
+                    ON audit_evidence(target_category, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_approval_decision
+                    ON audit_evidence(approval_decision, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_policy_decision
+                    ON audit_evidence(policy_decision, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_execution_status
+                    ON audit_evidence(execution_status, evidence_id);
+                CREATE INDEX IF NOT EXISTS audit_evidence_outcome
+                    ON audit_evidence(outcome, evidence_id);
+                CREATE TRIGGER IF NOT EXISTS audit_evidence_no_update
+                    BEFORE UPDATE ON audit_evidence
+                    BEGIN
+                        SELECT RAISE(ABORT, 'audit evidence is append-only');
+                    END;
+                CREATE TRIGGER IF NOT EXISTS audit_evidence_no_delete
+                    BEFORE DELETE ON audit_evidence
+                    BEGIN
+                        SELECT RAISE(ABORT, 'audit evidence is append-only');
+                    END;
+                """
+            )
+            self._connection.commit()
+            self._connection.set_authorizer(self._authorize_sql)
         except sqlite3.Error as exc:
+            self._connection.rollback()
             raise AuditWriteError("could not initialize SQLite audit") from exc
 
     def append(self, evidence: AuditEvidence) -> None:
-        try:
-            self.connection.execute(
-                """
-                INSERT INTO audit_evidence(
-                    evidence_id, kind, occurred_at, event_id, request_id,
-                    outcome, actor, details_json, redacted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-                """,
-                (
-                    evidence.evidence_id,
-                    evidence.kind,
-                    ensure_utc(evidence.occurred_at).isoformat(),
-                    evidence.event_id,
-                    evidence.request_id,
-                    evidence.outcome,
-                    evidence.actor,
-                    json.dumps(
-                        dict(evidence.details),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                ),
+        self.append_batch((evidence,))
+
+    def append_batch(self, evidence: Sequence[AuditEvidence]) -> None:
+        records = tuple(evidence)
+        if any(not isinstance(record, AuditEvidence) for record in records):
+            raise TypeError("audit boundary accepts only AuditEvidence")
+        if not records:
+            return
+        identifiers = [record.evidence_id for record in records]
+        if len(set(identifiers)) != len(identifiers):
+            raise AuditWriteError("duplicate audit evidence identifier")
+        if not self._owns_connection and self._connection.in_transaction:
+            raise AuditWriteError(
+                "caller-owned SQLite connection has an uncommitted transaction"
             )
-            self.connection.commit()
+        transaction_started = False
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            self._append_transaction_active = True
+            self._assert_schema_integrity()
+            placeholders = ",".join("?" for _ in identifiers)
+            existing = self._connection.execute(
+                f"SELECT evidence_id FROM audit_evidence WHERE evidence_id IN ({placeholders})",
+                identifiers,
+            ).fetchone()
+            if existing is not None:
+                raise AuditWriteError("duplicate audit evidence identifier")
+            before = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM audit_evidence"
+            ).fetchone()["count"]
+            for record in records:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO audit_evidence(
+                        evidence_id, kind, occurred_at, event_id, request_id,
+                        message_id, operation_type, target_category, approval_decision,
+                        policy_decision, execution_status,
+                        outcome, actor, details_json, redacted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    """,
+                    (
+                        record.evidence_id,
+                        record.kind,
+                        ensure_utc(record.occurred_at).isoformat(),
+                        record.event_id,
+                        record.request_id,
+                        record.message_id,
+                        record.operation_type,
+                        record.target_category,
+                        record.approval_decision,
+                        record.policy_decision,
+                        record.execution_status,
+                        record.outcome,
+                        record.actor,
+                        json.dumps(
+                            dict(record.details),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise AuditWriteError(
+                        "SQLite audit append did not retain exactly one evidence row"
+                    )
+            after = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM audit_evidence"
+            ).fetchone()["count"]
+            if after - before != len(records):
+                raise AuditWriteError(
+                    "SQLite audit batch did not retain exactly one row per evidence"
+                )
+            self._connection.commit()
+        except AuditWriteError:
+            if transaction_started:
+                self._connection.rollback()
+            raise
         except sqlite3.Error as exc:
+            if transaction_started or self._owns_connection:
+                self._connection.rollback()
             raise AuditWriteError("could not append SQLite audit evidence") from exc
+        finally:
+            self._append_transaction_active = False
 
     @property
     def records(self) -> tuple[AuditEvidence, ...]:
+        return self.safe_view()
+
+    def safe_view(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> tuple[AuditEvidence, ...]:
+        resolved = _resolve_audit_filter(query, filters)
+        self._assert_schema_integrity()
         try:
-            rows = self.connection.execute(
-                "SELECT * FROM audit_evidence ORDER BY rowid"
-            ).fetchall()
+            rows = self._select_rows(resolved)
         except sqlite3.Error as exc:
             raise AuditWriteError("could not read SQLite audit evidence") from exc
-        return tuple(
-            AuditEvidence(
-                evidence_id=row["evidence_id"],
-                kind=row["kind"],
-                occurred_at=datetime.fromisoformat(row["occurred_at"]),
-                event_id=row["event_id"],
-                request_id=row["request_id"],
-                outcome=row["outcome"],
-                actor=row["actor"],
-                details=json.loads(row["details_json"]),
-                redacted=bool(row["redacted"]),
+        try:
+            records = tuple(self._evidence_from_row(row) for row in rows)
+            records = tuple(record for record in records if resolved.matches(record))
+            return records[: resolved.limit] if resolved.limit is not None else records
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AuditWriteError(
+                "stored audit evidence is not safe to inspect"
+            ) from exc
+
+    def inspect(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> tuple[AuditEvidence, ...]:
+        """Alias for the local administration safe inspection view."""
+
+        return self.safe_view(query, **filters)
+
+    def export_json(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> str:
+        return _export_audit_json(self.safe_view(query, **filters))
+
+    def export(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> str:
+        """Export only the filtered redacted view as deterministic JSON."""
+
+        return self.export_json(query, **filters)
+
+    def _assert_schema_integrity(self) -> None:
+        try:
+            if (
+                not self._owns_connection
+                and self._connection.in_transaction
+                and not self._append_transaction_active
+            ):
+                raise AuditWriteError(
+                    "caller-owned SQLite connection has an uncommitted transaction"
+                )
+            table = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("audit_evidence",),
+            ).fetchone()
+            columns = self._connection.execute(
+                "PRAGMA table_info(audit_evidence)"
+            ).fetchall()
+            rows = self._connection.execute(
+                """
+                SELECT name, sql FROM sqlite_master
+                WHERE type = 'trigger' AND tbl_name = 'audit_evidence'
+                """
+            ).fetchall()
+        except AuditWriteError:
+            raise
+        except sqlite3.Error as exc:
+            raise AuditWriteError("could not inspect SQLite audit schema") from exc
+
+        actual_columns = {
+            row["name"]: (row["type"].upper(), row["notnull"], row["pk"])
+            for row in columns
+        }
+        normalized_table_sql = " ".join(
+            (table["sql"] if table is not None and table["sql"] else "")
+            .casefold()
+            .split()
+        )
+        if (
+            table is None
+            or actual_columns != self._AUDIT_COLUMNS
+            or normalized_table_sql not in self._AUDIT_TABLE_SQL_VARIANTS
+        ):
+            raise AuditWriteError("SQLite audit schema integrity check failed")
+
+        actual_triggers = {
+            row["name"]: " ".join((row["sql"] or "").casefold().split()) for row in rows
+        }
+        if actual_triggers != self._AUDIT_TRIGGERS:
+            raise AuditWriteError("SQLite audit schema integrity check failed")
+
+    def _authorize_sql(
+        self,
+        action: int,
+        first_argument: str | None,
+        second_argument: str | None,
+        _database_name: str | None,
+        _trigger_name: str | None,
+    ) -> int:
+        audit_table = (
+            first_argument == "audit_evidence" or second_argument == "audit_evidence"
+        )
+        audit_trigger = (first_argument or "").startswith("audit_evidence_") or (
+            second_argument or ""
+        ).startswith("audit_evidence_")
+        if (
+            audit_table
+            and action == sqlite3.SQLITE_INSERT
+            and not self._append_transaction_active
+            or audit_table
+            and action
+            in (
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+                sqlite3.SQLITE_DROP_TABLE,
+                sqlite3.SQLITE_ALTER_TABLE,
             )
-            for row in rows
+            or audit_trigger
+            and action == sqlite3.SQLITE_DROP_TRIGGER
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def _select_rows(self, query: AuditFilter) -> list[sqlite3.Row]:
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if query.start_at is not None:
+            conditions.append("occurred_at >= ?")
+            parameters.append(query.start_at.isoformat())
+        if query.end_at is not None:
+            conditions.append("occurred_at < ?")
+            parameters.append(query.end_at.isoformat())
+        if query.on_date is not None:
+            conditions.append("substr(occurred_at, 1, 10) = ?")
+            parameters.append(query.on_date.isoformat())
+        for column, value in (
+            ("request_id", query.request_id),
+            ("operation_type", query.operation_type),
+            ("target_category", query.target_category),
+            ("approval_decision", query.approval_decision),
+            ("policy_decision", query.policy_decision),
+            ("execution_status", query.execution_status),
+            ("outcome", query.outcome),
+        ):
+            if value is not None:
+                conditions.append(f"{column} = ?")
+                parameters.append(value)
+        statement = "SELECT * FROM audit_evidence"
+        if conditions:
+            statement += " WHERE " + " AND ".join(conditions)
+        statement += " ORDER BY rowid"
+        if query.limit is not None:
+            statement += " LIMIT ?"
+            parameters.append(query.limit)
+        return self._connection.execute(statement, parameters).fetchall()
+
+    @staticmethod
+    def _evidence_from_row(row: sqlite3.Row) -> AuditEvidence:
+        return AuditEvidence(
+            evidence_id=row["evidence_id"],
+            kind=row["kind"],
+            occurred_at=datetime.fromisoformat(row["occurred_at"]),
+            event_id=row["event_id"],
+            request_id=row["request_id"],
+            outcome=row["outcome"],
+            actor=row["actor"],
+            details=json.loads(row["details_json"]),
+            redacted=bool(row["redacted"]),
+            message_id=row["message_id"],
+            operation_type=row["operation_type"],
+            target_category=row["target_category"],
+            approval_decision=row["approval_decision"],
+            policy_decision=row["policy_decision"],
+            execution_status=row["execution_status"],
         )
 
     def close(self) -> None:
         if self._owns_connection:
-            self.connection.close()
+            self._connection.close()
 
 
 class ControlledOrchestrationAdapter:
@@ -482,7 +984,12 @@ class ControlledOrchestrationAdapter:
 
 
 class ControlledOutboundConnector:
-    """Closed fake connector with an audit gate and fixed destination."""
+    """Closed fake connector with a fixed destination.
+
+    The capability broker owns the audit admission gate immediately before
+    calling this connector.  The retained audit/clock/ID constructor inputs
+    keep the ticket01 controlled-adapter shape source-compatible.
+    """
 
     def __init__(
         self,
@@ -503,63 +1010,29 @@ class ControlledOutboundConnector:
         self.sent: list[OutboundReply] = []
 
     def send(self, reply: OutboundReply) -> None:
+        self.preflight(reply)
+        if self.failure is not None:
+            raise OutboundConnectorError(self.failure)
+
+        self.sent.append(reply)
+
+    def preflight(self, reply: OutboundReply) -> None:
+        """Validate the deterministic send without performing it.
+
+        The broker uses this contract to append the complete outbound audit
+        admission before calling ``send``.  A connector whose send can fail
+        after preflight must expose that uncertainty instead of implementing
+        this method as a best-effort check.
+        """
+
         if reply.session_id != self.session_id:
             raise OutboundConnectorError("reply session is not configured")
         if reply.recipient_id != self.operator_id:
             raise OutboundConnectorError("reply recipient is not configured")
         if reply.request_id not in reply.body:
             raise OutboundConnectorError("reply is missing request correlation")
-
-        self._audit(
-            kind="outbound_attempt",
-            reply=reply,
-            outcome="attempted",
-            details={
-                "channel": "controlled_outbound",
-                "destination": "configured_operator",
-            },
-        )
         if self.failure is not None:
-            self._audit(
-                kind="outbound_result",
-                reply=reply,
-                outcome="failed",
-                details={"channel": "controlled_outbound", "result": "failed"},
-            )
             raise OutboundConnectorError(self.failure)
-
-        self.sent.append(reply)
-        try:
-            self._audit(
-                kind="outbound_result",
-                reply=reply,
-                outcome="accepted",
-                details={"channel": "controlled_outbound", "result": "accepted"},
-            )
-        except AuditWriteError as exc:
-            raise OutboundConnectorError(
-                "outbound audit result was not recorded",
-                may_have_sent=True,
-            ) from exc
-
-    def _audit(
-        self,
-        *,
-        kind: str,
-        reply: OutboundReply,
-        outcome: str,
-        details: dict[str, str],
-    ) -> None:
-        evidence = AuditEvidence(
-            evidence_id=self.ids.new_id("audit"),
-            kind=kind,
-            occurred_at=self.clock.now(),
-            request_id=reply.request_id,
-            outcome=outcome,
-            actor="controlled_outbound",
-            details=details,
-        )
-        self.audit.append(evidence)
 
 
 def replace_request(request: RequestState, **changes: object) -> RequestState:

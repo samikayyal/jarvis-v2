@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,21 +14,20 @@ from jarvis_control_plane import (
     DeterministicCapabilityBroker,
     DeterministicIdGenerator,
     FixedClock,
+    InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDurableStateStore,
-    InboundMessage,
     OutboundReply,
-    SQLiteAuditBoundary,
-    SQLiteDurableStateStore,
     SignedInboundEvent,
     SignedMessageReceiver,
+    SQLiteAuditBoundary,
+    SQLiteDurableStateStore,
 )
-
 
 SECRET = b"ticket01-test-secret"
 OPERATOR = "operator.test"
 SESSION = "session.test"
-NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
 
 
 def make_message(**changes: object) -> InboundMessage:
@@ -141,13 +140,14 @@ def test_primary_seam_persists_state_and_audit_and_sends_one_correlated_reply() 
         "orchestration_result",
         "outbound_attempt",
         "outbound_result",
+        "request_lifecycle",
     }
     assert all(record.redacted for record in records)
     assert all(
         "Check the controlled path" not in str(record.details) for record in records
     )
     assert all(SECRET.decode() not in str(record.details) for record in records)
-    assert sum(record.kind == "outbound_result" for record in records) == 1
+    assert sum(record.kind == "outbound_result" for record in records) == 2
 
 
 def test_replay_is_deduplicated_before_broker_and_outbound() -> None:
@@ -224,8 +224,8 @@ def test_audit_failure_at_outbound_gate_blocks_the_controlled_send() -> None:
     assert result.disposition == "failed"
     assert result.reply is None
     assert result.request is not None
-    assert result.request.status == "failed"
-    assert result.request.error_code == "outbound_error"
+    assert result.request.status == "accepted"
+    assert result.request.error_code is None
     assert len(orchestration.calls) == 1
     assert outbound.sent == []
     assert len(state.list_requests()) == 1
@@ -277,7 +277,7 @@ def test_state_failure_after_outbound_acceptance_returns_unknown_without_durable
     None
 ):
     state = InMemoryDurableStateStore()
-    config, _, _, orchestration, outbound, receiver = make_components(state=state)
+    config, _, _, _orchestration, outbound, receiver = make_components(state=state)
     original_send = outbound.send
 
     def send_then_fail_completion(reply: OutboundReply) -> None:
@@ -302,23 +302,23 @@ def test_state_failure_after_outbound_acceptance_returns_unknown_without_durable
     assert durable_request[0] == result.request
     assert durable_request[0].status == "replying"
     assert durable_request[0].reply_id == result.reply.reply_id
-    assert durable_request[0].outcome == "completed"
+    assert durable_request[0].outcome == "replying"
     assert all(request.status != "completed" for request in durable_request)
 
 
-def test_outbound_acceptance_with_completion_audit_failure_is_unknown() -> None:
+def test_outbound_audit_batch_failure_blocks_before_send() -> None:
     audit = InMemoryAuditBoundary(fail_on_append=5)
     config, state, _, _, outbound, receiver = make_components(audit=audit)
 
     result = receiver.receive(make_event(config))
 
     assert result.status_code == 202
-    assert result.disposition == "unknown"
+    assert result.disposition == "failed"
     assert result.reply is None
     assert result.request is not None
-    assert result.request.status == "unknown"
-    assert result.request.outcome == "outbound_unknown"
-    assert outbound.sent and outbound.sent[0].request_id == result.request_id
+    assert result.request.status == "replying"
+    assert result.request.outcome == "replying"
+    assert outbound.sent == []
     assert state.list_requests() == (result.request,)
 
 
