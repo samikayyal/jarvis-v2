@@ -18,6 +18,7 @@ from .ports import (
     AuditBoundary,
     AuditWriteError,
     Clock,
+    DiagnosticTraceError,
     DurableStateStore,
     IdGenerator,
     OrchestrationAdapter,
@@ -25,8 +26,11 @@ from .ports import (
     OutboundConnector,
     OutboundConnectorError,
     StateStoreError,
+    TraceCapacityError,
+    TraceWriteError,
     require_non_empty,
 )
+from .traces import DiagnosticTraceRecorder
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,7 @@ class DeterministicCapabilityBroker:
         outbound: OutboundConnector,
         clock: Clock,
         ids: IdGenerator,
+        trace: DiagnosticTraceRecorder,
     ) -> None:
         self.config = config
         self.state = state
@@ -68,6 +73,7 @@ class DeterministicCapabilityBroker:
         self.outbound = outbound
         self.clock = clock
         self.ids = ids
+        self.trace = trace
 
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive the typed path."""
@@ -123,7 +129,20 @@ class DeterministicCapabilityBroker:
 
         orchestration_request = OrchestrationRequest(state=request, text=message.text)
         try:
-            result = self.orchestration.run(orchestration_request)
+            result = self.trace.execute(
+                request_id=request.request_id,
+                operation_id=f"{request.request_id}:model",
+                operation_type="model",
+                input_payload=orchestration_request,
+                arguments={
+                    "adapter": type(self.orchestration).__name__,
+                    "operation": "run",
+                },
+                telemetry={"phase": "orchestration"},
+                operation=lambda: self.orchestration.run(orchestration_request),
+                result_limit_bytes=self.config.max_text_length * 8 + 4_096,
+                error_limit_bytes=8_192,
+            )
             if result.request_id != request.request_id:
                 raise OrchestrationAdapterError(
                     "orchestration result correlation mismatch"
@@ -136,14 +155,32 @@ class DeterministicCapabilityBroker:
                 actor="controlled_orchestration",
                 details={"adapter": result.adapter},
             )
-        except (OrchestrationAdapterError, AuditWriteError, ValueError) as exc:
+        except (
+            DiagnosticTraceError,
+            OrchestrationAdapterError,
+            AuditWriteError,
+            ValueError,
+        ) as exc:
+            trace_failed = isinstance(exc, (TraceCapacityError, TraceWriteError))
+            failure_outcome = (
+                "trace_unavailable" if trace_failed else "orchestration_failed"
+            )
+            failure_code = (
+                "trace_capacity"
+                if isinstance(exc, TraceCapacityError)
+                else (
+                    "trace_error"
+                    if isinstance(exc, TraceWriteError)
+                    else "orchestration_error"
+                )
+            )
             try:
                 failed = self._transition(
                     request,
                     status="failed",
                     phase="orchestration",
-                    outcome="orchestration_failed",
-                    error_code="orchestration_error",
+                    outcome=failure_outcome,
+                    error_code=failure_code,
                 )
             except StateStoreError as transition_error:
                 self._best_effort_audit(
@@ -170,7 +207,10 @@ class DeterministicCapabilityBroker:
                 request_id=request.request_id,
                 outcome="failed",
                 actor="controlled_orchestration",
-                details={"result": "failed"},
+                details={
+                    "result": "failed",
+                    "reason": "trace_unavailable" if trace_failed else "orchestration",
+                },
             )
             return ReceiveResult(
                 status_code=202,
@@ -215,21 +255,50 @@ class DeterministicCapabilityBroker:
             )
 
         try:
-            self.outbound.send(reply)
-        except (AuditWriteError, OutboundConnectorError, ValueError) as exc:
+            self.trace.execute(
+                request_id=request.request_id,
+                operation_id=f"{request.request_id}:connector:outbound",
+                operation_type="connector",
+                input_payload=reply,
+                arguments={"operation": "send", "channel": "controlled_outbound"},
+                telemetry={"phase": "outbound"},
+                operation=lambda: self._send_and_confirm(reply),
+                result_limit_bytes=4_096,
+                error_limit_bytes=8_192,
+            )
+        except (
+            DiagnosticTraceError,
+            AuditWriteError,
+            OutboundConnectorError,
+            ValueError,
+        ) as exc:
             may_have_sent = (
                 isinstance(exc, OutboundConnectorError) and exc.may_have_sent
+            ) or (isinstance(exc, TraceWriteError) and exc.operation_started)
+            trace_failed = isinstance(exc, (TraceCapacityError, TraceWriteError))
+            outcome = (
+                "trace_unavailable"
+                if isinstance(exc, TraceCapacityError)
+                else "outbound_unknown"
+                if may_have_sent
+                else "outbound_failed"
             )
-            outcome = "outbound_unknown" if may_have_sent else "outbound_failed"
+            error_code = (
+                "trace_capacity"
+                if isinstance(exc, TraceCapacityError)
+                else "trace_error"
+                if isinstance(exc, TraceWriteError)
+                else "outbound_unknown"
+                if may_have_sent
+                else "outbound_error"
+            )
             try:
                 failed = self._transition(
                     replying,
-                    status="unknown" if may_have_sent else "failed",
+                    status=("unknown" if may_have_sent else "failed"),
                     phase="outbound",
                     outcome=outcome,
-                    error_code="outbound_unknown"
-                    if may_have_sent
-                    else "outbound_error",
+                    error_code=error_code,
                 )
             except StateStoreError as transition_error:
                 self._best_effort_audit(
@@ -256,7 +325,10 @@ class DeterministicCapabilityBroker:
                 request_id=request.request_id,
                 outcome=outcome,
                 actor="controlled_outbound",
-                details={"result": outcome},
+                details={
+                    "result": outcome,
+                    "reason": "trace_unavailable" if trace_failed else "outbound",
+                },
             )
             return ReceiveResult(
                 status_code=202,
@@ -299,6 +371,10 @@ class DeterministicCapabilityBroker:
             request=completed,
             reply=reply,
         )
+
+    def _send_and_confirm(self, reply: OutboundReply) -> dict[str, str]:
+        self.outbound.send(reply)
+        return {"result": "accepted"}
 
     def _transition(self, request: RequestState, **changes: object) -> RequestState:
         updated = replace(request, updated_at=self.clock.now(), **changes)

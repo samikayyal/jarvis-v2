@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import gc
+import inspect
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import Enum
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
+from pathlib import Path
+
+import pytest
+
+from jarvis_control_plane import (
+    MAX_TRACE_RESERVATION_BYTES,
+    ControlledOrchestrationAdapter,
+    ControlledOutboundConnector,
+    ControlPlaneConfig,
+    DeterministicCapabilityBroker,
+    DeterministicIdGenerator,
+    DiagnosticTraceLimits,
+    DiagnosticTraceRecorder,
+    FixedClock,
+    InboundMessage,
+    InMemoryAuditBoundary,
+    InMemoryDiagnosticTraceStore,
+    InMemoryDurableStateStore,
+    SignedInboundEvent,
+    SignedMessageReceiver,
+    SQLiteDiagnosticTraceStore,
+    TraceCapacityError,
+    TraceWriteError,
+)
+from jarvis_control_plane.manual_admin import (
+    ManualDiagnosticTraceBoundary,
+    _open_manual_trace_boundary,
+    open_sqlite_manual_trace_boundary,
+)
+from jarvis_control_plane.traces import _DiagnosticTraceStoreBase
+
+SECRET = "credential-like-value-that-must-remain-verbatim"
+SIGNING_SECRET = b"ticket04-signing-secret"
+OPERATOR = "operator.test"
+SESSION = "session.test"
+NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+
+
+class TraceMode(Enum):
+    LIVE = "live"
+
+
+@dataclass(frozen=True)
+class TypedTracePayload:
+    when: datetime
+    path: Path
+    values: tuple[str, ...]
+
+
+class FixedCapacityProvider:
+    def __init__(self, available: int) -> None:
+        self.available = available
+
+    def available_bytes(self) -> int:
+        return self.available
+
+    def reserve(self, amount: int) -> None:
+        if amount > self.available:
+            raise TraceCapacityError(
+                "test filesystem capacity is insufficient",
+                requested_bytes=amount,
+                available_bytes=self.available,
+            )
+        self.available -= amount
+
+    def release(self, amount: int) -> None:
+        self.available += amount
+
+
+def mapping_value(value: object, key: str) -> object:
+    """Read a value from the explicit, collision-safe mapping envelope."""
+
+    assert hasattr(value, "__getitem__")
+    assert value["__type__"] == "mapping"  # type: ignore[index]
+    for item in value["items"]:  # type: ignore[index]
+        if item["key"] == key:
+            return item["value"]
+    raise AssertionError(f"mapping key not found: {key}")
+
+
+def bounded_reachable(root: object, *, max_nodes: int = 256) -> list[object]:
+    """Walk the capability graph without descending into imported modules/types."""
+
+    pending = [root]
+    visited: set[int] = set()
+    reachable: list[object] = []
+    while pending and len(reachable) < max_nodes:
+        value = pending.pop()
+        if id(value) in visited:
+            continue
+        visited.add(id(value))
+        reachable.append(value)
+        if isinstance(value, (str, bytes, int, float, bool, type(None))):
+            continue
+        if inspect.ismodule(value) or inspect.isclass(value) or inspect.iscode(value):
+            continue
+        if inspect.ismethod(value):
+            pending.extend((value.__self__, value.__func__))
+            continue
+        if inspect.isfunction(value):
+            pending.append(value.__globals__)
+            if value.__closure__:
+                pending.extend(
+                    cell.cell_contents
+                    for cell in value.__closure__
+                    if cell.cell_contents is not None
+                )
+            continue
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+            continue
+        pending.extend(gc.get_referents(value))
+    return reachable
+
+
+def make_message(**changes: object) -> InboundMessage:
+    values: dict[str, object] = {
+        "event_type": "message.received",
+        "session_id": SESSION,
+        "event_id": "event-004",
+        "message_id": "message-004",
+        "sender_id": OPERATOR,
+        "chat_id": OPERATOR,
+        "chat_type": "direct",
+        "message_type": "text",
+        "from_me": False,
+        "text": "Run the controlled operation",
+    }
+    values.update(changes)
+    return InboundMessage(**values)  # type: ignore[arg-type]
+
+
+def make_components(
+    *,
+    trace: DiagnosticTraceRecorder | None = None,
+    state: object | None = None,
+    audit: object | None = None,
+    orchestration: ControlledOrchestrationAdapter | None = None,
+) -> tuple[
+    ControlPlaneConfig,
+    object,
+    object,
+    ControlledOrchestrationAdapter,
+    ControlledOutboundConnector,
+    SignedMessageReceiver,
+]:
+    config = ControlPlaneConfig(
+        operator_id=OPERATOR,
+        session_id=SESSION,
+        signing_secret=SIGNING_SECRET,
+    )
+    clock = FixedClock(NOW)
+    ids = DeterministicIdGenerator("ticket04")
+    state = state if state is not None else InMemoryDurableStateStore()
+    audit = audit if audit is not None else InMemoryAuditBoundary()
+    orchestration = orchestration or ControlledOrchestrationAdapter()
+    outbound = ControlledOutboundConnector(
+        operator_id=OPERATOR,
+        session_id=SESSION,
+        audit=audit,  # type: ignore[arg-type]
+        clock=clock,
+        ids=ids,
+    )
+    broker = DeterministicCapabilityBroker(
+        config=config,
+        state=state,  # type: ignore[arg-type]
+        audit=audit,  # type: ignore[arg-type]
+        orchestration=orchestration,
+        outbound=outbound,
+        clock=clock,
+        ids=ids,
+        trace=trace,
+    )
+    receiver = SignedMessageReceiver(
+        config=config,
+        state=state,  # type: ignore[arg-type]
+        audit=audit,  # type: ignore[arg-type]
+        broker=broker,
+        clock=clock,
+        ids=ids,
+    )
+    return config, state, audit, orchestration, outbound, receiver
+
+
+def make_event(config: ControlPlaneConfig, **changes: object) -> SignedInboundEvent:
+    return SignedInboundEvent.from_message(
+        make_message(**changes), config.signing_secret
+    )
+
+
+def test_trace_retains_complete_payloads_only_through_manual_boundary() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("trace"),
+    )
+
+    returned = recorder.execute(
+        request_id="request-004",
+        operation_id="request-004:codex",
+        operation_type="codex",
+        input_payload={"prompt": SECRET},
+        arguments={"api_key": SECRET},
+        telemetry={"private_note": SECRET},
+        operation=lambda: {"output": SECRET, "bytes": b"raw"},
+        result_limit_bytes=2_048,
+        error_limit_bytes=2_048,
+    )
+
+    assert returned["output"] == SECRET
+    assert not hasattr(recorder, "store")
+    assert not hasattr(recorder._writer, "_store")
+    assert not hasattr(recorder._writer, "_append_fn")
+    assert not hasattr(recorder._writer, "_thread")
+    assert not hasattr(recorder._writer, "_connection")
+    assert not hasattr(recorder._writer, "_request")
+    assert not hasattr(recorder._writer, "_read_persisted_traces")
+    assert {
+        name
+        for name in dir(recorder._writer)
+        if not name.startswith("_") and callable(getattr(recorder._writer, name))
+    } == {"append", "release", "reserve"}
+    for operation_name in ("append", "release", "reserve"):
+        operation = getattr(recorder._writer, operation_name)
+        operation_globals = operation.__func__.__globals__
+        assert "Client" not in operation_globals
+        assert "_WRITER_ENDPOINTS" not in operation_globals
+        assert "_writer_authkey" not in operation_globals
+        assert "_writer_endpoint" not in operation_globals
+        assert "_writer_request" not in operation_globals
+        reachable = bounded_reachable(operation)
+        assert not any(isinstance(value, Connection) for value in reachable)
+        assert not any(isinstance(value, BaseProcess) for value in reachable)
+        assert not any(
+            isinstance(value, _DiagnosticTraceStoreBase) for value in reachable
+        )
+        assert not any(
+            isinstance(value, ManualDiagnosticTraceBoundary) for value in reachable
+        )
+        assert SECRET not in reachable
+    assert not hasattr(store, "records")
+    assert not hasattr(store, "list_traces")
+    manual = _open_manual_trace_boundary(store)
+    traces = manual.list_traces(request_id="request-004")
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace.operation_type == "codex"
+    assert mapping_value(trace.input_payload, "prompt") == SECRET
+    assert mapping_value(trace.arguments, "api_key") == SECRET
+    assert mapping_value(trace.output_payload, "output") == SECRET
+    assert mapping_value(trace.telemetry, "private_note") == SECRET
+    assert mapping_value(trace.output_payload, "bytes") == {
+        "__type__": "bytes",
+        "base64": "cmF3",
+    }
+    assert SECRET in manual.export_json(request_id="request-004").decode()
+    assert not hasattr(store, "_manual_access_token")
+    assert not hasattr(store, "_read_for_manual_admin")
+    with pytest.raises(AttributeError):
+        ManualDiagnosticTraceBoundary(store).list_traces()
+
+
+def test_writer_finalization_stops_child_with_admin_channel_open() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+    )
+    writer = store.writer()
+    process = store._service_process
+    assert process is not None
+
+    del writer
+    gc.collect()
+    process.join(timeout=2)
+    try:
+        assert not process.is_alive()
+    finally:
+        store._close_writer_service()
+
+
+def test_failed_operation_retains_complete_error_and_does_not_expire() -> None:
+    clock = FixedClock(NOW)
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=clock,
+        ids=DeterministicIdGenerator("trace-error"),
+    )
+
+    def fail() -> None:
+        raise RuntimeError(SECRET)
+
+    with pytest.raises(RuntimeError, match=SECRET):
+        recorder.execute(
+            request_id="request-error",
+            operation_type="worker",
+            input_payload={"input": SECRET},
+            arguments={"command": "controlled"},
+            operation=fail,
+            result_limit_bytes=2_048,
+            error_limit_bytes=2_048,
+        )
+
+    clock.advance(minutes=365 * 10)
+    traces = _open_manual_trace_boundary(store).list_traces(request_id="request-error")
+    assert len(traces) == 1
+    assert traces[0].outcome == "failed"
+    assert traces[0].error["message"] == SECRET
+
+
+def test_non_json_payload_types_are_explicitly_tagged_without_collisions() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("typed"),
+    )
+    recorder.execute(
+        request_id="request-typed",
+        operation_type="model",
+        input_payload={
+            "dataclass": TypedTracePayload(
+                when=NOW,
+                path=Path("C:/private/payload"),
+                values=("one",),
+            ),
+            "tuple": ("one",),
+            "list": ["one"],
+            "set": {"one"},
+            "frozenset": frozenset({"one"}),
+            "enum": TraceMode.LIVE,
+            "datetime": NOW,
+            "path": Path("C:/private/payload"),
+            "literal_tag_like_mapping": {
+                "__type__": "bytes",
+                "base64": "not-a-bytes-envelope",
+            },
+        },
+        operation=lambda: None,
+        result_limit_bytes=512,
+        error_limit_bytes=2_048,
+    )
+
+    payload = _open_manual_trace_boundary(store).list_traces()[0].input_payload
+    dataclass_payload = mapping_value(payload, "dataclass")
+    dataclass_fields = dataclass_payload["fields"]  # type: ignore[index]
+    assert dataclass_payload["__type__"] == "dataclass"  # type: ignore[index]
+    assert dataclass_fields["__type__"] == "mapping"  # type: ignore[index]
+    assert mapping_value(dataclass_fields, "when")["__type__"] == "datetime"  # type: ignore[index]
+    assert mapping_value(dataclass_fields, "path")["__type__"] == "path"  # type: ignore[index]
+    assert mapping_value(dataclass_fields, "values")["__type__"] == "tuple"  # type: ignore[index]
+    assert mapping_value(payload, "tuple")["__type__"] == "tuple"  # type: ignore[index]
+    assert mapping_value(payload, "list")["__type__"] == "list"  # type: ignore[index]
+    assert mapping_value(payload, "set")["__type__"] == "set"  # type: ignore[index]
+    assert mapping_value(payload, "frozenset")["__type__"] == "frozenset"  # type: ignore[index]
+    assert mapping_value(payload, "enum")["class"].endswith("TraceMode")  # type: ignore[index]
+    assert mapping_value(payload, "datetime")["__type__"] == "datetime"  # type: ignore[index]
+    assert mapping_value(payload, "path")["__type__"] == "path"  # type: ignore[index]
+    literal_mapping = mapping_value(payload, "literal_tag_like_mapping")
+    assert literal_mapping["__type__"] == "mapping"  # type: ignore[index]
+    assert mapping_value(literal_mapping, "__type__") == "bytes"
+
+
+def test_sqlite_trace_store_survives_reconstruction_without_expiry(tmp_path) -> None:
+    database = tmp_path / "ticket04-traces.sqlite3"
+    store = SQLiteDiagnosticTraceStore(
+        database,
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("sqlite-trace"),
+    )
+    recorder.execute(
+        request_id="request-sqlite",
+        operation_type="connector",
+        input_payload={"token": SECRET},
+        operation=lambda: {"result": SECRET},
+        result_limit_bytes=2_048,
+        error_limit_bytes=2_048,
+    )
+    store.close()
+
+    reconstructed = SQLiteDiagnosticTraceStore(
+        database,
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+    )
+    try:
+        manual = open_sqlite_manual_trace_boundary(database)
+        try:
+            traces = manual.list_traces(request_id="request-sqlite")
+            assert len(traces) == 1
+            assert mapping_value(traces[0].input_payload, "token") == SECRET
+            assert mapping_value(traces[0].result, "result") == SECRET
+        finally:
+            manual.close()
+    finally:
+        reconstructed.close()
+
+
+def test_broker_traces_model_and_connector_payloads_without_leaking_into_audit() -> (
+    None
+):
+    store = InMemoryDiagnosticTraceStore()
+    clock = FixedClock(NOW)
+    ids = DeterministicIdGenerator("broker-trace")
+    recorder = DiagnosticTraceRecorder(writer=store.writer(), clock=clock, ids=ids)
+    orchestration = ControlledOrchestrationAdapter(
+        response_text=f"Completed with {SECRET}"
+    )
+    config, _, audit, orchestration, outbound, receiver = make_components(
+        trace=recorder,
+        orchestration=orchestration,
+    )
+
+    result = receiver.receive(make_event(config, text=f"Use {SECRET}"))
+
+    assert result.disposition == "completed"
+    assert len(orchestration.calls) == 1
+    assert len(outbound.sent) == 1
+    traces = _open_manual_trace_boundary(store).list_traces(
+        request_id=result.request_id
+    )
+    assert [trace.operation_type for trace in traces] == ["model", "connector"]
+    assert all(SECRET in str(trace.to_mapping()) for trace in traces)
+    assert all(SECRET not in str(record.details) for record in audit.records)
+
+
+def test_trace_capacity_rejects_before_connector_and_preserves_prior_trace() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=102_000,
+        reservation_bytes=200_000,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("capacity"),
+        reservation_bytes=100_000,
+    )
+    config, _, _, orchestration, outbound, receiver = make_components(trace=recorder)
+
+    result = receiver.receive(make_event(config))
+
+    assert result.disposition == "failed"
+    assert result.request is not None
+    assert result.request.outcome == "trace_unavailable"
+    assert len(orchestration.calls) == 1
+    assert outbound.sent == []
+    traces = _open_manual_trace_boundary(store).list_traces(
+        request_id=result.request_id
+    )
+    assert [trace.operation_type for trace in traces] == ["model"]
+    assert store.retained_bytes > 0
+    assert store.available_bytes < store.limits.reservation_bytes
+
+
+def test_capacity_failure_happens_before_operation_starts() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=64,
+        reservation_bytes=128,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("capacity-before"),
+    )
+    started: list[bool] = []
+
+    with pytest.raises(TraceCapacityError):
+        recorder.execute(
+            request_id="request-capacity",
+            operation_type="model",
+            operation=lambda: started.append(True),
+            result_limit_bytes=512,
+            error_limit_bytes=512,
+        )
+
+    assert started == []
+    assert _open_manual_trace_boundary(store).list_traces() == ()
+
+
+def test_known_oversized_payload_is_rejected_before_operation_starts() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=4_096,
+        reservation_bytes=4_096,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("known-size"),
+        reservation_bytes=128,
+    )
+    started: list[bool] = []
+
+    with pytest.raises(TraceCapacityError):
+        recorder.execute(
+            request_id="request-known-size",
+            operation_type="connector",
+            input_payload={"body": "x" * 2_000},
+            operation=lambda: started.append(True),
+            result_limit_bytes=512,
+            error_limit_bytes=512,
+        )
+
+    assert started == []
+    assert _open_manual_trace_boundary(store).list_traces() == ()
+
+
+def test_sqlite_capacity_provider_rejects_low_physical_capacity_before_work(
+    tmp_path,
+) -> None:
+    provider = FixedCapacityProvider(64)
+    database = tmp_path / "ticket04-capacity.sqlite3"
+    store = SQLiteDiagnosticTraceStore(
+        database,
+        capacity_bytes=32_768,
+        reservation_bytes=8_192,
+        capacity_provider=provider,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("sqlite-capacity"),
+    )
+    try:
+        started: list[bool] = []
+        with pytest.raises(TraceCapacityError):
+            recorder.execute(
+                request_id="request-low-space",
+                operation_type="worker",
+                operation=lambda: started.append(True),
+                result_limit_bytes=512,
+                error_limit_bytes=512,
+            )
+        assert started == []
+        manual = open_sqlite_manual_trace_boundary(database)
+        try:
+            assert manual.list_traces(request_id="request-low-space") == ()
+        finally:
+            manual.close()
+    finally:
+        store.close()
+
+
+def test_trace_limit_hard_max_and_cumulative_request_budget_are_enforced() -> None:
+    with pytest.raises(ValueError, match="hard_max_bytes"):
+        DiagnosticTraceLimits(hard_max_bytes=MAX_TRACE_RESERVATION_BYTES + 1)
+
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=8_192,
+        reservation_bytes=2_048,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("cumulative"),
+        reservation_bytes=1_024,
+    )
+    started: list[int] = []
+
+    for attempt in range(10):
+        try:
+            recorder.execute(
+                request_id="request-cumulative",
+                operation_type="worker",
+                input_payload={"attempt": attempt},
+                operation=lambda attempt=attempt: started.append(attempt),
+                result_limit_bytes=64,
+                error_limit_bytes=64,
+            )
+        except TraceCapacityError:
+            break
+    else:
+        pytest.fail("per-request trace capacity never rejected new work")
+
+    assert len(started) < 10
+    assert len(
+        _open_manual_trace_boundary(store).list_traces(request_id="request-cumulative")
+    ) == len(started)
+    assert store.request_retained_bytes("request-cumulative") <= 2_048
+
+
+def test_post_start_payload_conversion_failure_is_a_trace_write_failure() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=8_192,
+        reservation_bytes=4_096,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("recursive"),
+    )
+    recursive: list[object] = []
+    recursive.append(recursive)
+
+    with pytest.raises(TraceWriteError) as error:
+        recorder.execute(
+            request_id="request-recursive",
+            operation_type="model",
+            operation=lambda: recursive,
+            result_limit_bytes=512,
+            error_limit_bytes=1_024,
+        )
+
+    assert error.value.operation_started is True
+    traces = _open_manual_trace_boundary(store).list_traces(
+        request_id="request-recursive"
+    )
+    assert len(traces) == 1
+    assert traces[0].outcome == "trace_failed"
+    assert traces[0].error["message"] == str(error.value)
+
+
+def test_oversized_result_retains_trace_failure_envelope() -> None:
+    store = InMemoryDiagnosticTraceStore(
+        capacity_bytes=8_192,
+        reservation_bytes=4_096,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("oversized-result"),
+        reservation_bytes=2_048,
+    )
+
+    with pytest.raises(TraceWriteError) as error:
+        recorder.execute(
+            request_id="request-oversized-result",
+            operation_type="worker",
+            operation=lambda: {"body": "x" * 5_000},
+            result_limit_bytes=512,
+            error_limit_bytes=1_024,
+        )
+
+    assert error.value.operation_started is True
+    traces = _open_manual_trace_boundary(store).list_traces(
+        request_id="request-oversized-result"
+    )
+    assert len(traces) == 1
+    assert traces[0].outcome == "trace_failed"
