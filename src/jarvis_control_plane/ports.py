@@ -14,6 +14,7 @@ from .models import (
     AuditEvidence,
     AuditFilter,
     ConversationMessage,
+    IngressAdmissionResult,
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
@@ -94,6 +95,20 @@ class AuditBoundary(Protocol):
 class DurableStateStore(Protocol):
     """Authoritative local state and replay-claim port."""
 
+    def admit_ingress(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        event_id: str,
+        claimed_at: datetime,
+        conversation_message: ConversationMessage | None,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+        terminal_disposition: str,
+        audit_blocked_disposition: str | None = None,
+    ) -> IngressAdmissionResult: ...
+
     def claim_ingress(
         self,
         *,
@@ -102,7 +117,7 @@ class DurableStateStore(Protocol):
         event_id: str,
         claimed_at: datetime,
         conversation_message: ConversationMessage | None = None,
-        disposition: str = "pending_audit",
+        disposition: str = "admitted",
     ) -> bool: ...
 
     def update_ingress_disposition(

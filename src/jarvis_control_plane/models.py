@@ -179,12 +179,14 @@ class IngressClaim:
     message_id: str
     event_id: str
     claimed_at: datetime
-    disposition: str = "pending_audit"
+    disposition: str = "admitted"
 
     def __post_init__(self) -> None:
         for name in ("session_id", "message_id", "event_id"):
             _non_empty_identifier(getattr(self, name), name)
         _non_empty_identifier(self.disposition, "disposition")
+        if self.disposition == "pending_audit":
+            raise ValueError("ingress claims must have a terminal disposition")
         object.__setattr__(self, "claimed_at", ensure_utc(self.claimed_at))
 
 
@@ -192,7 +194,8 @@ class IngressClaim:
 class ConversationMessage:
     """Immutable authorized-operator text retained by ingress admission."""
 
-    session_id: str
+    working_session_id: str
+    transport_session_id: str
     message_id: str
     event_id: str
     chat_id: str
@@ -203,7 +206,8 @@ class ConversationMessage:
 
     def __post_init__(self) -> None:
         for name in (
-            "session_id",
+            "working_session_id",
+            "transport_session_id",
             "message_id",
             "event_id",
             "chat_id",
@@ -216,6 +220,29 @@ class ConversationMessage:
         if self.direction != "inbound":
             raise ValueError("ticket02 conversation messages must be inbound")
         object.__setattr__(self, "occurred_at", ensure_utc(self.occurred_at))
+
+    @property
+    def session_id(self) -> str:
+        """Compatibility alias for the OpenWA transport session identifier."""
+
+        return self.transport_session_id
+
+    @property
+    def conversation_id(self) -> str:
+        """Alias for the durable working-session conversation boundary."""
+
+        return self.working_session_id
+
+
+@dataclass(frozen=True, slots=True)
+class IngressAdmissionResult:
+    """Result of one atomic claim, audit, and terminal-disposition attempt."""
+
+    claimed: bool
+    disposition: str
+
+    def __post_init__(self) -> None:
+        _non_empty_identifier(self.disposition, "disposition")
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,10 +521,6 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
         "channel": frozenset({"direct_text"}),
         "phase": frozenset({"admission"}),
     },
-    "inbound_admission_finalization_failed": {
-        "disposition": frozenset({"pending_audit"}),
-        "phase": frozenset({"admission_finalization"}),
-    },
     "inbound_malformed": {"reason": frozenset({"malformed_envelope"})},
     "inbound_rejected": {"reason": _ADMISSION_REJECTION_REASONS},
     "orchestration_result": {
@@ -534,13 +557,6 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
         "configured_operator",
         frozenset({"accepted"}),
         frozenset({"accepted"}),
-    ),
-    "inbound_admission_finalization_failed": (
-        "inbound_admission",
-        "messaging_gateway",
-        "transport",
-        frozenset({"state_unavailable"}),
-        frozenset({"failed"}),
     ),
     "inbound_malformed": (
         "inbound_admission",

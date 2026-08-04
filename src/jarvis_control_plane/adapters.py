@@ -22,6 +22,7 @@ from .models import (
     AuditEvidence,
     AuditFilter,
     ConversationMessage,
+    IngressAdmissionResult,
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
@@ -99,6 +100,76 @@ class InMemoryDurableStateStore:
         self.fail_update = False
         self._lock = threading.RLock()
 
+    def admit_ingress(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        event_id: str,
+        claimed_at: datetime,
+        conversation_message: ConversationMessage | None,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+        terminal_disposition: str,
+        audit_blocked_disposition: str | None = None,
+    ) -> IngressAdmissionResult:
+        """Atomically admit one keyed event with a terminal disposition.
+
+        The in-memory adapter stages the state write only after the required
+        audit append succeeds.  An admitted operator message may instead be
+        retained as ``audit_blocked`` when audit is unavailable; rejected
+        traffic is safely discarded in that case because it creates no work or
+        conversation history.
+        """
+
+        with self._lock:
+            key = (session_id, message_id)
+            if key in self.claims:
+                return IngressAdmissionResult(
+                    claimed=False,
+                    disposition="duplicate",
+                )
+            if self.fail_claim:
+                raise StateStoreError("controlled ingress claim failure")
+            if conversation_message is not None:
+                if self.fail_conversation:
+                    raise StateStoreError("controlled conversation write failure")
+                if (
+                    conversation_message.transport_session_id,
+                    conversation_message.message_id,
+                ) != key:
+                    raise StateStoreError(
+                        "conversation message key does not match claim"
+                    )
+            if self.fail_update:
+                raise StateStoreError("controlled ingress disposition update failure")
+
+            try:
+                audit.append(audit_evidence)
+            except AuditWriteError:
+                if audit_blocked_disposition is None:
+                    return IngressAdmissionResult(
+                        claimed=False,
+                        disposition=terminal_disposition,
+                    )
+                disposition = audit_blocked_disposition
+            else:
+                disposition = terminal_disposition
+
+            self.claims[key] = IngressClaim(
+                session_id=session_id,
+                message_id=message_id,
+                event_id=event_id,
+                claimed_at=claimed_at,
+                disposition=disposition,
+            )
+            if conversation_message is not None:
+                self.conversation_messages[key] = conversation_message
+            return IngressAdmissionResult(
+                claimed=True,
+                disposition=disposition,
+            )
+
     def claim_ingress(
         self,
         *,
@@ -107,9 +178,11 @@ class InMemoryDurableStateStore:
         event_id: str,
         claimed_at: datetime,
         conversation_message: ConversationMessage | None = None,
-        disposition: str = "pending_audit",
+        disposition: str = "admitted",
     ) -> bool:
         with self._lock:
+            if disposition == "pending_audit":
+                raise StateStoreError("ingress claims require a terminal disposition")
             if self.fail_claim:
                 raise StateStoreError("controlled ingress claim failure")
             key = (session_id, message_id)
@@ -119,7 +192,7 @@ class InMemoryDurableStateStore:
                 if self.fail_conversation:
                     raise StateStoreError("controlled conversation write failure")
                 if (
-                    conversation_message.session_id,
+                    conversation_message.transport_session_id,
                     conversation_message.message_id,
                 ) != key:
                     raise StateStoreError(
@@ -143,6 +216,8 @@ class InMemoryDurableStateStore:
         disposition: str,
     ) -> None:
         with self._lock:
+            if disposition == "pending_audit":
+                raise StateStoreError("ingress claims require a terminal disposition")
             if self.fail_update:
                 raise StateStoreError("controlled ingress disposition update failure")
             key = (session_id, message_id)
@@ -169,7 +244,10 @@ class InMemoryDurableStateStore:
 
     def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
-            return self.claims.pop((session_id, message_id), None) is not None
+            key = (session_id, message_id)
+            released = self.claims.pop(key, None) is not None
+            self.conversation_messages.pop(key, None)
+            return released
 
     def save_request(self, request: RequestState) -> None:
         with self._lock:
@@ -215,6 +293,7 @@ class SQLiteDurableStateStore:
             else sqlite3.connect(str(database))
         )
         self.connection.row_factory = sqlite3.Row
+        self._conversation_has_legacy_session = False
         try:
             self.connection.executescript(
                 """
@@ -223,7 +302,7 @@ class SQLiteDurableStateStore:
                     message_id TEXT NOT NULL,
                     event_id TEXT NOT NULL,
                     claimed_at TEXT NOT NULL,
-                    disposition TEXT NOT NULL DEFAULT 'pending_audit',
+                    disposition TEXT NOT NULL DEFAULT 'admitted',
                     PRIMARY KEY (session_id, message_id)
                 );
                 CREATE TABLE IF NOT EXISTS request_state (
@@ -242,7 +321,8 @@ class SQLiteDurableStateStore:
                     error_code TEXT
                 );
                 CREATE TABLE IF NOT EXISTS conversation_history (
-                    session_id TEXT NOT NULL,
+                    transport_session_id TEXT NOT NULL,
+                    working_session_id TEXT NOT NULL,
                     message_id TEXT NOT NULL,
                     event_id TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
@@ -250,7 +330,7 @@ class SQLiteDurableStateStore:
                     text TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
                     direction TEXT NOT NULL CHECK (direction = 'inbound'),
-                    PRIMARY KEY (session_id, message_id)
+                    PRIMARY KEY (transport_session_id, message_id)
                 );
                 """
             )
@@ -269,8 +349,214 @@ class SQLiteDurableStateStore:
                     """
                 )
                 self.connection.commit()
+            self.connection.execute(
+                "UPDATE ingress_claims SET disposition = 'audit_blocked' "
+                "WHERE disposition = 'pending_audit'"
+            )
+            self.connection.commit()
+
+            conversation_columns = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(conversation_history)"
+                ).fetchall()
+            }
+            if "transport_session_id" not in conversation_columns:
+                self.connection.execute(
+                    "ALTER TABLE conversation_history "
+                    "ADD COLUMN transport_session_id TEXT"
+                )
+                conversation_columns.add("transport_session_id")
+            if "working_session_id" not in conversation_columns:
+                self.connection.execute(
+                    "ALTER TABLE conversation_history "
+                    "ADD COLUMN working_session_id TEXT"
+                )
+                conversation_columns.add("working_session_id")
+            if "session_id" in conversation_columns:
+                self._conversation_has_legacy_session = True
+                self.connection.execute(
+                    "UPDATE conversation_history "
+                    "SET transport_session_id = session_id "
+                    "WHERE transport_session_id IS NULL"
+                )
+                self.connection.execute(
+                    "UPDATE conversation_history "
+                    "SET working_session_id = 'legacy-working-' || session_id "
+                    "WHERE working_session_id IS NULL"
+                )
+                self.connection.commit()
         except sqlite3.Error as exc:
             raise StateStoreError("could not initialize SQLite state") from exc
+
+    def admit_ingress(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        event_id: str,
+        claimed_at: datetime,
+        conversation_message: ConversationMessage | None,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+        terminal_disposition: str,
+        audit_blocked_disposition: str | None = None,
+    ) -> IngressAdmissionResult:
+        """Commit one ingress claim, history row, audit row, and disposition.
+
+        SQLite state and audit share a transaction when they use the same
+        connection.  When audit is an independent boundary, the state rows
+        are still staged before the append and rolled back on an audit error;
+        an admitted message can then be retained in a terminal blocked state.
+        """
+
+        key = (session_id, message_id)
+        if (
+            conversation_message is not None
+            and (
+                conversation_message.transport_session_id,
+                conversation_message.message_id,
+            )
+            != key
+        ):
+            raise StateStoreError("conversation message key does not match claim")
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            existing = self.connection.execute(
+                """
+                SELECT 1 FROM ingress_claims
+                WHERE session_id = ? AND message_id = ?
+                """,
+                key,
+            ).fetchone()
+            if existing is not None:
+                self.connection.rollback()
+                return IngressAdmissionResult(
+                    claimed=False,
+                    disposition="duplicate",
+                )
+
+            self._insert_ingress_row(
+                session_id=session_id,
+                message_id=message_id,
+                event_id=event_id,
+                claimed_at=claimed_at,
+                disposition=terminal_disposition,
+            )
+            if conversation_message is not None:
+                self._insert_conversation_message(conversation_message)
+
+            shared_audit = (
+                isinstance(audit, SQLiteAuditBoundary)
+                and audit._connection is self.connection
+            )
+            try:
+                if shared_audit:
+                    audit._append_batch_in_transaction((audit_evidence,))
+                else:
+                    audit.append(audit_evidence)
+            except AuditWriteError:
+                self.connection.rollback()
+                if audit_blocked_disposition is None:
+                    return IngressAdmissionResult(
+                        claimed=False,
+                        disposition=terminal_disposition,
+                    )
+                self.connection.execute("BEGIN IMMEDIATE")
+                self._insert_ingress_row(
+                    session_id=session_id,
+                    message_id=message_id,
+                    event_id=event_id,
+                    claimed_at=claimed_at,
+                    disposition=audit_blocked_disposition,
+                )
+                if conversation_message is not None:
+                    self._insert_conversation_message(conversation_message)
+                self.connection.commit()
+                return IngressAdmissionResult(
+                    claimed=True,
+                    disposition=audit_blocked_disposition,
+                )
+
+            self.connection.commit()
+            return IngressAdmissionResult(
+                claimed=True,
+                disposition=terminal_disposition,
+            )
+        except AuditWriteError:
+            try:
+                self.connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        except sqlite3.Error as exc:
+            try:
+                self.connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise StateStoreError("could not admit ingress") from exc
+
+    def _insert_ingress_row(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        event_id: str,
+        claimed_at: datetime,
+        disposition: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO ingress_claims(
+                session_id, message_id, event_id, claimed_at, disposition
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                message_id,
+                event_id,
+                ensure_utc(claimed_at).isoformat(),
+                disposition,
+            ),
+        )
+
+    def _insert_conversation_message(
+        self,
+        conversation_message: ConversationMessage,
+    ) -> None:
+        values = (
+            conversation_message.transport_session_id,
+            conversation_message.working_session_id,
+            conversation_message.message_id,
+            conversation_message.event_id,
+            conversation_message.chat_id,
+            conversation_message.sender_id,
+            conversation_message.text,
+            ensure_utc(conversation_message.occurred_at).isoformat(),
+            conversation_message.direction,
+        )
+        if self._conversation_has_legacy_session:
+            self.connection.execute(
+                """
+                INSERT INTO conversation_history(
+                    session_id, transport_session_id, working_session_id,
+                    message_id, event_id, chat_id, sender_id, text,
+                    occurred_at, direction
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (conversation_message.transport_session_id, *values),
+            )
+        else:
+            self.connection.execute(
+                """
+                INSERT INTO conversation_history(
+                    transport_session_id, working_session_id, message_id,
+                    event_id, chat_id, sender_id, text, occurred_at, direction
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
 
     def claim_ingress(
         self,
@@ -280,8 +566,10 @@ class SQLiteDurableStateStore:
         event_id: str,
         claimed_at: datetime,
         conversation_message: ConversationMessage | None = None,
-        disposition: str = "pending_audit",
+        disposition: str = "admitted",
     ) -> bool:
+        if disposition == "pending_audit":
+            raise StateStoreError("ingress claims require a terminal disposition")
         try:
             cursor = self.connection.execute(
                 """
@@ -302,31 +590,14 @@ class SQLiteDurableStateStore:
             claimed = cursor.rowcount == 1
             if claimed and conversation_message is not None:
                 if (
-                    conversation_message.session_id,
+                    conversation_message.transport_session_id,
                     conversation_message.message_id,
                 ) != (session_id, message_id):
                     self.connection.rollback()
                     raise StateStoreError(
                         "conversation message key does not match claim"
                     )
-                self.connection.execute(
-                    """
-                    INSERT INTO conversation_history(
-                        session_id, message_id, event_id, chat_id, sender_id,
-                        text, occurred_at, direction
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        conversation_message.session_id,
-                        conversation_message.message_id,
-                        conversation_message.event_id,
-                        conversation_message.chat_id,
-                        conversation_message.sender_id,
-                        conversation_message.text,
-                        ensure_utc(conversation_message.occurred_at).isoformat(),
-                        conversation_message.direction,
-                    ),
-                )
+                self._insert_conversation_message(conversation_message)
             self.connection.commit()
             return claimed
         except StateStoreError:
@@ -345,6 +616,8 @@ class SQLiteDurableStateStore:
         message_id: str,
         disposition: str,
     ) -> None:
+        if disposition == "pending_audit":
+            raise StateStoreError("ingress claims require a terminal disposition")
         try:
             cursor = self.connection.execute(
                 """
@@ -493,17 +766,18 @@ class SQLiteDurableStateStore:
         try:
             rows = self.connection.execute(
                 """
-                SELECT session_id, message_id, event_id, chat_id, sender_id,
-                       text, occurred_at, direction
+                SELECT transport_session_id, working_session_id, message_id,
+                       event_id, chat_id, sender_id, text, occurred_at, direction
                 FROM conversation_history
-                ORDER BY occurred_at, session_id, message_id
+                ORDER BY occurred_at, transport_session_id, message_id
                 """
             ).fetchall()
         except sqlite3.Error as exc:
             raise StateStoreError("could not list conversation history") from exc
         return tuple(
             ConversationMessage(
-                session_id=row["session_id"],
+                working_session_id=row["working_session_id"],
+                transport_session_id=row["transport_session_id"],
                 message_id=row["message_id"],
                 event_id=row["event_id"],
                 chat_id=row["chat_id"],
@@ -847,9 +1121,6 @@ class SQLiteAuditBoundary:
             raise TypeError("audit boundary accepts only AuditEvidence")
         if not records:
             return
-        identifiers = [record.evidence_id for record in records]
-        if len(set(identifiers)) != len(identifiers):
-            raise AuditWriteError("duplicate audit evidence identifier")
         if not self._owns_connection and self._connection.in_transaction:
             raise AuditWriteError(
                 "caller-owned SQLite connection has an uncommitted transaction"
@@ -858,7 +1129,36 @@ class SQLiteAuditBoundary:
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             transaction_started = True
-            self._append_transaction_active = True
+            self._append_batch_in_transaction(records)
+            self._connection.commit()
+        except AuditWriteError:
+            if transaction_started:
+                self._connection.rollback()
+            raise
+        except sqlite3.Error as exc:
+            if transaction_started or self._owns_connection:
+                self._connection.rollback()
+            raise AuditWriteError("could not append SQLite audit evidence") from exc
+        finally:
+            self._append_transaction_active = False
+
+    def _append_batch_in_transaction(
+        self,
+        evidence: Sequence[AuditEvidence],
+    ) -> None:
+        """Append into a caller-owned transaction without committing it."""
+
+        records = tuple(evidence)
+        if any(not isinstance(record, AuditEvidence) for record in records):
+            raise TypeError("audit boundary accepts only AuditEvidence")
+        if not records:
+            return
+        identifiers = [record.evidence_id for record in records]
+        if len(set(identifiers)) != len(identifiers):
+            raise AuditWriteError("duplicate audit evidence identifier")
+
+        self._append_transaction_active = True
+        try:
             self._assert_schema_integrity()
             placeholders = ",".join("?" for _ in identifiers)
             existing = self._connection.execute(
@@ -913,14 +1213,9 @@ class SQLiteAuditBoundary:
                 raise AuditWriteError(
                     "SQLite audit batch did not retain exactly one row per evidence"
                 )
-            self._connection.commit()
         except AuditWriteError:
-            if transaction_started:
-                self._connection.rollback()
             raise
         except sqlite3.Error as exc:
-            if transaction_started or self._owns_connection:
-                self._connection.rollback()
             raise AuditWriteError("could not append SQLite audit evidence") from exc
         finally:
             self._append_transaction_active = False

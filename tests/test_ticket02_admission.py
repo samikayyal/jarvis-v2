@@ -50,6 +50,8 @@ def make_components(
     *,
     state: object | None = None,
     audit: object | None = None,
+    working_session_id: str | None = None,
+    ids: DeterministicIdGenerator | None = None,
 ) -> tuple[
     ControlPlaneConfig,
     object,
@@ -62,9 +64,10 @@ def make_components(
         operator_id=OPERATOR,
         session_id=SESSION,
         signing_secret=SECRET,
+        working_session_id=working_session_id,
     )
     clock = FixedClock(NOW)
-    ids = DeterministicIdGenerator("ticket02")
+    ids = ids or DeterministicIdGenerator("ticket02")
     state = state if state is not None else InMemoryDurableStateStore()
     audit = audit if audit is not None else InMemoryAuditBoundary()
     orchestration = ControlledOrchestrationAdapter()
@@ -122,6 +125,8 @@ def test_admission_retains_authorized_text_and_replay_cannot_duplicate_it() -> N
     history = state.list_conversation_messages()  # type: ignore[attr-defined]
     assert len(history) == 1
     assert history[0].session_id == SESSION
+    assert history[0].transport_session_id == SESSION
+    assert history[0].working_session_id == "working-session-session.test"
     assert history[0].message_id == "message-001"
     assert history[0].event_id == "event-001"
     assert history[0].sender_id == OPERATOR
@@ -168,6 +173,8 @@ def test_sqlite_admission_history_and_replay_survive_reconstruction(tmp_path) ->
         history = reconstructed_state.list_conversation_messages()
         assert len(history) == 1
         assert history[0].text == "Retain this exact authorized text"
+        assert history[0].transport_session_id == SESSION
+        assert history[0].working_session_id == "working-session-session.test"
 
         replay = replay_receiver.receive(event)
 
@@ -240,7 +247,7 @@ def test_minimal_authenticated_unsupported_envelope_is_acknowledged() -> None:
     assert result.status_code == 204
     assert result.disposition == "rejected"
     assert result.reason == "unsupported_event_type"
-    assert state.list_ingress_claims() == ()  # type: ignore[attr-defined]
+    assert state.list_ingress_claims()[0].disposition == "rejected"  # type: ignore[attr-defined]
     assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
     assert state.list_requests() == ()  # type: ignore[attr-defined]
     assert orchestration.calls == []
@@ -268,7 +275,7 @@ def test_authenticated_from_me_null_is_rejected_not_malformed() -> None:
     assert result.status_code == 204
     assert result.disposition == "rejected"
     assert result.reason == "self_message"
-    assert state.list_ingress_claims() == ()  # type: ignore[attr-defined]
+    assert state.list_ingress_claims()[0].disposition == "rejected"  # type: ignore[attr-defined]
     assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
     assert state.list_requests() == ()  # type: ignore[attr-defined]
     assert orchestration.calls == []
@@ -289,7 +296,7 @@ def test_unresolved_identity_is_acknowledged_without_history_or_work(
     assert result.status_code == 204
     assert result.disposition == "rejected"
     assert result.reason == "unresolved_identity"
-    assert state.list_ingress_claims() == ()  # type: ignore[attr-defined]
+    assert state.list_ingress_claims()[0].disposition == "rejected"  # type: ignore[attr-defined]
     assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
     assert state.list_requests() == ()  # type: ignore[attr-defined]
     assert orchestration.calls == []
@@ -310,6 +317,7 @@ def test_unresolved_identity_is_acknowledged_without_history_or_work(
         ("sender_id", "other.operator", "unauthorized_operator"),
         ("chat_id", "other.operator", "unauthorized_chat"),
         ("from_me", True, "self_message"),
+        ("text", "   ", "blank_text"),
         ("text", "x" * 4097, "text_too_large"),
     ],
 )
@@ -325,13 +333,98 @@ def test_authenticated_unsupported_events_are_acknowledged_without_capability_us
     assert result.status_code == 204
     assert result.disposition == "rejected"
     assert result.reason == reason
-    assert state.list_ingress_claims() == ()  # type: ignore[attr-defined]
+    claims = state.list_ingress_claims()  # type: ignore[attr-defined]
+    assert len(claims) == 1
+    assert claims[0].disposition == "rejected"
     assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
     assert state.list_requests() == ()  # type: ignore[attr-defined]
     assert orchestration.calls == []
     assert outbound.sent == []
     assert len(audit.records) == 1
     assert audit.records[0].details == {"reason": reason}
+
+
+def test_rejected_replay_is_keyed_and_does_not_reaudit_or_retain_body() -> None:
+    config, state, audit, orchestration, outbound, receiver = make_components()
+    first = receiver.receive(
+        make_event(
+            config,
+            sender_id="other.operator",
+            event_id="rejected-event-001",
+            text="do not retain this body",
+        )
+    )
+    replay = receiver.receive(
+        make_event(
+            config,
+            sender_id=OPERATOR,
+            event_id="rejected-event-002",
+            text="this changed body must not become admitted",
+        )
+    )
+
+    assert first.status_code == 204
+    assert first.disposition == "rejected"
+    assert first.reason == "unauthorized_operator"
+    assert replay.status_code == 204
+    assert replay.disposition == "duplicate"
+    assert len(state.list_ingress_claims()) == 1  # type: ignore[attr-defined]
+    assert state.list_ingress_claims()[0].disposition == "rejected"  # type: ignore[attr-defined]
+    assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
+    assert len(audit.records) == 1
+    assert audit.records[0].details == {"reason": "unauthorized_operator"}
+    assert orchestration.calls == []
+    assert outbound.sent == []
+
+
+@pytest.mark.parametrize("field", ["session_id", "message_id"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_blank_ingress_identifiers_are_malformed_without_claim_or_audit(
+    field: str,
+    value: str,
+) -> None:
+    config, state, audit, orchestration, outbound, receiver = make_components()
+    payload = make_message().as_mapping()
+    payload[field] = value
+
+    result = receiver.receive(
+        make_raw_event(
+            config,
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
+    )
+
+    assert result.status_code == 400
+    assert result.disposition == "malformed"
+    assert state.list_ingress_claims() == ()  # type: ignore[attr-defined]
+    assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
+    assert len(audit.records) == 1
+    assert audit.records[0].kind == "inbound_malformed"
+    assert orchestration.calls == []
+    assert outbound.sent == []
+
+
+def test_non_string_text_is_a_rejected_terminal_disposition() -> None:
+    config, state, audit, orchestration, outbound, receiver = make_components()
+    payload = make_message().as_mapping()
+    payload["text"] = 123
+
+    result = receiver.receive(
+        make_raw_event(
+            config,
+            json.dumps(payload, separators=(",", ":")).encode(),
+        )
+    )
+
+    assert result.status_code == 204
+    assert result.disposition == "rejected"
+    assert result.reason == "blank_text"
+    assert state.list_ingress_claims()[0].disposition == "rejected"  # type: ignore[attr-defined]
+    assert state.list_conversation_messages() == ()  # type: ignore[attr-defined]
+    assert len(audit.records) == 1
+    assert audit.records[0].details == {"reason": "blank_text"}
+    assert orchestration.calls == []
+    assert outbound.sent == []
 
 
 def test_ingress_claim_and_history_are_atomic_when_state_write_fails() -> None:
@@ -349,6 +442,18 @@ def test_ingress_claim_and_history_are_atomic_when_state_write_fails() -> None:
     assert audit.records == []
     assert orchestration.calls == []
     assert outbound.sent == []
+
+    state.fail_conversation = False
+    retry = receiver.receive(make_event(config))
+
+    assert retry.status_code == 202
+    assert retry.disposition == "completed"
+    assert len(state.list_ingress_claims()) == 1
+    assert state.list_ingress_claims()[0].disposition == "admitted"
+    assert len(state.list_conversation_messages()) == 1
+    assert len(state.list_requests()) == 1
+    assert len(orchestration.calls) == 1
+    assert len(outbound.sent) == 1
 
 
 def test_audit_unavailable_keeps_claimed_history_but_blocks_assistant_work() -> None:
@@ -432,17 +537,24 @@ def test_audit_blocked_update_failure_keeps_claim_non_eligible() -> None:
 
     assert result.status_code == 503
     assert result.disposition == "state_unavailable"
-    assert state.list_ingress_claims()[0].disposition == "pending_audit"
-    assert len(state.list_conversation_messages()) == 1
+    assert state.list_ingress_claims() == ()
+    assert state.list_conversation_messages() == ()
     assert state.list_requests() == ()
     assert audit.records == []
     assert orchestration.calls == []
     assert outbound.sent == []
+    state.fail_update = False
     replay = receiver.receive(make_event(config))
-    assert replay.status_code == 204
-    assert replay.disposition == "duplicate"
+    assert replay.status_code == 202
+    assert replay.disposition == "audit_blocked"
+    assert state.list_ingress_claims()[0].disposition == "audit_blocked"
+    assert len(state.list_conversation_messages()) == 1
     assert orchestration.calls == []
     assert outbound.sent == []
+
+    final_replay = receiver.receive(make_event(config))
+    assert final_replay.status_code == 204
+    assert final_replay.disposition == "duplicate"
 
 
 def test_admitted_update_failure_keeps_claim_non_eligible() -> None:
@@ -454,20 +566,104 @@ def test_admitted_update_failure_keeps_claim_non_eligible() -> None:
 
     assert result.status_code == 503
     assert result.disposition == "state_unavailable"
-    assert state.list_ingress_claims()[0].disposition == "pending_audit"
-    assert len(state.list_conversation_messages()) == 1
+    assert state.list_ingress_claims() == ()
+    assert state.list_conversation_messages() == ()
     assert state.list_requests() == ()
-    assert [record.kind for record in audit.records] == [
-        "inbound_admitted",
-        "inbound_admission_finalization_failed",
-    ]
-    assert audit.records[0].kind == "inbound_admitted"
-    assert audit.records[1].details == {
-        "disposition": "pending_audit",
-        "phase": "admission_finalization",
-    }
+    assert audit.records == []
     assert orchestration.calls == []
     assert outbound.sent == []
+
+    state.fail_update = False
+    replay = receiver.receive(make_event(config))
+    assert replay.status_code == 202
+    assert replay.disposition == "completed"
+    assert len(state.list_ingress_claims()) == 1
+    assert state.list_ingress_claims()[0].disposition == "admitted"
+    assert len(state.list_conversation_messages()) == 1
+    assert len(state.list_requests()) == 1
+    assert len(orchestration.calls) == 1
+    assert len(outbound.sent) == 1
+
+
+def test_claim_write_failure_returns_503_and_retry_processes_once() -> None:
+    state = InMemoryDurableStateStore()
+    state.fail_claim = True
+    config, _, audit, orchestration, outbound, receiver = make_components(state=state)
+
+    first = receiver.receive(make_event(config))
+
+    assert first.status_code == 503
+    assert first.disposition == "state_unavailable"
+    assert state.list_ingress_claims() == ()
+    assert state.list_conversation_messages() == ()
+    assert audit.records == []
+
+    state.fail_claim = False
+    retry = receiver.receive(make_event(config))
+
+    assert retry.status_code == 202
+    assert retry.disposition == "completed"
+    assert len(state.list_ingress_claims()) == 1
+    assert state.list_ingress_claims()[0].disposition == "admitted"
+    assert len(state.list_conversation_messages()) == 1
+    assert len(state.list_requests()) == 1
+    assert len(orchestration.calls) == 1
+    assert len(outbound.sent) == 1
+
+
+def test_rejected_event_is_safely_discarded_when_audit_is_unavailable() -> None:
+    audit = InMemoryAuditBoundary(fail_on_append=1)
+    config, state, _, orchestration, outbound, receiver = make_components(audit=audit)
+
+    result = receiver.receive(make_event(config, sender_id="other.operator"))
+
+    assert result.status_code == 204
+    assert result.disposition == "rejected"
+    assert result.reason == "unauthorized_operator"
+    assert state.list_ingress_claims() == ()
+    assert state.list_conversation_messages() == ()
+    assert audit.records == []
+    assert orchestration.calls == []
+    assert outbound.sent == []
+
+
+def test_history_separates_working_session_from_transport_session() -> None:
+    state = InMemoryDurableStateStore()
+    ids = DeterministicIdGenerator("ticket02-sessions")
+    audit_one = InMemoryAuditBoundary()
+    config_one, _, _, _, _, receiver_one = make_components(
+        state=state,
+        audit=audit_one,
+        working_session_id="working-session-001",
+        ids=ids,
+    )
+    first = receiver_one.receive(make_event(config_one, message_id="message-001"))
+
+    audit_two = InMemoryAuditBoundary()
+    config_two, _, _, _, _, receiver_two = make_components(
+        state=state,
+        audit=audit_two,
+        working_session_id="working-session-002",
+        ids=ids,
+    )
+    second = receiver_two.receive(
+        make_event(
+            config_two,
+            event_id="event-002",
+            message_id="message-002",
+            text="A new working session under the same transport session",
+        )
+    )
+
+    assert first.disposition == "completed"
+    assert second.disposition == "completed"
+    history = state.list_conversation_messages()
+    assert [message.working_session_id for message in history] == [
+        "working-session-001",
+        "working-session-002",
+    ]
+    assert [message.transport_session_id for message in history] == [SESSION, SESSION]
+    assert [message.session_id for message in history] == [SESSION, SESSION]
 
 
 def test_invalid_signature_is_rejected_before_malformed_body_parsing() -> None:

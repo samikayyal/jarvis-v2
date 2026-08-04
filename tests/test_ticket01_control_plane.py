@@ -205,7 +205,8 @@ def test_signed_but_non_admissible_events_are_rejected_without_work(
     assert result.status_code == 204
     assert result.disposition == "rejected"
     assert result.reason == reason
-    assert state.list_ingress_claims() == ()
+    assert len(state.list_ingress_claims()) == 1
+    assert state.list_ingress_claims()[0].disposition == "rejected"
     assert state.list_requests() == ()
     assert orchestration.calls == []
     assert outbound.sent == []

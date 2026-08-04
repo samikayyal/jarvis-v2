@@ -41,10 +41,13 @@ class ControlPlaneConfig:
     session_id: str
     signing_secret: bytes
     max_text_length: int = 4096
+    working_session_id: str | None = None
 
     def __post_init__(self) -> None:
         require_non_empty(self.operator_id, "operator_id")
         require_non_empty(self.session_id, "session_id")
+        if self.working_session_id is not None:
+            require_non_empty(self.working_session_id, "working_session_id")
         if not isinstance(self.signing_secret, bytes) or not self.signing_secret:
             raise ValueError("signing_secret must be non-empty bytes")
         if not isinstance(self.max_text_length, int) or self.max_text_length <= 0:
@@ -618,6 +621,9 @@ class SignedMessageReceiver:
         self.broker = broker
         self.clock = clock
         self.ids = ids
+        self.working_session_id = (
+            config.working_session_id or f"working-session-{config.session_id}"
+        )
 
     def receive(self, event: SignedInboundEvent) -> ReceiveResult:
         """Verify, admit, claim, and dispatch one signed event."""
@@ -648,16 +654,37 @@ class SignedMessageReceiver:
 
         rejection = self._admission_rejection(message)
         if rejection is not None:
-            self._best_effort_audit(
-                kind="inbound_rejected",
-                event_id=message.event_id,
-                outcome="rejected",
-                actor="transport",
-                message_id=message.message_id,
-                operation_type="inbound_admission",
-                target_category="messaging_gateway",
-                details={"reason": rejection},
-            )
+            try:
+                admission = self.state.admit_ingress(
+                    session_id=message.session_id,
+                    message_id=message.message_id,
+                    event_id=message.event_id,
+                    claimed_at=self.clock.now(),
+                    conversation_message=None,
+                    audit=self.audit,
+                    audit_evidence=self._audit_evidence(
+                        kind="inbound_rejected",
+                        event_id=message.event_id,
+                        outcome="rejected",
+                        actor="transport",
+                        message_id=message.message_id,
+                        operation_type="inbound_admission",
+                        target_category="messaging_gateway",
+                        details={"reason": rejection},
+                    ),
+                    terminal_disposition="rejected",
+                )
+            except StateStoreError:
+                # Rejected events never create assistant work or conversation
+                # history.  If the keyed disposition cannot be retained, the
+                # safe outcome is still an empty 204 acknowledgement.
+                return ReceiveResult(
+                    status_code=204,
+                    disposition="rejected",
+                    reason=rejection,
+                )
+            if admission.disposition == "duplicate":
+                return ReceiveResult(status_code=204, disposition="duplicate")
             return ReceiveResult(
                 status_code=204,
                 disposition="rejected",
@@ -665,13 +692,14 @@ class SignedMessageReceiver:
             )
 
         try:
-            claimed = self.state.claim_ingress(
+            admission = self.state.admit_ingress(
                 session_id=message.session_id,
                 message_id=message.message_id,
                 event_id=message.event_id,
                 claimed_at=self.clock.now(),
                 conversation_message=ConversationMessage(
-                    session_id=message.session_id,
+                    working_session_id=self.working_session_id,
+                    transport_session_id=message.session_id,
                     message_id=message.message_id,
                     event_id=message.event_id,
                     chat_id=message.chat_id,
@@ -679,6 +707,19 @@ class SignedMessageReceiver:
                     text=message.text,
                     occurred_at=self.clock.now(),
                 ),
+                audit=self.audit,
+                audit_evidence=self._audit_evidence(
+                    kind="inbound_admitted",
+                    event_id=message.event_id,
+                    outcome="accepted",
+                    actor="configured_operator",
+                    message_id=message.message_id,
+                    operation_type="inbound_admission",
+                    target_category="messaging_gateway",
+                    details={"channel": "direct_text", "phase": "admission"},
+                ),
+                terminal_disposition="admitted",
+                audit_blocked_disposition="audit_blocked",
             )
         except StateStoreError:
             return ReceiveResult(
@@ -686,70 +727,13 @@ class SignedMessageReceiver:
                 disposition="state_unavailable",
                 reason="durable ingress state was unavailable",
             )
-        if not claimed:
+        if admission.disposition == "duplicate":
             return ReceiveResult(status_code=204, disposition="duplicate")
-
-        try:
-            self._append_audit(
-                kind="inbound_admitted",
-                event_id=message.event_id,
-                outcome="accepted",
-                actor="configured_operator",
-                message_id=message.message_id,
-                operation_type="inbound_admission",
-                target_category="messaging_gateway",
-                details={"channel": "direct_text", "phase": "admission"},
-            )
-        except AuditWriteError:
-            try:
-                self.state.update_ingress_disposition(
-                    session_id=message.session_id,
-                    message_id=message.message_id,
-                    disposition="audit_blocked",
-                )
-            except StateStoreError as exc:
-                return ReceiveResult(
-                    status_code=503,
-                    disposition="state_unavailable",
-                    reason=(
-                        "audit evidence was unavailable and the blocked ingress "
-                        f"disposition could not be persisted: {exc}"
-                    ),
-                )
+        if admission.disposition == "audit_blocked":
             return ReceiveResult(
                 status_code=202,
                 disposition="audit_blocked",
                 reason="required audit evidence was unavailable",
-            )
-
-        try:
-            self.state.update_ingress_disposition(
-                session_id=message.session_id,
-                message_id=message.message_id,
-                disposition="admitted",
-            )
-        except StateStoreError as exc:
-            self._best_effort_audit(
-                kind="inbound_admission_finalization_failed",
-                event_id=message.event_id,
-                outcome="state_unavailable",
-                actor="transport",
-                message_id=message.message_id,
-                operation_type="inbound_admission",
-                target_category="messaging_gateway",
-                execution_status="failed",
-                details={
-                    "phase": "admission_finalization",
-                    "disposition": "pending_audit",
-                },
-            )
-            return ReceiveResult(
-                status_code=503,
-                disposition="state_unavailable",
-                reason=(
-                    "audit evidence was recorded but the admitted ingress "
-                    f"disposition could not be persisted: {exc}"
-                ),
             )
         return self.broker.handle(message)
 
@@ -799,22 +783,53 @@ class SignedMessageReceiver:
         execution_status: str | None = None,
     ) -> None:
         self.audit.append(
-            AuditEvidence(
-                evidence_id=self.ids.new_id("audit"),
+            self._audit_evidence(
                 kind=kind,
-                occurred_at=self.clock.now(),
                 event_id=event_id,
                 request_id=request_id,
                 outcome=outcome,
                 actor=actor,
                 details=details,
                 message_id=message_id,
-                operation_type=operation_type or kind,
+                operation_type=operation_type,
                 target_category=target_category,
                 approval_decision=approval_decision,
                 policy_decision=policy_decision,
                 execution_status=execution_status,
             )
+        )
+
+    def _audit_evidence(
+        self,
+        *,
+        kind: str,
+        event_id: str | None = None,
+        request_id: str | None = None,
+        outcome: str,
+        actor: str,
+        details: dict[str, str],
+        message_id: str | None = None,
+        operation_type: str | None = None,
+        target_category: str | None = None,
+        approval_decision: str | None = None,
+        policy_decision: str | None = None,
+        execution_status: str | None = None,
+    ) -> AuditEvidence:
+        return AuditEvidence(
+            evidence_id=self.ids.new_id("audit"),
+            kind=kind,
+            occurred_at=self.clock.now(),
+            event_id=event_id,
+            request_id=request_id,
+            outcome=outcome,
+            actor=actor,
+            details=details,
+            message_id=message_id,
+            operation_type=operation_type or kind,
+            target_category=target_category,
+            approval_decision=approval_decision,
+            policy_decision=policy_decision,
+            execution_status=execution_status,
         )
 
     def _best_effort_audit(self, **kwargs: object) -> None:
