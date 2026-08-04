@@ -12,11 +12,9 @@ from jarvis_control_plane import (
     ControlPlaneConfig,
     DeterministicCapabilityBroker,
     DeterministicIdGenerator,
-    DiagnosticTraceRecorder,
     FixedClock,
     InboundMessage,
     InMemoryAuditBoundary,
-    InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
     SignedInboundEvent,
     SignedMessageReceiver,
@@ -70,11 +68,6 @@ def make_components(
     state = state if state is not None else InMemoryDurableStateStore()
     audit = audit if audit is not None else InMemoryAuditBoundary()
     orchestration = ControlledOrchestrationAdapter()
-    trace = DiagnosticTraceRecorder(
-        writer=InMemoryDiagnosticTraceStore().writer(),
-        clock=clock,
-        ids=ids,
-    )
     outbound = ControlledOutboundConnector(
         operator_id=OPERATOR,
         session_id=SESSION,
@@ -90,7 +83,6 @@ def make_components(
         outbound=outbound,
         clock=clock,
         ids=ids,
-        trace=trace,
     )
     receiver = SignedMessageReceiver(
         config=config,

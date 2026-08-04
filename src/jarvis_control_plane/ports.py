@@ -1,7 +1,8 @@
-"""Small ports and errors for the ticket01/ticket02 control-plane seam."""
+"""Small ports and errors for the ticket01-ticket04 control-plane seam."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
 
 from .models import (
     AuditEvidence,
+    AuditFilter,
     ConversationMessage,
     IngressClaim,
     OrchestrationRequest,
@@ -76,9 +78,17 @@ class TraceWriteError(DiagnosticTraceError):
 
 
 class AuditBoundary(Protocol):
-    """Append-only redacted audit boundary."""
+    """Append-only redacted audit boundary and safe local read surface."""
 
     def append(self, evidence: AuditEvidence) -> None: ...
+
+    def append_batch(self, evidence: Sequence[AuditEvidence]) -> None: ...
+
+    def safe_view(
+        self, query: AuditFilter | None = None
+    ) -> tuple[AuditEvidence, ...]: ...
+
+    def export_json(self, query: AuditFilter | None = None) -> str: ...
 
 
 class DurableStateStore(Protocol):
@@ -105,7 +115,13 @@ class DurableStateStore(Protocol):
 
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]: ...
 
+    def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
+
+    def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
+
     def save_request(self, request: RequestState) -> None: ...
+
+    def delete_request(self, request_id: str) -> bool: ...
 
     def update_request(self, request: RequestState) -> None: ...
 
@@ -123,7 +139,9 @@ class OrchestrationAdapter(Protocol):
 
 
 class OutboundConnector(Protocol):
-    """Closed outbound messaging capability."""
+    """Closed outbound capability with a side-effect-free admission check."""
+
+    def preflight(self, reply: OutboundReply) -> None: ...
 
     def send(self, reply: OutboundReply) -> None: ...
 
