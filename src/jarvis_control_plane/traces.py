@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import shutil
 import sqlite3
 import tempfile
 import threading
+import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, is_dataclass
@@ -25,12 +27,11 @@ from enum import Enum
 from multiprocessing import Pipe, Process
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol, TypeVar
+from typing import Any, ClassVar, Protocol, TypeVar
 
 from .models import ensure_utc
 from .ports import (
     Clock,
-    DiagnosticTraceError,
     DiagnosticTraceStore,
     IdGenerator,
     TraceCapacityError,
@@ -57,84 +58,227 @@ def _validate_non_negative_int(value: object, name: str) -> int:
     return value
 
 
-def _trace_value(value: Any) -> Any:
-    """Convert typed operation values to an immutable JSON-compatible shape.
+def _safe_text(value: Any, *, fallback: str) -> str:
+    try:
+        return str(value)
+    except BaseException:  # noqa: BLE001 - trace capture must survive hostile values
+        return fallback
 
-    This conversion intentionally performs no redaction.  In particular, a
-    string containing a password, token, or private key is copied verbatim.
-    Bytes are represented losslessly as tagged base64 values so connector and
-    worker payloads do not need to be coerced through an unsafe ``repr``.
+
+def _safe_repr(value: Any) -> str:
+    try:
+        return repr(value)
+    except BaseException as exc:  # noqa: BLE001 - trace capture must never call user code twice
+        error_type = f"{type(exc).__module__}.{type(exc).__qualname__}"
+        return (
+            f"<repr failed: {error_type}: {_safe_text(exc, fallback='unknown error')}>"
+        )
+
+
+class _TraceValueEncoder:
+    """Encode one object graph without dropping cycles or unexpected values.
+
+    The old recursive converter treated an object graph as a tree and raised
+    on the first cycle or unsupported adapter value.  A diagnostic trace is a
+    record of what happened, so the encoder assigns identities to graph nodes
+    and uses explicit references for cycles.  Values that do not have a
+    built-in lossless JSON representation are retained as a structural object
+    snapshot, including attributes and a safe representation.
     """
 
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, datetime):
-        return {
-            "__type__": "datetime",
-            "value": ensure_utc(value).isoformat(),
-        }
-    if isinstance(value, bytes):
-        return {
-            "__type__": "bytes",
-            "base64": base64.b64encode(value).decode("ascii"),
-        }
-    if isinstance(value, Enum):
-        return {
-            "__type__": "enum",
-            "class": f"{type(value).__module__}.{type(value).__qualname__}",
-            "name": value.name,
-            "value": _trace_value(value.value),
-        }
-    if isinstance(value, Mapping):
-        return {
-            "__type__": "mapping",
-            "items": [
-                {"key": _trace_value(key), "value": _trace_value(item)}
-                for key, item in value.items()
-            ],
-        }
-    if is_dataclass(value) and not isinstance(value, type):
-        value_type = type(value)
-        return {
-            "__type__": "dataclass",
-            "class": f"{value_type.__module__}.{value_type.__qualname__}",
-            "fields": _trace_value(
-                {
-                    item.name: getattr(value, item.name)
-                    for item in dataclass_fields(value)
-                }
-            ),
-        }
-    if isinstance(value, (list, tuple, set, frozenset)):
-        values = [_trace_value(item) for item in value]
-        if isinstance(value, list):
-            return {"__type__": "list", "items": values}
-        if isinstance(value, tuple):
-            return {"__type__": "tuple", "items": values}
-        if isinstance(value, (set, frozenset)):
-            try:
-                values = sorted(values, key=_canonical_json)
-            except (TypeError, ValueError, RecursionError) as exc:
-                raise TypeError("trace set contains an unsupported value") from exc
+    __slots__ = ("_active", "_next_reference", "_references")
+
+    def __init__(self) -> None:
+        self._active: set[int] = set()
+        self._next_reference = 1
+        self._references: dict[int, int] = {}
+
+    def encode(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, bool)):
+            return value
+        if isinstance(value, float):
+            if math.isfinite(value):
+                return value
+            return {"__type__": "float", "value": _safe_repr(value)}
+        if isinstance(value, datetime):
             return {
-                "__type__": "frozenset" if isinstance(value, frozenset) else "set",
-                "items": values,
+                "__type__": "datetime",
+                "value": ensure_utc(value).isoformat(),
             }
-        return values
-    if isinstance(value, BaseException):
-        return {
+        if isinstance(value, bytes):
+            return {
+                "__type__": "bytes",
+                "base64": base64.b64encode(value).decode("ascii"),
+            }
+        if isinstance(value, bytearray):
+            return {
+                "__type__": "bytearray",
+                "base64": base64.b64encode(bytes(value)).decode("ascii"),
+            }
+        if isinstance(value, memoryview):
+            return {
+                "__type__": "memoryview",
+                "base64": base64.b64encode(value.tobytes()).decode("ascii"),
+            }
+        if isinstance(value, Path):
+            return {"__type__": "path", "value": str(value)}
+        if isinstance(value, Enum):
+            return {
+                "__type__": "enum",
+                "class": self._class_name(value),
+                "name": value.name,
+                "value": self.encode(value.value),
+            }
+
+        reference = self._begin_node(value)
+        if isinstance(reference, dict):
+            return reference
+        try:
+            if isinstance(value, BaseException):
+                return self._exception(value, reference)
+            if isinstance(value, Mapping):
+                return self._mapping(value, reference)
+            if is_dataclass(value) and not isinstance(value, type):
+                fields: dict[str, Any] = {}
+                for item in dataclass_fields(value):
+                    try:
+                        fields[item.name] = getattr(value, item.name)
+                    except BaseException as exc:  # noqa: BLE001 - preserve field access failure
+                        fields[item.name] = self._attribute_error(exc)
+                return self._identified(
+                    {
+                        "__type__": "dataclass",
+                        "class": self._class_name(value),
+                        "fields": self.encode(fields),
+                    },
+                    reference,
+                )
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return self._sequence(value, reference)
+            return self._object(value, reference)
+        finally:
+            self._active.discard(id(value))
+
+    def _begin_node(self, value: Any) -> int | dict[str, int]:
+        identity = id(value)
+        if identity in self._active:
+            existing = self._references[identity]
+            return {"__type__": "reference", "id": existing}
+        reference = self._next_reference
+        self._next_reference += 1
+        self._references[identity] = reference
+        self._active.add(identity)
+        return reference
+
+    @staticmethod
+    def _class_name(value: Any) -> str:
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}"
+
+    @staticmethod
+    def _identified(value: dict[str, Any], reference: int) -> dict[str, Any]:
+        value["id"] = reference
+        return value
+
+    def _mapping(self, value: Mapping[Any, Any], reference: int) -> dict[str, Any]:
+        return self._identified(
+            {
+                "__type__": "mapping",
+                "items": [
+                    {"key": self.encode(key), "value": self.encode(item)}
+                    for key, item in value.items()
+                ],
+            },
+            reference,
+        )
+
+    def _sequence(self, value: Any, reference: int) -> dict[str, Any]:
+        values = [self.encode(item) for item in value]
+        if isinstance(value, set | frozenset):
+            values.sort(key=_canonical_json)
+            sequence_type = "frozenset" if isinstance(value, frozenset) else "set"
+        elif isinstance(value, list):
+            sequence_type = "list"
+        else:
+            sequence_type = "tuple"
+        return self._identified(
+            {"__type__": sequence_type, "items": values},
+            reference,
+        )
+
+    def _exception(self, value: BaseException, reference: int) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "__type__": "exception",
-            "class": f"{type(value).__module__}.{type(value).__qualname__}",
-            "message": str(value),
-            "args": _trace_value(value.args),
-            "repr": repr(value),
+            "class": self._class_name(value),
+            "message": _safe_text(value, fallback="<str failed>"),
+            "args": self.encode(value.args),
+            "repr": _safe_repr(value),
+            "attributes": self.encode(self._attributes(value)),
+            "traceback": self._traceback(value),
+            "suppress_context": bool(value.__suppress_context__),
         }
-    if isinstance(value, Path):
-        return {"__type__": "path", "value": str(value)}
-    raise TypeError(
-        "trace payload contains unsupported value type "
-        f"{type(value).__module__}.{type(value).__qualname__}"
-    )
+        if value.__cause__ is not None:
+            payload["cause"] = self.encode(value.__cause__)
+        if value.__context__ is not None:
+            payload["context"] = self.encode(value.__context__)
+        notes = getattr(value, "__notes__", None)
+        if notes is not None:
+            payload["notes"] = self.encode(notes)
+        return self._identified(payload, reference)
+
+    @staticmethod
+    def _traceback(value: BaseException) -> list[str]:
+        try:
+            return traceback.format_exception(type(value), value, value.__traceback__)
+        except BaseException:  # noqa: BLE001 - formatting is diagnostic best effort
+            return ["<traceback unavailable>"]
+
+    def _object(self, value: Any, reference: int) -> dict[str, Any]:
+        return self._identified(
+            {
+                "__type__": "object",
+                "class": self._class_name(value),
+                "attributes": self.encode(self._attributes(value)),
+                "repr": _safe_repr(value),
+            },
+            reference,
+        )
+
+    @staticmethod
+    def _attribute_error(exc: BaseException) -> dict[str, str]:
+        return {
+            "__type__": "attribute_error",
+            "class": f"{type(exc).__module__}.{type(exc).__qualname__}",
+            "message": _safe_text(exc, fallback="<str failed>"),
+        }
+
+    @staticmethod
+    def _attributes(value: Any) -> dict[str, Any]:
+        attributes: dict[str, Any] = {}
+        try:
+            attributes.update(vars(value))
+        except (TypeError, AttributeError):
+            pass
+        for value_type in type(value).__mro__:
+            slots = value_type.__dict__.get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for name in slots:
+                if name in {"__dict__", "__weakref__"} or name in attributes:
+                    continue
+                try:
+                    attributes[name] = getattr(value, name)
+                except AttributeError:
+                    continue
+                except BaseException as exc:  # noqa: BLE001 - preserve hostile slot access
+                    attributes[name] = _TraceValueEncoder._attribute_error(exc)
+        return attributes
+
+
+def _trace_value(value: Any) -> Any:
+    """Convert one complete operation value into a JSON-safe graph snapshot."""
+
+    return _TraceValueEncoder().encode(value)
 
 
 def _freeze_trace_value(value: Any) -> Any:
@@ -343,23 +487,23 @@ def _trace_writer_mailbox(capability_id: str) -> Path:
     return Path(tempfile.gettempdir()) / f"jarvis-trace-{capability_id}"
 
 
-def _trace_writer_process_main(
-    admin_connection: Any,
-    startup_connection: Any,
-    configuration: Mapping[str, Any],
-    capability_id: str,
-) -> None:
-    """Serve trace writes in a separate process with an isolated store."""
+class _TraceWriterLifecycle(Enum):
+    STARTING = "starting"
+    SERVING = "serving"
+    STOPPING = "stopping"
+    CLOSED = "closed"
 
+
+def _build_trace_writer_store(configuration: Mapping[str, Any]) -> DiagnosticTraceStore:
     if configuration["kind"] == "memory":
-        store: DiagnosticTraceStore = InMemoryDiagnosticTraceStore(
+        return InMemoryDiagnosticTraceStore(
             capacity_bytes=configuration["capacity_bytes"],
             reservation_bytes=configuration["reservation_bytes"],
             hard_max_bytes=configuration["hard_max_bytes"],
         )
-    elif configuration["kind"] == "sqlite":
+    if configuration["kind"] == "sqlite":
         physical_capacity = configuration.get("physical_capacity_bytes")
-        store = SQLiteDiagnosticTraceStore(
+        return SQLiteDiagnosticTraceStore(
             configuration["database"],
             capacity_bytes=configuration["capacity_bytes"],
             reservation_bytes=configuration["reservation_bytes"],
@@ -370,33 +514,82 @@ def _trace_writer_process_main(
                 else None
             ),
         )
-    else:
-        raise RuntimeError("unknown trace writer store kind")
+    raise RuntimeError("unknown trace writer store kind")
 
-    writer_mailbox = _trace_writer_mailbox(capability_id)
-    writer_mailbox.mkdir(parents=True, exist_ok=True)
-    startup_connection.send({"ok": True})
-    startup_connection.close()
 
-    reservations: dict[str, TraceReservation] = {}
-    state_lock = threading.RLock()
-    stop_event = threading.Event()
+class _TraceWriterRuntime:
+    """Own the child-process lifecycle, mailbox requests, and admin reads."""
 
-    def handle_writer_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    _MAILBOX_OPERATIONS: ClassVar[set[str]] = {
+        "append",
+        "close",
+        "release",
+        "reserve",
+    }
+
+    def __init__(
+        self,
+        *,
+        store: DiagnosticTraceStore,
+        admin_connection: Any,
+        capability_id: str,
+    ) -> None:
+        self.store = store
+        self.admin_connection = admin_connection
+        self.mailbox = _trace_writer_mailbox(capability_id)
+        self.reservations: dict[str, TraceReservation] = {}
+        self.state_lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.state = _TraceWriterLifecycle.STARTING
+
+    def serve(self, startup_connection: Any) -> None:
+        self.mailbox.mkdir(parents=True, exist_ok=True)
+        startup_connection.send({"ok": True})
+        startup_connection.close()
+        self.state = _TraceWriterLifecycle.SERVING
+        admin_open = True
+        try:
+            while self.state is _TraceWriterLifecycle.SERVING:
+                processed = self.process_mailbox_requests()
+                if self.state is not _TraceWriterLifecycle.SERVING:
+                    continue
+                if not admin_open:
+                    self.stop_event.wait(0.1)
+                    continue
+                try:
+                    if not self.admin_connection.poll(0.1):
+                        if not processed:
+                            self.stop_event.wait(0.01)
+                        continue
+                    request = self.admin_connection.recv()
+                except (EOFError, OSError):
+                    admin_open = False
+                    continue
+                response, should_stop = self.handle_admin_request(request)
+                if should_stop:
+                    self.state = _TraceWriterLifecycle.STOPPING
+                    continue
+                try:
+                    self.admin_connection.send(response)
+                except (BrokenPipeError, EOFError, OSError):
+                    return
+        finally:
+            self.close()
+
+    def handle_writer_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
         operation = request.get("operation")
-        with state_lock:
+        with self.state_lock:
             if operation == "close":
-                for reservation in reservations.values():
-                    store.release(reservation)
-                reservations.clear()
+                self._release_all()
+                self.state = _TraceWriterLifecycle.STOPPING
                 return {"ok": True}
             try:
                 if operation == "reserve":
-                    reservation = store.reserve(
+                    reservation = self.store.reserve(
                         request_id=request["request_id"],
                         reservation_bytes=request.get("reservation_bytes"),
                     )
-                    reservations[reservation.reservation_id] = reservation
+                    self.reservations[reservation.reservation_id] = reservation
                     return {
                         "ok": True,
                         "reservation_id": reservation.reservation_id,
@@ -405,40 +598,42 @@ def _trace_writer_process_main(
                     }
                 if operation == "append":
                     reservation_id = request["reservation_id"]
-                    reservation = reservations.get(reservation_id)
+                    reservation = self.reservations.get(reservation_id)
                     if reservation is None:
                         raise TraceWriteError("trace reservation is not active")
-                    store.append(
+                    self.store.append(
                         DiagnosticTrace.from_mapping(request["trace"]),
                         reservation,
                     )
-                    reservations.pop(reservation_id, None)
+                    self.reservations.pop(reservation_id, None)
                     return {"ok": True}
                 if operation == "release":
-                    reservation = reservations.pop(request["reservation_id"], None)
+                    reservation = self.reservations.pop(request["reservation_id"], None)
                     if reservation is not None:
-                        store.release(reservation)
+                        self.store.release(reservation)
                     return {"ok": True}
                 raise TraceWriteError(
                     "trace content is available only on the admin channel"
                 )
-            except Exception as exc:  # noqa: BLE001 - IPC boundary must report adapter failures
+            except Exception as exc:  # noqa: BLE001 - IPC boundary reports adapter failures
                 if operation == "append":
-                    reservation = reservations.pop(request.get("reservation_id"), None)
+                    reservation = self.reservations.pop(
+                        request.get("reservation_id"), None
+                    )
                     if reservation is not None:
-                        store.release(reservation)
+                        self.store.release(reservation)
                 return {"ok": False, "error": _trace_writer_error(exc)}
 
-    def process_writer_requests() -> bool:
+    def process_mailbox_requests(self) -> bool:
         processed = False
-        for request_path in sorted(writer_mailbox.glob("*.request")):
+        for request_path in sorted(self.mailbox.glob("*.request")):
             if request_path.name.startswith("."):
                 continue
             processed = True
             try:
                 request = json.loads(request_path.read_text(encoding="utf-8"))
                 operation = request_path.name.split("-", 1)[0]
-                if operation not in {"append", "close", "release", "reserve"}:
+                if operation not in self._MAILBOX_OPERATIONS:
                     request_path.unlink(missing_ok=True)
                     continue
                 request["operation"] = operation
@@ -447,91 +642,99 @@ def _trace_writer_process_main(
                 request_path.unlink(missing_ok=True)
                 continue
             request_path.unlink(missing_ok=True)
-            response = handle_writer_request(request)
-            response_path = writer_mailbox / f"{ipc_id}.response"
-            temporary_path = writer_mailbox / f".{ipc_id}.response"
-            temporary_path.write_text(
-                json.dumps(response, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temporary_path.replace(response_path)
-            if request.get("operation") == "close":
-                stop_event.set()
+            response = self.handle_writer_request(request)
+            self._publish_response(ipc_id, response)
         return processed
 
-    admin_open = True
-    try:
-        while not stop_event.is_set():
-            processed = process_writer_requests()
-            if stop_event.is_set():
-                continue
-            if not admin_open:
-                stop_event.wait(0.1)
-                continue
+    def handle_admin_request(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        operation = request.get("operation")
+        if operation == "admin_close":
+            return {"ok": True}, True
+        with self.state_lock:
             try:
-                if not admin_connection.poll(0.1):
-                    if not processed:
-                        stop_event.wait(0.01)
-                    continue
-                request = admin_connection.recv()
-            except (EOFError, OSError):
-                admin_open = False
-                continue
-            operation = request.get("operation")
-            if operation == "admin_close":
-                return
-            with state_lock:
-                try:
-                    if operation == "read":
-                        traces = tuple(
-                            trace
-                            for trace in store._read_persisted_traces()  # type: ignore[attr-defined]
-                            if (
-                                request.get("trace_id") is None
-                                or trace.trace_id == request["trace_id"]
-                            )
-                            and (
-                                request.get("request_id") is None
-                                or trace.request_id == request["request_id"]
-                            )
-                            and (
-                                request.get("operation_type") is None
-                                or trace.operation_type == request["operation_type"]
-                            )
+                if operation == "read":
+                    traces = tuple(
+                        trace
+                        for trace in self.store._read_persisted_traces()  # type: ignore[attr-defined]
+                        if (
+                            request.get("trace_id") is None
+                            or trace.trace_id == request["trace_id"]
                         )
-                        response = {
-                            "ok": True,
-                            "traces": [trace.to_mapping() for trace in traces],
-                        }
-                    elif operation == "stats":
-                        response = {
-                            "ok": True,
-                            "available_bytes": store.available_bytes,
-                            "retained_bytes": store.retained_bytes,
-                            "reserved_bytes": store.reserved_bytes,
-                            "request_retained_bytes": {
-                                request_id: store.request_retained_bytes(request_id)
-                                for request_id in request.get("request_ids", [])
-                            },
-                        }
-                    else:
-                        raise TraceWriteError("unknown trace administration operation")
-                except Exception as exc:  # noqa: BLE001 - IPC boundary must report adapter failures
-                    response = {"ok": False, "error": _trace_writer_error(exc)}
-            try:
-                admin_connection.send(response)
-            except (BrokenPipeError, EOFError, OSError):
-                return
-    finally:
-        stop_event.set()
-        with state_lock:
-            for reservation in reservations.values():
-                store.release(reservation)
-            reservations.clear()
+                        and (
+                            request.get("request_id") is None
+                            or trace.request_id == request["request_id"]
+                        )
+                        and (
+                            request.get("operation_type") is None
+                            or trace.operation_type == request["operation_type"]
+                        )
+                    )
+                    return {
+                        "ok": True,
+                        "traces": [trace.to_mapping() for trace in traces],
+                    }, False
+                if operation == "stats":
+                    return {
+                        "ok": True,
+                        "available_bytes": self.store.available_bytes,
+                        "retained_bytes": self.store.retained_bytes,
+                        "reserved_bytes": self.store.reserved_bytes,
+                        "request_retained_bytes": {
+                            request_id: self.store.request_retained_bytes(request_id)
+                            for request_id in request.get("request_ids", [])
+                        },
+                    }, False
+                raise TraceWriteError("unknown trace administration operation")
+            except Exception as exc:  # noqa: BLE001 - admin IPC reports adapter failures
+                return {"ok": False, "error": _trace_writer_error(exc)}, False
+
+    def _publish_response(self, ipc_id: str, response: Mapping[str, Any]) -> None:
+        response_path = self.mailbox / f"{ipc_id}.response"
+        temporary_path = self.mailbox / f".{ipc_id}.response"
+        temporary_path.write_text(
+            json.dumps(response, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary_path.replace(response_path)
+
+    def _release_all(self) -> None:
+        for reservation in self.reservations.values():
+            self.store.release(reservation)
+        self.reservations.clear()
+
+    def close(self) -> None:
+        if self.state is _TraceWriterLifecycle.CLOSED:
+            return
+        self.state = _TraceWriterLifecycle.STOPPING
+        self.stop_event.set()
+        with self.state_lock:
+            self._release_all()
         try:
-            admin_connection.close()
+            self.admin_connection.close()
         except OSError:
             pass
+        close = getattr(self.store, "close", None)
+        if callable(close):
+            close()
+        self.state = _TraceWriterLifecycle.CLOSED
+
+
+def _trace_writer_process_main(
+    admin_connection: Any,
+    startup_connection: Any,
+    configuration: Mapping[str, Any],
+    capability_id: str,
+) -> None:
+    """Start the isolated writer runtime and hand it the two IPC channels."""
+
+    runtime = _TraceWriterRuntime(
+        store=_build_trace_writer_store(configuration),
+        admin_connection=admin_connection,
+        capability_id=capability_id,
+    )
+    runtime.serve(startup_connection)
 
 
 def _start_trace_writer_service(
@@ -1137,6 +1340,257 @@ class SQLiteDiagnosticTraceStore(_DiagnosticTraceStoreBase):
             self.connection.close()
 
 
+class _TraceExecutionState(Enum):
+    """Named lifecycle states for one admitted trace-producing operation."""
+
+    ADMITTED = "admitted"
+    STARTED = "started"
+    CAPTURED = "captured"
+    RETAINED = "retained"
+
+
+@dataclass(slots=True)
+class _TraceExecution:
+    """Operation metadata plus the one reservation it is allowed to consume."""
+
+    trace_id: str
+    operation_id: str
+    request_id: str
+    operation_type: str
+    started_at: datetime
+    input_payload: Any
+    arguments: Any
+    telemetry: Any
+    outcome: str
+    reservation: TraceReservation
+    state: _TraceExecutionState = _TraceExecutionState.ADMITTED
+
+    def start(self) -> None:
+        self._require(_TraceExecutionState.ADMITTED)
+        self.state = _TraceExecutionState.STARTED
+
+    def preview_size_bytes(self) -> int:
+        return self._build_trace(
+            completed_at=self.started_at,
+            outcome=self.outcome,
+            output_payload=None,
+            result=None,
+            error=None,
+        ).serialized_size_bytes
+
+    def capture_result(self, result: Any, completed_at: datetime) -> DiagnosticTrace:
+        self._require(_TraceExecutionState.STARTED)
+        trace = self._build_trace(
+            completed_at=completed_at,
+            outcome=self.outcome,
+            output_payload=result,
+            result=result,
+            error=None,
+        )
+        self.state = _TraceExecutionState.CAPTURED
+        return trace
+
+    def capture_error(
+        self, error: BaseException, completed_at: datetime
+    ) -> DiagnosticTrace:
+        self._require(_TraceExecutionState.STARTED)
+        trace = self._build_trace(
+            completed_at=completed_at,
+            outcome="failed",
+            output_payload=None,
+            result=None,
+            error=error,
+        )
+        self.state = _TraceExecutionState.CAPTURED
+        return trace
+
+    def mark_retained(self) -> None:
+        self._require(_TraceExecutionState.CAPTURED)
+        self.state = _TraceExecutionState.RETAINED
+
+    def _build_trace(
+        self,
+        *,
+        completed_at: datetime,
+        outcome: str,
+        output_payload: Any,
+        result: Any,
+        error: Any,
+    ) -> DiagnosticTrace:
+        encoded_output = _trace_value(output_payload)
+        encoded_result = (
+            encoded_output if output_payload is result else _trace_value(result)
+        )
+        return DiagnosticTrace(
+            trace_id=self.trace_id,
+            operation_id=self.operation_id,
+            request_id=self.request_id,
+            operation_type=self.operation_type,
+            started_at=self.started_at,
+            completed_at=ensure_utc(completed_at),
+            outcome=outcome,
+            payload={
+                # Inputs, arguments, and telemetry were normalized before the
+                # operation began.  Output, result, and error are captured only
+                # after the operation boundary returns or raises.
+                "input": self.input_payload,
+                "output": encoded_output,
+                "arguments": self.arguments,
+                "result": encoded_result,
+                "error": _trace_value(error),
+                "telemetry": self.telemetry,
+            },
+        )
+
+    def _require(self, expected: _TraceExecutionState) -> None:
+        if self.state is not expected:
+            raise RuntimeError(
+                f"trace execution is {self.state.value}, expected {expected.value}"
+            )
+
+
+class _TraceAdmission:
+    """Validate operation metadata and reserve capacity before work starts."""
+
+    def __init__(
+        self,
+        *,
+        writer: DiagnosticTraceStore,
+        clock: Clock,
+        ids: IdGenerator,
+        reservation_bytes: int | None,
+    ) -> None:
+        self._writer = writer
+        self._clock = clock
+        self._ids = ids
+        self._reservation_bytes = reservation_bytes
+
+    def admit(
+        self,
+        *,
+        request_id: str,
+        operation_type: str,
+        input_payload: Any,
+        arguments: Any,
+        telemetry: Any,
+        operation_id: str | None,
+        outcome: str,
+        result_limit_bytes: int | None,
+        error_limit_bytes: int | None,
+    ) -> _TraceExecution:
+        self._validate(
+            operation_type=operation_type,
+            outcome=outcome,
+            result_limit_bytes=result_limit_bytes,
+            error_limit_bytes=error_limit_bytes,
+        )
+        reservation = self._writer.reserve(
+            request_id=request_id,
+            reservation_bytes=self._reservation_bytes,
+        )
+        try:
+            try:
+                normalized_input = _trace_value(input_payload)
+                normalized_arguments = _trace_value(arguments)
+                normalized_telemetry = _trace_value(telemetry)
+            except Exception as exc:
+                raise TraceWriteError(
+                    "trace input payload cannot be represented",
+                    operation_started=False,
+                ) from exc
+            trace_id = self._ids.new_id("trace")
+            execution = _TraceExecution(
+                trace_id=trace_id,
+                operation_id=operation_id or trace_id,
+                request_id=request_id,
+                operation_type=operation_type,
+                started_at=ensure_utc(self._clock.now()),
+                input_payload=normalized_input,
+                arguments=normalized_arguments,
+                telemetry=normalized_telemetry,
+                outcome=outcome,
+                reservation=reservation,
+            )
+            known_trace_size = execution.preview_size_bytes()
+            if known_trace_size > reservation.reserved_bytes:
+                raise TraceCapacityError(
+                    "known trace payload exceeds its reserved capacity",
+                    requested_bytes=known_trace_size,
+                    available_bytes=reservation.reserved_bytes,
+                )
+            required_size = self._required_size(
+                known_trace_size=known_trace_size,
+                result_limit_bytes=result_limit_bytes,
+                error_limit_bytes=error_limit_bytes,
+            )
+            if required_size > reservation.reserved_bytes:
+                raise TraceCapacityError(
+                    "declared complete trace bounds exceed reserved capacity",
+                    requested_bytes=required_size,
+                    available_bytes=reservation.reserved_bytes,
+                )
+            return execution
+        except Exception:
+            self._writer.release(reservation)
+            raise
+
+    @staticmethod
+    def _validate(
+        *,
+        operation_type: str,
+        outcome: str,
+        result_limit_bytes: int | None,
+        error_limit_bytes: int | None,
+    ) -> None:
+        if (
+            not isinstance(operation_type, str)
+            or not operation_type
+            or operation_type.strip() != operation_type
+        ):
+            raise ValueError("operation_type must be a non-empty canonical string")
+        if not isinstance(outcome, str) or not outcome or outcome.strip() != outcome:
+            raise ValueError("outcome must be a non-empty canonical string")
+        if result_limit_bytes is None or error_limit_bytes is None:
+            raise ValueError(
+                "result_limit_bytes and error_limit_bytes are required trace bounds"
+            )
+        _validate_non_negative_int(result_limit_bytes, "result_limit_bytes")
+        _validate_non_negative_int(error_limit_bytes, "error_limit_bytes")
+
+    @staticmethod
+    def _required_size(
+        *,
+        known_trace_size: int,
+        result_limit_bytes: int | None,
+        error_limit_bytes: int | None,
+    ) -> int:
+        if result_limit_bytes is None or error_limit_bytes is None:
+            raise AssertionError("trace bounds must be validated before sizing")
+        # This budget is reserved before invoking the operation.  Once the
+        # boundary has started, the actual encoded payload is authoritative:
+        # it is never truncated or replaced with a trace_failed envelope.
+        required_result_size = known_trace_size + 2 * (result_limit_bytes + 128)
+        required_error_size = known_trace_size + error_limit_bytes + 128
+        return max(required_result_size, required_error_size)
+
+
+class _TracePersistence:
+    """Append a captured trace and translate writer failures at one seam."""
+
+    def __init__(self, writer: DiagnosticTraceStore) -> None:
+        self._writer = writer
+
+    def append(self, execution: _TraceExecution, trace: DiagnosticTrace) -> None:
+        try:
+            self._writer.append(trace, execution.reservation)
+        except TraceWriteError as exc:
+            raise TraceWriteError(
+                str(exc) or "diagnostic trace could not be retained",
+                operation_started=execution.state is not _TraceExecutionState.ADMITTED,
+            ) from exc
+        execution.mark_retained()
+
+
 class DiagnosticTraceRecorder:
     """Reserve capacity, run one operation, and append its complete trace."""
 
@@ -1165,6 +1619,13 @@ class DiagnosticTraceRecorder:
         self.clock = clock
         self.ids = ids
         self.reservation_bytes = reservation_bytes
+        self._admission = _TraceAdmission(
+            writer=writer,
+            clock=clock,
+            ids=ids,
+            reservation_bytes=reservation_bytes,
+        )
+        self._persistence = _TracePersistence(writer)
 
     def execute(
         self,
@@ -1180,326 +1641,36 @@ class DiagnosticTraceRecorder:
         result_limit_bytes: int | None = None,
         error_limit_bytes: int | None = None,
     ) -> _T:
-        """Run one operation under declared, serializable result bounds."""
+        """Run one admitted operation and retain its complete outcome."""
 
-        if (
-            not isinstance(operation_type, str)
-            or not operation_type
-            or operation_type.strip() != operation_type
-        ):
-            raise ValueError("operation_type must be a non-empty canonical string")
-        if not isinstance(outcome, str) or not outcome or outcome.strip() != outcome:
-            raise ValueError("outcome must be a non-empty canonical string")
-        if result_limit_bytes is None or error_limit_bytes is None:
-            raise ValueError(
-                "result_limit_bytes and error_limit_bytes are required trace bounds"
-            )
-        _validate_non_negative_int(result_limit_bytes, "result_limit_bytes")
-        _validate_non_negative_int(error_limit_bytes, "error_limit_bytes")
-        reservation = self._writer.reserve(
+        execution = self._admission.admit(
             request_id=request_id,
-            reservation_bytes=self.reservation_bytes,
+            operation_type=operation_type,
+            input_payload=input_payload,
+            arguments=arguments,
+            telemetry=telemetry,
+            operation_id=operation_id,
+            outcome=outcome,
+            result_limit_bytes=result_limit_bytes,
+            error_limit_bytes=error_limit_bytes,
         )
         try:
-            trace_id = self.ids.new_id("trace")
-            started_at = ensure_utc(self.clock.now())
-            # Normalize all input fields before the operation starts.  This
-            # prevents an unserializable input from launching untraceable work.
-            try:
-                input_payload = _trace_value(input_payload)
-                arguments = _trace_value(arguments)
-                telemetry = _trace_value(telemetry)
-            except Exception as exc:
-                raise TraceWriteError(
-                    "trace input payload cannot be represented",
-                    operation_started=False,
-                ) from exc
-            try:
-                known_trace_size = self._trace(
-                    trace_id=trace_id,
-                    operation_id=operation_id or trace_id,
-                    request_id=request_id,
-                    operation_type=operation_type,
-                    started_at=started_at,
-                    completed_at=started_at,
-                    outcome=outcome,
-                    input_payload=input_payload,
-                    output_payload=None,
-                    arguments=arguments,
-                    result=None,
-                    error=None,
-                    telemetry=telemetry,
-                ).serialized_size_bytes
-            except Exception as exc:
-                raise TraceWriteError(
-                    "known trace payload cannot be represented",
-                    operation_started=False,
-                ) from exc
-            if known_trace_size > reservation.reserved_bytes:
-                raise TraceCapacityError(
-                    "known trace payload exceeds its reserved capacity",
-                    requested_bytes=known_trace_size,
-                    available_bytes=reservation.reserved_bytes,
-                )
-            if result_limit_bytes is not None and error_limit_bytes is not None:
-                required_result_size = known_trace_size + 2 * (result_limit_bytes + 128)
-                required_error_size = known_trace_size + error_limit_bytes + 128
-                required_size = max(required_result_size, required_error_size)
-                if required_size > reservation.reserved_bytes:
-                    raise TraceCapacityError(
-                        "declared complete trace bounds exceed reserved capacity",
-                        requested_bytes=required_size,
-                        available_bytes=reservation.reserved_bytes,
-                    )
+            execution.start()
             try:
                 result = operation()
             except Exception as exc:
-                completed_at = ensure_utc(self.clock.now())
+                trace = execution.capture_error(exc, self.clock.now())
                 try:
-                    encoded_error = _trace_value(exc)
-                    if (
-                        error_limit_bytes is not None
-                        and len(_canonical_json(encoded_error)) > error_limit_bytes
-                    ):
-                        raise TraceWriteError(
-                            "operation error exceeds its declared trace bound",
-                            operation_started=True,
-                        )
-                    trace = self._trace(
-                        trace_id=trace_id,
-                        operation_id=operation_id or trace_id,
-                        request_id=request_id,
-                        operation_type=operation_type,
-                        started_at=started_at,
-                        completed_at=completed_at,
-                        outcome="failed",
-                        input_payload=input_payload,
-                        output_payload=None,
-                        arguments=arguments,
-                        result=None,
-                        error=exc,
-                        telemetry=telemetry,
-                    )
-                except Exception as trace_error:
-                    write_error = (
-                        trace_error
-                        if isinstance(trace_error, TraceWriteError)
-                        else TraceWriteError(
-                            "failed operation trace payload cannot be represented",
-                            operation_started=True,
-                        )
-                    )
-                    self._retain_trace_failure(
-                        trace_id=trace_id,
-                        operation_id=operation_id or trace_id,
-                        request_id=request_id,
-                        operation_type=operation_type,
-                        started_at=started_at,
-                        completed_at=completed_at,
-                        input_payload=input_payload,
-                        arguments=arguments,
-                        telemetry=telemetry,
-                        error=write_error,
-                        reservation=reservation,
-                    )
-                    raise write_error from trace_error
-                try:
-                    self._append(trace, reservation, operation_started=True)
+                    self._persistence.append(execution, trace)
                 except TraceWriteError as write_error:
-                    self._retain_trace_failure(
-                        trace_id=trace_id,
-                        operation_id=operation_id or trace_id,
-                        request_id=request_id,
-                        operation_type=operation_type,
-                        started_at=started_at,
-                        completed_at=completed_at,
-                        input_payload=input_payload,
-                        arguments=arguments,
-                        telemetry=telemetry,
-                        error=write_error,
-                        reservation=None,
-                    )
-                    raise
+                    # The domain exception remains visible.  Persistence is
+                    # its cause, never a replacement trace payload.
+                    raise exc from write_error
                 raise
-            completed_at = ensure_utc(self.clock.now())
-            try:
-                encoded_result = _trace_value(result)
-                if (
-                    result_limit_bytes is not None
-                    and len(_canonical_json(encoded_result)) > result_limit_bytes
-                ):
-                    raise TraceWriteError(
-                        "operation result exceeds its declared trace bound",
-                        operation_started=True,
-                    )
-                trace = self._trace(
-                    trace_id=trace_id,
-                    operation_id=operation_id or trace_id,
-                    request_id=request_id,
-                    operation_type=operation_type,
-                    started_at=started_at,
-                    completed_at=completed_at,
-                    outcome=outcome,
-                    input_payload=input_payload,
-                    output_payload=result,
-                    arguments=arguments,
-                    result=result,
-                    error=None,
-                    telemetry=telemetry,
-                )
-            except Exception as trace_error:
-                write_error = (
-                    trace_error
-                    if isinstance(trace_error, TraceWriteError)
-                    else TraceWriteError(
-                        "operation result trace payload cannot be represented",
-                        operation_started=True,
-                    )
-                )
-                self._retain_trace_failure(
-                    trace_id=trace_id,
-                    operation_id=operation_id or trace_id,
-                    request_id=request_id,
-                    operation_type=operation_type,
-                    started_at=started_at,
-                    completed_at=completed_at,
-                    input_payload=input_payload,
-                    arguments=arguments,
-                    telemetry=telemetry,
-                    error=write_error,
-                    reservation=reservation,
-                )
-                raise write_error from trace_error
-            try:
-                self._append(trace, reservation, operation_started=True)
-            except TraceWriteError as write_error:
-                self._retain_trace_failure(
-                    trace_id=trace_id,
-                    operation_id=operation_id or trace_id,
-                    request_id=request_id,
-                    operation_type=operation_type,
-                    started_at=started_at,
-                    completed_at=completed_at,
-                    input_payload=input_payload,
-                    arguments=arguments,
-                    telemetry=telemetry,
-                    error=write_error,
-                    reservation=None,
-                )
-                raise
+            trace = execution.capture_result(result, self.clock.now())
+            self._persistence.append(execution, trace)
             return result
         finally:
-            # append() consumes the reservation.  release() is intentionally
-            # idempotent so unexpected failures before a complete trace is
-            # built cannot strand capacity.
-            self._writer.release(reservation)
-
-    @staticmethod
-    def _trace(
-        *,
-        trace_id: str,
-        operation_id: str,
-        request_id: str,
-        operation_type: str,
-        started_at: datetime,
-        completed_at: datetime,
-        outcome: str,
-        input_payload: Any,
-        output_payload: Any,
-        arguments: Any,
-        result: Any,
-        error: Any,
-        telemetry: Any,
-    ) -> DiagnosticTrace:
-        return DiagnosticTrace(
-            trace_id=trace_id,
-            operation_id=operation_id,
-            request_id=request_id,
-            operation_type=operation_type,
-            started_at=started_at,
-            completed_at=completed_at,
-            outcome=outcome,
-            payload={
-                # These three values were normalized before the operation
-                # started.  Re-encoding them here would wrap an explicit
-                # mapping/list envelope in another mapping envelope.
-                "input": input_payload,
-                "output": _trace_value(output_payload),
-                "arguments": arguments,
-                "result": _trace_value(result),
-                "error": _trace_value(error),
-                "telemetry": telemetry,
-            },
-        )
-
-    def _append(
-        self,
-        trace: DiagnosticTrace,
-        reservation: TraceReservation,
-        *,
-        operation_started: bool,
-    ) -> None:
-        try:
-            self._writer.append(trace, reservation)
-        except TraceWriteError as exc:
-            raise TraceWriteError(
-                str(exc) or "diagnostic trace could not be retained",
-                operation_started=operation_started or exc.operation_started,
-            ) from exc
-
-    def _retain_trace_failure(
-        self,
-        *,
-        trace_id: str,
-        operation_id: str,
-        request_id: str,
-        operation_type: str,
-        started_at: datetime,
-        completed_at: datetime,
-        input_payload: Any,
-        arguments: Any,
-        telemetry: Any,
-        error: TraceWriteError,
-        reservation: TraceReservation | None,
-    ) -> None:
-        """Retain a bounded failure envelope when the full result cannot encode."""
-
-        try:
-            failure_trace = self._trace(
-                trace_id=trace_id,
-                operation_id=operation_id,
-                request_id=request_id,
-                operation_type=operation_type,
-                started_at=started_at,
-                completed_at=completed_at,
-                outcome="trace_failed",
-                input_payload=input_payload,
-                output_payload=None,
-                arguments=arguments,
-                result=None,
-                error=error,
-                telemetry=telemetry,
-            )
-        except Exception:  # noqa: BLE001 - failure fallback must never mask the original error
-            return
-
-        if reservation is not None:
-            try:
-                self._append(failure_trace, reservation, operation_started=True)
-                return
-            except TraceWriteError:
-                pass
-
-        try:
-            fallback_reservation = self._writer.reserve(
-                request_id=request_id,
-                reservation_bytes=failure_trace.serialized_size_bytes,
-            )
-        except (DiagnosticTraceError, ValueError):
-            return
-        try:
-            self._writer.append(failure_trace, fallback_reservation)
-        except TraceWriteError:
-            return
-        finally:
-            self._writer.release(fallback_reservation)
+            # append() consumes the reservation.  release() is idempotent so
+            # every pre-retention path gives capacity back.
+            self._writer.release(execution.reservation)

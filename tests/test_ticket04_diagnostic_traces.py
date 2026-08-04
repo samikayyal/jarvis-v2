@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -29,7 +31,6 @@ from jarvis_control_plane import (
     SignedMessageReceiver,
     SQLiteDiagnosticTraceStore,
     TraceCapacityError,
-    TraceWriteError,
 )
 from jarvis_control_plane.manual_admin import (
     ManualDiagnosticTraceBoundary,
@@ -37,6 +38,7 @@ from jarvis_control_plane.manual_admin import (
     open_sqlite_manual_trace_boundary,
 )
 from jarvis_control_plane.traces import _DiagnosticTraceStoreBase
+from jarvis_control_plane.writer_capability import _read_response_until_ready
 
 SECRET = "credential-like-value-that-must-remain-verbatim"
 SIGNING_SECRET = b"ticket04-signing-secret"
@@ -683,10 +685,10 @@ def test_trace_limit_hard_max_and_cumulative_request_budget_are_enforced() -> No
     assert store.request_retained_bytes("request-cumulative") <= 2_048
 
 
-def test_post_start_payload_conversion_failure_is_a_trace_write_failure() -> None:
+def test_recursive_result_is_retained_as_a_complete_trace_payload() -> None:
     store = new_trace_store(
-        capacity_bytes=8_192,
-        reservation_bytes=4_096,
+        capacity_bytes=32_768,
+        reservation_bytes=16_384,
     )
     recorder = DiagnosticTraceRecorder(
         writer=store.writer(),
@@ -696,48 +698,125 @@ def test_post_start_payload_conversion_failure_is_a_trace_write_failure() -> Non
     recursive: list[object] = []
     recursive.append(recursive)
 
-    with pytest.raises(TraceWriteError) as error:
-        recorder.execute(
-            request_id="request-recursive",
-            operation_type="model",
-            operation=lambda: recursive,
-            result_limit_bytes=512,
-            error_limit_bytes=1_024,
-        )
+    returned = recorder.execute(
+        request_id="request-recursive",
+        operation_type="model",
+        operation=lambda: recursive,
+        result_limit_bytes=512,
+        error_limit_bytes=1_024,
+    )
 
-    assert error.value.operation_started is True
+    assert returned is recursive
     traces = _open_manual_trace_boundary(store).list_traces(
         request_id="request-recursive"
     )
     assert len(traces) == 1
-    assert traces[0].outcome == "trace_failed"
-    assert traces[0].error["message"] == str(error.value)
+    assert traces[0].outcome == "completed"
+    assert traces[0].result["__type__"] == "list"  # type: ignore[index]
+    assert traces[0].result["items"][0]["__type__"] == "reference"  # type: ignore[index]
+    assert traces[0].output_payload["items"][0]["__type__"] == "reference"  # type: ignore[index]
 
 
-def test_oversized_result_retains_trace_failure_envelope() -> None:
+def test_oversized_result_retains_the_complete_result() -> None:
     store = new_trace_store(
-        capacity_bytes=8_192,
-        reservation_bytes=4_096,
+        capacity_bytes=32_768,
+        reservation_bytes=16_384,
     )
     recorder = DiagnosticTraceRecorder(
         writer=store.writer(),
         clock=FixedClock(NOW),
         ids=DeterministicIdGenerator("oversized-result"),
-        reservation_bytes=2_048,
+        reservation_bytes=16_384,
     )
 
-    with pytest.raises(TraceWriteError) as error:
-        recorder.execute(
-            request_id="request-oversized-result",
-            operation_type="worker",
-            operation=lambda: {"body": "x" * 5_000},
-            result_limit_bytes=512,
-            error_limit_bytes=1_024,
-        )
+    returned = recorder.execute(
+        request_id="request-oversized-result",
+        operation_type="worker",
+        operation=lambda: {"body": "x" * 5_000},
+        result_limit_bytes=512,
+        error_limit_bytes=1_024,
+    )
 
-    assert error.value.operation_started is True
+    assert returned == {"body": "x" * 5_000}
     traces = _open_manual_trace_boundary(store).list_traces(
         request_id="request-oversized-result"
     )
     assert len(traces) == 1
-    assert traces[0].outcome == "trace_failed"
+    assert traces[0].outcome == "completed"
+    assert mapping_value(traces[0].result, "body") == "x" * 5_000
+    assert mapping_value(traces[0].output_payload, "body") == "x" * 5_000
+
+
+def test_unserializable_exception_retains_the_original_error_payload() -> None:
+    class UnserializableError(RuntimeError):
+        def __repr__(self) -> str:
+            raise RuntimeError("repr is unavailable")
+
+    store = new_trace_store(
+        capacity_bytes=32_768,
+        reservation_bytes=16_384,
+    )
+    recorder = DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("unserializable-error"),
+        reservation_bytes=16_384,
+    )
+
+    def fail() -> None:
+        error = UnserializableError(SECRET)
+        error.payload = {"credential": SECRET}  # type: ignore[attr-defined]
+        raise error
+
+    with pytest.raises(UnserializableError, match=SECRET):
+        recorder.execute(
+            request_id="request-unserializable-error",
+            operation_type="worker",
+            operation=fail,
+            result_limit_bytes=512,
+            error_limit_bytes=64,
+        )
+
+    traces = _open_manual_trace_boundary(store).list_traces(
+        request_id="request-unserializable-error"
+    )
+    assert len(traces) == 1
+    assert traces[0].outcome == "failed"
+    error_payload = traces[0].error
+    assert error_payload["__type__"] == "exception"  # type: ignore[index]
+    assert error_payload["message"] == SECRET  # type: ignore[index]
+    attributes = error_payload["attributes"]  # type: ignore[index]
+    assert mapping_value(mapping_value(attributes, "payload"), "credential") == SECRET
+
+
+def test_response_reader_retries_transient_access_and_partial_acknowledgement() -> None:
+    class FlakyResponsePath:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.unlinks = 0
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            self.reads += 1
+            if self.reads == 1:
+                raise PermissionError("response is still being published")
+            if self.reads == 2:
+                raise json.JSONDecodeError("partial response", "{", 1)
+            return '{"ok":true}'
+
+        def unlink(self, *, missing_ok: bool) -> None:
+            assert missing_ok is True
+            self.unlinks += 1
+            if self.unlinks == 1:
+                raise PermissionError("response is still held by the writer")
+
+    response_path = FlakyResponsePath()
+    response = _read_response_until_ready(
+        response_path,  # type: ignore[arg-type]
+        deadline=time.monotonic() + 1,
+        operation_started=True,
+    )
+
+    assert response == {"ok": True}
+    assert response_path.reads == 4
+    assert response_path.unlinks == 2

@@ -32,15 +32,42 @@ def _read_response_until_ready(
     while True:
         try:
             response = json.loads(response_path.read_text(encoding="utf-8"))
-            response_path.unlink(missing_ok=True)
-            return response
-        except (FileNotFoundError, PermissionError):
+            if not isinstance(response, dict):
+                raise TypeError("trace writer response is not an object")
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ):
+            # The writer publishes with an atomic rename, but Windows can
+            # still expose a short interval in which the new name exists while
+            # the file is locked or its contents are not yet readable.  Treat
+            # every read/parse/acknowledgement failure as transient until the
+            # same deadline rather than treating ``exists()`` as readiness.
             if time.monotonic() >= deadline:
                 raise TraceWriteError(
                     "diagnostic trace writer is unavailable",
                     operation_started=operation_started,
                 )
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+            continue
+        try:
+            response_path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            # Another acknowledgement cleanup may have removed the response
+            # after we parsed it.  The response itself is still valid.
+            return response
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TraceWriteError(
+                    "diagnostic trace writer is unavailable",
+                    operation_started=operation_started,
+                )
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+            continue
+        return response
 
 
 def _raise_writer_error(error: dict[str, Any]) -> None:
@@ -75,12 +102,12 @@ def close_writer_capability(capability_id: str) -> None:
         )
         temporary_path.replace(request_path)
         deadline = time.monotonic() + _CLOSE_RESPONSE_TIMEOUT_SECONDS
-        while not response_path.exists():
-            if time.monotonic() >= deadline:
-                return
-            time.sleep(0.01)
-        response_path.unlink(missing_ok=True)
-    except (OSError, ValueError, TypeError):
+        _read_response_until_ready(
+            response_path,
+            deadline=deadline,
+            operation_started=False,
+        )
+    except (OSError, ValueError, TypeError, TraceWriteError):
         return
     try:
         mailbox.rmdir()
@@ -203,12 +230,11 @@ class TraceWriterCapability:
             )
             temporary_path.replace(request_path)
             deadline = time.monotonic() + _RESPONSE_TIMEOUT_SECONDS
-            while not response_path.exists():
-                if time.monotonic() >= deadline:
-                    return
-                time.sleep(0.01)
-            response = json.loads(response_path.read_text(encoding="utf-8"))
-            response_path.unlink(missing_ok=True)
+            response = _read_response_until_ready(
+                response_path,
+                deadline=deadline,
+                operation_started=False,
+            )
             if not response.get("ok", False):
                 _raise_writer_error(response["error"])
         except (
