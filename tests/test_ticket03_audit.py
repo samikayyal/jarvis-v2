@@ -14,9 +14,11 @@ from jarvis_control_plane import (
     ControlPlaneConfig,
     DeterministicCapabilityBroker,
     DeterministicIdGenerator,
+    DiagnosticTraceRecorder,
     FixedClock,
     InboundMessage,
     InMemoryAuditBoundary,
+    InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
     OutboundConnectorError,
     SignedInboundEvent,
@@ -28,6 +30,28 @@ NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 SECRET = b"ticket03-test-secret"
 OPERATOR = "operator.test"
 SESSION = "session.test"
+_TRACE_STORE: InMemoryDiagnosticTraceStore | None = None
+_TRACE_WRITER: object | None = None
+
+
+def make_trace(
+    clock: FixedClock, ids: DeterministicIdGenerator
+) -> DiagnosticTraceRecorder:
+    global _TRACE_STORE, _TRACE_WRITER
+    if _TRACE_WRITER is None:
+        _TRACE_STORE = InMemoryDiagnosticTraceStore()
+        _TRACE_WRITER = _TRACE_STORE.writer()
+    return DiagnosticTraceRecorder(writer=_TRACE_WRITER, clock=clock, ids=ids)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def close_module_trace_store():
+    global _TRACE_STORE, _TRACE_WRITER
+    yield
+    if _TRACE_STORE is not None:
+        _TRACE_STORE._close_writer_service()
+    _TRACE_WRITER = None
+    _TRACE_STORE = None
 
 
 def make_evidence(
@@ -272,6 +296,7 @@ def test_audit_append_failure_prevents_plain_outbound_dispatch() -> None:
     outbound = PlainOutbound()
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket03")
+    trace = make_trace(clock, ids)
     broker = DeterministicCapabilityBroker(
         config=config,
         state=state,
@@ -280,6 +305,7 @@ def test_audit_append_failure_prevents_plain_outbound_dispatch() -> None:
         outbound=outbound,  # type: ignore[arg-type]
         clock=clock,
         ids=ids,
+        trace=trace,
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -300,6 +326,98 @@ def test_audit_append_failure_prevents_plain_outbound_dispatch() -> None:
     assert result.request.error_code is None
 
 
+def test_outbound_audit_admission_failure_at_terminal_slot_prevents_dispatch() -> None:
+    config = ControlPlaneConfig(
+        operator_id=OPERATOR,
+        session_id=SESSION,
+        signing_secret=SECRET,
+    )
+    state = InMemoryDurableStateStore()
+    audit = InMemoryAuditBoundary(fail_on_append=7)
+    outbound = PlainOutbound()
+    clock = FixedClock(NOW)
+    ids = DeterministicIdGenerator("ticket03-terminal-slot")
+    trace = make_trace(clock, ids)
+    broker = DeterministicCapabilityBroker(
+        config=config,
+        state=state,
+        audit=audit,
+        orchestration=ControlledOrchestrationAdapter(),
+        outbound=outbound,  # type: ignore[arg-type]
+        clock=clock,
+        ids=ids,
+        trace=trace,
+    )
+    receiver = SignedMessageReceiver(
+        config=config,
+        state=state,
+        audit=audit,
+        broker=broker,
+        clock=clock,
+        ids=ids,
+    )
+
+    result = receiver.receive(make_event(config))
+
+    assert result.disposition == "failed"
+    assert result.reply is None
+    assert outbound.sent == []
+    assert not any(
+        record.kind == "outbound_result" and record.outcome == "accepted"
+        for record in audit.records
+    )
+
+
+def test_post_dispatch_audit_observation_failure_is_reconcilable_unknown() -> None:
+    config = ControlPlaneConfig(
+        operator_id=OPERATOR,
+        session_id=SESSION,
+        signing_secret=SECRET,
+    )
+    state = InMemoryDurableStateStore()
+    audit = InMemoryAuditBoundary(fail_on_append=8)
+    outbound = PlainOutbound()
+    clock = FixedClock(NOW)
+    ids = DeterministicIdGenerator("ticket03-post-dispatch")
+    trace = make_trace(clock, ids)
+    broker = DeterministicCapabilityBroker(
+        config=config,
+        state=state,
+        audit=audit,
+        orchestration=ControlledOrchestrationAdapter(),
+        outbound=outbound,  # type: ignore[arg-type]
+        clock=clock,
+        ids=ids,
+        trace=trace,
+    )
+    receiver = SignedMessageReceiver(
+        config=config,
+        state=state,
+        audit=audit,
+        broker=broker,
+        clock=clock,
+        ids=ids,
+    )
+
+    result = receiver.receive(make_event(config))
+
+    assert result.disposition == "unknown"
+    assert result.request is not None
+    assert result.request.status == "unknown"
+    assert result.request.outcome == "outbound_unknown"
+    assert outbound.sent == [result.reply]
+    assert any(
+        record.kind == "outbound_completion"
+        and record.outcome == "pending"
+        and record.execution_status == "pending"
+        for record in audit.records
+    )
+    assert not any(
+        record.kind == "outbound_result" and record.outcome == "accepted"
+        for record in audit.records
+    )
+
+
 def test_ambiguous_outbound_failure_never_records_successful_completion() -> None:
     config = ControlPlaneConfig(
         operator_id=OPERATOR,
@@ -311,6 +429,7 @@ def test_ambiguous_outbound_failure_never_records_successful_completion() -> Non
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket03")
     outbound = PlainOutbound()
+    trace = make_trace(clock, ids)
 
     def send_ambiguously(reply: object) -> None:
         outbound.sent.append(reply)
@@ -325,6 +444,7 @@ def test_ambiguous_outbound_failure_never_records_successful_completion() -> Non
         outbound=outbound,  # type: ignore[arg-type]
         clock=clock,
         ids=ids,
+        trace=trace,
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -377,6 +497,7 @@ def test_audit_failure_at_ingress_preserves_the_replay_key() -> None:
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket03")
     outbound = PlainOutbound()
+    trace = make_trace(clock, ids)
     broker = DeterministicCapabilityBroker(
         config=config,
         state=state,
@@ -385,6 +506,7 @@ def test_audit_failure_at_ingress_preserves_the_replay_key() -> None:
         outbound=outbound,  # type: ignore[arg-type]
         clock=clock,
         ids=ids,
+        trace=trace,
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -417,6 +539,7 @@ def test_request_audit_failure_rolls_back_request_and_preserves_replay_claim() -
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket03")
     outbound = PlainOutbound()
+    trace = make_trace(clock, ids)
     broker = DeterministicCapabilityBroker(
         config=config,
         state=state,
@@ -425,6 +548,7 @@ def test_request_audit_failure_rolls_back_request_and_preserves_replay_claim() -
         outbound=outbound,  # type: ignore[arg-type]
         clock=clock,
         ids=ids,
+        trace=trace,
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -463,6 +587,65 @@ def test_safe_local_reads_remain_available_when_append_is_down() -> None:
     assert json.loads(audit.export_json(request_id="request-001")) == [
         evidence.as_safe_mapping()
     ]
+
+
+def test_ticket01_sqlite_audit_schema_is_reconstructed_before_ticket03_use(
+    tmp_path,
+) -> None:
+    database = tmp_path / "legacy-ticket01-audit.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE audit_evidence (
+            evidence_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            event_id TEXT,
+            request_id TEXT,
+            outcome TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            redacted INTEGER NOT NULL CHECK (redacted = 1)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO audit_evidence(
+            evidence_id, kind, occurred_at, event_id, request_id,
+            outcome, actor, details_json, redacted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """,
+        (
+            "legacy-audit-001",
+            "action_outcome",
+            NOW.isoformat(),
+            "legacy-event-001",
+            "legacy-request-001",
+            "accepted",
+            "capability_broker",
+            json.dumps({"channel": "controlled"}),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    audit = SQLiteAuditBoundary(database)
+    try:
+        evidence = make_evidence(
+            "ticket03-after-legacy-migration",
+            NOW + timedelta(minutes=1),
+            request_id="request-after-migration",
+        )
+        audit.append(evidence)
+        assert audit.safe_view(request_id="request-after-migration") == (evidence,)
+        exported = json.loads(audit.export_json(request_id="request-after-migration"))
+        assert exported == [evidence.as_safe_mapping()]
+        assert audit.safe_view(request_id="legacy-request-001")[0].evidence_id == (
+            "legacy-audit-001"
+        )
+    finally:
+        audit.close()
 
 
 def test_safe_views_are_bounded_by_default_for_both_adapters() -> None:

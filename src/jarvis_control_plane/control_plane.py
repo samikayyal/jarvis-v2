@@ -30,7 +30,7 @@ from .ports import (
     TraceWriteError,
     require_non_empty,
 )
-from .traces import DiagnosticTraceRecorder, InMemoryDiagnosticTraceStore
+from .traces import DiagnosticTraceRecorder
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +67,12 @@ class DeterministicCapabilityBroker:
         outbound: OutboundConnector,
         clock: Clock,
         ids: IdGenerator,
-        trace: DiagnosticTraceRecorder | None = None,
+        trace: DiagnosticTraceRecorder,
     ) -> None:
+        if not isinstance(trace, DiagnosticTraceRecorder):
+            raise TypeError(
+                "trace must be an explicitly configured DiagnosticTraceRecorder"
+            )
         self.config = config
         self.state = state
         self.audit = audit
@@ -76,14 +80,9 @@ class DeterministicCapabilityBroker:
         self.outbound = outbound
         self.clock = clock
         self.ids = ids
-        self._default_trace_store = (
-            InMemoryDiagnosticTraceStore() if trace is None else None
-        )
-        self.trace = trace or DiagnosticTraceRecorder(
-            writer=self._default_trace_store,
-            clock=clock,
-            ids=ids,
-        )
+        # The recorder is a write-only capability backed by an isolated writer.
+        # Never retain a readable diagnostic store on the broker graph.
+        self._trace = trace
 
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive the typed path."""
@@ -146,7 +145,7 @@ class DeterministicCapabilityBroker:
 
         orchestration_request = OrchestrationRequest(state=request, text=message.text)
         try:
-            result = self.trace.execute(
+            result = self._trace.execute(
                 request_id=request.request_id,
                 operation_id=f"{request.request_id}:model",
                 operation_type="model",
@@ -332,9 +331,24 @@ class DeterministicCapabilityBroker:
                             "result": "pending",
                         },
                     ),
+                    # This immutable pending record is the terminal-evidence
+                    # outbox.  It is admitted before dispatch so a storage
+                    # failure cannot be discovered only after WhatsApp send.
+                    self._audit_evidence(
+                        kind="outbound_completion",
+                        event_id=message.event_id,
+                        request_id=request.request_id,
+                        message_id=message.message_id,
+                        outcome="pending",
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        execution_status="pending",
+                        details={"result": "pending"},
+                    ),
                 )
             )
-            self.trace.execute(
+            self._trace.execute(
                 request_id=request.request_id,
                 operation_id=f"{request.request_id}:connector:outbound",
                 operation_type="connector",
@@ -346,18 +360,67 @@ class DeterministicCapabilityBroker:
                 error_limit_bytes=8_192,
             )
             side_effect_may_have_happened = True
-            self._append_audit(
-                kind="outbound_result",
-                event_id=message.event_id,
-                request_id=request.request_id,
-                message_id=message.message_id,
-                outcome="accepted",
-                actor="controlled_outbound",
-                operation_type="outbound_message",
-                target_category="operator_conversation",
-                execution_status="accepted",
-                details={"channel": "controlled_outbound", "result": "accepted"},
-            )
+            try:
+                # Terminal evidence is an observation of the already-admitted
+                # outbox.  It must never be a second dispatch gate: if this
+                # append fails, the pending outbox record remains the durable
+                # reconciliation point and the reply is reported unknown.
+                self._append_audit(
+                    kind="outbound_result",
+                    event_id=message.event_id,
+                    request_id=request.request_id,
+                    message_id=message.message_id,
+                    outcome="accepted",
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    execution_status="accepted",
+                    details={"channel": "controlled_outbound", "result": "accepted"},
+                )
+            except AuditWriteError as observation_error:
+                try:
+                    unknown = self._transition(
+                        replying,
+                        status="unknown",
+                        phase="outbound",
+                        outcome="outbound_unknown",
+                        error_code="audit_observation_error",
+                        reply_id=reply.reply_id,
+                        audit=False,
+                    )
+                except StateStoreError as transition_error:
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="unknown",
+                        request=replying,
+                        reply=reply,
+                        reason=(
+                            "outbound reply was sent, but terminal audit evidence and "
+                            f"unknown state could not be persisted: {transition_error}"
+                        ),
+                    )
+                self._best_effort_audit(
+                    kind="request_lifecycle",
+                    event_id=message.event_id,
+                    request_id=request.request_id,
+                    message_id=message.message_id,
+                    outcome="outbound_unknown",
+                    actor="control_plane",
+                    operation_type="request_lifecycle",
+                    target_category="control_plane",
+                    execution_status="unknown",
+                    details={"phase": "outbound", "status": "unknown"},
+                )
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="unknown",
+                    request=unknown,
+                    reply=reply,
+                    reason=(
+                        "outbound reply was sent; terminal audit evidence is pending "
+                        f"reconciliation: {observation_error}"
+                    ),
+                )
             completed = self._transition(
                 replying,
                 status="completed",
@@ -365,6 +428,19 @@ class DeterministicCapabilityBroker:
                 outcome="reply_sent",
                 error_code=None,
                 reply_id=reply.reply_id,
+                audit=False,
+            )
+            self._best_effort_audit(
+                kind="request_lifecycle",
+                event_id=message.event_id,
+                request_id=request.request_id,
+                message_id=message.message_id,
+                outcome="reply_sent",
+                actor="control_plane",
+                operation_type="request_lifecycle",
+                target_category="control_plane",
+                execution_status="completed",
+                details={"phase": "completed", "status": "completed"},
             )
         except (
             DiagnosticTraceError,
@@ -427,7 +503,7 @@ class DeterministicCapabilityBroker:
                     phase="outbound",
                     outcome=outcome,
                     error_code=error_code,
-                    audit=True,
+                    audit=not may_have_sent,
                 )
             except (StateStoreError, AuditWriteError) as transition_error:
                 if not may_have_sent:
@@ -462,7 +538,20 @@ class DeterministicCapabilityBroker:
                     reply=reply if may_have_sent else None,
                     reason=reason,
                 )
-            if not may_have_sent:
+            if may_have_sent:
+                self._best_effort_audit(
+                    kind="request_lifecycle",
+                    event_id=message.event_id,
+                    request_id=request.request_id,
+                    message_id=message.message_id,
+                    outcome="outbound_unknown",
+                    actor="control_plane",
+                    operation_type="request_lifecycle",
+                    target_category="control_plane",
+                    execution_status="unknown",
+                    details={"phase": "outbound", "status": "unknown"},
+                )
+            else:
                 self._best_effort_audit(
                     kind="outbound_completion",
                     event_id=message.event_id,

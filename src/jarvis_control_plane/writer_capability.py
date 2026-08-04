@@ -16,10 +16,31 @@ if TYPE_CHECKING:
     from .traces import DiagnosticTrace
 
 _RESPONSE_TIMEOUT_SECONDS = 30.0
+_CLOSE_RESPONSE_TIMEOUT_SECONDS = 2.0
 
 
 def _mailbox(capability_id: str) -> Path:
     return Path(tempfile.gettempdir()) / f"jarvis-trace-{capability_id}"
+
+
+def _read_response_until_ready(
+    response_path: Path,
+    *,
+    deadline: float,
+    operation_started: bool,
+) -> dict[str, Any]:
+    while True:
+        try:
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            response_path.unlink(missing_ok=True)
+            return response
+        except (FileNotFoundError, PermissionError):
+            if time.monotonic() >= deadline:
+                raise TraceWriteError(
+                    "diagnostic trace writer is unavailable",
+                    operation_started=operation_started,
+                )
+            time.sleep(0.01)
 
 
 def _raise_writer_error(error: dict[str, Any]) -> None:
@@ -53,7 +74,7 @@ def close_writer_capability(capability_id: str) -> None:
             encoding="utf-8",
         )
         temporary_path.replace(request_path)
-        deadline = time.monotonic() + _RESPONSE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + _CLOSE_RESPONSE_TIMEOUT_SECONDS
         while not response_path.exists():
             if time.monotonic() >= deadline:
                 return
@@ -106,12 +127,11 @@ class TraceWriterCapability:
             )
             temporary_path.replace(request_path)
             deadline = time.monotonic() + _RESPONSE_TIMEOUT_SECONDS
-            while not response_path.exists():
-                if time.monotonic() >= deadline:
-                    raise TraceWriteError("diagnostic trace writer is unavailable")
-                time.sleep(0.01)
-            response = json.loads(response_path.read_text(encoding="utf-8"))
-            response_path.unlink(missing_ok=True)
+            response = _read_response_until_ready(
+                response_path,
+                deadline=deadline,
+                operation_started=False,
+            )
         except TraceWriteError:
             raise
         except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
@@ -147,15 +167,11 @@ class TraceWriterCapability:
             )
             temporary_path.replace(request_path)
             deadline = time.monotonic() + _RESPONSE_TIMEOUT_SECONDS
-            while not response_path.exists():
-                if time.monotonic() >= deadline:
-                    raise TraceWriteError(
-                        "diagnostic trace writer is unavailable",
-                        operation_started=True,
-                    )
-                time.sleep(0.01)
-            response = json.loads(response_path.read_text(encoding="utf-8"))
-            response_path.unlink(missing_ok=True)
+            response = _read_response_until_ready(
+                response_path,
+                deadline=deadline,
+                operation_started=True,
+            )
         except TraceWriteError:
             raise
         except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:

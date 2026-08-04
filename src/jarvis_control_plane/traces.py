@@ -904,6 +904,17 @@ class _DiagnosticTraceStoreBase(DiagnosticTraceStore):
         writer_token = self._service_writer_token
         if admin_connection is None and writer_token is None:
             return
+        process = self._service_process
+        if process is not None and not process.is_alive():
+            if admin_connection is not None:
+                try:
+                    admin_connection.close()
+                except OSError:
+                    pass
+            self._service_writer_token = None
+            self._service_admin_connection = None
+            self._service_process = None
+            return
         if writer_token is not None:
             close_writer_capability(writer_token)
         with self._service_lock:
@@ -917,9 +928,11 @@ class _DiagnosticTraceStoreBase(DiagnosticTraceStore):
                     admin_connection.close()
                 except OSError:
                     pass
-        process = self._service_process
         if process is not None:
             process.join(timeout=1)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
         self._service_writer_token = None
         self._service_admin_connection = None
         self._service_process = None
@@ -1127,6 +1140,15 @@ class SQLiteDiagnosticTraceStore(_DiagnosticTraceStoreBase):
 class DiagnosticTraceRecorder:
     """Reserve capacity, run one operation, and append its complete trace."""
 
+    _READ_OPERATIONS = (
+        "read_traces",
+        "list_traces",
+        "inspect",
+        "export",
+        "export_json",
+        "_read_persisted_traces",
+    )
+
     def __init__(
         self,
         *,
@@ -1135,6 +1157,10 @@ class DiagnosticTraceRecorder:
         ids: IdGenerator,
         reservation_bytes: int | None = None,
     ) -> None:
+        if any(callable(getattr(writer, name, None)) for name in self._READ_OPERATIONS):
+            raise TypeError(
+                "DiagnosticTraceRecorder requires a write-only trace capability"
+            )
         self._writer = writer
         self.clock = clock
         self.ids = ids

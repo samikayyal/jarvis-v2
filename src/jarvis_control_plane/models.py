@@ -595,11 +595,12 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
                 "not_sent",
                 "outbound_failed",
                 "outbound_unknown",
+                "pending",
                 "reply_sent",
                 "trace_unavailable",
             }
         ),
-        frozenset({"failed", "unknown", "accepted"}),
+        frozenset({"failed", "unknown", "accepted", "pending"}),
     ),
     "outbound_result": (
         "outbound_message",

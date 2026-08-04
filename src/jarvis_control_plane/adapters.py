@@ -991,6 +991,17 @@ class SQLiteAuditBoundary:
         "details_json": ("TEXT", 1, 0),
         "redacted": ("INTEGER", 1, 0),
     }
+    _LEGACY_AUDIT_COLUMNS: ClassVar[dict[str, tuple[str, int, int]]] = {
+        "evidence_id": ("TEXT", 0, 1),
+        "kind": ("TEXT", 1, 0),
+        "occurred_at": ("TEXT", 1, 0),
+        "event_id": ("TEXT", 0, 0),
+        "request_id": ("TEXT", 0, 0),
+        "outcome": ("TEXT", 1, 0),
+        "actor": ("TEXT", 1, 0),
+        "details_json": ("TEXT", 1, 0),
+        "redacted": ("INTEGER", 1, 0),
+    }
     _AUDIT_TABLE_SQL_VARIANTS: ClassVar[frozenset[str]] = frozenset(
         {
             (
@@ -1037,45 +1048,7 @@ class SQLiteAuditBoundary:
         self._append_transaction_active = False
         try:
             self._connection.execute("PRAGMA recursive_triggers = ON")
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_evidence (
-                    evidence_id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    event_id TEXT,
-                    request_id TEXT,
-                    message_id TEXT,
-                    operation_type TEXT,
-                    target_category TEXT,
-                    approval_decision TEXT,
-                    policy_decision TEXT,
-                    execution_status TEXT,
-                    outcome TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    details_json TEXT NOT NULL,
-                    redacted INTEGER NOT NULL CHECK (redacted = 1)
-                )
-                """
-            )
-            existing_columns = {
-                row["name"]
-                for row in self._connection.execute(
-                    "PRAGMA table_info(audit_evidence)"
-                ).fetchall()
-            }
-            for column, definition in (
-                ("message_id", "TEXT"),
-                ("operation_type", "TEXT"),
-                ("target_category", "TEXT"),
-                ("approval_decision", "TEXT"),
-                ("policy_decision", "TEXT"),
-                ("execution_status", "TEXT"),
-            ):
-                if column not in existing_columns:
-                    self._connection.execute(
-                        f"ALTER TABLE audit_evidence ADD COLUMN {column} {definition}"
-                    )
+            self._ensure_canonical_audit_table()
             self._connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS audit_evidence_occurred_at
@@ -1111,6 +1084,161 @@ class SQLiteAuditBoundary:
         except sqlite3.Error as exc:
             self._connection.rollback()
             raise AuditWriteError("could not initialize SQLite audit") from exc
+
+    def _ensure_canonical_audit_table(self) -> None:
+        table = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("audit_evidence",),
+        ).fetchone()
+        if table is None:
+            self._connection.execute(
+                """
+                CREATE TABLE audit_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    event_id TEXT,
+                    request_id TEXT,
+                    message_id TEXT,
+                    operation_type TEXT,
+                    target_category TEXT,
+                    approval_decision TEXT,
+                    policy_decision TEXT,
+                    execution_status TEXT,
+                    outcome TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    redacted INTEGER NOT NULL CHECK (redacted = 1)
+                )
+                """
+            )
+            return
+
+        columns = self._connection.execute(
+            "PRAGMA table_info(audit_evidence)"
+        ).fetchall()
+        actual_columns = {
+            row["name"]: (row["type"].upper(), row["notnull"], row["pk"])
+            for row in columns
+        }
+        if actual_columns == self._AUDIT_COLUMNS:
+            return
+        if actual_columns != self._LEGACY_AUDIT_COLUMNS:
+            # Leave unknown schemas for _assert_schema_integrity(), which keeps
+            # unexpected or tampered layouts fail-closed on reads/appends.
+            return
+
+        normalized_sql = " ".join((table["sql"] or "").casefold().split())
+        required_fragments = (
+            "create table audit_evidence",
+            "evidence_id text primary key",
+            "kind text not null",
+            "occurred_at text not null",
+            "outcome text not null",
+            "actor text not null",
+            "details_json text not null",
+            "redacted integer not null check (redacted = 1)",
+        )
+        if "on conflict" in normalized_sql or any(
+            fragment not in normalized_sql for fragment in required_fragments
+        ):
+            raise AuditWriteError("unsupported legacy SQLite audit schema")
+        self._rebuild_legacy_audit_table()
+
+    def _rebuild_legacy_audit_table(self) -> None:
+        migration_table = "audit_evidence_ticket03_migration"
+        try:
+            existing = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (migration_table,),
+            ).fetchone()
+            if existing is not None:
+                raise AuditWriteError("SQLite audit migration table already exists")
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                f"""
+                CREATE TABLE {migration_table} (
+                    evidence_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    event_id TEXT,
+                    request_id TEXT,
+                    message_id TEXT,
+                    operation_type TEXT,
+                    target_category TEXT,
+                    approval_decision TEXT,
+                    policy_decision TEXT,
+                    execution_status TEXT,
+                    outcome TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    redacted INTEGER NOT NULL CHECK (redacted = 1)
+                )
+                """
+            )
+            self._connection.execute(
+                f"""
+                INSERT INTO {migration_table}(
+                    evidence_id, kind, occurred_at, event_id, request_id,
+                    message_id, operation_type, target_category,
+                    approval_decision, policy_decision, execution_status,
+                    outcome, actor, details_json, redacted
+                )
+                SELECT evidence_id, kind, occurred_at, event_id, request_id,
+                       NULL, NULL, NULL, NULL, NULL, NULL,
+                       outcome, actor, details_json, redacted
+                FROM audit_evidence
+                ORDER BY rowid
+                """
+            )
+            self._connection.execute("DROP TABLE audit_evidence")
+            self._connection.execute(
+                """
+                CREATE TABLE audit_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    event_id TEXT,
+                    request_id TEXT,
+                    message_id TEXT,
+                    operation_type TEXT,
+                    target_category TEXT,
+                    approval_decision TEXT,
+                    policy_decision TEXT,
+                    execution_status TEXT,
+                    outcome TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    redacted INTEGER NOT NULL CHECK (redacted = 1)
+                )
+                """
+            )
+            self._connection.execute(
+                f"""
+                INSERT INTO audit_evidence(
+                    evidence_id, kind, occurred_at, event_id, request_id,
+                    message_id, operation_type, target_category,
+                    approval_decision, policy_decision, execution_status,
+                    outcome, actor, details_json, redacted
+                )
+                SELECT evidence_id, kind, occurred_at, event_id, request_id,
+                       message_id, operation_type, target_category,
+                       approval_decision, policy_decision, execution_status,
+                       outcome, actor, details_json, redacted
+                FROM {migration_table}
+                ORDER BY rowid
+                """
+            )
+            self._connection.execute(f"DROP TABLE {migration_table}")
+            self._connection.commit()
+        except AuditWriteError:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise
+        except sqlite3.Error as exc:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise AuditWriteError("could not migrate legacy SQLite audit") from exc
 
     def append(self, evidence: AuditEvidence) -> None:
         self.append_batch((evidence,))

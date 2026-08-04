@@ -43,6 +43,47 @@ SIGNING_SECRET = b"ticket04-signing-secret"
 OPERATOR = "operator.test"
 SESSION = "session.test"
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+_DEFAULT_TRACE_STORE: InMemoryDiagnosticTraceStore | None = None
+_DEFAULT_TRACE_WRITER: object | None = None
+_TEST_TRACE_STORES: list[InMemoryDiagnosticTraceStore] = []
+
+
+def make_default_trace(
+    clock: FixedClock, ids: DeterministicIdGenerator
+) -> DiagnosticTraceRecorder:
+    global _DEFAULT_TRACE_STORE, _DEFAULT_TRACE_WRITER
+    if _DEFAULT_TRACE_WRITER is None:
+        _DEFAULT_TRACE_STORE = InMemoryDiagnosticTraceStore()
+        _DEFAULT_TRACE_WRITER = _DEFAULT_TRACE_STORE.writer()
+    return DiagnosticTraceRecorder(
+        writer=_DEFAULT_TRACE_WRITER,
+        clock=clock,
+        ids=ids,
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def close_module_default_trace_store():
+    global _DEFAULT_TRACE_STORE, _DEFAULT_TRACE_WRITER
+    yield
+    if _DEFAULT_TRACE_STORE is not None:
+        _DEFAULT_TRACE_STORE._close_writer_service()
+    _DEFAULT_TRACE_WRITER = None
+    _DEFAULT_TRACE_STORE = None
+
+
+def new_trace_store(**kwargs: int) -> InMemoryDiagnosticTraceStore:
+    store = InMemoryDiagnosticTraceStore(**kwargs)
+    _TEST_TRACE_STORES.append(store)
+    return store
+
+
+@pytest.fixture(autouse=True)
+def close_test_trace_stores():
+    yield
+    for store in _TEST_TRACE_STORES:
+        store._close_writer_service()
+    _TEST_TRACE_STORES.clear()
 
 
 class TraceMode(Enum):
@@ -171,6 +212,8 @@ def make_components(
         clock=clock,
         ids=ids,
     )
+    if trace is None:
+        trace = make_default_trace(clock, ids)
     broker = DeterministicCapabilityBroker(
         config=config,
         state=state,  # type: ignore[arg-type]
@@ -199,7 +242,7 @@ def make_event(config: ControlPlaneConfig, **changes: object) -> SignedInboundEv
 
 
 def test_trace_retains_complete_payloads_only_through_manual_boundary() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=32_768,
         reservation_bytes=8_192,
     )
@@ -274,8 +317,19 @@ def test_trace_retains_complete_payloads_only_through_manual_boundary() -> None:
         ManualDiagnosticTraceBoundary(store).list_traces()
 
 
+def test_recorder_rejects_a_readable_store_as_a_control_plane_capability() -> None:
+    store = new_trace_store()
+
+    with pytest.raises(TypeError, match="write-only"):
+        DiagnosticTraceRecorder(
+            writer=store,
+            clock=FixedClock(NOW),
+            ids=DeterministicIdGenerator("readable-store"),
+        )
+
+
 def test_writer_finalization_stops_child_with_admin_channel_open() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=32_768,
         reservation_bytes=8_192,
     )
@@ -294,7 +348,7 @@ def test_writer_finalization_stops_child_with_admin_channel_open() -> None:
 
 def test_failed_operation_retains_complete_error_and_does_not_expire() -> None:
     clock = FixedClock(NOW)
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=32_768,
         reservation_bytes=8_192,
     )
@@ -326,7 +380,7 @@ def test_failed_operation_retains_complete_error_and_does_not_expire() -> None:
 
 
 def test_non_json_payload_types_are_explicitly_tagged_without_collisions() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=32_768,
         reservation_bytes=8_192,
     )
@@ -424,7 +478,7 @@ def test_sqlite_trace_store_survives_reconstruction_without_expiry(tmp_path) -> 
 def test_broker_traces_model_and_connector_payloads_without_leaking_into_audit() -> (
     None
 ):
-    store = InMemoryDiagnosticTraceStore()
+    store = new_trace_store()
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("broker-trace")
     recorder = DiagnosticTraceRecorder(writer=store.writer(), clock=clock, ids=ids)
@@ -449,8 +503,34 @@ def test_broker_traces_model_and_connector_payloads_without_leaking_into_audit()
     assert all(SECRET not in str(record.details) for record in audit.records)
 
 
+def test_broker_never_retains_a_readable_trace_store() -> None:
+    config, state, audit, orchestration, outbound, receiver = make_components()
+    broker = receiver.broker
+    reachable = bounded_reachable(broker, max_nodes=512)
+
+    with pytest.raises(TypeError):
+        DeterministicCapabilityBroker(
+            config=config,
+            state=state,  # type: ignore[arg-type]
+            audit=audit,  # type: ignore[arg-type]
+            orchestration=orchestration,
+            outbound=outbound,
+            clock=FixedClock(NOW),
+            ids=DeterministicIdGenerator("missing-trace"),
+        )
+
+    assert not hasattr(broker, "_default_trace_store")
+    assert not any(
+        callable(getattr(value, method, None))
+        for value in reachable
+        for method in ("read_traces", "_read_persisted_traces")
+    )
+    assert not any(isinstance(value, _DiagnosticTraceStoreBase) for value in reachable)
+    assert config.session_id == SESSION
+
+
 def test_trace_capacity_rejects_before_connector_and_preserves_prior_trace() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=102_000,
         reservation_bytes=200_000,
     )
@@ -478,7 +558,7 @@ def test_trace_capacity_rejects_before_connector_and_preserves_prior_trace() -> 
 
 
 def test_capacity_failure_happens_before_operation_starts() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=64,
         reservation_bytes=128,
     )
@@ -503,7 +583,7 @@ def test_capacity_failure_happens_before_operation_starts() -> None:
 
 
 def test_known_oversized_payload_is_rejected_before_operation_starts() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=4_096,
         reservation_bytes=4_096,
     )
@@ -569,7 +649,7 @@ def test_trace_limit_hard_max_and_cumulative_request_budget_are_enforced() -> No
     with pytest.raises(ValueError, match="hard_max_bytes"):
         DiagnosticTraceLimits(hard_max_bytes=MAX_TRACE_RESERVATION_BYTES + 1)
 
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=8_192,
         reservation_bytes=2_048,
     )
@@ -604,7 +684,7 @@ def test_trace_limit_hard_max_and_cumulative_request_budget_are_enforced() -> No
 
 
 def test_post_start_payload_conversion_failure_is_a_trace_write_failure() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=8_192,
         reservation_bytes=4_096,
     )
@@ -635,7 +715,7 @@ def test_post_start_payload_conversion_failure_is_a_trace_write_failure() -> Non
 
 
 def test_oversized_result_retains_trace_failure_envelope() -> None:
-    store = InMemoryDiagnosticTraceStore(
+    store = new_trace_store(
         capacity_bytes=8_192,
         reservation_bytes=4_096,
     )

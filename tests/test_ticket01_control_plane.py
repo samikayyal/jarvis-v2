@@ -13,9 +13,11 @@ from jarvis_control_plane import (
     ControlPlaneConfig,
     DeterministicCapabilityBroker,
     DeterministicIdGenerator,
+    DiagnosticTraceRecorder,
     FixedClock,
     InboundMessage,
     InMemoryAuditBoundary,
+    InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
     OutboundReply,
     SignedInboundEvent,
@@ -28,6 +30,28 @@ SECRET = b"ticket01-test-secret"
 OPERATOR = "operator.test"
 SESSION = "session.test"
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+_TRACE_STORE: InMemoryDiagnosticTraceStore | None = None
+_TRACE_WRITER: object | None = None
+
+
+def make_trace(
+    clock: FixedClock, ids: DeterministicIdGenerator
+) -> DiagnosticTraceRecorder:
+    global _TRACE_STORE, _TRACE_WRITER
+    if _TRACE_WRITER is None:
+        _TRACE_STORE = InMemoryDiagnosticTraceStore()
+        _TRACE_WRITER = _TRACE_STORE.writer()
+    return DiagnosticTraceRecorder(writer=_TRACE_WRITER, clock=clock, ids=ids)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def close_module_trace_store():
+    global _TRACE_STORE, _TRACE_WRITER
+    yield
+    if _TRACE_STORE is not None:
+        _TRACE_STORE._close_writer_service()
+    _TRACE_WRITER = None
+    _TRACE_STORE = None
 
 
 def make_message(**changes: object) -> InboundMessage:
@@ -85,6 +109,7 @@ def make_components(
         clock=clock,
         ids=ids,
     )
+    trace = make_trace(clock, ids)
     broker = DeterministicCapabilityBroker(
         config=config,
         state=state,  # type: ignore[arg-type]
@@ -93,6 +118,7 @@ def make_components(
         outbound=outbound,
         clock=clock,
         ids=ids,
+        trace=trace,
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -140,6 +166,7 @@ def test_primary_seam_persists_state_and_audit_and_sends_one_correlated_reply() 
         "orchestration_result",
         "outbound_attempt",
         "outbound_result",
+        "outbound_completion",
         "request_lifecycle",
     }
     assert all(record.redacted for record in records)
