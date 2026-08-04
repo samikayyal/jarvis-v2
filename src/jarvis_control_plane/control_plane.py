@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from .control_grammar import ControlTransition, ControlTransitionKind, handle_message
 from .models import (
     AuditEvidence,
     ConversationMessage,
@@ -29,6 +30,17 @@ from .ports import (
     TraceCapacityError,
     TraceWriteError,
     require_non_empty,
+)
+from .sessions import (
+    CancellationToken,
+    InMemoryWorkingSessionStore,
+    RequestResult,
+    SessionConfig,
+    SessionStoreError,
+    TransitionKind,
+    WorkingSession,
+    WorkingSessionStore,
+    apply_request_result,
 )
 from .traces import DiagnosticTraceRecorder
 
@@ -68,6 +80,7 @@ class DeterministicCapabilityBroker:
         clock: Clock,
         ids: IdGenerator,
         trace: DiagnosticTraceRecorder,
+        working_sessions: WorkingSessionStore | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError(
@@ -80,6 +93,19 @@ class DeterministicCapabilityBroker:
         self.outbound = outbound
         self.clock = clock
         self.ids = ids
+        self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
+        if self.working_sessions.load() is None:
+            self.working_sessions.create(
+                WorkingSession.initial(
+                    config.operator_id,
+                    clock,
+                    session_id=(
+                        config.working_session_id
+                        or f"working-session-{config.session_id}"
+                    ),
+                    config=SessionConfig(operator_id=config.operator_id),
+                )
+            )
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
         self._trace = trace
@@ -87,8 +113,21 @@ class DeterministicCapabilityBroker:
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive the typed path."""
 
+        session = self._current_working_session()
+        request_id = self.ids.new_id("request")
+        session_transition = handle_message(
+            session,
+            message.text,
+            now=self.clock,
+            request_id=request_id,
+            originating_message_id=message.message_id,
+            phase="processing",
+        )
+        if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
+            return self._handle_session_control(message, session, session_transition)
+
         request = RequestState(
-            request_id=self.ids.new_id("request"),
+            request_id=request_id,
             event_id=message.event_id,
             message_id=message.message_id,
             operator_id=self.config.operator_id,
@@ -142,6 +181,34 @@ class DeterministicCapabilityBroker:
                     f"was rolled back: {admission_error}"
                 ),
             )
+
+        try:
+            self.working_sessions.compare_and_set(session, session_transition.state)
+        except SessionStoreError as exc:
+            try:
+                self.state.delete_request(request.request_id)
+            except StateStoreError:
+                pass
+            self._best_effort_audit(
+                kind="working_session_conflict",
+                event_id=message.event_id,
+                request_id=request.request_id,
+                message_id=message.message_id,
+                outcome="blocked",
+                actor="control_plane",
+                operation_type="request_lifecycle",
+                target_category="working_session",
+                details={},
+            )
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                request=request,
+                reason=f"working-session admission failed: {exc}",
+            )
+
+        cancellation_token = session_transition.cancellation_token
+        assert cancellation_token is not None
 
         orchestration_request = OrchestrationRequest(state=request, text=message.text)
         try:
@@ -213,6 +280,11 @@ class DeterministicCapabilityBroker:
                     target_category="control_plane",
                     details={"result": "failed", "state": "unavailable"},
                 )
+                self._finish_session_request(
+                    cancellation_token,
+                    outcome=failure_outcome,
+                    message=message,
+                )
                 return ReceiveResult(
                     status_code=202,
                     disposition="failed",
@@ -234,11 +306,40 @@ class DeterministicCapabilityBroker:
                 target_category="control_plane",
                 details={"result": "failed"},
             )
+            self._finish_session_request(
+                cancellation_token,
+                outcome=failure_outcome,
+                message=message,
+            )
             return ReceiveResult(
                 status_code=202,
                 disposition="failed",
                 request=failed,
                 reason=str(exc) or "orchestration failed",
+            )
+
+        if not self._finish_session_request(
+            cancellation_token,
+            outcome=result.outcome,
+            message=message,
+        ):
+            ignored = replace(
+                request,
+                updated_at=self.clock.now(),
+                status="cancelled",
+                phase="cancelled",
+                outcome="late_result_ignored",
+                error_code="cancelled",
+            )
+            try:
+                self.state.update_request(ignored)
+            except StateStoreError:
+                pass
+            return ReceiveResult(
+                status_code=202,
+                disposition="late_result_ignored",
+                request=ignored,
+                reason="orchestration result no longer owns the working session",
             )
 
         reply = OutboundReply(
@@ -581,6 +682,209 @@ class DeterministicCapabilityBroker:
             reply=reply,
         )
 
+    @property
+    def current_working_session_id(self) -> str:
+        """Expose only the current conversation boundary to ingress admission."""
+
+        return self._current_working_session().session_id
+
+    def _current_working_session(self) -> WorkingSession:
+        session = self.working_sessions.load()
+        if session is None:
+            raise SessionStoreError("working session is unavailable")
+        return session
+
+    def _handle_session_control(
+        self,
+        message: InboundMessage,
+        expected: WorkingSession,
+        transition: ControlTransition,
+    ) -> ReceiveResult:
+        audit_kind = {
+            ControlTransitionKind.STATUS: "working_session_status_viewed",
+            ControlTransitionKind.CANCELLED: "working_session_cancelled",
+            ControlTransitionKind.NOTHING_TO_CANCEL: "working_session_cancel_noop",
+            ControlTransitionKind.NEW_SESSION: "working_session_replaced",
+            ControlTransitionKind.BUSY_REFUSED: "request_refused_busy",
+            ControlTransitionKind.PENDING_BLOCKED: "request_refused_pending",
+            ControlTransitionKind.EMPTY: "empty_control_ignored",
+            ControlTransitionKind.MALFORMED_COMMAND: "malformed_control_ignored",
+            ControlTransitionKind.UNKNOWN_COMMAND: "unknown_control_ignored",
+        }.get(transition.kind, "working_session_control")
+        try:
+            self._append_audit(
+                kind=audit_kind,
+                event_id=message.event_id,
+                request_id=(
+                    expected.active_request.request_id
+                    if expected.active_request is not None
+                    else None
+                ),
+                message_id=message.message_id,
+                outcome=transition.kind.value,
+                actor="configured_operator",
+                operation_type="working_session_control",
+                target_category="working_session",
+                details={},
+            )
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"working-session control was blocked by audit: {exc}",
+            )
+
+        if transition.state != expected:
+            try:
+                self.working_sessions.compare_and_set(expected, transition.state)
+            except SessionStoreError as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="failed",
+                    reason=f"working-session control lost a concurrent race: {exc}",
+                )
+
+        if transition.reply is None:
+            return ReceiveResult(status_code=202, disposition=transition.kind.value)
+        return self._dispatch_control_reply(message, transition)
+
+    def _dispatch_control_reply(
+        self,
+        message: InboundMessage,
+        transition: ControlTransition,
+    ) -> ReceiveResult:
+        control_id = self.ids.new_id("control")
+        reply = OutboundReply(
+            reply_id=self.ids.new_id("reply"),
+            request_id=control_id,
+            session_id=self.config.session_id,
+            recipient_id=message.chat_id,
+            body=f"{transition.reply or 'Control completed.'} (request_id={control_id})",
+        )
+        try:
+            self.outbound.preflight(reply)
+            self.audit.append_batch(
+                (
+                    self._audit_evidence(
+                        kind="outbound_attempt",
+                        event_id=message.event_id,
+                        request_id=control_id,
+                        message_id=message.message_id,
+                        outcome="attempted",
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        details={"channel": "controlled_outbound"},
+                    ),
+                    self._audit_evidence(
+                        kind="outbound_result",
+                        event_id=message.event_id,
+                        request_id=control_id,
+                        message_id=message.message_id,
+                        outcome="pending",
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        execution_status="pending",
+                        details={"result": "pending"},
+                    ),
+                    self._audit_evidence(
+                        kind="outbound_completion",
+                        event_id=message.event_id,
+                        request_id=control_id,
+                        message_id=message.message_id,
+                        outcome="pending",
+                        actor="controlled_outbound",
+                        operation_type="outbound_message",
+                        target_category="operator_conversation",
+                        execution_status="pending",
+                        details={"result": "pending"},
+                    ),
+                )
+            )
+            self._trace.execute(
+                request_id=control_id,
+                operation_id=f"{control_id}:connector:outbound",
+                operation_type="connector",
+                input_payload=reply,
+                arguments={"operation": "send", "channel": "controlled_outbound"},
+                telemetry={"phase": "control_reply"},
+                operation=lambda: self._send_and_confirm(reply),
+                result_limit_bytes=4_096,
+                error_limit_bytes=8_192,
+            )
+            self._append_audit(
+                kind="outbound_result",
+                event_id=message.event_id,
+                request_id=control_id,
+                message_id=message.message_id,
+                outcome="accepted",
+                actor="controlled_outbound",
+                operation_type="outbound_message",
+                target_category="operator_conversation",
+                execution_status="accepted",
+                details={"result": "accepted"},
+            )
+        except (
+            DiagnosticTraceError,
+            AuditWriteError,
+            OutboundConnectorError,
+            ValueError,
+        ) as exc:
+            may_have_sent = (
+                isinstance(exc, OutboundConnectorError) and exc.may_have_sent
+            ) or (isinstance(exc, TraceWriteError) and exc.operation_started)
+            return ReceiveResult(
+                status_code=202,
+                disposition="unknown" if may_have_sent else "failed",
+                reply=reply if may_have_sent else None,
+                reason=str(exc) or "control reply failed",
+            )
+        return ReceiveResult(
+            status_code=202,
+            disposition=transition.kind.value,
+            reply=reply,
+        )
+
+    def _finish_session_request(
+        self,
+        token: CancellationToken,
+        *,
+        outcome: str,
+        message: InboundMessage,
+    ) -> bool:
+        for _ in range(3):
+            current = self._current_working_session()
+            transition = apply_request_result(
+                current,
+                token,
+                RequestResult(
+                    request_id=token.request_id,
+                    generation=token.generation,
+                    outcome=outcome,
+                ),
+                now=self.clock,
+            )
+            if transition.kind is TransitionKind.LATE_RESULT_IGNORED:
+                self._best_effort_audit(
+                    kind="late_result_ignored",
+                    event_id=message.event_id,
+                    request_id=token.request_id,
+                    message_id=message.message_id,
+                    outcome="ignored",
+                    actor="control_plane",
+                    operation_type="request_lifecycle",
+                    target_category="working_session",
+                    details={},
+                )
+                return False
+            try:
+                self.working_sessions.compare_and_set(current, transition.state)
+                return True
+            except SessionStoreError:
+                continue
+        return False
+
     def _send_and_confirm(self, reply: OutboundReply) -> dict[str, str]:
         self.outbound.send(reply)
         return {"result": "accepted"}
@@ -781,13 +1085,18 @@ class SignedMessageReceiver:
             )
 
         try:
+            working_session_id = getattr(
+                self.broker,
+                "current_working_session_id",
+                self.working_session_id,
+            )
             admission = self.state.admit_ingress(
                 session_id=message.session_id,
                 message_id=message.message_id,
                 event_id=message.event_id,
                 claimed_at=self.clock.now(),
                 conversation_message=ConversationMessage(
-                    working_session_id=self.working_session_id,
+                    working_session_id=working_session_id,
                     transport_session_id=message.session_id,
                     message_id=message.message_id,
                     event_id=message.event_id,

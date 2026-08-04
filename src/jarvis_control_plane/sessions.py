@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -1291,6 +1292,56 @@ class WorkingSessionStore(Protocol):
     def list_history(
         self, session_id: str | None = None
     ) -> tuple[HistoryEntry, ...]: ...
+
+
+class InMemoryWorkingSessionStore:
+    """Thread-safe working-session store used by the composed control plane.
+
+    The compare-and-set boundary is deliberately identical to the SQLite
+    adapter so cancellation can race an in-flight orchestration result without
+    allowing both transitions to win.
+    """
+
+    def __init__(self) -> None:
+        self._session: WorkingSession | None = None
+        self._history: list[HistoryEntry] = []
+        self._lock = threading.RLock()
+
+    def load(self) -> WorkingSession | None:
+        with self._lock:
+            return self._session
+
+    def create(self, session: WorkingSession) -> None:
+        with self._lock:
+            if self._session is not None:
+                raise SessionStoreError("working session already exists")
+            self._session = session
+
+    def compare_and_set(
+        self,
+        expected: WorkingSession,
+        updated: WorkingSession,
+        *,
+        history: Iterable[HistoryEntry] = (),
+    ) -> None:
+        with self._lock:
+            if self._session != expected:
+                raise SessionStoreError("stale working-session transition")
+            entries = tuple(history)
+            self._session = updated
+            self._history.extend(entries)
+
+    def append_history(self, entry: HistoryEntry) -> None:
+        with self._lock:
+            self._history.append(entry)
+
+    def list_history(self, session_id: str | None = None) -> tuple[HistoryEntry, ...]:
+        with self._lock:
+            if session_id is None:
+                return tuple(self._history)
+            return tuple(
+                entry for entry in self._history if entry.session_id == session_id
+            )
 
 
 def _session_json(session: WorkingSession) -> str:

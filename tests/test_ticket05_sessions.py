@@ -2,9 +2,25 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+from threading import Event, Thread
 
 import pytest
 
+from jarvis_control_plane import (
+    ControlledOrchestrationAdapter,
+    ControlledOutboundConnector,
+    ControlPlaneConfig,
+    DeterministicCapabilityBroker,
+    DeterministicIdGenerator,
+    DiagnosticTraceRecorder,
+    FixedClock,
+    InboundMessage,
+    InMemoryAuditBoundary,
+    InMemoryDiagnosticTraceStore,
+    InMemoryDurableStateStore,
+    SignedInboundEvent,
+    SignedMessageReceiver,
+)
 from jarvis_control_plane.control_grammar import (
     ControlCommand,
     ControlTransitionKind,
@@ -47,6 +63,72 @@ from jarvis_control_plane.sessions import (
 )
 
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+SECRET = b"ticket05-test-secret"
+OPERATOR = "operator.test"
+TRANSPORT_SESSION = "session.test"
+
+
+def make_receiver_components(
+    *, orchestration: ControlledOrchestrationAdapter | None = None
+):
+    config = ControlPlaneConfig(
+        operator_id=OPERATOR,
+        session_id=TRANSPORT_SESSION,
+        signing_secret=SECRET,
+    )
+    clock = FixedClock(NOW)
+    ids = DeterministicIdGenerator("ticket05-receiver")
+    state = InMemoryDurableStateStore()
+    audit = InMemoryAuditBoundary()
+    orchestration = orchestration or ControlledOrchestrationAdapter()
+    outbound = ControlledOutboundConnector(
+        operator_id=OPERATOR,
+        session_id=TRANSPORT_SESSION,
+        audit=audit,
+        clock=clock,
+        ids=ids,
+    )
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
+    broker = DeterministicCapabilityBroker(
+        config=config,
+        state=state,
+        audit=audit,
+        orchestration=orchestration,
+        outbound=outbound,
+        clock=clock,
+        ids=ids,
+        trace=trace,
+    )
+    receiver = SignedMessageReceiver(
+        config=config,
+        state=state,
+        audit=audit,
+        broker=broker,
+        clock=clock,
+        ids=ids,
+    )
+    return state, audit, orchestration, outbound, broker, receiver, trace_store
+
+
+def make_signed_event(
+    text: str, *, event_id: str, message_id: str
+) -> SignedInboundEvent:
+    return SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id=TRANSPORT_SESSION,
+            event_id=event_id,
+            message_id=message_id,
+            sender_id=OPERATOR,
+            chat_id=OPERATOR,
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text=text,
+        ),
+        SECRET,
+    )
 
 
 def make_session(*, config: SessionConfig | None = None) -> WorkingSession:
@@ -552,3 +634,103 @@ def test_sqlite_store_rejects_stale_complete_state_transition(tmp_path) -> None:
         assert store.load() == accepted.state
     finally:
         store.close()
+
+
+def test_signed_receiver_routes_status_and_new_through_working_session() -> None:
+    state, _, orchestration, outbound, broker, receiver, trace_store = (
+        make_receiver_components()
+    )
+    try:
+        original_session_id = broker.current_working_session_id
+        status = receiver.receive(
+            make_signed_event(
+                " /STATUS ", event_id="event-status", message_id="m-status"
+            )
+        )
+        assert status.disposition == "status", status.reason
+        assert status.reply is not None
+        assert f"Session {original_session_id}" in status.reply.body
+        assert orchestration.calls == []
+
+        replaced = receiver.receive(
+            make_signed_event("/new", event_id="event-new", message_id="m-new")
+        )
+        assert replaced.disposition == "new_session"
+        assert broker.current_working_session_id != original_session_id
+        assert orchestration.calls == []
+        assert len(outbound.sent) == 2
+
+        completed = receiver.receive(
+            make_signed_event(
+                "Start clean work", event_id="event-work", message_id="m-work"
+            )
+        )
+        assert completed.disposition == "completed"
+        history = state.list_conversation_messages()
+        assert [entry.working_session_id for entry in history] == [
+            original_session_id,
+            original_session_id,
+            broker.current_working_session_id,
+        ]
+    finally:
+        trace_store._close_writer_service()
+
+
+def test_cancel_wins_race_and_late_result_never_dispatches() -> None:
+    orchestration_started = Event()
+    release_orchestration = Event()
+
+    def blocked_response(_: object) -> str:
+        orchestration_started.set()
+        assert release_orchestration.wait(timeout=5)
+        return "This late result must not be sent."
+
+    orchestration = ControlledOrchestrationAdapter(response_factory=blocked_response)
+    _, audit, _, outbound, broker, receiver, trace_store = make_receiver_components(
+        orchestration=orchestration
+    )
+    result_holder: list[object] = []
+
+    def run_request() -> None:
+        result_holder.append(
+            receiver.receive(
+                make_signed_event(
+                    "Long running work",
+                    event_id="event-work",
+                    message_id="m-work",
+                )
+            )
+        )
+
+    worker = Thread(target=run_request)
+    worker.start()
+    try:
+        assert orchestration_started.wait(timeout=5)
+        active = broker.working_sessions.load()
+        assert active is not None and active.active_request is not None
+
+        busy = receiver.receive(
+            make_signed_event(
+                "Second request", event_id="event-busy", message_id="m-busy"
+            )
+        )
+        assert busy.disposition == "busy_refused", busy.reason
+        assert len(orchestration.calls) == 1
+
+        cancelled = receiver.receive(
+            make_signed_event("/cancel", event_id="event-cancel", message_id="m-cancel")
+        )
+        assert cancelled.disposition == "cancelled"
+        current = broker.working_sessions.load()
+        assert current is not None and current.active_request is None
+
+        release_orchestration.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert result_holder[0].disposition == "late_result_ignored"  # type: ignore[attr-defined]
+        assert all("late result" not in reply.body.lower() for reply in outbound.sent)
+        assert "late_result_ignored" in [record.kind for record in audit.records]
+    finally:
+        release_orchestration.set()
+        worker.join(timeout=5)
+        trace_store._close_writer_service()
