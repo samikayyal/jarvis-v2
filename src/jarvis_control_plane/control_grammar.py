@@ -28,9 +28,11 @@ from .sessions import (
     TransitionKind,
     WorkingSession,
     accept_request,
+    active_command_permissions,
     cancel_active_request,
     ensure_utc,
     new_working_session,
+    revoke_command_permission,
     status_view,
 )
 
@@ -47,6 +49,7 @@ CONTROL_COMMANDS = (
     "/model",
     "/reasoning",
     "/config",
+    "/permissions",
 )
 
 _THIS_TIME_APPROVALS = frozenset(
@@ -77,6 +80,7 @@ class ControlCommand(str, Enum):
     MODEL = "model"
     REASONING = "reasoning"
     CONFIG = "config"
+    PERMISSIONS = "permissions"
 
 
 class MessageKind(str, Enum):
@@ -105,6 +109,9 @@ class ControlTransitionKind(str, Enum):
     INVALID_CONFIGURATION = "invalid_configuration"
     MODEL_UNAVAILABLE = "model_unavailable"
     REASONING_UNAVAILABLE = "reasoning_unavailable"
+    PERMISSIONS_LISTED = "permissions_listed"
+    PERMISSION_REVOKED = "permission_revoked"
+    PERMISSION_NOT_ACTIVE = "permission_not_active"
 
 
 class ApprovalChoice(str, Enum):
@@ -218,6 +225,7 @@ def _known_command(value: str) -> ControlCommand | None:
         "/model": ControlCommand.MODEL,
         "/reasoning": ControlCommand.REASONING,
         "/config": ControlCommand.CONFIG,
+        "/permissions": ControlCommand.PERMISSIONS,
     }.get(value)
 
 
@@ -245,6 +253,7 @@ def parse_control(message: str) -> ParsedControl:
         ControlCommand.MODEL: {0, 1},
         ControlCommand.REASONING: {0, 1},
         ControlCommand.CONFIG: {0, 2},
+        ControlCommand.PERMISSIONS: {0, 2},
     }
     if len(parts) - 1 not in allowed_argument_counts[command]:
         return ParsedControl(
@@ -325,6 +334,24 @@ def render_status(view: StatusView) -> str:
 safe_status = render_status
 
 
+def render_permissions(session: WorkingSession) -> str:
+    """Render active exact rules without command output or hidden payloads."""
+
+    permissions = active_command_permissions(session)
+    if not permissions:
+        return "No active command permissions."
+    return "\n".join(
+        (
+            "Active command permissions:",
+            *(
+                f"{permission.permission_id} | {permission.lifetime.value} | "
+                f"{permission.host} | {permission.cwd} | {permission.command}"
+                for permission in permissions
+            ),
+        )
+    )
+
+
 def _usage(parsed: ParsedControl) -> str:
     usage = {
         ControlCommand.MODEL: f"Usage: /model [{_MODEL_USAGE_TOKENS}]",
@@ -332,6 +359,7 @@ def _usage(parsed: ParsedControl) -> str:
         ControlCommand.CONFIG: (
             "Usage: /config [model <model>|reasoning <level>|session-minutes <minutes>]"
         ),
+        ControlCommand.PERMISSIONS: "Usage: /permissions [revoke <permission-id>]",
     }
     if parsed.command is not None:
         return usage.get(parsed.command, f"Usage: /{parsed.command.value}")
@@ -588,6 +616,38 @@ def _apply_control(
                 "Invalid config value. Use canonical models/reasoning or session-minutes "
                 "15, 30, 60, 120, or 240."
             ),
+        )
+
+    if parsed.command is ControlCommand.PERMISSIONS:
+        if not parsed.args:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.PERMISSIONS_LISTED,
+                reply=render_permissions(session),
+            )
+        if parsed.args[0] != "revoke":
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.MALFORMED_COMMAND,
+                reply=_usage(parsed),
+            )
+        transition = revoke_command_permission(
+            session, permission_id=parsed.args[1], now=now
+        )
+        if transition.kind is TransitionKind.NOOP:
+            return _transition_from_session(
+                parsed,
+                transition,
+                kind=ControlTransitionKind.PERMISSION_NOT_ACTIVE,
+                reply="That command permission is not active.",
+            )
+        return _transition_from_session(
+            parsed,
+            transition,
+            kind=ControlTransitionKind.PERMISSION_REVOKED,
+            reply=f"Revoked command permission {parsed.args[1]}.",
         )
 
     raise AssertionError("_apply_control called without a complete control command")

@@ -4,9 +4,8 @@
 
 **Blocked by:** 07 — Freeze and execute one exact approval-gated action.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] Every fragment carries the same action identity and digest and remains within the messaging size bound.
 - [ ] The confirmation prompt becomes valid only after every ordered fragment has been accepted by the outbound adapter.
 - [ ] Failed, incomplete, reordered, or ambiguous presentation invalidates the entire proposal without selective automatic retry.
-

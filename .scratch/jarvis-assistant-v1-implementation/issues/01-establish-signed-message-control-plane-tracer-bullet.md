@@ -4,9 +4,8 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] A valid signed operator event produces exactly one correlated reply through the highest external control-plane testing seam.
 - [ ] The path persists its request state and required redacted audit evidence using controlled adapters only.
 - [ ] The Python project installs, runs, and tests through `uv`, and the full repository remains green.
-

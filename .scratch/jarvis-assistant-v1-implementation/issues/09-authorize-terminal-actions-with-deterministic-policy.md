@@ -4,7 +4,7 @@
 
 **Blocked by:** 07 — Freeze and execute one exact approval-gated action.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] Deterministic policy produces the specified refusal, fresh-approval, reusable-permission, safe-read, or ordinary-approval disposition.
 - [ ] Every component of a compound command is parsed and authorized before any component can execute.

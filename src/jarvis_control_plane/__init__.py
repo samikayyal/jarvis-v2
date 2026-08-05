@@ -36,6 +36,7 @@ from .models import (
     SignedInboundEvent,
     sign_body,
 )
+from .orchestration import AgentsSdkOrchestrationAdapter
 from .ports import (
     ActionDispatcherError,
     AuditWriteError,
@@ -63,6 +64,7 @@ __all__ = [
     "DEFAULT_TRACE_RESERVATION_BYTES",
     "MAX_TRACE_RESERVATION_BYTES",
     "ActionDispatcherError",
+    "AgentsSdkOrchestrationAdapter",
     "AuditEvidence",
     "AuditFilter",
     "AuditWriteError",

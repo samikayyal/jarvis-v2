@@ -4,9 +4,8 @@
 
 **Blocked by:** 01 — Establish the signed-message control-plane tracer bullet.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] Signature, session, event, message, direct-chat, text, identity, and authorized-operator checks produce the specified durable ingress dispositions.
 - [ ] Media, reactions, groups, status events, unresolved identities, and unauthorized senders create no request or assistant reply.
 - [ ] Replaying the same `(session ID, message ID)` cannot duplicate work or any observable side effect.
-

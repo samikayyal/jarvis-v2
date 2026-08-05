@@ -91,6 +91,7 @@ class TransitionKind(str, Enum):
     RESTART_INTERRUPTED = "restart_interrupted"
     RESULT_APPLIED = "result_applied"
     LATE_RESULT_IGNORED = "late_result_ignored"
+    PERMISSION_REVOKED = "permission_revoked"
     INVARIANT_REJECTED = "invariant_rejected"
 
 
@@ -1910,6 +1911,67 @@ def status_view(session: WorkingSession) -> StatusView:
 
 safe_status_view = status_view
 session_status = status_view
+
+
+def active_command_permissions(
+    session: WorkingSession,
+) -> tuple[CommandPermissionState, ...]:
+    """Return the inspectable permission projection in one stable order."""
+
+    return tuple(
+        sorted(
+            (permission for permission in session.permissions if permission.is_active),
+            key=lambda permission: (permission.created_at, permission.permission_id),
+        )
+    )
+
+
+def revoke_command_permission(
+    session: WorkingSession,
+    *,
+    permission_id: str,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Remove one matching rule from usable authority before any acknowledgement.
+
+    The revocation timestamp stays in operational state for provenance, while
+    policy matching considers only active rules.  A missing or already revoked
+    identifier is an idempotent no-op and therefore cannot reveal stale rules.
+    """
+
+    _identifier(permission_id, "permission_id")
+    at = _now(now)
+    target = next(
+        (
+            permission
+            for permission in session.permissions
+            if permission.permission_id == permission_id and permission.is_active
+        ),
+        None,
+    )
+    if target is None:
+        return _transition(
+            session,
+            session,
+            TransitionKind.NOOP,
+            reason="command permission was not active",
+        )
+    after = replace(
+        session,
+        permissions=tuple(
+            replace(permission, revoked_at=at)
+            if permission.permission_id == permission_id
+            else permission
+            for permission in session.permissions
+        ),
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.PERMISSION_REVOKED,
+        effects=("revoke_command_permission",),
+        reason="command permission revoked before acknowledgement",
+    )
 
 
 class WorkingSessionStore(Protocol):

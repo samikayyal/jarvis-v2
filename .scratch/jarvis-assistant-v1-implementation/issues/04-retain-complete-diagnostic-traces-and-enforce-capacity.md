@@ -4,9 +4,8 @@
 
 **Blocked by:** 01 — Establish the signed-message control-plane tracer bullet.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] Controlled operations retain complete inputs, outputs, arguments, results, errors, and credential-like payloads without automatic redaction or expiry.
 - [ ] Trace content is unavailable to ordinary Jarvis behavior and accessible only through the manual-administration boundary.
 - [ ] Insufficient capacity rejects new trace-producing work without deleting or truncating previously retained traces.
-

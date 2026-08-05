@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "openai-agents>=0.19.4",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
