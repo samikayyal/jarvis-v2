@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
-
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 REASONING_LEVELS = ("none", "low", "medium", "high", "xhigh", "max")
 HOSTS = ("ubuntu", "windows")
@@ -153,9 +152,11 @@ def handle_operator_message(state: ControlState, message: str) -> Transition:
             return Transition(
                 state,
                 (
-                    "A pending action pauses this request and blocks unrelated work. "
-                    "Reply with 1, 2, 3, or 4 (or an exact displayed phrase). "
-                    "Qualified or ambiguous replies do not execute it.",
+                    (
+                        "A pending action pauses this request and blocks unrelated work. "
+                        "Reply with 1, 2, 3, or 4 (or an exact displayed phrase). "
+                        "Qualified or ambiguous replies do not execute it."
+                    ),
                 ),
             )
         return _resolve_approval(state, choice)
@@ -164,8 +165,10 @@ def handle_operator_message(state: ControlState, message: str) -> Transition:
         return Transition(
             state,
             (
-                f"Request {state.active_request.id} is still active. "
-                "Use /status or /cancel; V1 does not queue another request.",
+                (
+                    f"Request {state.active_request.id} is still active. "
+                    "Use /status or /cancel; V1 does not queue another request."
+                ),
             ),
         )
 
@@ -184,8 +187,10 @@ def handle_operator_message(state: ControlState, message: str) -> Transition:
     return Transition(
         updated,
         (
-            f"Accepted {request.id}. I’m choosing between the default Ubuntu host and your personal "
-            "Windows laptop from the request and host availability. I’ll state the selection and reason before execution.",
+            (
+                f"Accepted {request.id}. I’m choosing between the default Ubuntu host and your personal "
+                "Windows laptop from the request and host availability. I’ll state the selection and reason before execution."
+            ),
         ),
         ("start_request",),
     )
@@ -290,8 +295,10 @@ def _handle_command(state: ControlState, message: str) -> Transition:
     return Transition(
         state,
         (
-            "Unknown or malformed control command. Valid: /new, /status, /cancel, /model [value], "
-            "/reasoning [value], /config [model|reasoning|session-minutes] [value], /permissions, /revoke <ID|session|persistent|all>.",
+            (
+                "Unknown or malformed control command. Valid: /new, /status, /cancel, /model [value], "
+                "/reasoning [value], /config [model|reasoning|session-minutes] [value], /permissions, /revoke <ID|session|persistent|all>."
+            ),
         ),
     )
 
@@ -301,8 +308,10 @@ def _handle_config(state: ControlState, args: list[str]) -> Transition:
         return Transition(
             state,
             (
-                f"Persistent defaults: model {state.default_model}; reasoning {state.default_reasoning}; "
-                f"session-minutes {state.session_minutes}. Changes apply to future sessions; session duration applies now too.",
+                (
+                    f"Persistent defaults: model {state.default_model}; reasoning {state.default_reasoning}; "
+                    f"session-minutes {state.session_minutes}. Changes apply to future sessions; session duration applies now too."
+                ),
             ),
         )
     if state.active_request:
@@ -518,8 +527,10 @@ def handle_system_event(state: ControlState, event: str, *args: str) -> Transiti
             return Transition(
                 state,
                 (
-                    "Prototype proposal refused: `:propose` simulates a proposal produced by an already active, "
-                    "routed agent request. First enter ordinary request text, then use `:route ubuntu|windows REASON`.",
+                    (
+                        "Prototype proposal refused: `:propose` simulates a proposal produced by an already active, "
+                        "routed agent request. First enter ordinary request text, then use `:route ubuntu|windows REASON`."
+                    ),
                 ),
             )
         mandatory = bool(args and args[0] == "mandatory")
@@ -553,8 +564,10 @@ def handle_system_event(state: ControlState, event: str, *args: str) -> Transiti
         return Transition(
             updated,
             (
-                f"Approval required for {action.id} (expires in 10 minutes).\n"
-                f"Host: {action.host}\nCommand: `{action.command}`\nWorking directory: `{action.cwd}`\n{choices}",
+                (
+                    f"Approval required for {action.id} (expires in 10 minutes).\n"
+                    f"Host: {action.host}\nCommand: `{action.command}`\nWorking directory: `{action.cwd}`\n{choices}"
+                ),
             ),
         )
     if event == "complete":

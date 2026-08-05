@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from threading import RLock
 
 from .control_grammar import ControlTransition, ControlTransitionKind, handle_message
 from .models import (
@@ -41,8 +43,15 @@ from .sessions import (
     WorkingSession,
     WorkingSessionStore,
     apply_request_result,
+    cancellation_token_is_current,
 )
 from .traces import DiagnosticTraceRecorder
+
+_MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
+
+
+class _CancelledBeforeDispatch(OutboundConnectorError):
+    """The request lost ownership before its outbound operation started."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +71,8 @@ class ControlPlaneConfig:
             require_non_empty(self.working_session_id, "working_session_id")
         if not isinstance(self.signing_secret, bytes) or not self.signing_secret:
             raise ValueError("signing_secret must be non-empty bytes")
-        if not isinstance(self.max_text_length, int) or self.max_text_length <= 0:
-            raise ValueError("max_text_length must be a positive integer")
+        if self.max_text_length != 4096:
+            raise ValueError("max_text_length is fixed at 4096 characters in V1")
 
 
 class DeterministicCapabilityBroker:
@@ -109,6 +118,7 @@ class DeterministicCapabilityBroker:
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
         self._trace = trace
+        self._dispatch_lock = RLock()
 
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive the typed path."""
@@ -318,29 +328,10 @@ class DeterministicCapabilityBroker:
                 reason=str(exc) or "orchestration failed",
             )
 
-        if not self._finish_session_request(
-            cancellation_token,
-            outcome=result.outcome,
-            message=message,
+        if not cancellation_token_is_current(
+            self._current_working_session(), cancellation_token
         ):
-            ignored = replace(
-                request,
-                updated_at=self.clock.now(),
-                status="cancelled",
-                phase="cancelled",
-                outcome="late_result_ignored",
-                error_code="cancelled",
-            )
-            try:
-                self.state.update_request(ignored)
-            except StateStoreError:
-                pass
-            return ReceiveResult(
-                status_code=202,
-                disposition="late_result_ignored",
-                request=ignored,
-                reason="orchestration result no longer owns the working session",
-            )
+            return self._late_result_result(request, message=message)
 
         reply = OutboundReply(
             reply_id=self.ids.new_id("reply"),
@@ -373,6 +364,11 @@ class DeterministicCapabilityBroker:
                 target_category="operator_conversation",
                 execution_status="failed",
                 details={"result": "not_sent", "state": "unavailable"},
+            )
+            self._finish_session_request(
+                cancellation_token,
+                outcome="outbound_failed",
+                message=message,
             )
             return ReceiveResult(
                 status_code=202,
@@ -456,7 +452,12 @@ class DeterministicCapabilityBroker:
                 input_payload=reply,
                 arguments={"operation": "send", "channel": "controlled_outbound"},
                 telemetry={"phase": "outbound"},
-                operation=lambda: self._send_and_confirm(reply),
+                operation=lambda: self._send_request_and_finish(
+                    reply,
+                    cancellation_token,
+                    outcome=result.outcome,
+                    message=message,
+                ),
                 result_limit_bytes=4_096,
                 error_limit_bytes=8_192,
             )
@@ -543,6 +544,20 @@ class DeterministicCapabilityBroker:
                 execution_status="completed",
                 details={"phase": "completed", "status": "completed"},
             )
+        except _CancelledBeforeDispatch:
+            self._best_effort_audit(
+                kind="outbound_completion",
+                event_id=message.event_id,
+                request_id=request.request_id,
+                message_id=message.message_id,
+                outcome="not_sent",
+                actor="controlled_outbound",
+                operation_type="outbound_message",
+                target_category="operator_conversation",
+                execution_status="failed",
+                details={"result": "not_sent"},
+            )
+            return self._late_result_result(replying, message=message)
         except (
             DiagnosticTraceError,
             AuditWriteError,
@@ -570,6 +585,11 @@ class DeterministicCapabilityBroker:
                 else "outbound_unknown"
                 if may_have_sent
                 else "outbound_error"
+            )
+            self._finish_session_request(
+                cancellation_token,
+                outcome=outcome,
+                message=message,
             )
             if may_have_sent:
                 self._best_effort_audit(
@@ -695,6 +715,23 @@ class DeterministicCapabilityBroker:
         return session
 
     def _handle_session_control(
+        self,
+        message: InboundMessage,
+        expected: WorkingSession,
+        transition: ControlTransition,
+    ) -> ReceiveResult:
+        guard = self._dispatch_lock if transition.parsed.is_command else nullcontext()
+        with guard:
+            if transition.parsed.is_command:
+                expected = self._current_working_session()
+                transition = handle_message(
+                    expected,
+                    message.text,
+                    now=self.clock,
+                )
+            return self._apply_session_control(message, expected, transition)
+
+    def _apply_session_control(
         self,
         message: InboundMessage,
         expected: WorkingSession,
@@ -889,6 +926,71 @@ class DeterministicCapabilityBroker:
         self.outbound.send(reply)
         return {"result": "accepted"}
 
+    def _send_request_and_finish(
+        self,
+        reply: OutboundReply,
+        token: CancellationToken,
+        *,
+        outcome: str,
+        message: InboundMessage,
+    ) -> dict[str, str]:
+        """Linearize cancellation against the start of outbound dispatch."""
+
+        with self._dispatch_lock:
+            if not cancellation_token_is_current(
+                self._current_working_session(), token
+            ):
+                raise _CancelledBeforeDispatch(
+                    "request was cancelled before outbound dispatch"
+                )
+            self.outbound.send(reply)
+            if not self._finish_session_request(
+                token,
+                outcome=outcome,
+                message=message,
+            ):
+                raise OutboundConnectorError(
+                    "outbound was accepted but session completion is uncertain",
+                    may_have_sent=True,
+                )
+            return {"result": "accepted"}
+
+    def _late_result_result(
+        self,
+        request: RequestState,
+        *,
+        message: InboundMessage,
+    ) -> ReceiveResult:
+        self._best_effort_audit(
+            kind="late_result_ignored",
+            event_id=message.event_id,
+            request_id=request.request_id,
+            message_id=message.message_id,
+            outcome="ignored",
+            actor="control_plane",
+            operation_type="request_lifecycle",
+            target_category="working_session",
+            details={},
+        )
+        ignored = replace(
+            request,
+            updated_at=self.clock.now(),
+            status="cancelled",
+            phase="cancelled",
+            outcome="late_result_ignored",
+            error_code="cancelled",
+        )
+        try:
+            self.state.update_request(ignored)
+        except StateStoreError:
+            pass
+        return ReceiveResult(
+            status_code=202,
+            disposition="late_result_ignored",
+            request=ignored,
+            reason="orchestration result no longer owns the working session",
+        )
+
     def _transition(
         self,
         request: RequestState,
@@ -1021,6 +1123,13 @@ class SignedMessageReceiver:
     def receive(self, event: SignedInboundEvent) -> ReceiveResult:
         """Verify, admit, claim, and dispatch one signed event."""
 
+        if len(event.raw_body) > _MAX_RAW_INBOUND_BODY_BYTES:
+            return ReceiveResult(
+                status_code=413,
+                disposition="payload_too_large",
+                reason="raw inbound body exceeds the fixed 128 KiB limit",
+            )
+
         if not event.verify(self.config.signing_secret):
             return ReceiveResult(
                 status_code=401,
@@ -1068,13 +1177,10 @@ class SignedMessageReceiver:
                     terminal_disposition="rejected",
                 )
             except StateStoreError:
-                # Rejected events never create assistant work or conversation
-                # history.  If the keyed disposition cannot be retained, the
-                # safe outcome is still an empty 204 acknowledgement.
                 return ReceiveResult(
-                    status_code=204,
-                    disposition="rejected",
-                    reason=rejection,
+                    status_code=503,
+                    disposition="state_unavailable",
+                    reason="durable ingress state was unavailable",
                 )
             if admission.disposition == "duplicate":
                 return ReceiveResult(status_code=204, disposition="duplicate")

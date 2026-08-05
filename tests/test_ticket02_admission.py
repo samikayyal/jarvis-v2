@@ -637,6 +637,47 @@ def test_claim_write_failure_returns_503_and_retry_processes_once() -> None:
     assert len(outbound.sent) == 1
 
 
+def test_rejected_event_claim_failure_returns_503_for_gateway_retry() -> None:
+    state = InMemoryDurableStateStore()
+    state.fail_claim = True
+    config, _, audit, orchestration, outbound, receiver = make_components(state=state)
+
+    result = receiver.receive(make_event(config, sender_id="other.operator"))
+
+    assert result.status_code == 503
+    assert result.disposition == "state_unavailable"
+    assert state.list_ingress_claims() == ()
+    assert state.list_conversation_messages() == ()
+    assert audit.records == []
+    assert orchestration.calls == []
+    assert outbound.sent == []
+
+
+def test_oversized_raw_body_is_413_without_signature_or_state_work() -> None:
+    _, state, audit, orchestration, outbound, receiver = make_components()
+    event = SignedInboundEvent(raw_body=b"x" * (128 * 1024 + 1))
+
+    result = receiver.receive(event)
+
+    assert result.status_code == 413
+    assert result.disposition == "payload_too_large"
+    assert state.list_ingress_claims() == ()
+    assert state.list_conversation_messages() == ()
+    assert audit.records == []
+    assert orchestration.calls == []
+    assert outbound.sent == []
+
+
+def test_text_limit_is_fixed_at_4096_characters() -> None:
+    with pytest.raises(ValueError, match="fixed at 4096"):
+        ControlPlaneConfig(
+            operator_id=OPERATOR,
+            session_id=SESSION,
+            signing_secret=SECRET,
+            max_text_length=4097,
+        )
+
+
 def test_rejected_event_is_safely_discarded_when_audit_is_unavailable() -> None:
     audit = InMemoryAuditBoundary(fail_on_append=1)
     config, state, _, orchestration, outbound, receiver = make_components(audit=audit)

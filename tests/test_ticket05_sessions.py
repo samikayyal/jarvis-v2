@@ -734,3 +734,60 @@ def test_cancel_wins_race_and_late_result_never_dispatches() -> None:
         release_orchestration.set()
         worker.join(timeout=5)
         trace_store._close_writer_service()
+
+
+def test_cancel_during_outbound_preflight_prevents_dispatch() -> None:
+    preflight_started = Event()
+    release_preflight = Event()
+    state, _, _, outbound, broker, receiver, trace_store = make_receiver_components()
+    original_preflight = outbound.preflight
+
+    def blocking_preflight(reply: object) -> None:
+        original_preflight(reply)  # type: ignore[arg-type]
+        if "Controlled orchestration completed" in reply.body:  # type: ignore[attr-defined]
+            preflight_started.set()
+            assert release_preflight.wait(timeout=5)
+
+    outbound.preflight = blocking_preflight  # type: ignore[method-assign]
+    result_holder: list[object] = []
+
+    worker = Thread(
+        target=lambda: result_holder.append(
+            receiver.receive(
+                make_signed_event(
+                    "Work that reaches outbound preflight",
+                    event_id="event-preflight-work",
+                    message_id="m-preflight-work",
+                )
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert preflight_started.wait(timeout=5)
+        active = broker.working_sessions.load()
+        assert active is not None and active.active_request is not None
+
+        cancelled = receiver.receive(
+            make_signed_event(
+                "/cancel",
+                event_id="event-preflight-cancel",
+                message_id="m-preflight-cancel",
+            )
+        )
+        assert cancelled.disposition == "cancelled"
+
+        release_preflight.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        result = result_holder[0]
+        assert result.disposition == "late_result_ignored"  # type: ignore[attr-defined]
+        assert all(
+            "Controlled orchestration completed" not in reply.body
+            for reply in outbound.sent
+        )
+        assert state.list_requests()[0].outcome == "late_result_ignored"
+    finally:
+        release_preflight.set()
+        worker.join(timeout=5)
+        trace_store._close_writer_service()

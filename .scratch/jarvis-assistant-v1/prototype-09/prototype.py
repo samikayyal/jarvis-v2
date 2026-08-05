@@ -12,7 +12,6 @@ from control_grammar import (
     state_dict,
 )
 
-
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
@@ -70,8 +69,10 @@ def dispatch(state: ControlState, line: str) -> Transition:
             return Transition(
                 state,
                 (
-                    "Prototype usage: `:propose` or `:propose mandatory`. This is a developer simulation "
-                    "control, not a proposal name or a WhatsApp command.",
+                    (
+                        "Prototype usage: `:propose` or `:propose mandatory`. This is a developer simulation "
+                        "control, not a proposal name or a WhatsApp command."
+                    ),
                 ),
             )
         return handle_system_event(state, "propose", *args)
