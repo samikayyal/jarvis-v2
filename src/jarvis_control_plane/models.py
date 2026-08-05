@@ -402,6 +402,8 @@ class OrchestrationResult:
     reply_text: str
     adapter: str = "controlled"
     proposal: FrozenActionProposal | None = None
+    execution_host: str | None = None
+    host_reason_code: str | None = None
 
     def __post_init__(self) -> None:
         _non_empty_identifier(self.request_id, "request_id")
@@ -413,6 +415,30 @@ class OrchestrationResult:
             raise ValueError(
                 "action proposal request_id must match orchestration result"
             )
+        if self.execution_host is None:
+            if self.host_reason_code is not None:
+                raise ValueError(
+                    "host_reason_code requires an execution_host selection"
+                )
+        else:
+            if self.execution_host not in {"ubuntu", "windows"}:
+                raise ValueError("execution_host must be ubuntu or windows")
+            if self.host_reason_code not in {
+                "default_ubuntu",
+                "explicit_windows",
+                "windows_dependency",
+            }:
+                raise ValueError("host_reason_code is not a controlled selection")
+            if (
+                self.execution_host == "ubuntu"
+                and self.host_reason_code != "default_ubuntu"
+            ):
+                raise ValueError("Ubuntu requires the default_ubuntu host reason")
+            if (
+                self.execution_host == "windows"
+                and self.host_reason_code == "default_ubuntu"
+            ):
+                raise ValueError("Windows requires an explicit or dependency reason")
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,7 +666,7 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     "inbound_malformed": {"reason": frozenset({"malformed_envelope"})},
     "inbound_rejected": {"reason": _ADMISSION_REJECTION_REASONS},
     "orchestration_result": {
-        "adapter": frozenset({"controlled"}),
+        "adapter": frozenset({"controlled", "agents_sdk_responses"}),
         "model": frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}),
         "reasoning": frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
         "result": frozenset({"failed"}),

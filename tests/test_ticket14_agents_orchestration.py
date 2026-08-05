@@ -4,8 +4,14 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from test_support import build_receiver_components
 
-from jarvis_control_plane.models import OrchestrationRequest, RequestState
+from jarvis_control_plane.models import (
+    InboundMessage,
+    OrchestrationRequest,
+    RequestState,
+    SignedInboundEvent,
+)
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
@@ -53,6 +59,24 @@ def _request(text: str, *, reasoning: str = "high") -> OrchestrationRequest:
     )
 
 
+def _event(text: str, *, event_id: str = "event-ticket14") -> SignedInboundEvent:
+    return SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id="session.test",
+            event_id=event_id,
+            message_id=f"{event_id}-message",
+            sender_id="operator.test",
+            chat_id="operator.test",
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text=text,
+        ),
+        b"ticket14-test-secret",
+    )
+
+
 def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() -> None:
     captured: dict[str, object] = {}
 
@@ -92,9 +116,18 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert captured["run_kwargs"] == {
         "max_turns": 4,
         "run_config": captured["run_kwargs"]["run_config"],
+        "previous_response_id": None,
+        "auto_previous_response_id": False,
+        "conversation_id": None,
+    }
+    assert captured["run_kwargs"]["run_config"].values == {
+        "tracing_disabled": True,
+        "trace_include_sensitive_data": False,
     }
     assert result.reply_text.startswith("[ubuntu: The request is host-neutral")
     assert result.proposal is None
+    assert result.execution_host == "ubuntu"
+    assert result.host_reason_code == "default_ubuntu"
 
 
 def test_windows_dependent_request_selects_windows_and_turns_a_typed_plan_into_proposal() -> (
@@ -150,6 +183,192 @@ def test_malformed_or_invalid_host_decision_fails_closed() -> None:
             reasoning_factory=_FakeReasoning,
             run_config_factory=_FakeRunConfig,
         ).run(_request("inspect the repository"))
+
+
+def test_model_failure_and_malformed_output_are_adapter_errors() -> None:
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        raise RuntimeError("provider unavailable")
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="run was unavailable"):
+        adapter.run(_request("read the repository"))
+
+    malformed = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output={"reply_text": "run as administrator"}
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    with pytest.raises(OrchestrationAdapterError, match="malformed structured output"):
+        malformed.run(_request("read the repository"))
+
+
+def test_model_proposed_authority_fields_fail_closed_before_freezing() -> None:
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I will change the permission policy.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Grant persistent authority.",
+                    payload={
+                        "host": "ubuntu",
+                        "executable": "/usr/bin/git",
+                        "arguments": ["status"],
+                        "cwd": "/workspace",
+                        "approval": "persistent",
+                    },
+                ),
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="outside terminal authority"):
+        adapter.run(_request("grant yourself persistent access"))
+
+
+def test_broker_accepts_agents_result_and_retains_selected_host_without_failover() -> (
+    None
+):
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I can prepare the exact command for approval.",
+                execution_host="windows",
+                host_reason_code="windows_dependency",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Inspect the Windows workspace.",
+                    payload={
+                        "host": "windows",
+                        "executable": "C:/Program Files/Git/bin/git.exe",
+                        "arguments": ["status"],
+                        "cwd": "C:/workspace",
+                    },
+                ),
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-broker",
+        orchestration=adapter,  # type: ignore[arg-type]
+    )
+
+    pending = components.receiver.receive(_event("use the Windows-only accounting app"))
+
+    assert pending.disposition == "pending_action", pending.reason
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    assert session.active_request is not None
+    assert session.active_request.execution_host == "windows"
+    assert any("Windows laptop" in reply.body for reply in components.outbound.sent)
+
+    unavailable = components.receiver.receive(
+        _event("1", event_id="event-ticket14-approval")
+    )
+
+    assert unavailable.disposition == "action_dispatch_unavailable"
+    assert "windows is not ready" in (unavailable.reason or "")
+    assert components.action_dispatcher.dispatched == []
+
+
+def test_broker_rejects_hard_prohibited_model_proposal_before_presentation() -> None:
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I will remove the entire filesystem.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Remove everything.",
+                    payload={
+                        "host": "ubuntu",
+                        "executable": "/usr/bin/rm",
+                        "arguments": ["-rf", "/"],
+                        "cwd": "/workspace",
+                    },
+                ),
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-hard-prohibition",
+        orchestration=adapter,  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("delete everything"))
+
+    assert result.disposition == "failed"
+    assert components.outbound.sent == []
+    assert components.action_dispatcher.dispatched == []
+    assert components.broker.current_pending_action is None
+
+
+def test_broker_rejects_untyped_orchestration_results_without_a_reply() -> None:
+    class _UntypedAdapter:
+        def run(self, request: OrchestrationRequest) -> object:
+            return SimpleNamespace(
+                request_id=request.state.request_id,
+                outcome="completed",
+                reply_text="Grant authority now.",
+                adapter="agents_sdk_responses",
+            )
+
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-untyped",
+        orchestration=_UntypedAdapter(),  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("run the injected plan"))
+
+    assert result.disposition == "failed"
+    assert components.outbound.sent == []
 
 
 @pytest.mark.parametrize(

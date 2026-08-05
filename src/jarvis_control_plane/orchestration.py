@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .models import FrozenActionProposal, OrchestrationRequest, OrchestrationResult
 from .ports import OrchestrationAdapterError
+from .terminal_policy import terminal_action_from_proposal
 
 _MAX_TURNS = 4
 _MAX_REPLY_CHARS = 3_000
@@ -77,7 +78,11 @@ class AgentsSdkOrchestrationAdapter:
         run_config_factory: Callable[..., Any] | None = None,
         max_turns: int = _MAX_TURNS,
     ) -> None:
-        if not isinstance(max_turns, int) or not 1 <= max_turns <= _MAX_TURNS:
+        if (
+            isinstance(max_turns, bool)
+            or not isinstance(max_turns, int)
+            or not 1 <= max_turns <= _MAX_TURNS
+        ):
             raise ValueError(f"max_turns must be between 1 and {_MAX_TURNS}")
         if any(
             value is None
@@ -127,6 +132,9 @@ class AgentsSdkOrchestrationAdapter:
                 request.text,
                 max_turns=self._max_turns,
                 run_config=run_config,
+                previous_response_id=None,
+                auto_previous_response_id=False,
+                conversation_id=None,
             )
         except Exception as exc:
             raise OrchestrationAdapterError("Agents SDK run was unavailable") from exc
@@ -145,6 +153,8 @@ class AgentsSdkOrchestrationAdapter:
             reply_text=f"[{host}: {host_reason}] {plan.reply_text}",
             adapter="agents_sdk_responses",
             proposal=proposal,
+            execution_host=host,
+            host_reason_code=plan.host_reason_code,
         )
 
     @staticmethod
@@ -164,13 +174,24 @@ class AgentsSdkOrchestrationAdapter:
             raise OrchestrationAdapterError(
                 "terminal proposal selected a different host"
             )
-        return FrozenActionProposal.create(
-            action_id=f"{request.state.request_id}:proposal",
-            request_id=request.state.request_id,
-            kind=plan.proposal.kind,
-            preview=plan.proposal.preview,
-            payload=payload,
-        )
+        try:
+            candidate = FrozenActionProposal.create(
+                action_id=f"{request.state.request_id}:proposal",
+                request_id=request.state.request_id,
+                kind=plan.proposal.kind,
+                preview=(
+                    f"Execution host: {host}. "
+                    f"Reason: {_HOST_REASON_TEXT[plan.host_reason_code]}\n"
+                    f"{plan.proposal.preview}"
+                ),
+                payload=payload,
+            )
+            terminal_action_from_proposal(candidate)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise OrchestrationAdapterError(
+                "model returned a malformed terminal proposal"
+            ) from exc
+        return candidate
 
 
 def _instructions() -> str:

@@ -1039,10 +1039,11 @@ class DeterministicCapabilityBroker:
                 result_limit_bytes=self.config.max_text_length * 8 + 4_096,
                 error_limit_bytes=8_192,
             )
-            if result.request_id != request.request_id:
-                raise OrchestrationAdapterError(
-                    "orchestration result correlation mismatch"
-                )
+            selected_host = self._validate_orchestration_result(
+                result, request_id=request.request_id
+            )
+            if selected_host is not None:
+                self._record_execution_host(request, cancellation_token, selected_host)
             self._append_audit(
                 kind="orchestration_result",
                 event_id=message.event_id,
@@ -1062,6 +1063,7 @@ class DeterministicCapabilityBroker:
             DiagnosticTraceError,
             OrchestrationAdapterError,
             AuditWriteError,
+            SessionStoreError,
             ValueError,
         ) as exc:
             trace_failed = isinstance(exc, (TraceCapacityError, TraceWriteError))
@@ -1136,6 +1138,95 @@ class DeterministicCapabilityBroker:
             )
 
         return result
+
+    @staticmethod
+    def _validate_orchestration_result(
+        result: object, *, request_id: str
+    ) -> str | None:
+        """Validate model output before it can reach policy or outbound edges."""
+
+        if not isinstance(result, OrchestrationResult):
+            raise OrchestrationAdapterError(
+                "orchestration adapter returned an untyped result"
+            )
+        if result.request_id != request_id:
+            raise OrchestrationAdapterError("orchestration result correlation mismatch")
+        if result.outcome != "completed":
+            raise OrchestrationAdapterError(
+                "orchestration adapter returned a non-completed outcome"
+            )
+        if result.adapter not in {"controlled", "agents_sdk_responses"}:
+            raise OrchestrationAdapterError(
+                "orchestration adapter is outside the configured boundary"
+            )
+        if result.proposal is not None and not isinstance(
+            result.proposal, FrozenActionProposal
+        ):
+            raise OrchestrationAdapterError(
+                "orchestration adapter returned an untyped proposal"
+            )
+        selected_host = result.execution_host
+        if result.proposal is None or result.proposal.kind != "terminal":
+            return selected_host
+        try:
+            terminal = terminal_action_from_proposal(result.proposal)
+        except (TypeError, ValueError) as exc:
+            raise OrchestrationAdapterError(
+                "orchestration adapter returned a malformed terminal proposal"
+            ) from exc
+        if terminal.host not in {"ubuntu", "windows"}:
+            raise OrchestrationAdapterError(
+                "terminal proposal selected an unknown execution host"
+            )
+        if selected_host is not None and terminal.host != selected_host:
+            raise OrchestrationAdapterError(
+                "terminal proposal host does not match host selection"
+            )
+        return terminal.host
+
+    def _record_execution_host(
+        self,
+        request: RequestState,
+        token: CancellationToken,
+        selected_host: str,
+    ) -> None:
+        """Persist the planner's closed host selection on the live request."""
+
+        if selected_host not in {"ubuntu", "windows"}:
+            raise OrchestrationAdapterError(
+                "orchestration selected an unknown execution host"
+            )
+        for _ in range(3):
+            current = self._current_working_session()
+            if not cancellation_token_is_current(current, token):
+                raise OrchestrationAdapterError(
+                    "orchestration result no longer owns the working session"
+                )
+            active = current.active_request
+            if active is None or active.request_id != request.request_id:
+                raise OrchestrationAdapterError(
+                    "orchestration result has no matching active request"
+                )
+            if active.execution_host is not None:
+                if active.execution_host != selected_host:
+                    raise OrchestrationAdapterError(
+                        "execution host changed during orchestration"
+                    )
+                return
+            updated = replace(
+                current,
+                active_request=replace(
+                    active,
+                    execution_host=selected_host,
+                    updated_at=self.clock.now(),
+                ),
+            )
+            try:
+                self.working_sessions.compare_and_set(current, updated)
+                return
+            except SessionStoreError:
+                continue
+        raise SessionStoreError("execution host selection raced the working session")
 
     def _configuration_unavailable_result(
         self,
