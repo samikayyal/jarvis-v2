@@ -27,6 +27,7 @@ from .models import (
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundDelivery,
     OutboundReply,
     RequestState,
     ensure_utc,
@@ -1664,12 +1665,13 @@ class ControlledOutboundConnector:
         self.failure = failure
         self.sent: list[OutboundReply] = []
 
-    def send(self, reply: OutboundReply) -> None:
+    def send(self, reply: OutboundReply) -> OutboundDelivery:
         self.preflight(reply)
         if self.failure is not None:
             raise OutboundConnectorError(self.failure)
 
         self.sent.append(reply)
+        return OutboundDelivery(outbound_id=self.ids.new_id("outbound"), accepted=True)
 
     def preflight(self, reply: OutboundReply) -> None:
         """Validate the deterministic send without performing it.

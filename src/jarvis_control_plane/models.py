@@ -436,6 +436,19 @@ class OutboundReply:
         return self.request_id
 
 
+@dataclass(frozen=True, slots=True)
+class OutboundDelivery:
+    """One gateway-confirmed outbound message identity."""
+
+    outbound_id: str
+    accepted: bool
+
+    def __post_init__(self) -> None:
+        _non_empty_identifier(self.outbound_id, "outbound_id")
+        if self.accepted is not True:
+            raise ValueError("a recorded outbound delivery must be accepted")
+
+
 _FORBIDDEN_AUDIT_KEYS = frozenset(
     {
         "access_token",

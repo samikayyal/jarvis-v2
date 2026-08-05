@@ -65,6 +65,13 @@ class PermissionLifetime(str, Enum):
     PERSISTENT = "persistent"
 
 
+class ProposalPresentationStatus(str, Enum):
+    """Whether a frozen proposal may consume an approval choice."""
+
+    PRESENTING = "presenting"
+    PRESENTED = "presented"
+
+
 class TransitionKind(str, Enum):
     """Bounded outcomes emitted by pure session transitions."""
 
@@ -353,6 +360,10 @@ class PendingActionState:
     digest: str = ""
     preview: str | None = None
     payload: str = ""
+    presentation_status: ProposalPresentationStatus | str = (
+        ProposalPresentationStatus.PRESENTED
+    )
+    presentation_fragments: tuple[ProposalPresentationFragment, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("action_id", "session_id", "request_id", "kind", "summary"):
@@ -378,6 +389,32 @@ class PendingActionState:
             raise ValueError("pending action digest does not match frozen content")
         object.__setattr__(self, "preview", preview)
         object.__setattr__(self, "digest", expected)
+        object.__setattr__(
+            self,
+            "presentation_status",
+            ProposalPresentationStatus(self.presentation_status),
+        )
+        fragments = tuple(self.presentation_fragments)
+        if any(
+            not isinstance(fragment, ProposalPresentationFragment)
+            for fragment in fragments
+        ):
+            raise TypeError(
+                "presentation fragments must be ProposalPresentationFragment values"
+            )
+        if fragments:
+            total = fragments[0].total
+            if any(fragment.total != total for fragment in fragments):
+                raise InvariantViolation("presentation fragments must have one total")
+            if tuple(fragment.number for fragment in fragments) != tuple(
+                range(1, len(fragments) + 1)
+            ):
+                raise InvariantViolation(
+                    "presentation fragments must be recorded in order"
+                )
+            if len(fragments) > total:
+                raise InvariantViolation("presentation contains too many fragments")
+        object.__setattr__(self, "presentation_fragments", fragments)
 
     @classmethod
     def create(
@@ -391,6 +428,8 @@ class PendingActionState:
         created_at: datetime | Clock,
         preview: str | None = None,
         payload: str = "",
+        presentation_status: ProposalPresentationStatus
+        | str = ProposalPresentationStatus.PRESENTED,
     ) -> PendingActionState:
         created = _now(created_at)
         return cls(
@@ -403,6 +442,7 @@ class PendingActionState:
             expires_at=created + PENDING_ACTION_TTL,
             preview=preview,
             payload=payload,
+            presentation_status=presentation_status,
         )
 
     @classmethod
@@ -412,6 +452,8 @@ class PendingActionState:
         *,
         session_id: str,
         created_at: datetime | Clock,
+        presentation_status: ProposalPresentationStatus
+        | str = ProposalPresentationStatus.PRESENTED,
     ) -> PendingActionState:
         """Freeze the typed orchestration proposal into durable session state."""
 
@@ -435,6 +477,7 @@ class PendingActionState:
             payload=payload,
             created_at=created,
             expires_at=created + PENDING_ACTION_TTL,
+            presentation_status=presentation_status,
         )
         if action.digest != digest:
             raise InvariantViolation("proposal digest does not match pending action")
@@ -442,6 +485,29 @@ class PendingActionState:
 
     def is_expired(self, at: datetime | Clock) -> bool:
         return _now(at) >= self.expires_at
+
+    @property
+    def is_confirmable(self) -> bool:
+        return self.presentation_status is ProposalPresentationStatus.PRESENTED
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalPresentationFragment:
+    """Durable proof of one ordered gateway-accepted proposal fragment."""
+
+    number: int
+    total: int
+    outbound_id: str
+    accepted: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.number, int) or self.number < 1:
+            raise ValueError("fragment number must be positive")
+        if not isinstance(self.total, int) or self.total < self.number:
+            raise ValueError("fragment total must include its number")
+        _identifier(self.outbound_id, "outbound_id")
+        if self.accepted is not True:
+            raise ValueError("only gateway-accepted fragments may be recorded")
 
 
 class DispatchStatus(str, Enum):
@@ -1097,6 +1163,78 @@ def install_pending_action(
 
 set_pending_action = install_pending_action
 attach_pending_action = install_pending_action
+
+
+def record_proposal_fragment(
+    session: WorkingSession,
+    *,
+    action_id: str,
+    number: int,
+    total: int,
+    outbound_id: str,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Record one accepted envelope fragment in the only valid send order."""
+
+    action = session.pending_action
+    if action is None or action.action_id != action_id:
+        raise InvariantViolation(
+            "presentation fragment does not own the pending action"
+        )
+    if action.presentation_status is not ProposalPresentationStatus.PRESENTING:
+        raise InvariantViolation("only a presenting action can receive fragments")
+    if number != len(action.presentation_fragments) + 1:
+        raise InvariantViolation("presentation fragment is out of order")
+    if (
+        action.presentation_fragments
+        and action.presentation_fragments[0].total != total
+    ):
+        raise InvariantViolation("presentation fragment total changed")
+    fragment = ProposalPresentationFragment(number, total, outbound_id)
+    return _transition(
+        session,
+        replace(
+            session,
+            pending_action=replace(
+                action,
+                presentation_fragments=(*action.presentation_fragments, fragment),
+            ),
+            last_activity_at=_now(now),
+        ),
+        TransitionKind.PENDING_INSTALLED,
+        effects=("record_proposal_fragment",),
+    )
+
+
+def mark_proposal_presented(
+    session: WorkingSession, *, action_id: str, now: datetime | Clock
+) -> SessionTransition:
+    """Enable approval only after every envelope fragment is confirmed."""
+
+    action = session.pending_action
+    if action is None or action.action_id != action_id:
+        raise InvariantViolation(
+            "presentation completion does not own the pending action"
+        )
+    if action.presentation_status is not ProposalPresentationStatus.PRESENTING:
+        raise InvariantViolation("proposal is not presenting")
+    if (
+        not action.presentation_fragments
+        or len(action.presentation_fragments) != action.presentation_fragments[0].total
+    ):
+        raise InvariantViolation("proposal presentation is incomplete")
+    return _transition(
+        session,
+        replace(
+            session,
+            pending_action=replace(
+                action, presentation_status=ProposalPresentationStatus.PRESENTED
+            ),
+            last_activity_at=_now(now),
+        ),
+        TransitionKind.PENDING_INSTALLED,
+        effects=("mark_proposal_presented",),
+    )
 
 
 def cancel_active_request(
@@ -1926,6 +2064,16 @@ def _session_json(session: WorkingSession) -> str:
                     "digest": session.pending_action.digest,
                     "preview": session.pending_action.preview,
                     "payload": session.pending_action.payload,
+                    "presentation_status": session.pending_action.presentation_status,
+                    "presentation_fragments": [
+                        {
+                            "number": fragment.number,
+                            "total": fragment.total,
+                            "outbound_id": fragment.outbound_id,
+                            "accepted": fragment.accepted,
+                        }
+                        for fragment in session.pending_action.presentation_fragments
+                    ],
                     "created_at": session.pending_action.created_at,
                     "expires_at": session.pending_action.expires_at,
                 }
@@ -2025,6 +2173,18 @@ def _session_from_json(value: str) -> WorkingSession:
                 digest=action.get("digest", ""),
                 preview=action.get("preview"),
                 payload=action.get("payload", ""),
+                presentation_status=action.get(
+                    "presentation_status", ProposalPresentationStatus.PRESENTED
+                ),
+                presentation_fragments=tuple(
+                    ProposalPresentationFragment(
+                        number=item["number"],
+                        total=item["total"],
+                        outbound_id=item["outbound_id"],
+                        accepted=item.get("accepted", True),
+                    )
+                    for item in action.get("presentation_fragments", ())
+                ),
                 created_at=_parse_timestamp(action["created_at"]),
                 expires_at=_parse_timestamp(action["expires_at"]),
             )

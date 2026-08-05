@@ -20,6 +20,7 @@ from .models import (
     IngressClaim,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundDelivery,
     OutboundReply,
     RequestState,
 )
@@ -180,7 +181,7 @@ class OutboundConnector(Protocol):
 
     def preflight(self, reply: OutboundReply) -> None: ...
 
-    def send(self, reply: OutboundReply) -> None: ...
+    def send(self, reply: OutboundReply) -> OutboundDelivery: ...
 
 
 class DiagnosticTraceStore(Protocol):

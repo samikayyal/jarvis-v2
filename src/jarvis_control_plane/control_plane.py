@@ -50,6 +50,7 @@ from .sessions import (
     InvariantViolation,
     ModelAvailability,
     PendingActionState,
+    ProposalPresentationStatus,
     RequestResult,
     SessionConfig,
     SessionStoreError,
@@ -66,11 +67,16 @@ from .sessions import (
     install_pending_action,
     interrupt_for_restart,
     mark_action_dispatch_attempted,
+    mark_proposal_presented,
+    record_proposal_fragment,
     reject_pending_action,
 )
+from .terminal_policy import TerminalDisposition, authorize_terminal_proposal
 from .traces import DiagnosticTraceRecorder
 
 _MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
+_PROPOSAL_FRAGMENT_PAYLOAD_CHARS = 3_000
+_MAX_OUTBOUND_MESSAGE_CHARS = 4_096
 
 
 class _CancelledBeforeDispatch(OutboundConnectorError):
@@ -176,6 +182,12 @@ class DeterministicCapabilityBroker:
         if session.pending_action is not None:
             choice = parse_approval_choice(message.text)
             if choice is not None:
+                if not session.pending_action.is_confirmable:
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="pending_presenting",
+                        reason="proposal presentation is incomplete",
+                    )
                 # `/cancel` takes this same lock. Once approval has consumed a
                 # proposal, cancellation cannot slip between that durable
                 # consumption and the one permitted dispatch attempt.
@@ -243,10 +255,12 @@ class DeterministicCapabilityBroker:
 
         if result.proposal is not None:
             try:
-                self.freeze_action(result.proposal)
+                action = self.freeze_action(result.proposal)
+                self._present_action(action, message)
             except (
                 AuditWriteError,
                 InvariantViolation,
+                OutboundConnectorError,
                 SessionStoreError,
                 ValueError,
             ) as exc:
@@ -297,8 +311,17 @@ class DeterministicCapabilityBroker:
             request = session.active_request
             if request is None or request.request_id != proposal.request_id:
                 raise InvariantViolation("proposal does not belong to the live request")
+            if proposal.kind == "terminal":
+                policy = authorize_terminal_proposal(
+                    proposal, permissions=session.permissions
+                )
+                if policy.disposition is TerminalDisposition.HARD_PROHIBITED:
+                    raise InvariantViolation("terminal action is hard-prohibited")
             action = PendingActionState.from_proposal(
-                proposal, session_id=session.session_id, created_at=self.clock
+                proposal,
+                session_id=session.session_id,
+                created_at=self.clock,
+                presentation_status=ProposalPresentationStatus.PRESENTING,
             )
             transition = install_pending_action(session, action, now=self.clock)
             try:
@@ -318,6 +341,116 @@ class DeterministicCapabilityBroker:
                 continue
             return action
         raise SessionStoreError("pending action could not be frozen atomically")
+
+    def _present_action(
+        self, action: PendingActionState, message: InboundMessage
+    ) -> None:
+        """Send an all-or-nothing, durable proposal-envelope presentation."""
+
+        fragments = tuple(
+            action.preview[index : index + _PROPOSAL_FRAGMENT_PAYLOAD_CHARS]
+            for index in range(0, len(action.preview), _PROPOSAL_FRAGMENT_PAYLOAD_CHARS)
+        )
+        if not fragments:
+            raise InvariantViolation("frozen action preview must be non-blank")
+        total = len(fragments)
+        try:
+            for number, fragment in enumerate(fragments, start=1):
+                reply = OutboundReply(
+                    reply_id=self.ids.new_id("proposal-fragment"),
+                    request_id=action.request_id,
+                    session_id=self.config.session_id,
+                    recipient_id=message.chat_id,
+                    body=(
+                        f"Proposal {action.action_id} digest {action.digest} "
+                        f"part {number}/{total} request_id={action.request_id}\n{fragment}"
+                    ),
+                )
+                if len(reply.body) > _MAX_OUTBOUND_MESSAGE_CHARS:
+                    raise InvariantViolation(
+                        "proposal envelope exceeded outbound bound"
+                    )
+                self.outbound.preflight(reply)
+                delivery = self.outbound.send(reply)
+                outbound_id = getattr(delivery, "outbound_id", None)
+                if getattr(delivery, "accepted", None) is not True or not isinstance(
+                    outbound_id, str
+                ):
+                    raise OutboundConnectorError(
+                        "proposal fragment gateway outcome was unknown",
+                        may_have_sent=True,
+                    )
+                self._record_proposal_fragment(
+                    action.action_id, number, total, outbound_id
+                )
+
+            prompt = OutboundReply(
+                reply_id=self.ids.new_id("proposal-prompt"),
+                request_id=action.request_id,
+                session_id=self.config.session_id,
+                recipient_id=message.chat_id,
+                body=(
+                    f"Proposal {action.action_id} digest {action.digest} "
+                    "All proposal fragments were presented. "
+                    "1 Allow this time | 4 Reject "
+                    f"request_id={action.request_id}"
+                ),
+            )
+            if len(prompt.body) > _MAX_OUTBOUND_MESSAGE_CHARS:
+                raise InvariantViolation("proposal prompt exceeded outbound bound")
+            self.outbound.preflight(prompt)
+            delivery = self.outbound.send(prompt)
+            if getattr(delivery, "accepted", None) is not True:
+                raise OutboundConnectorError(
+                    "proposal prompt gateway outcome was unknown", may_have_sent=True
+                )
+            self._mark_proposal_presented(action.action_id)
+        except (
+            InvariantViolation,
+            OutboundConnectorError,
+            SessionStoreError,
+            ValueError,
+        ):
+            self._invalidate_presenting_action(action.action_id)
+            raise
+
+    def _record_proposal_fragment(
+        self, action_id: str, number: int, total: int, outbound_id: str
+    ) -> None:
+        current = self._current_working_session()
+        transition = record_proposal_fragment(
+            current,
+            action_id=action_id,
+            number=number,
+            total=total,
+            outbound_id=outbound_id,
+            now=self.clock,
+        )
+        self.working_sessions.compare_and_set(current, transition.state)
+
+    def _mark_proposal_presented(self, action_id: str) -> None:
+        current = self._current_working_session()
+        transition = mark_proposal_presented(
+            current, action_id=action_id, now=self.clock
+        )
+        self.working_sessions.compare_and_set(current, transition.state)
+
+    def _invalidate_presenting_action(self, action_id: str) -> None:
+        """An uncertain fragment result is terminal: never retry or keep payload."""
+
+        for _ in range(3):
+            current = self._current_working_session()
+            action = current.pending_action
+            if action is None or action.action_id != action_id:
+                return
+            transition = cancel_active_request(
+                current, now=self.clock, reason="proposal_presentation_failed"
+            )
+            try:
+                self.working_sessions.compare_and_set(current, transition.state)
+                return
+            except SessionStoreError:
+                continue
 
     def _consume_pending_approval(
         self,
