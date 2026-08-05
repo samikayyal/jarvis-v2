@@ -14,10 +14,12 @@ from jarvis_control_plane import (
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
     FixedClock,
+    FixedModelAvailabilityProvider,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
+    ModelAvailability,
     SignedInboundEvent,
     SignedMessageReceiver,
 )
@@ -99,6 +101,7 @@ def make_receiver_components(
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -655,7 +658,7 @@ def test_signed_receiver_routes_status_and_new_through_working_session() -> None
         replaced = receiver.receive(
             make_signed_event("/new", event_id="event-new", message_id="m-new")
         )
-        assert replaced.disposition == "new_session"
+        assert replaced.disposition == "new_session", replaced.reason
         assert broker.current_working_session_id != original_session_id
         assert orchestration.calls == []
         assert len(outbound.sent) == 2

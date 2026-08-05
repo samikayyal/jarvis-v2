@@ -16,10 +16,12 @@ from jarvis_control_plane import (
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
     FixedClock,
+    FixedModelAvailabilityProvider,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
+    ModelAvailability,
     OutboundConnectorError,
     SignedInboundEvent,
     SignedMessageReceiver,
@@ -306,6 +308,7 @@ def test_audit_append_failure_prevents_plain_outbound_dispatch() -> None:
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -347,6 +350,7 @@ def test_outbound_audit_admission_failure_at_terminal_slot_prevents_dispatch() -
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -389,6 +393,7 @@ def test_post_dispatch_audit_observation_failure_is_reconcilable_unknown() -> No
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -445,6 +450,7 @@ def test_ambiguous_outbound_failure_never_records_successful_completion() -> Non
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -507,6 +513,7 @@ def test_audit_failure_at_ingress_preserves_the_replay_key() -> None:
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -549,6 +556,7 @@ def test_request_audit_failure_rolls_back_request_and_preserves_replay_claim() -
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,

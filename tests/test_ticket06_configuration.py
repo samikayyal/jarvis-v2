@@ -8,13 +8,29 @@ from datetime import UTC, datetime
 
 import pytest
 
+from jarvis_control_plane import (
+    ControlledOrchestrationAdapter,
+    ControlledOutboundConnector,
+    ControlPlaneConfig,
+    DeterministicCapabilityBroker,
+    DeterministicIdGenerator,
+    DiagnosticTraceRecorder,
+    FixedClock,
+    FixedModelAvailabilityProvider,
+    InboundMessage,
+    InMemoryAuditBoundary,
+    InMemoryDiagnosticTraceStore,
+    InMemoryDurableStateStore,
+    ModelAvailability,
+    SignedInboundEvent,
+    SignedMessageReceiver,
+)
 from jarvis_control_plane.control_grammar import (
     ControlTransitionKind,
     handle_message,
     parse_control,
 )
 from jarvis_control_plane.sessions import (
-    ModelAvailability,
     SessionConfig,
     SessionStoreError,
     SQLiteWorkingSessionStore,
@@ -22,6 +38,86 @@ from jarvis_control_plane.sessions import (
 )
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
+SECRET = b"ticket06-test-secret"
+OPERATOR = "operator.test"
+TRANSPORT_SESSION = "session.test"
+
+
+def make_receiver_components(
+    *,
+    availability: ModelAvailability | None = None,
+    orchestration: ControlledOrchestrationAdapter | None = None,
+):
+    config = ControlPlaneConfig(
+        operator_id=OPERATOR,
+        session_id=TRANSPORT_SESSION,
+        signing_secret=SECRET,
+    )
+    clock = FixedClock(NOW)
+    ids = DeterministicIdGenerator("ticket06-receiver")
+    state = InMemoryDurableStateStore()
+    audit = InMemoryAuditBoundary()
+    provider = FixedModelAvailabilityProvider(availability or ModelAvailability())
+    orchestration = orchestration or ControlledOrchestrationAdapter()
+    outbound = ControlledOutboundConnector(
+        operator_id=OPERATOR,
+        session_id=TRANSPORT_SESSION,
+        audit=audit,
+        clock=clock,
+        ids=ids,
+    )
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
+    broker = DeterministicCapabilityBroker(
+        config=config,
+        state=state,
+        audit=audit,
+        orchestration=orchestration,
+        outbound=outbound,
+        clock=clock,
+        ids=ids,
+        trace=trace,
+        model_availability_provider=provider,
+    )
+    receiver = SignedMessageReceiver(
+        config=config,
+        state=state,
+        audit=audit,
+        broker=broker,
+        clock=clock,
+        ids=ids,
+    )
+    return (
+        state,
+        audit,
+        clock,
+        provider,
+        orchestration,
+        outbound,
+        broker,
+        receiver,
+        trace_store,
+    )
+
+
+def make_signed_event(
+    text: str, *, event_id: str, message_id: str
+) -> SignedInboundEvent:
+    return SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id=TRANSPORT_SESSION,
+            event_id=event_id,
+            message_id=message_id,
+            sender_id=OPERATOR,
+            chat_id=OPERATOR,
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text=text,
+        ),
+        SECRET,
+    )
 
 
 def make_session():
@@ -228,3 +324,124 @@ def test_ticket05_persisted_session_uses_its_duration_as_legacy_default(
     assert restored.default_session_minutes == session.session_minutes
     assert apply(restored, "/new").state.session_minutes == session.session_minutes
     store.close()
+
+
+def test_broker_freezes_selected_configuration_for_orchestration_and_audit() -> None:
+    state, audit, _, _, orchestration, _, _, receiver, trace_store = (
+        make_receiver_components()
+    )
+    try:
+        assert (
+            receiver.receive(
+                make_signed_event(
+                    "/model gpt-5.6-sol", event_id="event-model", message_id="m-model"
+                )
+            ).disposition
+            == "session_model_updated"
+        )
+        assert (
+            receiver.receive(
+                make_signed_event(
+                    "/reasoning high",
+                    event_id="event-reasoning",
+                    message_id="m-reasoning",
+                )
+            ).disposition
+            == "session_reasoning_updated"
+        )
+
+        result = receiver.receive(
+            make_signed_event(
+                "inspect state", event_id="event-request", message_id="m-request"
+            )
+        )
+
+        assert result.disposition == "completed"
+        request = orchestration.calls[0]
+        assert request.model == "gpt-5.6-sol"
+        assert request.reasoning == "high"
+        stored = state.get_request(request.state.request_id)
+        assert stored is not None
+        assert (stored.model, stored.reasoning) == ("gpt-5.6-sol", "high")
+        accepted = next(
+            record for record in audit.records if record.kind == "request_accepted"
+        )
+        assert accepted.details == {
+            "phase": "orchestration",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high",
+        }
+    finally:
+        trace_store._close_writer_service()
+
+
+def test_broker_rechecks_exact_configuration_before_dispatch_without_fallback() -> None:
+    def revoke_selected_model(_: object) -> str:
+        provider.availability = ModelAvailability(
+            available_models=("gpt-5.6-terra",),
+            available_reasoning_levels=("medium",),
+        )
+        return "This reply must not be sent."
+
+    orchestration = ControlledOrchestrationAdapter(
+        response_factory=revoke_selected_model
+    )
+    _, _, _, provider, orchestration, outbound, _, receiver, trace_store = (
+        make_receiver_components(orchestration=orchestration)
+    )
+    try:
+        assert (
+            receiver.receive(
+                make_signed_event(
+                    "/model gpt-5.6-sol", event_id="event-model", message_id="m-model"
+                )
+            ).disposition
+            == "session_model_updated"
+        )
+
+        result = receiver.receive(
+            make_signed_event(
+                "inspect state", event_id="event-request", message_id="m-request"
+            )
+        )
+
+        assert result.disposition == "model_availability_unavailable"
+        assert orchestration.calls[0].model == "gpt-5.6-sol"
+        assert (
+            len(outbound.sent) == 1
+        )  # Only the /model acknowledgement was dispatched.
+    finally:
+        trace_store._close_writer_service()
+
+
+def test_broker_expires_idle_session_before_assigning_next_conversation() -> None:
+    state, audit, clock, _, orchestration, _, broker, receiver, trace_store = (
+        make_receiver_components()
+    )
+    try:
+        original_session_id = broker.current_working_session_id
+        assert (
+            receiver.receive(
+                make_signed_event(
+                    "/model gpt-5.6-sol", event_id="event-model", message_id="m-model"
+                )
+            ).disposition
+            == "session_model_updated"
+        )
+        clock.advance(minutes=60)
+
+        result = receiver.receive(
+            make_signed_event(
+                "fresh request", event_id="event-fresh", message_id="m-fresh"
+            )
+        )
+
+        assert result.disposition == "completed"
+        assert broker.current_working_session_id != original_session_id
+        assert orchestration.calls[0].model == "gpt-5.6-terra"
+        assert state.list_conversation_messages()[-1].working_session_id == (
+            broker.current_working_session_id
+        )
+        assert "working_session_expired" in [record.kind for record in audit.records]
+    finally:
+        trace_store._close_writer_service()

@@ -259,6 +259,8 @@ class RequestState:
     updated_at: datetime
     status: str
     phase: str
+    model: str = "gpt-5.6-terra"
+    reasoning: str = "medium"
     reply_id: str | None = None
     outcome: str | None = None
     error_code: str | None = None
@@ -275,6 +277,8 @@ class RequestState:
             "phase",
         ):
             _non_empty_identifier(getattr(self, name), name)
+        _non_empty_identifier(self.model, "model")
+        _non_empty_identifier(self.reasoning, "reasoning")
         object.__setattr__(self, "created_at", ensure_utc(self.created_at))
         object.__setattr__(self, "updated_at", ensure_utc(self.updated_at))
 
@@ -295,6 +299,18 @@ class OrchestrationRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("orchestration text must be non-blank")
+
+    @property
+    def model(self) -> str:
+        """The immutable model snapshot that the adapter must execute."""
+
+        return self.state.model
+
+    @property
+    def reasoning(self) -> str:
+        """The immutable reasoning snapshot that the adapter must execute."""
+
+        return self.state.reasoning
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +419,7 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "kind",
         "limit",
         "message",
+        "model",
         "mode",
         "operation",
         "path",
@@ -411,6 +428,7 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "policy",
         "query",
         "reason",
+        "reasoning",
         "result",
         "scope",
         "service",
@@ -525,6 +543,8 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     "inbound_rejected": {"reason": _ADMISSION_REJECTION_REASONS},
     "orchestration_result": {
         "adapter": frozenset({"controlled"}),
+        "model": frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}),
+        "reasoning": frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
         "result": frozenset({"failed"}),
         "state": frozenset({"unavailable"}),
     },
@@ -540,7 +560,11 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
         "channel": frozenset({"controlled_outbound"}),
         "result": _OUTBOUND_RESULTS,
     },
-    "request_accepted": {"phase": frozenset({"orchestration"})},
+    "request_accepted": {
+        "phase": frozenset({"orchestration"}),
+        "model": frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}),
+        "reasoning": frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+    },
     "request_lifecycle": {
         "phase": _LIFECYCLE_PHASES,
         "status": _LIFECYCLE_STATUSES,

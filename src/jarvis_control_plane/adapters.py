@@ -39,6 +39,7 @@ from .ports import (
     OutboundConnectorError,
     StateStoreError,
 )
+from .sessions import ModelAvailability
 
 
 class SystemClock:
@@ -59,6 +60,18 @@ class FixedClock:
 
     def advance(self, *, seconds: float = 0, minutes: float = 0) -> None:
         self.current = self.current + timedelta(seconds=seconds, minutes=minutes)
+
+
+class FixedModelAvailabilityProvider:
+    """Explicit controlled availability source for tests and local simulations."""
+
+    def __init__(self, availability: ModelAvailability) -> None:
+        if not isinstance(availability, ModelAvailability):
+            raise TypeError("availability must be a ModelAvailability")
+        self.availability = availability
+
+    def current(self) -> ModelAvailability:
+        return self.availability
 
 
 class UuidIdGenerator:
@@ -316,6 +329,8 @@ class SQLiteDurableStateStore:
                     updated_at TEXT NOT NULL,
                     status TEXT NOT NULL,
                     phase TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT 'gpt-5.6-terra',
+                    reasoning TEXT NOT NULL DEFAULT 'medium',
                     reply_id TEXT,
                     outcome TEXT,
                     error_code TEXT
@@ -334,6 +349,24 @@ class SQLiteDurableStateStore:
                 );
                 """
             )
+            self.connection.commit()
+
+            request_columns = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(request_state)"
+                ).fetchall()
+            }
+            if "model" not in request_columns:
+                self.connection.execute(
+                    "ALTER TABLE request_state "
+                    "ADD COLUMN model TEXT NOT NULL DEFAULT 'gpt-5.6-terra'"
+                )
+            if "reasoning" not in request_columns:
+                self.connection.execute(
+                    "ALTER TABLE request_state "
+                    "ADD COLUMN reasoning TEXT NOT NULL DEFAULT 'medium'"
+                )
             self.connection.commit()
             columns = {
                 row["name"]
@@ -667,8 +700,8 @@ class SQLiteDurableStateStore:
                 INSERT INTO request_state(
                     request_id, event_id, message_id, operator_id, session_id,
                     chat_id, created_at, updated_at, status, phase,
-                    reply_id, outcome, error_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model, reasoning, reply_id, outcome, error_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _request_values(request),
             )
@@ -683,7 +716,7 @@ class SQLiteDurableStateStore:
                 UPDATE request_state SET
                     event_id = ?, message_id = ?, operator_id = ?, session_id = ?,
                     chat_id = ?, created_at = ?, updated_at = ?, status = ?,
-                    phase = ?, reply_id = ?, outcome = ?, error_code = ?
+                    phase = ?, model = ?, reasoning = ?, reply_id = ?, outcome = ?, error_code = ?
                 WHERE request_id = ?
                 """,
                 (
@@ -696,6 +729,8 @@ class SQLiteDurableStateStore:
                     ensure_utc(request.updated_at).isoformat(),
                     request.status,
                     request.phase,
+                    request.model,
+                    request.reasoning,
                     request.reply_id,
                     request.outcome,
                     request.error_code,
@@ -806,6 +841,8 @@ def _request_values(request: RequestState) -> tuple[object, ...]:
         ensure_utc(request.updated_at).isoformat(),
         request.status,
         request.phase,
+        request.model,
+        request.reasoning,
         request.reply_id,
         request.outcome,
         request.error_code,
@@ -824,6 +861,8 @@ def _request_from_row(row: sqlite3.Row) -> RequestState:
         updated_at=datetime.fromisoformat(row["updated_at"]),
         status=row["status"],
         phase=row["phase"],
+        model=row["model"],
+        reasoning=row["reasoning"],
         reply_id=row["reply_id"],
         outcome=row["outcome"],
         error_code=row["error_code"],

@@ -5,6 +5,7 @@ from .adapters import (
     ControlledOutboundConnector,
     DeterministicIdGenerator,
     FixedClock,
+    FixedModelAvailabilityProvider,
     InMemoryAuditBoundary,
     InMemoryDurableStateStore,
     SQLiteAuditBoundary,
@@ -43,6 +44,7 @@ from .ports import (
     TraceCapacityError,
     TraceWriteError,
 )
+from .sessions import ModelAvailability
 from .traces import (
     DEFAULT_TRACE_RESERVATION_BYTES,
     MAX_TRACE_RESERVATION_BYTES,
@@ -73,12 +75,14 @@ __all__ = [
     "DiagnosticTraceLimits",
     "DiagnosticTraceRecorder",
     "FixedClock",
+    "FixedModelAvailabilityProvider",
     "InMemoryAuditBoundary",
     "InMemoryDiagnosticTraceStore",
     "InMemoryDurableStateStore",
     "InboundMessage",
     "IngressAdmissionResult",
     "IngressClaim",
+    "ModelAvailability",
     "OrchestrationAdapterError",
     "OrchestrationRequest",
     "OrchestrationResult",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from threading import RLock
 
 from .control_grammar import ControlTransition, ControlTransitionKind, handle_message
@@ -24,6 +24,7 @@ from .ports import (
     DiagnosticTraceError,
     DurableStateStore,
     IdGenerator,
+    ModelAvailabilityProvider,
     OrchestrationAdapter,
     OrchestrationAdapterError,
     OutboundConnector,
@@ -45,6 +46,7 @@ from .sessions import (
     WorkingSessionStore,
     apply_request_result,
     cancellation_token_is_current,
+    expire_inactive_session,
 )
 from .traces import DiagnosticTraceRecorder
 
@@ -64,7 +66,6 @@ class ControlPlaneConfig:
     signing_secret: bytes
     max_text_length: int = 4096
     working_session_id: str | None = None
-    model_availability: ModelAvailability = field(default_factory=ModelAvailability)
 
     def __post_init__(self) -> None:
         require_non_empty(self.operator_id, "operator_id")
@@ -75,8 +76,6 @@ class ControlPlaneConfig:
             raise ValueError("signing_secret must be non-empty bytes")
         if self.max_text_length != 4096:
             raise ValueError("max_text_length is fixed at 4096 characters in V1")
-        if not isinstance(self.model_availability, ModelAvailability):
-            raise TypeError("model_availability must be a ModelAvailability")
 
 
 class DeterministicCapabilityBroker:
@@ -93,6 +92,7 @@ class DeterministicCapabilityBroker:
         clock: Clock,
         ids: IdGenerator,
         trace: DiagnosticTraceRecorder,
+        model_availability_provider: ModelAvailabilityProvider,
         working_sessions: WorkingSessionStore | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
@@ -106,6 +106,7 @@ class DeterministicCapabilityBroker:
         self.outbound = outbound
         self.clock = clock
         self.ids = ids
+        self.model_availability_provider = model_availability_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
         if self.working_sessions.load() is None:
             self.working_sessions.create(
@@ -123,11 +124,20 @@ class DeterministicCapabilityBroker:
         # Never retain a readable diagnostic store on the broker graph.
         self._trace = trace
         self._dispatch_lock = RLock()
+        self._session_lifecycle_lock = RLock()
 
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive the typed path."""
 
-        session = self._current_working_session()
+        session = self._reconcile_inactivity()
+        try:
+            model_availability = self._model_availability()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return ReceiveResult(
+                status_code=503,
+                disposition="model_availability_unavailable",
+                reason=f"runtime model availability was unavailable: {exc}",
+            )
         request_id = self.ids.new_id("request")
         session_transition = handle_message(
             session,
@@ -136,7 +146,7 @@ class DeterministicCapabilityBroker:
             request_id=request_id,
             originating_message_id=message.message_id,
             phase="processing",
-            model_availability=self.config.model_availability,
+            model_availability=model_availability,
         )
         if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
             return self._handle_session_control(message, session, session_transition)
@@ -152,6 +162,8 @@ class DeterministicCapabilityBroker:
             updated_at=self.clock.now(),
             status="accepted",
             phase="orchestration",
+            model=session.model,
+            reasoning=session.reasoning,
         )
         try:
             self.state.save_request(request)
@@ -164,7 +176,11 @@ class DeterministicCapabilityBroker:
                 actor="configured_operator",
                 operation_type="request_lifecycle",
                 target_category="control_plane",
-                details={"phase": "orchestration"},
+                details={
+                    "phase": "orchestration",
+                    "model": request.model,
+                    "reasoning": request.reasoning,
+                },
             )
         except (StateStoreError, AuditWriteError) as admission_error:
             try:
@@ -235,8 +251,14 @@ class DeterministicCapabilityBroker:
                 arguments={
                     "adapter": type(self.orchestration).__name__,
                     "operation": "run",
+                    "model": request.model,
+                    "reasoning": request.reasoning,
                 },
-                telemetry={"phase": "orchestration"},
+                telemetry={
+                    "phase": "orchestration",
+                    "model": request.model,
+                    "reasoning": request.reasoning,
+                },
                 operation=lambda: self.orchestration.run(orchestration_request),
                 result_limit_bytes=self.config.max_text_length * 8 + 4_096,
                 error_limit_bytes=8_192,
@@ -254,7 +276,11 @@ class DeterministicCapabilityBroker:
                 actor="controlled_orchestration",
                 operation_type="orchestration",
                 target_category="control_plane",
-                details={"adapter": result.adapter},
+                details={
+                    "adapter": result.adapter,
+                    "model": request.model,
+                    "reasoning": request.reasoning,
+                },
             )
         except (
             DiagnosticTraceError,
@@ -337,6 +363,26 @@ class DeterministicCapabilityBroker:
             self._current_working_session(), cancellation_token
         ):
             return self._late_result_result(request, message=message)
+
+        if not self._selected_configuration_is_available(request):
+            self._finish_session_request(
+                cancellation_token,
+                outcome="model_availability_unavailable",
+                message=message,
+            )
+            failed = self._transition(
+                request,
+                status="failed",
+                phase="orchestration",
+                outcome="orchestration_failed",
+                error_code="model_availability_unavailable",
+            )
+            return ReceiveResult(
+                status_code=202,
+                disposition="model_availability_unavailable",
+                request=failed,
+                reason="selected model or reasoning became unavailable before dispatch",
+            )
 
         reply = OutboundReply(
             reply_id=self.ids.new_id("reply"),
@@ -711,13 +757,57 @@ class DeterministicCapabilityBroker:
     def current_working_session_id(self) -> str:
         """Expose only the current conversation boundary to ingress admission."""
 
-        return self._current_working_session().session_id
+        return self._reconcile_inactivity().session_id
 
     def _current_working_session(self) -> WorkingSession:
         session = self.working_sessions.load()
         if session is None:
             raise SessionStoreError("working session is unavailable")
         return session
+
+    def _reconcile_inactivity(self) -> WorkingSession:
+        """Advance an idle working session before it receives another message."""
+
+        with self._session_lifecycle_lock:
+            for _ in range(3):
+                session = self._current_working_session()
+                transition = expire_inactive_session(session, now=self.clock)
+                if transition.kind is not TransitionKind.SESSION_EXPIRED:
+                    return session
+                self._append_audit(
+                    kind="working_session_expired",
+                    event_id=None,
+                    request_id=None,
+                    outcome="expired",
+                    actor="control_plane",
+                    operation_type="working_session_lifecycle",
+                    target_category="working_session",
+                    details={},
+                )
+                try:
+                    self.working_sessions.compare_and_set(session, transition.state)
+                    return transition.state
+                except SessionStoreError:
+                    continue
+        raise SessionStoreError("working-session inactivity reconciliation raced")
+
+    def _model_availability(self) -> ModelAvailability:
+        try:
+            availability = self.model_availability_provider.current()
+        except Exception as exc:
+            raise RuntimeError("availability provider check failed") from exc
+        if not isinstance(availability, ModelAvailability):
+            raise TypeError("model availability provider returned an invalid value")
+        return availability
+
+    def _selected_configuration_is_available(self, request: RequestState) -> bool:
+        try:
+            return self._model_availability().supports(
+                model=request.model,
+                reasoning=request.reasoning,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
 
     def _handle_session_control(
         self,
@@ -729,11 +819,19 @@ class DeterministicCapabilityBroker:
         with guard:
             if transition.parsed.is_command:
                 expected = self._current_working_session()
+                try:
+                    model_availability = self._model_availability()
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    return ReceiveResult(
+                        status_code=503,
+                        disposition="model_availability_unavailable",
+                        reason=f"runtime model availability was unavailable: {exc}",
+                    )
                 transition = handle_message(
                     expected,
                     message.text,
                     now=self.clock,
-                    model_availability=self.config.model_availability,
+                    model_availability=model_availability,
                 )
             return self._apply_session_control(message, expected, transition)
 

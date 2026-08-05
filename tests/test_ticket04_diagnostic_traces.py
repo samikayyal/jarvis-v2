@@ -23,10 +23,12 @@ from jarvis_control_plane import (
     DiagnosticTraceLimits,
     DiagnosticTraceRecorder,
     FixedClock,
+    FixedModelAvailabilityProvider,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
+    ModelAvailability,
     SignedInboundEvent,
     SignedMessageReceiver,
     SQLiteDiagnosticTraceStore,
@@ -225,6 +227,7 @@ def make_components(
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
@@ -519,6 +522,9 @@ def test_broker_never_retains_a_readable_trace_store() -> None:
             outbound=outbound,
             clock=FixedClock(NOW),
             ids=DeterministicIdGenerator("missing-trace"),
+            model_availability_provider=FixedModelAvailabilityProvider(
+                ModelAvailability()
+            ),
         )
 
     assert not hasattr(broker, "_default_trace_store")

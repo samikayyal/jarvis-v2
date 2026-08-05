@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from .sessions import ModelAvailability
     from .trace_types import TraceReservation
     from .traces import DiagnosticTrace
 
@@ -151,6 +152,12 @@ class OrchestrationAdapter(Protocol):
     """Non-authoritative planner boundary."""
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult: ...
+
+
+class ModelAvailabilityProvider(Protocol):
+    """Authoritative provider access/availability check for exact runtime choices."""
+
+    def current(self) -> ModelAvailability: ...
 
 
 class OutboundConnector(Protocol):

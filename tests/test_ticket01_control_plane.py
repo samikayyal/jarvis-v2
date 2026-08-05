@@ -15,10 +15,12 @@ from jarvis_control_plane import (
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
     FixedClock,
+    FixedModelAvailabilityProvider,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
+    ModelAvailability,
     OutboundReply,
     SignedInboundEvent,
     SignedMessageReceiver,
@@ -119,6 +121,7 @@ def make_components(
         clock=clock,
         ids=ids,
         trace=trace,
+        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
     receiver = SignedMessageReceiver(
         config=config,
