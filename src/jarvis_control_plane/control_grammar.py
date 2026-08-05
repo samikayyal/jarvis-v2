@@ -49,6 +49,22 @@ CONTROL_COMMANDS = (
     "/config",
 )
 
+_THIS_TIME_APPROVALS = frozenset(
+    {"yes", "okay", "ok", "allow", "approve", "confirm", "go ahead", "1"}
+)
+_REJECTIONS = frozenset(
+    {
+        "no",
+        "reject",
+        "deny",
+        "cancel",
+        "cancel action",
+        "don't do it",
+        "do not do it",
+        "4",
+    }
+)
+
 
 class ControlCommand(str, Enum):
     STATUS = "status"
@@ -85,6 +101,11 @@ class ControlTransitionKind(str, Enum):
     INVALID_CONFIGURATION = "invalid_configuration"
     MODEL_UNAVAILABLE = "model_unavailable"
     REASONING_UNAVAILABLE = "reasoning_unavailable"
+
+
+class ApprovalChoice(str, Enum):
+    APPROVE = "approve"
+    REJECT = "reject"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +187,17 @@ def normalize_message(message: str) -> str:
 
 
 normalize = normalize_message
+
+
+def parse_approval_choice(message: str) -> ApprovalChoice | None:
+    """Recognize only complete normalized V1 approval or rejection replies."""
+
+    normalized = normalize_message(message)
+    if normalized in _THIS_TIME_APPROVALS:
+        return ApprovalChoice.APPROVE
+    if normalized in _REJECTIONS:
+        return ApprovalChoice.REJECT
+    return None
 
 
 def _known_command(value: str) -> ControlCommand | None:

@@ -6,10 +6,16 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from threading import RLock
 
-from .control_grammar import ControlTransition, ControlTransitionKind, handle_message
+from .control_grammar import (
+    ControlTransition,
+    ControlTransitionKind,
+    handle_message,
+    parse_approval_choice,
+)
 from .models import (
     AuditEvidence,
     ConversationMessage,
+    FrozenActionProposal,
     InboundMessage,
     OrchestrationRequest,
     OrchestrationResult,
@@ -19,6 +25,8 @@ from .models import (
     SignedInboundEvent,
 )
 from .ports import (
+    ActionDispatcher,
+    ActionDispatcherError,
     AuditBoundary,
     AuditWriteError,
     Clock,
@@ -38,7 +46,9 @@ from .ports import (
 from .sessions import (
     CancellationToken,
     InMemoryWorkingSessionStore,
+    InvariantViolation,
     ModelAvailability,
+    PendingActionState,
     RequestResult,
     SessionConfig,
     SessionStoreError,
@@ -46,8 +56,13 @@ from .sessions import (
     WorkingSession,
     WorkingSessionStore,
     apply_request_result,
+    approve_pending_action,
     cancellation_token_is_current,
     expire_inactive_session,
+    expire_pending_action,
+    install_pending_action,
+    interrupt_for_restart,
+    reject_pending_action,
 )
 from .traces import DiagnosticTraceRecorder
 
@@ -56,6 +71,13 @@ _MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
 
 class _CancelledBeforeDispatch(OutboundConnectorError):
     """The request lost ownership before its outbound operation started."""
+
+
+class _UnavailableActionDispatcher:
+    """Fail closed until a later ticket supplies a concrete capability edge."""
+
+    def dispatch(self, action: FrozenActionProposal) -> None:
+        raise ActionDispatcherError("no action dispatcher is configured")
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +125,7 @@ class DeterministicCapabilityBroker:
         trace: DiagnosticTraceRecorder,
         model_availability_provider: ModelAvailabilityProvider,
         working_sessions: WorkingSessionStore | None = None,
+        action_dispatcher: ActionDispatcher | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError(
@@ -117,6 +140,7 @@ class DeterministicCapabilityBroker:
         self.ids = ids
         self.model_availability_provider = model_availability_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
+        self.action_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
         if self.working_sessions.load() is None:
             self.working_sessions.create(
                 WorkingSession.initial(
@@ -129,6 +153,8 @@ class DeterministicCapabilityBroker:
                     config=SessionConfig(operator_id=config.operator_id),
                 )
             )
+        else:
+            self._invalidate_restart_work()
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
         self._trace = trace
@@ -139,6 +165,26 @@ class DeterministicCapabilityBroker:
         """Accept one already-admitted message and drive its named lifecycle stages."""
 
         session = self._reconcile_inactivity()
+        if session.pending_action is not None and session.pending_action.is_expired(
+            self.clock
+        ):
+            return self._expire_pending_action(message, session)
+        if session.pending_action is not None:
+            choice = parse_approval_choice(message.text)
+            if choice is not None:
+                # `/cancel` takes this same lock. Once approval has consumed a
+                # proposal, cancellation cannot slip between that durable
+                # consumption and the one permitted dispatch attempt.
+                with self._dispatch_lock:
+                    current = self._current_working_session()
+                    if current.pending_action is None:
+                        return ReceiveResult(
+                            status_code=202,
+                            disposition="pending_unavailable",
+                        )
+                    if current.pending_action.is_expired(self.clock):
+                        return self._expire_pending_action(message, current)
+                    return self._consume_pending_approval(message, current, choice)
         try:
             model_availability = self._model_availability()
         except (TypeError, ValueError, RuntimeError) as exc:
@@ -191,12 +237,231 @@ class DeterministicCapabilityBroker:
                 cancellation_token=cancellation_token,
             )
 
+        if result.proposal is not None:
+            try:
+                self.freeze_action(result.proposal)
+            except (
+                AuditWriteError,
+                InvariantViolation,
+                SessionStoreError,
+                ValueError,
+            ) as exc:
+                return self._finish_proposal_failure(
+                    message=message,
+                    request=request,
+                    token=cancellation_token,
+                    error=exc,
+                )
+            return ReceiveResult(
+                status_code=202,
+                disposition="pending_action",
+                request=request,
+                reason="exact action proposal is frozen pending operator approval",
+            )
+
         return self._complete_outbound_reply(
             message=message,
             request=request,
             cancellation_token=cancellation_token,
             result=result,
         )
+
+    @property
+    def current_pending_action(self) -> PendingActionState | None:
+        """Expose the current frozen action without exposing its payload in status."""
+
+        return self._current_working_session().pending_action
+
+    def freeze_action(self, proposal: FrozenActionProposal) -> PendingActionState:
+        """Persist one proposal whose exact payload can later be dispatched once."""
+
+        for _ in range(3):
+            session = self._current_working_session()
+            request = session.active_request
+            if request is None or request.request_id != proposal.request_id:
+                raise InvariantViolation("proposal does not belong to the live request")
+            action = PendingActionState.from_proposal(
+                proposal, session_id=session.session_id, created_at=self.clock
+            )
+            transition = install_pending_action(session, action, now=self.clock)
+            self._append_audit(
+                kind="pending_action",
+                event_id=None,
+                request_id=proposal.request_id,
+                outcome="pending",
+                actor="control_plane",
+                operation_type="approval_gated_action",
+                target_category="pending_action",
+                details={"action": action.action_id, "state": "frozen"},
+            )
+            try:
+                self.working_sessions.compare_and_set(session, transition.state)
+                return action
+            except SessionStoreError:
+                continue
+        raise SessionStoreError("pending action could not be frozen atomically")
+
+    def _consume_pending_approval(
+        self,
+        message: InboundMessage,
+        session: WorkingSession,
+        choice: object,
+    ) -> ReceiveResult:
+        """Persist approval consumption before the one permitted dispatch attempt."""
+
+        action = session.pending_action
+        request = session.active_request
+        if action is None or request is None:
+            return ReceiveResult(status_code=202, disposition="pending_unavailable")
+        if getattr(choice, "value", choice) == "reject":
+            transition = reject_pending_action(session, now=self.clock)
+            try:
+                self._append_audit(
+                    kind="pending_action",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome="rejected",
+                    actor="control_plane",
+                    operation_type="approval_gated_action",
+                    target_category="pending_action",
+                    approval_decision="rejected",
+                    details={"action": action.action_id, "state": "rejected"},
+                )
+                self.working_sessions.compare_and_set(session, transition.state)
+            except (AuditWriteError, SessionStoreError) as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"pending action rejection was not recorded: {exc}",
+                )
+            return ReceiveResult(status_code=202, disposition="action_rejected")
+
+        transition = approve_pending_action(session, now=self.clock)
+        try:
+            self._append_audit(
+                kind="pending_action",
+                event_id=message.event_id,
+                request_id=action.request_id,
+                message_id=message.message_id,
+                outcome="approved",
+                actor="control_plane",
+                operation_type="approval_gated_action",
+                target_category="pending_action",
+                approval_decision="approved",
+                details={"action": action.action_id, "state": "approved"},
+            )
+            self.working_sessions.compare_and_set(session, transition.state)
+        except (AuditWriteError, SessionStoreError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"pending action approval was not recorded: {exc}",
+            )
+
+        try:
+            self.action_dispatcher.dispatch(
+                FrozenActionProposal(
+                    action_id=action.action_id,
+                    request_id=action.request_id,
+                    kind=action.kind,
+                    preview=action.preview or action.summary,
+                    payload=action.payload,
+                    digest=action.digest,
+                )
+            )
+        except ActionDispatcherError as exc:
+            self._finish_frozen_action(action, outcome="action_dispatch_failed")
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_dispatch_failed",
+                reason=str(exc),
+            )
+        self._finish_frozen_action(action, outcome="action_dispatched")
+        return ReceiveResult(status_code=202, disposition="action_dispatched")
+
+    def _finish_frozen_action(
+        self, action: PendingActionState, *, outcome: str
+    ) -> None:
+        current = self._current_working_session()
+        request = current.active_request
+        if request is None or request.request_id != action.request_id:
+            return
+        transition = apply_request_result(
+            current,
+            CancellationToken(
+                session_id=current.session_id,
+                request_id=action.request_id,
+                generation=request.generation,
+            ),
+            RequestResult(action.request_id, request.generation, outcome),
+            now=self.clock,
+        )
+        if transition.kind is TransitionKind.RESULT_APPLIED:
+            try:
+                self.working_sessions.compare_and_set(current, transition.state)
+            except SessionStoreError:
+                pass
+
+    def _expire_pending_action(
+        self, message: InboundMessage, session: WorkingSession
+    ) -> ReceiveResult:
+        transition = expire_pending_action(session, now=self.clock)
+        try:
+            self._append_audit(
+                kind="pending_action",
+                event_id=message.event_id,
+                request_id=(
+                    session.active_request.request_id
+                    if session.active_request is not None
+                    else None
+                ),
+                message_id=message.message_id,
+                outcome="expired",
+                actor="control_plane",
+                operation_type="approval_gated_action",
+                target_category="pending_action",
+                details={"state": "expired"},
+            )
+            self.working_sessions.compare_and_set(session, transition.state)
+        except (AuditWriteError, SessionStoreError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"pending expiry was not recorded: {exc}",
+            )
+        return ReceiveResult(status_code=202, disposition="pending_expired")
+
+    def _finish_proposal_failure(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        token: CancellationToken,
+        error: Exception,
+    ) -> ReceiveResult:
+        self._finish_session_request(token, outcome="proposal_failed", message=message)
+        return ReceiveResult(
+            status_code=202,
+            disposition="failed",
+            request=request,
+            reason=f"action proposal could not be frozen: {error}",
+        )
+
+    def _invalidate_restart_work(self) -> None:
+        """A recreated broker must never make a stale proposal executable."""
+
+        for _ in range(3):
+            session = self._current_working_session()
+            transition = interrupt_for_restart(session, now=self.clock)
+            if transition.kind is TransitionKind.NOOP:
+                return
+            try:
+                self.working_sessions.compare_and_set(session, transition.state)
+                return
+            except SessionStoreError:
+                continue
+        raise SessionStoreError("could not invalidate work during restart")
 
     def _admit_request(
         self,

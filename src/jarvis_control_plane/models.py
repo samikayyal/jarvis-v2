@@ -313,6 +313,86 @@ class OrchestrationRequest:
         return self.state.reasoning
 
 
+def _canonical_action_payload(payload: object) -> str:
+    """Make a proposal payload immutable before it crosses a trust boundary."""
+
+    if isinstance(payload, str):
+        if not payload:
+            raise ValueError("action payload must be non-blank")
+        return payload
+    try:
+        frozen = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("action payload must be JSON-serializable") from exc
+    if not frozen or frozen == "null":
+        raise ValueError("action payload must be non-blank")
+    return frozen
+
+
+def _action_digest(
+    *, action_id: str, request_id: str, kind: str, preview: str, payload: str
+) -> str:
+    material = f"{action_id}\x1f{request_id}\x1f{kind}\x1f{preview}\x1f{payload}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenActionProposal:
+    """An immutable, non-authoritative proposal awaiting broker approval."""
+
+    action_id: str
+    request_id: str
+    kind: str
+    preview: str
+    payload: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        for name in ("action_id", "request_id", "kind", "preview", "payload"):
+            _non_empty_identifier(getattr(self, name), name)
+        expected = _action_digest(
+            action_id=self.action_id,
+            request_id=self.request_id,
+            kind=self.kind,
+            preview=self.preview,
+            payload=self.payload,
+        )
+        if self.digest != expected:
+            raise ValueError("action digest does not match the frozen proposal")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        action_id: str,
+        request_id: str,
+        kind: str,
+        preview: str,
+        payload: object,
+    ) -> FrozenActionProposal:
+        frozen_payload = _canonical_action_payload(payload)
+        return cls(
+            action_id=action_id,
+            request_id=request_id,
+            kind=kind,
+            preview=preview,
+            payload=frozen_payload,
+            digest=_action_digest(
+                action_id=action_id,
+                request_id=request_id,
+                kind=kind,
+                preview=preview,
+                payload=frozen_payload,
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class OrchestrationResult:
     """Typed, non-authoritative result returned by orchestration."""
@@ -321,6 +401,7 @@ class OrchestrationResult:
     outcome: str
     reply_text: str
     adapter: str = "controlled"
+    proposal: FrozenActionProposal | None = None
 
     def __post_init__(self) -> None:
         _non_empty_identifier(self.request_id, "request_id")
@@ -328,6 +409,10 @@ class OrchestrationResult:
         if not isinstance(self.reply_text, str) or not self.reply_text.strip():
             raise ValueError("reply_text must be non-blank")
         _non_empty_identifier(self.adapter, "adapter")
+        if self.proposal is not None and self.proposal.request_id != self.request_id:
+            raise ValueError(
+                "action proposal request_id must match orchestration result"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,6 +658,19 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
         "phase": _LIFECYCLE_PHASES,
         "status": _LIFECYCLE_STATUSES,
     },
+    "pending_action": {
+        "action": None,
+        "state": frozenset(
+            {
+                "frozen",
+                "approved",
+                "rejected",
+                "expired",
+                "dispatched",
+                "dispatch_failed",
+            }
+        ),
+    },
 }
 _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str]]] = {
     "inbound_admitted": (
@@ -661,6 +759,22 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
             }
         ),
         _LIFECYCLE_STATUSES,
+    ),
+    "pending_action": (
+        "approval_gated_action",
+        "pending_action",
+        "control_plane",
+        frozenset(
+            {
+                "pending",
+                "approved",
+                "rejected",
+                "expired",
+                "dispatched",
+                "dispatch_failed",
+            }
+        ),
+        frozenset({"pending", "accepted", "completed", "failed"}),
     ),
 }
 

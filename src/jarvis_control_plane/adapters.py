@@ -22,6 +22,7 @@ from .models import (
     AuditEvidence,
     AuditFilter,
     ConversationMessage,
+    FrozenActionProposal,
     IngressAdmissionResult,
     IngressClaim,
     OrchestrationRequest,
@@ -31,6 +32,7 @@ from .models import (
     ensure_utc,
 )
 from .ports import (
+    ActionDispatcherError,
     AuditBoundary,
     AuditWriteError,
     Clock,
@@ -1585,12 +1587,15 @@ class ControlledOrchestrationAdapter:
         response_text: str = "Controlled orchestration completed the request.",
         failure: str | None = None,
         response_factory: Callable[[OrchestrationRequest], str] | None = None,
+        proposal_factory: Callable[[OrchestrationRequest], FrozenActionProposal]
+        | None = None,
     ) -> None:
         if not response_text.strip():
             raise ValueError("response_text must be non-blank")
         self.response_text = response_text
         self.failure = failure
         self.response_factory = response_factory
+        self.proposal_factory = proposal_factory
         self.calls: list[OrchestrationRequest] = []
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
@@ -1607,7 +1612,25 @@ class ControlledOrchestrationAdapter:
             outcome="completed",
             reply_text=reply_text,
             adapter="controlled",
+            proposal=(
+                self.proposal_factory(request)
+                if self.proposal_factory is not None
+                else None
+            ),
         )
+
+
+class ControlledActionDispatcher:
+    """Controlled action edge that records exactly the frozen proposal passed in."""
+
+    def __init__(self, *, failure: str | None = None) -> None:
+        self.failure = failure
+        self.dispatched: list[FrozenActionProposal] = []
+
+    def dispatch(self, action: FrozenActionProposal) -> None:
+        if self.failure is not None:
+            raise ActionDispatcherError(self.failure)
+        self.dispatched.append(action)
 
 
 class ControlledOutboundConnector:

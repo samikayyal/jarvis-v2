@@ -1,6 +1,7 @@
 """Ticket01 signed-message seam with the ticket03 audit boundary."""
 
 from .adapters import (
+    ControlledActionDispatcher,
     ControlledOrchestrationAdapter,
     ControlledOutboundConnector,
     DeterministicIdGenerator,
@@ -23,6 +24,7 @@ from .models import (
     AuditEvidence,
     AuditFilter,
     ConversationMessage,
+    FrozenActionProposal,
     InboundMessage,
     IngressAdmissionResult,
     IngressClaim,
@@ -35,6 +37,7 @@ from .models import (
     sign_body,
 )
 from .ports import (
+    ActionDispatcherError,
     AuditWriteError,
     ControlPlaneError,
     DiagnosticTraceError,
@@ -59,12 +62,14 @@ from .traces import (
 __all__ = [
     "DEFAULT_TRACE_RESERVATION_BYTES",
     "MAX_TRACE_RESERVATION_BYTES",
+    "ActionDispatcherError",
     "AuditEvidence",
     "AuditFilter",
     "AuditWriteError",
     "ControlPlane",
     "ControlPlaneConfig",
     "ControlPlaneError",
+    "ControlledActionDispatcher",
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
     "ConversationMessage",
@@ -76,6 +81,7 @@ __all__ = [
     "DiagnosticTraceRecorder",
     "FixedClock",
     "FixedModelAvailabilityProvider",
+    "FrozenActionProposal",
     "InMemoryAuditBoundary",
     "InMemoryDiagnosticTraceStore",
     "InMemoryDurableStateStore",

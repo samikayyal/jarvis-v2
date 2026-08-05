@@ -15,6 +15,7 @@ from .models import (
     AuditEvidence,
     AuditFilter,
     ConversationMessage,
+    FrozenActionProposal,
     IngressAdmissionResult,
     IngressClaim,
     OrchestrationRequest,
@@ -42,6 +43,10 @@ class AuditWriteError(ControlPlaneError):
 
 class OrchestrationAdapterError(ControlPlaneError):
     """The controlled orchestration adapter failed."""
+
+
+class ActionDispatcherError(ControlPlaneError):
+    """A frozen approval-gated action could not be dispatched."""
 
 
 class OutboundConnectorError(ControlPlaneError):
@@ -152,6 +157,12 @@ class OrchestrationAdapter(Protocol):
     """Non-authoritative planner boundary."""
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult: ...
+
+
+class ActionDispatcher(Protocol):
+    """Closed side-effect boundary for a broker-approved frozen action."""
+
+    def dispatch(self, action: FrozenActionProposal) -> None: ...
 
 
 class ModelAvailabilityProvider(Protocol):

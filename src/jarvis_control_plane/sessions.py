@@ -20,6 +20,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -74,6 +75,9 @@ class TransitionKind(str, Enum):
     NEW_SESSION = "new_session"
     SESSION_EXPIRED = "session_expired"
     PENDING_EXPIRED = "pending_expired"
+    PENDING_APPROVED = "pending_approved"
+    PENDING_REJECTED = "pending_rejected"
+    RESTART_INTERRUPTED = "restart_interrupted"
     RESULT_APPLIED = "result_applied"
     LATE_RESULT_IGNORED = "late_result_ignored"
     INVARIANT_REJECTED = "invariant_rejected"
@@ -333,12 +337,7 @@ class ReadinessState:
 
 @dataclass(frozen=True, slots=True)
 class PendingActionState:
-    """Safe lifecycle placeholder for one frozen pending action.
-
-    The executable target, arguments, material preview, and raw payload are
-    intentionally absent.  Ticket 07 and the capability broker will own those
-    fields and their persistence.
-    """
+    """One exact, immutable action awaiting its owning operator's decision."""
 
     action_id: str
     session_id: str
@@ -347,6 +346,9 @@ class PendingActionState:
     summary: str
     created_at: datetime
     expires_at: datetime
+    digest: str = ""
+    preview: str | None = None
+    payload: str = ""
 
     def __post_init__(self) -> None:
         for name in ("action_id", "session_id", "request_id", "kind", "summary"):
@@ -357,6 +359,21 @@ class PendingActionState:
             raise ValueError("pending action expiry must be after creation")
         object.__setattr__(self, "created_at", created_at)
         object.__setattr__(self, "expires_at", expires_at)
+        preview = self.preview if self.preview is not None else self.summary
+        _identifier(preview, "preview")
+        if not isinstance(self.payload, str):
+            raise TypeError("payload must be frozen text")
+        expected = _pending_action_digest(
+            action_id=self.action_id,
+            request_id=self.request_id,
+            kind=self.kind,
+            preview=preview,
+            payload=self.payload,
+        )
+        if self.digest and self.digest != expected:
+            raise ValueError("pending action digest does not match frozen content")
+        object.__setattr__(self, "preview", preview)
+        object.__setattr__(self, "digest", expected)
 
     @classmethod
     def create(
@@ -368,6 +385,8 @@ class PendingActionState:
         kind: str,
         summary: str,
         created_at: datetime | Clock,
+        preview: str | None = None,
+        payload: str = "",
     ) -> PendingActionState:
         created = _now(created_at)
         return cls(
@@ -378,10 +397,61 @@ class PendingActionState:
             summary=summary,
             created_at=created,
             expires_at=created + PENDING_ACTION_TTL,
+            preview=preview,
+            payload=payload,
         )
+
+    @classmethod
+    def from_proposal(
+        cls,
+        proposal: object,
+        *,
+        session_id: str,
+        created_at: datetime | Clock,
+    ) -> PendingActionState:
+        """Freeze the typed orchestration proposal into durable session state."""
+
+        try:
+            action_id = proposal.action_id
+            request_id = proposal.request_id
+            kind = proposal.kind
+            preview = proposal.preview
+            payload = proposal.payload
+            digest = proposal.digest
+        except AttributeError as exc:
+            raise TypeError("proposal must expose the frozen action contract") from exc
+        created = _now(created_at)
+        action = cls(
+            action_id=action_id,
+            session_id=session_id,
+            request_id=request_id,
+            kind=kind,
+            summary=preview,
+            preview=preview,
+            payload=payload,
+            created_at=created,
+            expires_at=created + PENDING_ACTION_TTL,
+        )
+        if action.digest != digest:
+            raise InvariantViolation("proposal digest does not match pending action")
+        return action
 
     def is_expired(self, at: datetime | Clock) -> bool:
         return _now(at) >= self.expires_at
+
+
+def _pending_action_digest(
+    *,
+    action_id: str,
+    request_id: str,
+    kind: str,
+    preview: str,
+    payload: str,
+) -> str:
+    # Ownership is separately immutable state; this portable content digest is
+    # deliberately identical to FrozenActionProposal's presentation digest.
+    material = f"{action_id}\x1f{request_id}\x1f{kind}\x1f{preview}\x1f{payload}"
+    return sha256(material.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1156,6 +1226,118 @@ def expire_pending_action(
     )
 
 
+def approve_pending_action(
+    session: WorkingSession,
+    *,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Consume the frozen action before any external dispatcher is called."""
+
+    action = session.pending_action
+    request = session.active_request
+    if action is None or request is None:
+        raise InvariantViolation("approval requires one live pending action")
+    if action.is_expired(now):
+        raise InvariantViolation("expired pending action cannot be approved")
+    at = _now(now)
+    after = replace(
+        session,
+        active_request=replace(request, phase=RequestPhase.DISPATCHING, updated_at=at),
+        pending_action=None,
+        last_activity_at=at,
+        inactivity_anchor_at=at,
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.PENDING_APPROVED,
+        effects=("record_pending_approval", "consume_pending_action"),
+    )
+
+
+def reject_pending_action(
+    session: WorkingSession,
+    *,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """End a paused request without making its stored action dispatchable."""
+
+    action = session.pending_action
+    request = session.active_request
+    if action is None or request is None:
+        raise InvariantViolation("rejection requires one live pending action")
+    at = _now(now)
+    after = replace(
+        session,
+        active_request=None,
+        pending_action=None,
+        cancellation_generation=session.cancellation_generation + 1,
+        last_activity_at=at,
+        inactivity_anchor_at=at,
+        last_request_id=request.request_id,
+        last_request_outcome="rejected",
+        last_terminal_at=at,
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.PENDING_REJECTED,
+        effects=(
+            "record_pending_rejection",
+            "invalidate_pending_action",
+            "advance_cancellation_generation",
+        ),
+    )
+
+
+def interrupt_for_restart(
+    session: WorkingSession,
+    *,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Invalidate non-resumable work and session permissions at restart."""
+
+    if session.active_request is None and session.pending_action is None:
+        return _transition(
+            session, session, TransitionKind.NOOP, reason="no work to interrupt"
+        )
+    at = _now(now)
+    request = session.active_request
+    after = replace(
+        session,
+        active_request=None,
+        pending_action=None,
+        permissions=tuple(
+            permission
+            for permission in session.permissions
+            if permission.lifetime is PermissionLifetime.PERSISTENT
+            and permission.is_active
+        ),
+        cancellation_generation=session.cancellation_generation + 1,
+        last_activity_at=at,
+        inactivity_anchor_at=at,
+        last_request_id=(
+            request.request_id if request is not None else session.last_request_id
+        ),
+        last_request_outcome=(
+            "interrupted" if request is not None else session.last_request_outcome
+        ),
+        last_terminal_at=(at if request is not None else session.last_terminal_at),
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.RESTART_INTERRUPTED,
+        effects=(
+            "interrupt_active_request",
+            "invalidate_pending_action",
+            "revoke_session_permissions",
+            "advance_cancellation_generation",
+        ),
+        reason="service restart invalidated non-resumable work",
+    )
+
+
 def cancellation_token_is_current(
     session: WorkingSession, token: CancellationToken
 ) -> bool:
@@ -1446,6 +1628,9 @@ def _session_json(session: WorkingSession) -> str:
                     "request_id": session.pending_action.request_id,
                     "kind": session.pending_action.kind,
                     "summary": session.pending_action.summary,
+                    "digest": session.pending_action.digest,
+                    "preview": session.pending_action.preview,
+                    "payload": session.pending_action.payload,
                     "created_at": session.pending_action.created_at,
                     "expires_at": session.pending_action.expires_at,
                 }
@@ -1526,6 +1711,9 @@ def _session_from_json(value: str) -> WorkingSession:
                 request_id=action["request_id"],
                 kind=action["kind"],
                 summary=action["summary"],
+                digest=action.get("digest", ""),
+                preview=action.get("preview"),
+                payload=action.get("payload", ""),
                 created_at=_parse_timestamp(action["created_at"]),
                 expires_at=_parse_timestamp(action["expires_at"]),
             )
