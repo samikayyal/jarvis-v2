@@ -192,6 +192,44 @@ class SessionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelAvailability:
+    """The exact model/runtime choices currently admitted by the provider seam.
+
+    Availability is runtime information, not an operator-selected default. A
+    configured choice is retained verbatim, then checked again at request
+    admission so an outage cannot silently substitute another choice.
+    """
+
+    available_models: tuple[str, ...] = CANONICAL_MODELS
+    available_reasoning_levels: tuple[str, ...] = CANONICAL_REASONING_LEVELS
+
+    def __post_init__(self) -> None:
+        models = tuple(self.available_models)
+        reasoning = tuple(self.available_reasoning_levels)
+        if len(models) != len(set(models)):
+            raise ValueError("available_models must not contain duplicates")
+        if len(reasoning) != len(set(reasoning)):
+            raise ValueError("available_reasoning_levels must not contain duplicates")
+        for model in models:
+            _canonical_choice(model, CANONICAL_MODELS, "available_models")
+        for level in reasoning:
+            _canonical_choice(
+                level, CANONICAL_REASONING_LEVELS, "available_reasoning_levels"
+            )
+        object.__setattr__(self, "available_models", models)
+        object.__setattr__(self, "available_reasoning_levels", reasoning)
+
+    def model_is_available(self, model: str) -> bool:
+        return model in self.available_models
+
+    def reasoning_is_available(self, reasoning: str) -> bool:
+        return reasoning in self.available_reasoning_levels
+
+    def supports(self, *, model: str, reasoning: str) -> bool:
+        return self.model_is_available(model) and self.reasoning_is_available(reasoning)
+
+
+@dataclass(frozen=True, slots=True)
 class DurableStateReferences:
     """Stable references that `/new` must preserve rather than delete."""
 
@@ -518,6 +556,7 @@ class WorkingSession:
     reasoning: str
     default_model: str
     default_reasoning: str
+    default_session_minutes: int
     conversation_ref: str
     durable_refs: DurableStateReferences
     active_request: ActiveRequestState | None = None
@@ -549,6 +588,14 @@ class WorkingSession:
         _canonical_choice(
             self.default_reasoning, CANONICAL_REASONING_LEVELS, "default_reasoning"
         )
+        if (
+            isinstance(self.default_session_minutes, bool)
+            or not isinstance(self.default_session_minutes, int)
+            or self.default_session_minutes not in ALLOWED_SESSION_MINUTES
+        ):
+            raise ValueError(
+                "default_session_minutes must be one of the configured allowed values"
+            )
         if (
             isinstance(self.cancellation_generation, bool)
             or not isinstance(self.cancellation_generation, int)
@@ -727,6 +774,7 @@ def create_working_session(
         reasoning=effective_config.default_reasoning,
         default_model=effective_config.default_model,
         default_reasoning=effective_config.default_reasoning,
+        default_session_minutes=effective_config.inactivity_minutes,
         conversation_ref=conversation,
         durable_refs=durable_refs or DurableStateReferences(),
         permissions=tuple(permissions),
@@ -974,11 +1022,12 @@ def new_working_session(
         created_at=at,
         last_activity_at=at,
         inactivity_anchor_at=at,
-        session_minutes=session.session_minutes,
+        session_minutes=session.default_session_minutes,
         model=session.default_model,
         reasoning=session.default_reasoning,
         default_model=session.default_model,
         default_reasoning=session.default_reasoning,
+        default_session_minutes=session.default_session_minutes,
         conversation_ref=new_conversation,
         durable_refs=session.durable_refs,
         permissions=persistent_permissions,
@@ -1366,6 +1415,7 @@ def _session_json(session: WorkingSession) -> str:
             "reasoning": session.reasoning,
             "default_model": session.default_model,
             "default_reasoning": session.default_reasoning,
+            "default_session_minutes": session.default_session_minutes,
             "conversation_ref": session.conversation_ref,
             "durable_refs": {
                 "operational_state_ref": session.durable_refs.operational_state_ref,
@@ -1507,6 +1557,12 @@ def _session_from_json(value: str) -> WorkingSession:
             reasoning=payload["reasoning"],
             default_model=payload["default_model"],
             default_reasoning=payload["default_reasoning"],
+            # Ticket 05 persisted only the current duration.  Before Ticket 06
+            # it was also the duration carried into `/new`, so retain that
+            # behavior while adding the distinct future-session default.
+            default_session_minutes=payload.get(
+                "default_session_minutes", payload["session_minutes"]
+            ),
             conversation_ref=payload["conversation_ref"],
             durable_refs=DurableStateReferences(**refs),
             active_request=active_request,

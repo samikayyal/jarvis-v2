@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from threading import RLock
 
 from .control_grammar import ControlTransition, ControlTransitionKind, handle_message
@@ -36,6 +36,7 @@ from .ports import (
 from .sessions import (
     CancellationToken,
     InMemoryWorkingSessionStore,
+    ModelAvailability,
     RequestResult,
     SessionConfig,
     SessionStoreError,
@@ -63,6 +64,7 @@ class ControlPlaneConfig:
     signing_secret: bytes
     max_text_length: int = 4096
     working_session_id: str | None = None
+    model_availability: ModelAvailability = field(default_factory=ModelAvailability)
 
     def __post_init__(self) -> None:
         require_non_empty(self.operator_id, "operator_id")
@@ -73,6 +75,8 @@ class ControlPlaneConfig:
             raise ValueError("signing_secret must be non-empty bytes")
         if self.max_text_length != 4096:
             raise ValueError("max_text_length is fixed at 4096 characters in V1")
+        if not isinstance(self.model_availability, ModelAvailability):
+            raise TypeError("model_availability must be a ModelAvailability")
 
 
 class DeterministicCapabilityBroker:
@@ -132,6 +136,7 @@ class DeterministicCapabilityBroker:
             request_id=request_id,
             originating_message_id=message.message_id,
             phase="processing",
+            model_availability=self.config.model_availability,
         )
         if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
             return self._handle_session_control(message, session, session_transition)
@@ -728,6 +733,7 @@ class DeterministicCapabilityBroker:
                     expected,
                     message.text,
                     now=self.clock,
+                    model_availability=self.config.model_availability,
                 )
             return self._apply_session_control(message, expected, transition)
 

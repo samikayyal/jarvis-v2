@@ -11,13 +11,16 @@ and does not call a receiver, broker, durable store, connector, or worker.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 
 from .sessions import (
+    CANONICAL_MODELS,
+    CANONICAL_REASONING_LEVELS,
     CancellationToken,
     Clock,
+    ModelAvailability,
     RequestPhase,
     SessionTransition,
     StatusView,
@@ -25,17 +28,28 @@ from .sessions import (
     WorkingSession,
     accept_request,
     cancel_active_request,
+    ensure_utc,
     new_working_session,
     status_view,
 )
 
-CONTROL_COMMANDS = ("/status", "/cancel", "/new")
+CONTROL_COMMANDS = (
+    "/status",
+    "/cancel",
+    "/new",
+    "/model",
+    "/reasoning",
+    "/config",
+)
 
 
 class ControlCommand(str, Enum):
     STATUS = "status"
     CANCEL = "cancel"
     NEW = "new"
+    MODEL = "model"
+    REASONING = "reasoning"
+    CONFIG = "config"
 
 
 class MessageKind(str, Enum):
@@ -57,6 +71,13 @@ class ControlTransitionKind(str, Enum):
     CANCELLED = "cancelled"
     NOTHING_TO_CANCEL = "nothing_to_cancel"
     NEW_SESSION = "new_session"
+    SESSION_MODEL_UPDATED = "session_model_updated"
+    SESSION_REASONING_UPDATED = "session_reasoning_updated"
+    CONFIG_UPDATED = "config_updated"
+    CONFIGURATION_BLOCKED = "configuration_blocked"
+    INVALID_CONFIGURATION = "invalid_configuration"
+    MODEL_UNAVAILABLE = "model_unavailable"
+    REASONING_UNAVAILABLE = "reasoning_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +166,9 @@ def _known_command(value: str) -> ControlCommand | None:
         "/status": ControlCommand.STATUS,
         "/cancel": ControlCommand.CANCEL,
         "/new": ControlCommand.NEW,
+        "/model": ControlCommand.MODEL,
+        "/reasoning": ControlCommand.REASONING,
+        "/config": ControlCommand.CONFIG,
     }.get(value)
 
 
@@ -165,14 +189,27 @@ def parse_control(message: str) -> ParsedControl:
             MessageKind.UNKNOWN_COMMAND,
             args=parts[1:],
         )
-    if len(parts) != 1:
+    allowed_argument_counts = {
+        ControlCommand.STATUS: {0},
+        ControlCommand.CANCEL: {0},
+        ControlCommand.NEW: {0},
+        ControlCommand.MODEL: {0, 1},
+        ControlCommand.REASONING: {0, 1},
+        ControlCommand.CONFIG: {0, 2},
+    }
+    if len(parts) - 1 not in allowed_argument_counts[command]:
         return ParsedControl(
             normalized,
             MessageKind.MALFORMED_COMMAND,
             command=command,
             args=parts[1:],
         )
-    return ParsedControl(normalized, MessageKind.CONTROL_COMMAND, command=command)
+    return ParsedControl(
+        normalized,
+        MessageKind.CONTROL_COMMAND,
+        command=command,
+        args=parts[1:],
+    )
 
 
 parse_command = parse_control
@@ -240,9 +277,48 @@ safe_status = render_status
 
 
 def _usage(parsed: ParsedControl) -> str:
+    usage = {
+        ControlCommand.MODEL: "Usage: /model [gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna]",
+        ControlCommand.REASONING: "Usage: /reasoning [none|low|medium|high|xhigh|max]",
+        ControlCommand.CONFIG: (
+            "Usage: /config [model <model>|reasoning <level>|session-minutes <minutes>]"
+        ),
+    }
     if parsed.command is not None:
-        return f"Usage: /{parsed.command.value}"
-    return "Unknown or malformed control command. Valid: /new, /status, /cancel."
+        return usage.get(parsed.command, f"Usage: /{parsed.command.value}")
+    return (
+        "Unknown or malformed control command. Valid: /new, /status, /cancel, "
+        "/model, /reasoning, /config."
+    )
+
+
+def _configuration_is_mutable(session: WorkingSession) -> bool:
+    return session.active_request is None and session.pending_action is None
+
+
+def _configuration_blocked(
+    session: WorkingSession,
+    parsed: ParsedControl,
+) -> ControlTransition:
+    return ControlTransition(
+        state=session,
+        parsed=parsed,
+        kind=ControlTransitionKind.CONFIGURATION_BLOCKED,
+        reply=(
+            "Configuration cannot change while a request or approval is active. "
+            "Cancel or finish it first."
+        ),
+        reason="model and configuration mutations require an idle working session",
+    )
+
+
+def _now(value: datetime_or_clock) -> datetime:
+    current = (
+        value.now()
+        if hasattr(value, "now") and not isinstance(value, datetime)
+        else value
+    )
+    return ensure_utc(current)
 
 
 def _apply_control(
@@ -250,6 +326,7 @@ def _apply_control(
     parsed: ParsedControl,
     *,
     now: datetime_or_clock,
+    model_availability: ModelAvailability,
 ) -> ControlTransition:
     if parsed.command is ControlCommand.STATUS:
         view = status_view(session)
@@ -292,6 +369,181 @@ def _apply_control(
             ),
         )
 
+    if parsed.command is ControlCommand.MODEL:
+        if not parsed.args:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.STATUS,
+                reply=(
+                    f"Session model: {session.model}. Valid: "
+                    "gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna."
+                ),
+            )
+        model = parsed.args[0]
+        if model not in CANONICAL_MODELS:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.INVALID_CONFIGURATION,
+                reply="Invalid model. Use a canonical model value.",
+            )
+        if not _configuration_is_mutable(session):
+            return _configuration_blocked(session, parsed)
+        if model not in model_availability.available_models:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.MODEL_UNAVAILABLE,
+                reply=f"Model {model} is unavailable. Current session model remains {session.model}.",
+            )
+        return ControlTransition(
+            state=replace(session, model=model),
+            parsed=parsed,
+            kind=ControlTransitionKind.SESSION_MODEL_UPDATED,
+            reply=f"Session model set to {model}. Persistent default unchanged.",
+            effects=("set_session_model",),
+        )
+
+    if parsed.command is ControlCommand.REASONING:
+        if not parsed.args:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.STATUS,
+                reply=(
+                    f"Session reasoning: {session.reasoning}. Valid: "
+                    "none, low, medium, high, xhigh, max."
+                ),
+            )
+        reasoning = parsed.args[0]
+        if reasoning not in CANONICAL_REASONING_LEVELS:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.INVALID_CONFIGURATION,
+                reply="Invalid reasoning level. Use a canonical reasoning value.",
+            )
+        if not _configuration_is_mutable(session):
+            return _configuration_blocked(session, parsed)
+        if reasoning not in model_availability.available_reasoning_levels:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.REASONING_UNAVAILABLE,
+                reply=(
+                    f"Reasoning level {reasoning} is unavailable. Current session reasoning "
+                    f"remains {session.reasoning}."
+                ),
+            )
+        return ControlTransition(
+            state=replace(session, reasoning=reasoning),
+            parsed=parsed,
+            kind=ControlTransitionKind.SESSION_REASONING_UPDATED,
+            reply=f"Session reasoning set to {reasoning}. Persistent default unchanged.",
+            effects=("set_session_reasoning",),
+        )
+
+    if parsed.command is ControlCommand.CONFIG:
+        if not parsed.args:
+            return ControlTransition(
+                state=session,
+                parsed=parsed,
+                kind=ControlTransitionKind.STATUS,
+                reply=(
+                    f"Persistent defaults: model {session.default_model}; reasoning "
+                    f"{session.default_reasoning}; session-minutes "
+                    f"{session.default_session_minutes}."
+                ),
+            )
+        if not _configuration_is_mutable(session):
+            return _configuration_blocked(session, parsed)
+        key, value = parsed.args
+        if key == "model":
+            if value not in CANONICAL_MODELS:
+                return ControlTransition(
+                    state=session,
+                    parsed=parsed,
+                    kind=ControlTransitionKind.INVALID_CONFIGURATION,
+                    reply="Invalid model. Use a canonical model value.",
+                )
+            if value not in model_availability.available_models:
+                return ControlTransition(
+                    state=session,
+                    parsed=parsed,
+                    kind=ControlTransitionKind.MODEL_UNAVAILABLE,
+                    reply=(
+                        f"Model {value} is unavailable. Persistent default remains "
+                        f"{session.default_model}."
+                    ),
+                )
+            return ControlTransition(
+                state=replace(session, default_model=value),
+                parsed=parsed,
+                kind=ControlTransitionKind.CONFIG_UPDATED,
+                reply=(
+                    f"Persistent model default set to {value}; current session remains "
+                    f"{session.model}."
+                ),
+                effects=("set_default_model",),
+            )
+        if key == "reasoning":
+            if value not in CANONICAL_REASONING_LEVELS:
+                return ControlTransition(
+                    state=session,
+                    parsed=parsed,
+                    kind=ControlTransitionKind.INVALID_CONFIGURATION,
+                    reply="Invalid reasoning level. Use a canonical reasoning value.",
+                )
+            if value not in model_availability.available_reasoning_levels:
+                return ControlTransition(
+                    state=session,
+                    parsed=parsed,
+                    kind=ControlTransitionKind.REASONING_UNAVAILABLE,
+                    reply=(
+                        f"Reasoning level {value} is unavailable. Persistent default remains "
+                        f"{session.default_reasoning}."
+                    ),
+                )
+            return ControlTransition(
+                state=replace(session, default_reasoning=value),
+                parsed=parsed,
+                kind=ControlTransitionKind.CONFIG_UPDATED,
+                reply=(
+                    f"Persistent reasoning default set to {value}; current session remains "
+                    f"{session.reasoning}."
+                ),
+                effects=("set_default_reasoning",),
+            )
+        if key == "session-minutes" and value in {"15", "30", "60", "120", "240"}:
+            minutes = int(value)
+            current = _now(now)
+            return ControlTransition(
+                state=replace(
+                    session,
+                    session_minutes=minutes,
+                    default_session_minutes=minutes,
+                    last_activity_at=current,
+                    inactivity_anchor_at=current,
+                ),
+                parsed=parsed,
+                kind=ControlTransitionKind.CONFIG_UPDATED,
+                reply=(
+                    f"Working-session inactivity boundary set to {minutes} minutes, "
+                    "effective now and for future sessions."
+                ),
+                effects=("set_session_minutes",),
+            )
+        return ControlTransition(
+            state=session,
+            parsed=parsed,
+            kind=ControlTransitionKind.INVALID_CONFIGURATION,
+            reply=(
+                "Invalid config value. Use canonical models/reasoning or session-minutes "
+                "15, 30, 60, 120, or 240."
+            ),
+        )
+
     raise AssertionError("_apply_control called without a complete control command")
 
 
@@ -303,6 +555,7 @@ def _apply_message(
     request_id: str | None,
     originating_message_id: str | None,
     phase: RequestPhase | str,
+    model_availability: ModelAvailability,
 ) -> ControlTransition:
     parsed = parse_control(message)
 
@@ -310,7 +563,12 @@ def _apply_message(
     # is the explicit precedence boundary that keeps /status, /cancel, and
     # /new available while work is active.
     if parsed.kind is MessageKind.CONTROL_COMMAND:
-        return _apply_control(session, parsed, now=now)
+        return _apply_control(
+            session,
+            parsed,
+            now=now,
+            model_availability=model_availability,
+        )
     if parsed.kind in {MessageKind.MALFORMED_COMMAND, MessageKind.UNKNOWN_COMMAND}:
         return ControlTransition(
             state=session,
@@ -360,6 +618,27 @@ def _apply_message(
             reason="one active request is already present; no queue transition",
         )
 
+    if not model_availability.model_is_available(session.model):
+        return ControlTransition(
+            state=session,
+            parsed=parsed,
+            kind=ControlTransitionKind.MODEL_UNAVAILABLE,
+            reply=(
+                f"Model {session.model} is unavailable. No substitute was selected; "
+                "choose an available model and try again."
+            ),
+        )
+    if not model_availability.reasoning_is_available(session.reasoning):
+        return ControlTransition(
+            state=session,
+            parsed=parsed,
+            kind=ControlTransitionKind.REASONING_UNAVAILABLE,
+            reply=(
+                f"Reasoning level {session.reasoning} is unavailable. No substitute was "
+                "selected; choose an available level and try again."
+            ),
+        )
+
     transition = accept_request(
         session,
         now=now,
@@ -393,6 +672,7 @@ def handle_message(
     request_id: str | None = None,
     originating_message_id: str | None = None,
     phase: RequestPhase | str = RequestPhase.INTERPRETING,
+    model_availability: ModelAvailability | None = None,
 ) -> ControlTransition:
     """Parse and reduce one authorized operator message purely."""
 
@@ -403,6 +683,7 @@ def handle_message(
         request_id=request_id,
         originating_message_id=originating_message_id,
         phase=phase,
+        model_availability=model_availability or ModelAvailability(),
     )
 
 
