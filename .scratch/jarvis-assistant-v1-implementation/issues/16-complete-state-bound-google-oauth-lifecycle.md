@@ -6,7 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] Short-lived state is single-use, callback responses are content-free, and the connected Google identity must match the configured identity.
-- [ ] Token replacement is atomic inside the connector credential boundary and does not place credentials in ordinary state, logs, command lines, or repository content.
-- [ ] Wrong identity, missing scope, revocation, `invalid_grant`, and reconnection invalidate stale actions and fail safely using controlled OAuth doubles.
-
+- [x] Short-lived state is single-use, callback responses are content-free, and the connected Google identity must match the configured identity.
+- [x] Token replacement is atomic inside the connector credential boundary and does not place credentials in ordinary state, logs, command lines, or repository content.
+- [x] Wrong identity, missing scope, revocation, `invalid_grant`, and reconnection invalidate stale actions and fail safely using controlled OAuth doubles.
