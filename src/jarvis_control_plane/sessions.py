@@ -604,14 +604,64 @@ def _pending_action_digest(
 
 
 @dataclass(frozen=True, slots=True)
+class CommandPermissionComponent:
+    """One ordered component in an exact permission identity."""
+
+    executable: str
+    arguments: tuple[str, ...]
+    operator_before: str = ""
+    redirections: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier(self.executable, "executable")
+        if self.operator_before not in {"", "|", "&&", "||", ";"}:
+            raise ValueError("operator_before is not supported")
+        arguments = tuple(self.arguments)
+        redirections = tuple(self.redirections)
+        if any(not isinstance(value, str) or not value for value in arguments):
+            raise ValueError("arguments must be non-empty strings")
+        if any(not isinstance(value, str) or not value for value in redirections):
+            raise ValueError("redirections must be non-empty strings")
+        object.__setattr__(self, "arguments", arguments)
+        object.__setattr__(self, "redirections", redirections)
+
+
+@dataclass(frozen=True, slots=True)
+class CommandPermissionIdentity:
+    """The complete immutable terminal identity an exact rule may match."""
+
+    host: str
+    cwd: str
+    components: tuple[CommandPermissionComponent, ...]
+
+    def __post_init__(self) -> None:
+        _identifier(self.host, "host")
+        _identifier(self.cwd, "cwd")
+        components = tuple(self.components)
+        if not components:
+            raise ValueError("permission identity must contain a component")
+        if components[0].operator_before:
+            raise ValueError("first component cannot have a leading operator")
+        object.__setattr__(self, "components", components)
+
+    @property
+    def command(self) -> str:
+        parts: list[str] = []
+        for component in self.components:
+            if component.operator_before:
+                parts.append(component.operator_before)
+            parts.extend((component.executable, *component.arguments))
+            parts.extend(f"redirect:{path}" for path in component.redirections)
+        return " ".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
 class CommandPermissionState:
     """Typed safe metadata for one exact command permission."""
 
     permission_id: str
     lifetime: PermissionLifetime | str
-    host: str
-    command: str
-    cwd: str
+    identity: CommandPermissionIdentity
     created_at: datetime
     session_id: str | None = None
     last_used_at: datetime | None = None
@@ -620,14 +670,9 @@ class CommandPermissionState:
     def __post_init__(self) -> None:
         _identifier(self.permission_id, "permission_id")
         lifetime = PermissionLifetime(self.lifetime)
-        _identifier(self.host, "host")
-        if not isinstance(self.command, str) or not self.command.strip():
-            raise ValueError("command must be non-blank")
-        if not isinstance(self.cwd, str) or not self.cwd.strip():
-            raise ValueError("cwd must be non-blank")
+        if not isinstance(self.identity, CommandPermissionIdentity):
+            raise TypeError("identity must be CommandPermissionIdentity")
         object.__setattr__(self, "lifetime", lifetime)
-        object.__setattr__(self, "command", " ".join(self.command.split()))
-        object.__setattr__(self, "cwd", self.cwd.strip())
         if self.session_id is not None:
             _identifier(self.session_id, "session_id")
         if lifetime is PermissionLifetime.SESSION and self.session_id is None:
@@ -646,11 +691,23 @@ class CommandPermissionState:
 
     @property
     def normalized_command(self) -> str:
-        return self.command
+        return self.identity.command
+
+    @property
+    def host(self) -> str:
+        return self.identity.host
+
+    @property
+    def command(self) -> str:
+        return self.identity.command
 
     @property
     def canonical_working_directory(self) -> str:
-        return self.cwd
+        return self.identity.cwd
+
+    @property
+    def cwd(self) -> str:
+        return self.identity.cwd
 
     @property
     def is_active(self) -> bool:
@@ -1680,10 +1737,15 @@ def interrupt_for_restart(
     live_dispatches = tuple(
         record for record in session.action_outbox if record.is_live
     )
+    active_session_permissions = any(
+        permission.lifetime is PermissionLifetime.SESSION and permission.is_active
+        for permission in session.permissions
+    )
     if (
         session.active_request is None
         and session.pending_action is None
         and not live_dispatches
+        and not active_session_permissions
     ):
         return _transition(
             session, session, TransitionKind.NOOP, reason="no work to interrupt"
@@ -2170,9 +2232,19 @@ def _session_json(session: WorkingSession) -> str:
                 {
                     "permission_id": item.permission_id,
                     "lifetime": item.lifetime,
-                    "host": item.host,
-                    "command": item.command,
-                    "cwd": item.cwd,
+                    "identity": {
+                        "host": item.identity.host,
+                        "cwd": item.identity.cwd,
+                        "components": [
+                            {
+                                "executable": component.executable,
+                                "arguments": component.arguments,
+                                "operator_before": component.operator_before,
+                                "redirections": component.redirections,
+                            }
+                            for component in item.identity.components
+                        ],
+                    },
                     "created_at": item.created_at,
                     "session_id": item.session_id,
                     "last_used_at": item.last_used_at,
@@ -2282,9 +2354,19 @@ def _session_from_json(value: str) -> WorkingSession:
             CommandPermissionState(
                 permission_id=item["permission_id"],
                 lifetime=item["lifetime"],
-                host=item["host"],
-                command=item["command"],
-                cwd=item["cwd"],
+                identity=CommandPermissionIdentity(
+                    host=item["identity"]["host"],
+                    cwd=item["identity"]["cwd"],
+                    components=tuple(
+                        CommandPermissionComponent(
+                            executable=component["executable"],
+                            arguments=tuple(component["arguments"]),
+                            operator_before=component["operator_before"],
+                            redirections=tuple(component["redirections"]),
+                        )
+                        for component in item["identity"]["components"]
+                    ),
+                ),
                 created_at=_parse_timestamp(item["created_at"]),
                 session_id=item["session_id"],
                 last_used_at=_parse_timestamp(item["last_used_at"]),

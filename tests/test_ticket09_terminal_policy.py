@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from test_support import build_receiver_components
@@ -11,7 +12,14 @@ from jarvis_control_plane import (
     InboundMessage,
     SignedInboundEvent,
 )
-from jarvis_control_plane.sessions import CommandPermissionState, PermissionLifetime
+from jarvis_control_plane.sessions import (
+    CommandPermissionComponent,
+    CommandPermissionIdentity,
+    CommandPermissionState,
+    DispatchStatus,
+    PermissionLifetime,
+    ReadinessState,
+)
 from jarvis_control_plane.terminal_policy import (
     TerminalAction,
     TerminalDisposition,
@@ -43,9 +51,15 @@ def test_terminal_policy_applies_fixed_precedence_without_a_model_classifier() -
     permission = CommandPermissionState(
         permission_id="permission-001",
         lifetime=PermissionLifetime.PERSISTENT,
-        host="ubuntu",
-        command="/usr/bin/git status",
-        cwd="/workspace",
+        identity=CommandPermissionIdentity(
+            host="ubuntu",
+            cwd="/workspace",
+            components=(
+                CommandPermissionComponent(
+                    executable="/usr/bin/git", arguments=("status",)
+                ),
+            ),
+        ),
         created_at=NOW,
     )
 
@@ -188,6 +202,15 @@ def _broker_for(payload: object) -> tuple[object, ControlledActionDispatcher]:
             )
         ),
     )
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    components.broker.working_sessions.compare_and_set(
+        session,
+        replace(
+            session,
+            readiness=ReadinessState(ubuntu="ready", windows="unavailable"),
+        ),
+    )
     return components, dispatcher
 
 
@@ -227,3 +250,25 @@ def test_broker_creates_a_session_permission_for_choice_two_then_dispatches() ->
     permissions = components.broker.working_sessions.load().permissions
     assert len(permissions) == 1
     assert permissions[0].lifetime is PermissionLifetime.SESSION
+
+
+def test_broker_does_not_dispatch_to_an_unavailable_selected_host() -> None:
+    components, dispatcher = _broker_for(
+        {
+            "host": "windows",
+            "executable": "C:/Program Files/Git/bin/git.exe",
+            "arguments": ["status"],
+            "cwd": "C:/workspace",
+        }
+    )
+
+    pending = components.receiver.receive(_event("show repo status", "unavailable"))
+    approved = components.receiver.receive(_event("1", "unavailable-approval"))
+
+    assert pending.disposition == "pending_action"
+    assert approved.disposition == "action_dispatch_unavailable"
+    assert "windows is not ready" in (approved.reason or "")
+    assert dispatcher.dispatched == []
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    assert session.action_outbox[-1].status is DispatchStatus.NOT_STARTED

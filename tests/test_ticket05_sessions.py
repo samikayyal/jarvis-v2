@@ -24,6 +24,8 @@ from jarvis_control_plane.control_grammar import (
 from jarvis_control_plane.sessions import (
     ALLOWED_SESSION_MINUTES,
     ActiveRequestState,
+    CommandPermissionComponent,
+    CommandPermissionIdentity,
     CommandPermissionState,
     DurableStateReferences,
     HistoryEntry,
@@ -47,6 +49,7 @@ from jarvis_control_plane.sessions import (
     expire_inactive_session,
     expire_pending_action,
     install_pending_action,
+    interrupt_for_restart,
     is_session_inactive,
     new_working_session,
     session_inactivity_suspended,
@@ -129,9 +132,15 @@ def make_session_permission(session: WorkingSession) -> CommandPermissionState:
     return CommandPermissionState(
         permission_id="P-session",
         lifetime=PermissionLifetime.SESSION,
-        host="ubuntu",
-        command="cat /tmp/example",
-        cwd="/tmp",
+        identity=CommandPermissionIdentity(
+            host="ubuntu",
+            cwd="/tmp",
+            components=(
+                CommandPermissionComponent(
+                    executable="/usr/bin/cat", arguments=("/tmp/example",)
+                ),
+            ),
+        ),
         created_at=NOW,
         session_id=session.session_id,
     )
@@ -141,9 +150,15 @@ def make_persistent_permission() -> CommandPermissionState:
     return CommandPermissionState(
         permission_id="P-persistent",
         lifetime=PermissionLifetime.PERSISTENT,
-        host="ubuntu",
-        command="git status",
-        cwd="/workspace",
+        identity=CommandPermissionIdentity(
+            host="ubuntu",
+            cwd="/workspace",
+            components=(
+                CommandPermissionComponent(
+                    executable="/usr/bin/git", arguments=("status",)
+                ),
+            ),
+        ),
         created_at=NOW,
     )
 
@@ -157,6 +172,20 @@ def make_pending(session: WorkingSession, request_id: str) -> PendingActionState
         summary="A safe bounded placeholder summary",
         created_at=NOW,
     )
+
+
+def test_restart_revokes_idle_session_permissions() -> None:
+    session = make_session()
+    session = replace(
+        session,
+        permissions=(make_session_permission(session), make_persistent_permission()),
+    )
+
+    transition = interrupt_for_restart(session, now=NOW + timedelta(minutes=1))
+
+    assert transition.kind is TransitionKind.RESTART_INTERRUPTED
+    assert transition.state.permissions == (make_persistent_permission(),)
+    assert "revoke_session_permissions" in transition.effects
 
 
 def test_normalization_is_exact_and_slash_commands_have_precedence() -> None:

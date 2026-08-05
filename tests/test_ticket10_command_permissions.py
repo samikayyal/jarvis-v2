@@ -6,7 +6,12 @@ from datetime import UTC, datetime
 from test_support import build_receiver_components
 
 from jarvis_control_plane import InboundMessage, SignedInboundEvent
-from jarvis_control_plane.sessions import CommandPermissionState, PermissionLifetime
+from jarvis_control_plane.sessions import (
+    CommandPermissionComponent,
+    CommandPermissionIdentity,
+    CommandPermissionState,
+    PermissionLifetime,
+)
 from jarvis_control_plane.terminal_policy import (
     TerminalAction,
     TerminalDisposition,
@@ -41,9 +46,15 @@ def _permission(permission_id: str) -> CommandPermissionState:
     return CommandPermissionState(
         permission_id=permission_id,
         lifetime=PermissionLifetime.PERSISTENT,
-        host="ubuntu",
-        command="/usr/bin/git status",
-        cwd="/workspace",
+        identity=CommandPermissionIdentity(
+            host="ubuntu",
+            cwd="/workspace",
+            components=(
+                CommandPermissionComponent(
+                    executable="/usr/bin/git", arguments=("status",)
+                ),
+            ),
+        ),
         created_at=NOW,
     )
 
@@ -101,4 +112,116 @@ def test_revoke_removes_permission_before_an_acknowledgement_can_fail() -> None:
     assert (
         authorize_terminal_action(action, permissions=session.permissions).disposition
         is TerminalDisposition.SAFE_READ
+    )
+
+
+def test_exact_permission_binds_redirection_and_argument_boundaries() -> None:
+    approved_action = TerminalAction(
+        host="ubuntu",
+        executable="/usr/bin/printf",
+        arguments=("ok",),
+        cwd="/workspace",
+        components=(
+            {
+                "executable": "/usr/bin/printf",
+                "arguments": ["ok"],
+                "redirections": ["/workspace/out.txt"],
+            },
+        ),
+    )
+    permission = CommandPermissionState(
+        permission_id="permission-redirect",
+        lifetime=PermissionLifetime.PERSISTENT,
+        identity=approved_action.permission_identity,
+        created_at=NOW,
+    )
+
+    assert (
+        authorize_terminal_action(
+            approved_action, permissions=(permission,)
+        ).disposition
+        is TerminalDisposition.EXACT_PERMISSION
+    )
+
+    redirected_elsewhere = TerminalAction(
+        host="ubuntu",
+        executable="/usr/bin/printf",
+        arguments=("ok",),
+        cwd="/workspace",
+        components=(
+            {
+                "executable": "/usr/bin/printf",
+                "arguments": ["ok"],
+                "redirections": ["/etc/passwd"],
+            },
+        ),
+    )
+    split_arguments = TerminalAction(
+        host="ubuntu",
+        executable="/usr/bin/printf",
+        arguments=("o", "k"),
+        cwd="/workspace",
+    )
+
+    assert (
+        authorize_terminal_action(
+            redirected_elsewhere, permissions=(permission,)
+        ).disposition
+        is TerminalDisposition.ORDINARY_APPROVAL
+    )
+    assert (
+        authorize_terminal_action(
+            split_arguments, permissions=(permission,)
+        ).disposition
+        is TerminalDisposition.ORDINARY_APPROVAL
+    )
+
+
+def test_exact_permission_binds_compound_component_order_and_operator() -> None:
+    approved_action = TerminalAction(
+        host="ubuntu",
+        executable="/usr/bin/printf",
+        arguments=("ok",),
+        cwd="/workspace",
+        components=(
+            {"executable": "/usr/bin/printf", "arguments": ["ok"]},
+            {
+                "executable": "/usr/bin/printf",
+                "arguments": ["done"],
+                "operator_before": "&&",
+            },
+        ),
+    )
+    permission = CommandPermissionState(
+        permission_id="permission-compound",
+        lifetime=PermissionLifetime.PERSISTENT,
+        identity=approved_action.permission_identity,
+        created_at=NOW,
+    )
+    different_operator = TerminalAction(
+        host="ubuntu",
+        executable="/usr/bin/printf",
+        arguments=("ok",),
+        cwd="/workspace",
+        components=(
+            {"executable": "/usr/bin/printf", "arguments": ["ok"]},
+            {
+                "executable": "/usr/bin/printf",
+                "arguments": ["done"],
+                "operator_before": "||",
+            },
+        ),
+    )
+
+    assert (
+        authorize_terminal_action(
+            approved_action, permissions=(permission,)
+        ).disposition
+        is TerminalDisposition.EXACT_PERMISSION
+    )
+    assert (
+        authorize_terminal_action(
+            different_operator, permissions=(permission,)
+        ).disposition
+        is TerminalDisposition.ORDINARY_APPROVAL
     )

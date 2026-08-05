@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .models import FrozenActionProposal
-from .sessions import CommandPermissionState
+from .sessions import (
+    CommandPermissionComponent,
+    CommandPermissionIdentity,
+    CommandPermissionState,
+)
 
 
 class TerminalDisposition(str, Enum):
@@ -110,6 +114,22 @@ class TerminalAction:
             parts.append(component.normalized_command)
         return " ".join(parts)
 
+    @property
+    def permission_identity(self) -> CommandPermissionIdentity:
+        return CommandPermissionIdentity(
+            host=self.host,
+            cwd=self.cwd,
+            components=tuple(
+                CommandPermissionComponent(
+                    executable=component.executable,
+                    arguments=component.arguments,
+                    operator_before=component.operator_before,
+                    redirections=component.redirections,
+                )
+                for component in self.components
+            ),
+        )
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> TerminalAction:
         """Construct an action only from a fully structured proposal payload."""
@@ -159,10 +179,7 @@ def authorize_terminal_action(
         return _result(TerminalDisposition.MANDATORY_FRESH, component_dispositions)
 
     permission_matches = any(
-        permission.is_active
-        and permission.host == action.host
-        and permission.cwd == action.cwd
-        and permission.normalized_command == action.normalized_command
+        permission.is_active and permission.identity == action.permission_identity
         for permission in permissions
     )
     protected = _uses_protected_resource((action.cwd.casefold(),)) or (

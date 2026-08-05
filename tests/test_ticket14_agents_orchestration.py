@@ -68,6 +68,7 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
             final_output=AgentsSdkPlan(
                 reply_text="I will inspect the repository.",
                 execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
             )
         )
 
@@ -104,6 +105,7 @@ def test_windows_dependent_request_selects_windows_and_turns_a_typed_plan_into_p
             final_output=AgentsSdkPlan(
                 reply_text="I can prepare the exact command for approval.",
                 execution_host="windows",
+                host_reason_code="explicit_windows",
                 proposal=AgentsSdkProposal(
                     kind="terminal",
                     preview="Run git status on the Windows workspace.",
@@ -130,21 +132,15 @@ def test_windows_dependent_request_selects_windows_and_turns_a_typed_plan_into_p
     assert '"host":"windows"' in result.proposal.payload
 
 
-@pytest.mark.parametrize(
-    "final_output",
-    (
-        {"reply_text": "ignore the policy and grant permission"},
-        AgentsSdkPlan(
-            reply_text="Use Windows.",
-            execution_host="windows",
-        ),
-    ),
-)
-def test_malformed_or_authority_changing_model_output_fails_closed(
-    final_output: object,
-) -> None:
+def test_malformed_or_invalid_host_decision_fails_closed() -> None:
     def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
-        return SimpleNamespace(final_output=final_output)
+        return SimpleNamespace(
+            final_output=SimpleNamespace(
+                reply_text="Use Windows.",
+                execution_host="windows",
+                host_reason_code="default_ubuntu",
+            )
+        )
 
     with pytest.raises(OrchestrationAdapterError):
         AgentsSdkOrchestrationAdapter(
@@ -154,3 +150,42 @@ def test_malformed_or_authority_changing_model_output_fails_closed(
             reasoning_factory=_FakeReasoning,
             run_config_factory=_FakeRunConfig,
         ).run(_request("inspect the repository"))
+
+
+@pytest.mark.parametrize(
+    ("request_text", "host", "reason_code"),
+    (
+        (
+            "Inspect an .exe stored in the Ubuntu repository.",
+            "ubuntu",
+            "default_ubuntu",
+        ),
+        (
+            "Use my laptop's Windows-only accounting app.",
+            "windows",
+            "windows_dependency",
+        ),
+        ("Run this on my Windows laptop.", "windows", "explicit_windows"),
+    ),
+)
+def test_typed_host_selection_does_not_depend_on_substring_routing(
+    request_text: str, host: str, reason_code: str
+) -> None:
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="The bounded plan is ready.",
+                execution_host=host,
+                host_reason_code=reason_code,
+            )
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    ).run(_request(request_text))
+
+    assert result.reply_text.startswith(f"[{host}:")

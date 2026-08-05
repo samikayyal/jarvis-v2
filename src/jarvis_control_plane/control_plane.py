@@ -633,9 +633,7 @@ class DeterministicCapabilityBroker:
             permission = CommandPermissionState(
                 permission_id=self.ids.new_id("permission"),
                 lifetime=lifetime,
-                host=terminal.host,
-                command=terminal.normalized_command,
-                cwd=terminal.cwd,
+                identity=terminal.permission_identity,
                 created_at=self.clock.now(),
                 session_id=(
                     session.session_id
@@ -672,6 +670,39 @@ class DeterministicCapabilityBroker:
             )
 
         dispatching = self._current_working_session()
+        unavailable_host = self._unavailable_terminal_host(action, dispatching)
+        if unavailable_host is not None:
+            self._close_unattempted_action(action.action_id)
+            try:
+                self._append_audit(
+                    kind="action_outcome",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome="host_unavailable",
+                    actor="control_plane",
+                    operation_type="terminal_dispatch",
+                    target_category="execution_host",
+                    execution_status="not_started",
+                    details={"command": "terminal", "result": "not_started"},
+                )
+            except AuditWriteError as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=(
+                        "selected execution host was unavailable but the "
+                        f"outcome was not recorded: {exc}"
+                    ),
+                )
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_dispatch_unavailable",
+                reason=(
+                    f"selected execution host {unavailable_host} is not ready; "
+                    "the action was not dispatched"
+                ),
+            )
         try:
             attempted = mark_action_dispatch_attempted(
                 dispatching, action_id=action.action_id, now=self.clock
@@ -760,6 +791,29 @@ class DeterministicCapabilityBroker:
         except (InvariantViolation, SessionStoreError):
             return False
         return True
+
+    @staticmethod
+    def _unavailable_terminal_host(
+        action: PendingActionState, session: WorkingSession
+    ) -> str | None:
+        """Return a terminal host that fails the last broker-side readiness gate."""
+
+        if action.kind != "terminal":
+            return None
+        proposal = FrozenActionProposal(
+            action_id=action.action_id,
+            request_id=action.request_id,
+            kind=action.kind,
+            preview=action.preview or "",
+            payload=action.payload,
+            digest=action.digest,
+        )
+        host = terminal_action_from_proposal(proposal).host
+        readiness = {
+            "ubuntu": session.readiness.ubuntu,
+            "windows": session.readiness.windows,
+        }
+        return None if readiness.get(host) == "ready" else host
 
     def _close_unattempted_action(self, action_id: str) -> None:
         """Fail closed after audit admission fails before the external attempt."""
