@@ -159,6 +159,7 @@ class TerminalPolicyResult:
     disposition: TerminalDisposition
     component_dispositions: tuple[TerminalDisposition, ...]
     reason: str
+    matched_permission_id: str | None = None
 
 
 def authorize_terminal_action(
@@ -178,10 +179,16 @@ def authorize_terminal_action(
     if TerminalDisposition.MANDATORY_FRESH in component_dispositions:
         return _result(TerminalDisposition.MANDATORY_FRESH, component_dispositions)
 
-    permission_matches = any(
-        permission.is_active and permission.identity == action.permission_identity
-        for permission in permissions
+    matched_permission = next(
+        (
+            permission
+            for permission in permissions
+            if permission.is_active
+            and permission.identity == action.permission_identity
+        ),
+        None,
     )
+    permission_matches = matched_permission is not None
     protected = _uses_protected_resource((action.cwd.casefold(),)) or (
         TerminalDisposition.PROTECTED_APPROVAL in component_dispositions
     )
@@ -191,9 +198,16 @@ def authorize_terminal_action(
             if permission_matches
             else TerminalDisposition.PROTECTED_APPROVAL,
             component_dispositions,
+            matched_permission_id=(
+                matched_permission.permission_id if matched_permission else None
+            ),
         )
     if permission_matches:
-        return _result(TerminalDisposition.EXACT_PERMISSION, component_dispositions)
+        return _result(
+            TerminalDisposition.EXACT_PERMISSION,
+            component_dispositions,
+            matched_permission_id=matched_permission.permission_id,
+        )
     if len(action.components) == 1 and all(
         item is TerminalDisposition.SAFE_READ for item in component_dispositions
     ):
@@ -405,9 +419,12 @@ def _is_canonical_path(value: str) -> bool:
 def _result(
     disposition: TerminalDisposition,
     components: tuple[TerminalDisposition, ...],
+    *,
+    matched_permission_id: str | None = None,
 ) -> TerminalPolicyResult:
     return TerminalPolicyResult(
         disposition=disposition,
         component_dispositions=components,
         reason=disposition.value,
+        matched_permission_id=matched_permission_id,
     )

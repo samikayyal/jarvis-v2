@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -31,6 +31,8 @@ SESSION_MINUTES = ALLOWED_SESSION_MINUTES
 DEFAULT_SESSION_MINUTES = 60
 PENDING_ACTION_MINUTES = 10
 PENDING_ACTION_TTL = timedelta(minutes=PENDING_ACTION_MINUTES)
+_WORKING_SESSION_SCHEMA_VERSION = 2
+_MAX_LEGACY_PERMISSION_MIGRATION_COUNT = 1_000
 
 CANONICAL_MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 MODELS = CANONICAL_MODELS
@@ -666,6 +668,10 @@ class CommandPermissionState:
     session_id: str | None = None
     last_used_at: datetime | None = None
     revoked_at: datetime | None = None
+    authorization_request_id: str | None = None
+    authorization_action_id: str | None = None
+    authorization_approval: str | None = None
+    authorization_audit_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.permission_id, "permission_id")
@@ -684,6 +690,15 @@ class CommandPermissionState:
             object.__setattr__(self, "last_used_at", ensure_utc(self.last_used_at))
         if self.revoked_at is not None:
             object.__setattr__(self, "revoked_at", ensure_utc(self.revoked_at))
+        for name in (
+            "authorization_request_id",
+            "authorization_action_id",
+            "authorization_approval",
+            "authorization_audit_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _identifier(value, name)
 
     @property
     def scope(self) -> PermissionLifetime:
@@ -847,6 +862,7 @@ class WorkingSession:
     last_request_id: str | None = None
     last_request_outcome: str | None = None
     last_terminal_at: datetime | None = None
+    legacy_permissions_invalidated: int = 0
 
     def __post_init__(self) -> None:
         for name in ("session_id", "operator_id", "conversation_ref"):
@@ -892,6 +908,16 @@ class WorkingSession:
         if self.last_terminal_at is not None:
             object.__setattr__(
                 self, "last_terminal_at", ensure_utc(self.last_terminal_at)
+            )
+        if (
+            isinstance(self.legacy_permissions_invalidated, bool)
+            or not isinstance(self.legacy_permissions_invalidated, int)
+            or not 0
+            <= self.legacy_permissions_invalidated
+            <= _MAX_LEGACY_PERMISSION_MIGRATION_COUNT
+        ):
+            raise ValueError(
+                "legacy_permissions_invalidated must be a bounded non-negative integer"
             )
         for name in ("last_request_id", "last_request_outcome"):
             value = getattr(self, name)
@@ -1456,6 +1482,7 @@ def new_working_session(
         last_terminal_at=at
         if old_request is not None or old_pending is not None
         else session.last_terminal_at,
+        legacy_permissions_invalidated=session.legacy_permissions_invalidated,
     )
     return _transition(
         session,
@@ -1988,41 +2015,50 @@ def active_command_permissions(
     )
 
 
-def revoke_command_permission(
+def revoke_command_permissions(
     session: WorkingSession,
     *,
-    permission_id: str,
+    selector: str,
     now: datetime | Clock,
 ) -> SessionTransition:
-    """Remove one matching rule from usable authority before any acknowledgement.
+    """Remove matching rules from usable authority before any acknowledgement.
 
     The revocation timestamp stays in operational state for provenance, while
-    policy matching considers only active rules.  A missing or already revoked
-    identifier is an idempotent no-op and therefore cannot reveal stale rules.
+    policy matching considers only active rules. ``selector`` is an exact
+    permission identifier or one of the canonical ``session``, ``persistent``,
+    and ``all`` scopes. A selector with no active matches is an idempotent no-op.
     """
 
-    _identifier(permission_id, "permission_id")
+    _identifier(selector, "permission_selector")
     at = _now(now)
-    target = next(
-        (
-            permission
-            for permission in session.permissions
-            if permission.permission_id == permission_id and permission.is_active
-        ),
-        None,
+    if selector == "all":
+        matches = lambda permission: permission.is_active
+    elif selector in {item.value for item in PermissionLifetime}:
+        lifetime = PermissionLifetime(selector)
+        matches = lambda permission: (
+            permission.is_active and permission.lifetime is lifetime
+        )
+    else:
+        matches = lambda permission: (
+            permission.is_active and permission.permission_id == selector
+        )
+    revoked_ids = tuple(
+        permission.permission_id
+        for permission in session.permissions
+        if matches(permission)
     )
-    if target is None:
+    if not revoked_ids:
         return _transition(
             session,
             session,
             TransitionKind.NOOP,
-            reason="command permission was not active",
+            reason="no matching command permissions were active",
         )
     after = replace(
         session,
         permissions=tuple(
             replace(permission, revoked_at=at)
-            if permission.permission_id == permission_id
+            if permission.permission_id in revoked_ids
             else permission
             for permission in session.permissions
         ),
@@ -2031,9 +2067,20 @@ def revoke_command_permission(
         session,
         after,
         TransitionKind.PERMISSION_REVOKED,
-        effects=("revoke_command_permission",),
-        reason="command permission revoked before acknowledgement",
+        effects=("revoke_command_permissions",),
+        reason=f"revoked {len(revoked_ids)} command permission(s) before acknowledgement",
     )
+
+
+def revoke_command_permission(
+    session: WorkingSession,
+    *,
+    permission_id: str,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Compatibility wrapper for revoking one exact permission identifier."""
+
+    return revoke_command_permissions(session, selector=permission_id, now=now)
 
 
 class WorkingSessionStore(Protocol):
@@ -2151,6 +2198,7 @@ def _session_json(session: WorkingSession) -> str:
 
     return json.dumps(
         {
+            "schema_version": _WORKING_SESSION_SCHEMA_VERSION,
             "session_id": session.session_id,
             "operator_id": session.operator_id,
             "created_at": session.created_at,
@@ -2249,6 +2297,10 @@ def _session_json(session: WorkingSession) -> str:
                     "session_id": item.session_id,
                     "last_used_at": item.last_used_at,
                     "revoked_at": item.revoked_at,
+                    "authorization_request_id": item.authorization_request_id,
+                    "authorization_action_id": item.authorization_action_id,
+                    "authorization_approval": item.authorization_approval,
+                    "authorization_audit_id": item.authorization_audit_id,
                 }
                 for item in session.permissions
             ],
@@ -2268,6 +2320,7 @@ def _session_json(session: WorkingSession) -> str:
             "last_request_id": session.last_request_id,
             "last_request_outcome": session.last_request_outcome,
             "last_terminal_at": session.last_terminal_at,
+            "legacy_permissions_invalidated": session.legacy_permissions_invalidated,
         },
         default=default,
         ensure_ascii=False,
@@ -2285,6 +2338,15 @@ def _session_from_json(value: str) -> WorkingSession:
 
     try:
         payload = json.loads(value)
+        if not isinstance(payload, Mapping):
+            raise TypeError("persisted working session must be an object")
+        schema_version = payload.get("schema_version")
+        if schema_version is not None and (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in {1, _WORKING_SESSION_SCHEMA_VERSION}
+        ):
+            raise ValueError("unsupported working-session schema version")
         refs = payload["durable_refs"]
         readiness = payload["readiness"]
         request = payload["active_request"]
@@ -2350,30 +2412,63 @@ def _session_from_json(value: str) -> WorkingSession:
             )
             for item in payload.get("action_outbox", ())
         )
-        permissions = tuple(
-            CommandPermissionState(
-                permission_id=item["permission_id"],
-                lifetime=item["lifetime"],
-                identity=CommandPermissionIdentity(
-                    host=item["identity"]["host"],
-                    cwd=item["identity"]["cwd"],
-                    components=tuple(
-                        CommandPermissionComponent(
-                            executable=component["executable"],
-                            arguments=tuple(component["arguments"]),
-                            operator_before=component["operator_before"],
-                            redirections=tuple(component["redirections"]),
-                        )
-                        for component in item["identity"]["components"]
-                    ),
-                ),
-                created_at=_parse_timestamp(item["created_at"]),
-                session_id=item["session_id"],
-                last_used_at=_parse_timestamp(item["last_used_at"]),
-                revoked_at=_parse_timestamp(item["revoked_at"]),
-            )
-            for item in payload["permissions"]
+        raw_permissions = payload["permissions"]
+        if not isinstance(raw_permissions, (list, tuple)):
+            raise TypeError("persisted permissions must be an ordered sequence")
+        legacy_permissions_invalidated = payload.get(
+            "legacy_permissions_invalidated", 0
         )
+        if (
+            isinstance(legacy_permissions_invalidated, bool)
+            or not isinstance(legacy_permissions_invalidated, int)
+            or not 0
+            <= legacy_permissions_invalidated
+            <= _MAX_LEGACY_PERMISSION_MIGRATION_COUNT
+        ):
+            raise ValueError("persisted permission migration count is invalid")
+
+        # The parent Ticket 10 representation was deliberately flattened.  It
+        # cannot be upgraded into an exact structured identity, so preserve
+        # every other session field and invalidate only those permission rules.
+        legacy_shape = schema_version == 1 or (
+            schema_version is None
+            and any(
+                not isinstance(item, Mapping) or "identity" not in item
+                for item in raw_permissions
+            )
+        )
+        if legacy_shape:
+            permissions = ()
+            legacy_permissions_invalidated += len(raw_permissions)
+        else:
+            permissions = tuple(
+                CommandPermissionState(
+                    permission_id=item["permission_id"],
+                    lifetime=item["lifetime"],
+                    identity=CommandPermissionIdentity(
+                        host=item["identity"]["host"],
+                        cwd=item["identity"]["cwd"],
+                        components=tuple(
+                            CommandPermissionComponent(
+                                executable=component["executable"],
+                                arguments=tuple(component["arguments"]),
+                                operator_before=component["operator_before"],
+                                redirections=tuple(component["redirections"]),
+                            )
+                            for component in item["identity"]["components"]
+                        ),
+                    ),
+                    created_at=_parse_timestamp(item["created_at"]),
+                    session_id=item["session_id"],
+                    last_used_at=_parse_timestamp(item["last_used_at"]),
+                    revoked_at=_parse_timestamp(item["revoked_at"]),
+                    authorization_request_id=item.get("authorization_request_id"),
+                    authorization_action_id=item.get("authorization_action_id"),
+                    authorization_approval=item.get("authorization_approval"),
+                    authorization_audit_id=item.get("authorization_audit_id"),
+                )
+                for item in raw_permissions
+            )
         return WorkingSession(
             session_id=payload["session_id"],
             operator_id=payload["operator_id"],
@@ -2412,6 +2507,7 @@ def _session_from_json(value: str) -> WorkingSession:
             last_request_id=payload["last_request_id"],
             last_request_outcome=payload["last_request_outcome"],
             last_terminal_at=_parse_timestamp(payload["last_terminal_at"]),
+            legacy_permissions_invalidated=legacy_permissions_invalidated,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise SessionStoreError("persisted working session is invalid") from exc
@@ -2467,7 +2563,31 @@ class SQLiteWorkingSessionStore:
             ).fetchone()
         except sqlite3.Error as exc:
             raise SessionStoreError("could not read working session") from exc
-        return _session_from_json(row[0]) if row is not None else None
+        if row is None:
+            return None
+        restored = _session_from_json(row[0])
+        canonical = _session_json(restored)
+        if row[0] != canonical:
+            try:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE working_session_current SET payload = ?
+                    WHERE slot = 1 AND payload = ?
+                    """,
+                    (canonical, row[0]),
+                )
+                if cursor.rowcount != 1:
+                    # Another process completed the migration or advanced the
+                    # session after our read.  Do not return a stale object.
+                    self.connection.rollback()
+                    return self.load()
+                self.connection.commit()
+            except sqlite3.Error as exc:
+                self.connection.rollback()
+                raise SessionStoreError(
+                    "could not normalize persisted working session"
+                ) from exc
+        return restored
 
     def create(self, session: WorkingSession) -> None:
         try:

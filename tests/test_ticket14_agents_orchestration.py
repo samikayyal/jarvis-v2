@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -128,6 +130,77 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert result.proposal is None
     assert result.execution_host == "ubuntu"
     assert result.host_reason_code == "default_ubuntu"
+
+
+def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_and_final() -> (
+    None
+):
+    captured: dict[str, object] = {}
+
+    def agent_factory(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        tools = captured["tools"]
+        assert isinstance(tools, list)
+        assert [tool.name for tool in tools] == ["read_request_context"]
+        read_tool = tools[0]
+        captured["tool_result"] = asyncio.run(
+            read_tool.on_invoke_tool(None, json.dumps({"max_chars": 8}))
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="The bounded read is complete.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=agent_factory,
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    ).run(_request("read the current request context"))
+
+    tool_result = captured["tool_result"]
+    assert tool_result["source"] == "authorized_request"
+    assert len(tool_result["text"]) <= 8
+    assert captured["tools"][0].needs_approval is False
+    assert result.reply_text.startswith("[ubuntu:")
+    assert result.reply_text.endswith("The bounded read is complete.")
+    assert [milestone.stage for milestone in result.milestones] == [
+        "orchestration_started",
+        "bounded_read",
+    ]
+
+
+def test_agents_adapter_enforces_a_per_request_read_invocation_limit() -> None:
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        read_tool = agent.tools[0]
+        asyncio.run(read_tool.on_invoke_tool(None, "{}"))
+        asyncio.run(read_tool.on_invoke_tool(None, "{}"))
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="unreachable",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        max_tool_invocations=1,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="invocation limit"):
+        adapter.run(_request("read the current request context twice"))
 
 
 def test_windows_dependent_request_selects_windows_and_turns_a_typed_plan_into_proposal() -> (

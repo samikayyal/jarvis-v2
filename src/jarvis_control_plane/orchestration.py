@@ -8,16 +8,25 @@ that the deterministic capability broker still validates, audits, and approves.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import FrozenActionProposal, OrchestrationRequest, OrchestrationResult
+from .models import (
+    FrozenActionProposal,
+    OrchestrationMilestone,
+    OrchestrationRequest,
+    OrchestrationResult,
+)
 from .ports import OrchestrationAdapterError
 from .terminal_policy import terminal_action_from_proposal
 
 _MAX_TURNS = 4
+_MAX_TOOL_INVOCATIONS = 4
 _MAX_REPLY_CHARS = 3_000
+_MAX_READ_CHARS = 1_000
+_CLOSED_READ_TOOL_NAMES = frozenset({"read_request_context"})
 _TERMINAL_PAYLOAD_FIELDS = frozenset(
     {"host", "executable", "arguments", "cwd", "components"}
 )
@@ -44,6 +53,63 @@ class AgentsSdkPlan(BaseModel):
         "default_ubuntu", "explicit_windows", "windows_dependency"
     ]
     proposal: AgentsSdkProposal | None = None
+
+
+class BoundedReadInput(BaseModel):
+    """Strict input schema for the one read-only context tool in Ticket 14."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_chars: int = Field(default=_MAX_READ_CHARS, ge=1, le=_MAX_READ_CHARS)
+
+
+class BoundedReadOutput(BaseModel):
+    """Strict bounded output returned by a read tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["authorized_request"]
+    text: str = Field(min_length=1, max_length=_MAX_READ_CHARS)
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedReadTool:
+    """Closed, typed read capability with no mutation or dispatch authority."""
+
+    name: str
+    description: str
+    input_model: type[BaseModel]
+    output_model: type[BaseModel]
+    handler: Callable[[OrchestrationRequest, BaseModel], BaseModel]
+
+    def __post_init__(self) -> None:
+        if self.name not in _CLOSED_READ_TOOL_NAMES:
+            raise ValueError("bounded read tool is outside the closed tool set")
+        if not self.description.strip():
+            raise ValueError("bounded read tool description must be non-blank")
+        if not isinstance(self.input_model, type) or not issubclass(
+            self.input_model, BaseModel
+        ):
+            raise TypeError("bounded read input_model must be a Pydantic model")
+        if not isinstance(self.output_model, type) or not issubclass(
+            self.output_model, BaseModel
+        ):
+            raise TypeError("bounded read output_model must be a Pydantic model")
+        if not callable(self.handler):
+            raise TypeError("bounded read handler must be callable")
+
+
+@dataclass(slots=True)
+class _ToolInvocationBudget:
+    limit: int
+    used: int = 0
+
+    def consume(self) -> None:
+        if self.used >= self.limit:
+            raise OrchestrationAdapterError(
+                "bounded read tool invocation limit exceeded"
+            )
+        self.used += 1
 
 
 _HOST_REASON_TEXT = {
@@ -77,6 +143,8 @@ class AgentsSdkOrchestrationAdapter:
         reasoning_factory: Callable[..., Any] | None = None,
         run_config_factory: Callable[..., Any] | None = None,
         max_turns: int = _MAX_TURNS,
+        max_tool_invocations: int = _MAX_TOOL_INVOCATIONS,
+        read_tool: BoundedReadTool | None = None,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -84,6 +152,14 @@ class AgentsSdkOrchestrationAdapter:
             or not 1 <= max_turns <= _MAX_TURNS
         ):
             raise ValueError(f"max_turns must be between 1 and {_MAX_TURNS}")
+        if (
+            isinstance(max_tool_invocations, bool)
+            or not isinstance(max_tool_invocations, int)
+            or not 1 <= max_tool_invocations <= _MAX_TOOL_INVOCATIONS
+        ):
+            raise ValueError(
+                f"max_tool_invocations must be between 1 and {_MAX_TOOL_INVOCATIONS}"
+            )
         if any(
             value is None
             for value in (
@@ -108,9 +184,21 @@ class AgentsSdkOrchestrationAdapter:
         self._reasoning_factory = reasoning_factory
         self._run_config_factory = run_config_factory
         self._max_turns = max_turns
+        self._max_tool_invocations = max_tool_invocations
+        self._read_tool = read_tool or _default_read_tool()
+        if not isinstance(self._read_tool, BoundedReadTool):
+            raise TypeError("read_tool must be a BoundedReadTool")
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+        milestones = [
+            OrchestrationMilestone(
+                stage="orchestration_started",
+                message="Started bounded orchestration.",
+            )
+        ]
+        budget = _ToolInvocationBudget(self._max_tool_invocations)
         try:
+            tools = self._build_tools(request, milestones, budget)
             agent = self._agent_factory(
                 name="Jarvis orchestration agent",
                 instructions=_instructions(),
@@ -120,7 +208,7 @@ class AgentsSdkOrchestrationAdapter:
                     parallel_tool_calls=False,
                     store=False,
                 ),
-                tools=[],
+                tools=tools,
                 output_type=AgentsSdkPlan,
             )
             run_config = self._run_config_factory(
@@ -136,6 +224,8 @@ class AgentsSdkOrchestrationAdapter:
                 auto_previous_response_id=False,
                 conversation_id=None,
             )
+        except OrchestrationAdapterError:
+            raise
         except Exception as exc:
             raise OrchestrationAdapterError("Agents SDK run was unavailable") from exc
 
@@ -155,7 +245,55 @@ class AgentsSdkOrchestrationAdapter:
             proposal=proposal,
             execution_host=host,
             host_reason_code=plan.host_reason_code,
+            milestones=tuple(milestones),
         )
+
+    def _build_tools(
+        self,
+        request: OrchestrationRequest,
+        milestones: list[OrchestrationMilestone],
+        budget: _ToolInvocationBudget,
+    ) -> list[Any]:
+        """Build the closed tool list anew for each request and invocation budget."""
+
+        from agents import FunctionTool
+
+        async def invoke(_context: Any, raw_input: str) -> dict[str, object]:
+            budget.consume()
+            try:
+                typed_input = self._read_tool.input_model.model_validate_json(raw_input)
+                typed_output = self._read_tool.handler(request, typed_input)
+                if not isinstance(typed_output, self._read_tool.output_model):
+                    raise TypeError("bounded read returned an untyped result")
+                bounded_output = self._read_tool.output_model.model_validate(
+                    typed_output
+                )
+            except OrchestrationAdapterError:
+                raise
+            except Exception as exc:
+                raise OrchestrationAdapterError(
+                    "bounded read tool returned malformed data"
+                ) from exc
+            milestones.append(
+                OrchestrationMilestone(
+                    stage="bounded_read",
+                    message=f"Completed bounded read with {self._read_tool.name}.",
+                )
+            )
+            return bounded_output.model_dump(mode="json")
+
+        return [
+            FunctionTool(
+                name=self._read_tool.name,
+                description=self._read_tool.description,
+                params_json_schema=self._read_tool.input_model.model_json_schema(),
+                on_invoke_tool=invoke,
+                strict_json_schema=True,
+                needs_approval=False,
+                timeout_seconds=2.0,
+                output_json_schema=self._read_tool.output_model.model_json_schema(),
+            )
+        ]
 
     @staticmethod
     def _frozen_proposal(
@@ -207,5 +345,30 @@ def _instructions() -> str:
         "depends on it; a mere platform or file-format mention is not a dependency. "
         "For a Windows selection, use only explicit_windows or windows_dependency. "
         "For a terminal action, emit one complete terminal proposal; it will still "
-        "be independently checked and require the broker's policy and approval flow."
+        "be independently checked and require the broker's policy and approval flow. "
+        "The only read tool is read_request_context; it accepts max_chars from 1 "
+        "through 1000 and returns only bounded authorized-request context. "
+        "Read tools never mutate, dispatch, approve, or create permissions."
+    )
+
+
+def _default_read_tool() -> BoundedReadTool:
+    def read_request_context(
+        request: OrchestrationRequest, typed_input: BaseModel
+    ) -> BaseModel:
+        if not isinstance(typed_input, BoundedReadInput):
+            raise TypeError("read_request_context received an invalid input model")
+        return BoundedReadOutput(
+            source="authorized_request",
+            text=request.text[: typed_input.max_chars],
+        )
+
+    return BoundedReadTool(
+        name="read_request_context",
+        description=(
+            "Read only the current authorized request text, bounded to max_chars."
+        ),
+        input_model=BoundedReadInput,
+        output_model=BoundedReadOutput,
+        handler=read_request_context,
     )

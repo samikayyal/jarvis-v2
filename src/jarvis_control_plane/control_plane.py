@@ -158,7 +158,8 @@ class DeterministicCapabilityBroker:
         self.model_availability_provider = model_availability_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
         self.action_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
-        if self.working_sessions.load() is None:
+        existing_session = self.working_sessions.load()
+        if existing_session is None:
             self.working_sessions.create(
                 WorkingSession.initial(
                     config.operator_id,
@@ -172,6 +173,7 @@ class DeterministicCapabilityBroker:
             )
         else:
             self._invalidate_restart_work()
+            self._record_pending_session_migration()
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
         self._trace = trace
@@ -315,6 +317,42 @@ class DeterministicCapabilityBroker:
         self.working_sessions.compare_and_set_with_audit(
             expected, updated, audit=self.audit, evidence=evidence
         )
+
+    def _record_pending_session_migration(self) -> None:
+        """Record and clear a durable permission-shape migration marker."""
+
+        for _ in range(3):
+            session = self._current_working_session()
+            count = session.legacy_permissions_invalidated
+            if count == 0:
+                return
+            evidence = self._audit_evidence(
+                kind="working_session_migration",
+                event_id=None,
+                request_id=None,
+                outcome="migrated",
+                actor="control_plane",
+                operation_type="working_session",
+                target_category="working_session",
+                execution_status="recorded",
+                details={
+                    "count": str(count),
+                    "state": "legacy_permissions_invalidated",
+                },
+            )
+            updated = replace(session, legacy_permissions_invalidated=0)
+            try:
+                self.working_sessions.compare_and_set_with_audit(
+                    session, updated, audit=self.audit, evidence=evidence
+                )
+                return
+            except AuditWriteError:
+                # Keep the marker durable so a later restart can retry the
+                # required migration evidence without restoring authority.
+                return
+            except SessionStoreError:
+                continue
+        raise SessionStoreError("could not record working-session migration")
 
     def freeze_action(self, proposal: FrozenActionProposal) -> PendingActionState:
         """Persist one proposal whose exact payload can later be dispatched once."""
@@ -606,6 +644,52 @@ class DeterministicCapabilityBroker:
         transition = approve_pending_action(session, now=self.clock)
         approved_state = transition.state
         approval_decision = "approved"
+        permission_id: str | None = None
+        permission_to_create: CommandPermissionState | None = None
+        terminal = None
+        terminal_policy = None
+        if action.kind == "terminal":
+            frozen = FrozenActionProposal(
+                action_id=action.action_id,
+                request_id=action.request_id,
+                kind=action.kind,
+                preview=action.preview or "",
+                payload=action.payload,
+                digest=action.digest,
+            )
+            try:
+                terminal = terminal_action_from_proposal(frozen)
+                terminal_policy = authorize_terminal_proposal(
+                    frozen, permissions=session.permissions
+                )
+            except (TypeError, ValueError):
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="pending_blocked",
+                    reason="terminal proposal could not be revalidated before dispatch",
+                )
+            if action.policy_disposition == TerminalDisposition.EXACT_PERMISSION.value:
+                if (
+                    terminal_policy.disposition
+                    is not TerminalDisposition.EXACT_PERMISSION
+                    or terminal_policy.matched_permission_id is None
+                ):
+                    return self._reject_revoked_pending_action(
+                        message,
+                        session,
+                        action,
+                        permission_id=terminal_policy.matched_permission_id,
+                    )
+                permission_id = terminal_policy.matched_permission_id
+                approved_state = replace(
+                    approved_state,
+                    permissions=tuple(
+                        replace(permission, last_used_at=self.clock.now())
+                        if permission.permission_id == permission_id
+                        else permission
+                        for permission in approved_state.permissions
+                    ),
+                )
         if choice_value in {
             ApprovalChoice.SESSION_PERMISSION.value,
             ApprovalChoice.PERSISTENT_PERMISSION.value,
@@ -615,22 +699,19 @@ class DeterministicCapabilityBroker:
                 TerminalDisposition.ORDINARY_APPROVAL.value,
             }:
                 return ReceiveResult(status_code=202, disposition="pending_blocked")
-            terminal = terminal_action_from_proposal(
-                FrozenActionProposal(
-                    action_id=action.action_id,
-                    request_id=action.request_id,
-                    kind=action.kind,
-                    preview=action.preview or "",
-                    payload=action.payload,
-                    digest=action.digest,
-                )
-            )
+            if terminal is None or terminal_policy is None:
+                return ReceiveResult(status_code=202, disposition="pending_blocked")
+            if terminal_policy.disposition not in {
+                TerminalDisposition.PROTECTED_APPROVAL,
+                TerminalDisposition.ORDINARY_APPROVAL,
+            }:
+                return ReceiveResult(status_code=202, disposition="pending_blocked")
             lifetime = (
                 PermissionLifetime.SESSION
                 if choice_value == ApprovalChoice.SESSION_PERMISSION.value
                 else PermissionLifetime.PERSISTENT
             )
-            permission = CommandPermissionState(
+            permission_to_create = CommandPermissionState(
                 permission_id=self.ids.new_id("permission"),
                 lifetime=lifetime,
                 identity=terminal.permission_identity,
@@ -640,16 +721,21 @@ class DeterministicCapabilityBroker:
                     if lifetime is PermissionLifetime.SESSION
                     else None
                 ),
+                authorization_request_id=action.request_id,
+                authorization_action_id=action.action_id,
+                authorization_approval=choice_value,
             )
+            permission_id = permission_to_create.permission_id
             approved_state = replace(
                 approved_state,
-                permissions=(*approved_state.permissions, permission),
+                permissions=(*approved_state.permissions, permission_to_create),
             )
             approval_decision = choice_value
         try:
-            self._commit_session_with_audit(
-                session,
-                approved_state,
+            details = {"action": action.action_id, "state": "approved"}
+            if permission_id is not None:
+                details["permission_id"] = permission_id
+            evidence = self._audit_evidence(
                 kind="pending_action",
                 event_id=message.event_id,
                 request_id=action.request_id,
@@ -659,7 +745,27 @@ class DeterministicCapabilityBroker:
                 operation_type="approval_gated_action",
                 target_category="pending_action",
                 approval_decision=approval_decision,
-                details={"action": action.action_id, "state": "approved"},
+                details=details,
+            )
+            if permission_to_create is not None:
+                approved_state = replace(
+                    approved_state,
+                    permissions=tuple(
+                        replace(
+                            permission,
+                            authorization_audit_id=evidence.evidence_id,
+                        )
+                        if permission.permission_id
+                        == permission_to_create.permission_id
+                        else permission
+                        for permission in approved_state.permissions
+                    ),
+                )
+            self.working_sessions.compare_and_set_with_audit(
+                session,
+                approved_state,
+                audit=self.audit,
+                evidence=evidence,
             )
         except (AuditWriteError, SessionStoreError) as exc:
             self._close_unattempted_action(action.action_id)
@@ -670,6 +776,48 @@ class DeterministicCapabilityBroker:
             )
 
         dispatching = self._current_working_session()
+        if permission_id is not None:
+            active_permission = next(
+                (
+                    permission
+                    for permission in dispatching.permissions
+                    if permission.permission_id == permission_id
+                    and permission.is_active
+                    and terminal is not None
+                    and permission.identity == terminal.permission_identity
+                ),
+                None,
+            )
+            if active_permission is None:
+                self._close_unattempted_action(action.action_id)
+                try:
+                    self._append_audit(
+                        kind="action_outcome",
+                        event_id=message.event_id,
+                        request_id=action.request_id,
+                        message_id=message.message_id,
+                        outcome="permission_revoked",
+                        actor="control_plane",
+                        operation_type="terminal_dispatch",
+                        target_category="execution_host",
+                        approval_decision="revoked",
+                        execution_status="not_started",
+                        details={"command": "terminal", "result": "not_started"},
+                    )
+                except AuditWriteError as exc:
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="audit_blocked",
+                        reason=(
+                            "command permission was revoked before dispatch but "
+                            f"the outcome was not recorded: {exc}"
+                        ),
+                    )
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="permission_revoked",
+                    reason="the command permission was revoked before dispatch",
+                )
         unavailable_host = self._unavailable_terminal_host(action, dispatching)
         if unavailable_host is not None:
             self._close_unattempted_action(action.action_id)
@@ -758,6 +906,47 @@ class DeterministicCapabilityBroker:
                 reason="action completed but terminal state could not be persisted",
             )
         return ReceiveResult(status_code=202, disposition="action_dispatched")
+
+    def _reject_revoked_pending_action(
+        self,
+        message: InboundMessage,
+        session: WorkingSession,
+        action: PendingActionState,
+        *,
+        permission_id: str | None,
+    ) -> ReceiveResult:
+        """Close an auto-authorized action whose exact rule was revoked."""
+
+        transition = reject_pending_action(session, now=self.clock)
+        details = {"action": action.action_id, "state": "rejected"}
+        if permission_id is not None:
+            details["permission_id"] = permission_id
+        try:
+            self._commit_session_with_audit(
+                session,
+                transition.state,
+                kind="pending_action",
+                event_id=message.event_id,
+                request_id=action.request_id,
+                message_id=message.message_id,
+                outcome="rejected",
+                actor="control_plane",
+                operation_type="approval_gated_action",
+                target_category="pending_action",
+                approval_decision="revoked",
+                details=details,
+            )
+        except (AuditWriteError, SessionStoreError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"revoked permission was not recorded: {exc}",
+            )
+        return ReceiveResult(
+            status_code=202,
+            disposition="permission_revoked",
+            reason="the exact command permission was revoked before dispatch",
+        )
 
     def _proposal_choices(self, action: PendingActionState) -> str:
         if action.policy_disposition in {

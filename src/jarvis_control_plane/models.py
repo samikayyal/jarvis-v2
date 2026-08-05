@@ -394,6 +394,23 @@ class FrozenActionProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class OrchestrationMilestone:
+    """One bounded, non-authoritative progress update for an active request."""
+
+    stage: str
+    message: str
+
+    def __post_init__(self) -> None:
+        _non_empty_identifier(self.stage, "milestone stage")
+        if len(self.stage) > 64:
+            raise ValueError("milestone stage is too long")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("milestone message must be non-blank")
+        if len(self.message) > 512:
+            raise ValueError("milestone message is too long")
+
+
+@dataclass(frozen=True, slots=True)
 class OrchestrationResult:
     """Typed, non-authoritative result returned by orchestration."""
 
@@ -404,6 +421,7 @@ class OrchestrationResult:
     proposal: FrozenActionProposal | None = None
     execution_host: str | None = None
     host_reason_code: str | None = None
+    milestones: tuple[OrchestrationMilestone, ...] = ()
 
     def __post_init__(self) -> None:
         _non_empty_identifier(self.request_id, "request_id")
@@ -411,6 +429,15 @@ class OrchestrationResult:
         if not isinstance(self.reply_text, str) or not self.reply_text.strip():
             raise ValueError("reply_text must be non-blank")
         _non_empty_identifier(self.adapter, "adapter")
+        milestones = tuple(self.milestones)
+        if len(milestones) > 8:
+            raise ValueError("orchestration result has too many milestones")
+        if any(
+            not isinstance(milestone, OrchestrationMilestone)
+            for milestone in milestones
+        ):
+            raise TypeError("milestones must contain OrchestrationMilestone values")
+        object.__setattr__(self, "milestones", milestones)
         if self.proposal is not None and self.proposal.request_id != self.request_id:
             raise ValueError(
                 "action proposal request_id must match orchestration result"
@@ -548,6 +575,7 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "operation",
         "path",
         "permission_scope",
+        "permission_id",
         "phase",
         "policy",
         "query",
@@ -699,6 +727,7 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     },
     "pending_action": {
         "action": None,
+        "permission_id": None,
         "state": frozenset(
             {
                 "frozen",
@@ -709,6 +738,10 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
                 "dispatch_failed",
             }
         ),
+    },
+    "working_session_migration": {
+        "count": None,
+        "state": frozenset({"legacy_permissions_invalidated"}),
     },
 }
 _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str]]] = {
@@ -814,6 +847,13 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
             }
         ),
         frozenset({"pending", "accepted", "completed", "failed"}),
+    ),
+    "working_session_migration": (
+        "working_session",
+        "working_session",
+        "control_plane",
+        frozenset({"migrated"}),
+        frozenset({"recorded"}),
     ),
 }
 
