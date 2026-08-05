@@ -24,6 +24,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .models import AuditEvidence
+
 ALLOWED_SESSION_MINUTES = (15, 30, 60, 120, 240)
 SESSION_MINUTES = ALLOWED_SESSION_MINUTES
 DEFAULT_SESSION_MINUTES = 60
@@ -77,6 +79,8 @@ class TransitionKind(str, Enum):
     PENDING_EXPIRED = "pending_expired"
     PENDING_APPROVED = "pending_approved"
     PENDING_REJECTED = "pending_rejected"
+    DISPATCH_ATTEMPTED = "dispatch_attempted"
+    DISPATCH_COMPLETED = "dispatch_completed"
     RESTART_INTERRUPTED = "restart_interrupted"
     RESULT_APPLIED = "result_applied"
     LATE_RESULT_IGNORED = "late_result_ignored"
@@ -440,6 +444,77 @@ class PendingActionState:
         return _now(at) >= self.expires_at
 
 
+class DispatchStatus(str, Enum):
+    """Durable lifecycle for one approval-gated dispatch attempt."""
+
+    UNATTEMPTED = "unattempted"
+    ATTEMPTED = "attempted"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    NOT_STARTED = "not_started"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class ActionDispatchRecord:
+    """One durable outbox record; live records retain the exact frozen payload."""
+
+    action_id: str
+    session_id: str
+    request_id: str
+    kind: str
+    digest: str
+    status: DispatchStatus | str
+    approved_at: datetime
+    payload: str | None
+    preview: str | None
+    attempted_at: datetime | None = None
+    terminal_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("action_id", "session_id", "request_id", "kind", "digest"):
+            _identifier(getattr(self, name), name)
+        status = DispatchStatus(self.status)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "approved_at", ensure_utc(self.approved_at))
+        if self.attempted_at is not None:
+            object.__setattr__(self, "attempted_at", ensure_utc(self.attempted_at))
+        if self.terminal_at is not None:
+            object.__setattr__(self, "terminal_at", ensure_utc(self.terminal_at))
+        live = status in {DispatchStatus.UNATTEMPTED, DispatchStatus.ATTEMPTED}
+        if live:
+            if not isinstance(self.payload, str) or not self.payload:
+                raise ValueError("live dispatch records require a frozen payload")
+            _identifier(self.preview, "preview")
+        elif self.payload is not None or self.preview is not None:
+            raise ValueError("terminal dispatch records must remove the frozen payload")
+        if status is DispatchStatus.ATTEMPTED and self.attempted_at is None:
+            raise ValueError("attempted dispatch records require attempted_at")
+        if not live and self.terminal_at is None:
+            raise ValueError("terminal dispatch records require terminal_at")
+
+    @classmethod
+    def unattempted(
+        cls, action: PendingActionState, *, approved_at: datetime | Clock
+    ) -> ActionDispatchRecord:
+        return cls(
+            action_id=action.action_id,
+            session_id=action.session_id,
+            request_id=action.request_id,
+            kind=action.kind,
+            digest=action.digest,
+            status=DispatchStatus.UNATTEMPTED,
+            approved_at=_now(approved_at),
+            payload=action.payload,
+            preview=action.preview,
+        )
+
+    @property
+    def is_live(self) -> bool:
+        return self.status in {DispatchStatus.UNATTEMPTED, DispatchStatus.ATTEMPTED}
+
+
 def _pending_action_digest(
     *,
     action_id: str,
@@ -631,6 +706,7 @@ class WorkingSession:
     durable_refs: DurableStateReferences
     active_request: ActiveRequestState | None = None
     pending_action: PendingActionState | None = None
+    action_outbox: tuple[ActionDispatchRecord, ...] = ()
     permissions: tuple[CommandPermissionState, ...] = ()
     readiness: ReadinessState = field(default_factory=ReadinessState)
     cancellation_generation: int = 0
@@ -700,6 +776,16 @@ class WorkingSession:
         if len(permission_ids) != len(set(permission_ids)):
             raise InvariantViolation("permission identifiers must be unique")
         object.__setattr__(self, "permissions", permissions)
+        outbox = tuple(self.action_outbox)
+        if any(not isinstance(record, ActionDispatchRecord) for record in outbox):
+            raise TypeError("action_outbox must contain ActionDispatchRecord values")
+        action_ids = [record.action_id for record in outbox]
+        if len(action_ids) != len(set(action_ids)):
+            raise InvariantViolation("action outbox identifiers must be unique")
+        live_outbox = tuple(record for record in outbox if record.is_live)
+        if len(live_outbox) > 1:
+            raise InvariantViolation("only one action dispatch may be live")
+        object.__setattr__(self, "action_outbox", outbox)
         if self.active_request is not None:
             if self.lifecycle is not SessionLifecycle.ACTIVE:
                 raise InvariantViolation(
@@ -721,6 +807,20 @@ class WorkingSession:
             if self.pending_action.request_id != self.active_request.request_id:
                 raise InvariantViolation(
                     "pending action belongs to a different request"
+                )
+        if live_outbox:
+            record = live_outbox[0]
+            if self.pending_action is not None or self.active_request is None:
+                raise InvariantViolation(
+                    "live action dispatch requires no pending action"
+                )
+            if self.active_request.request_id != record.request_id:
+                raise InvariantViolation(
+                    "live action dispatch belongs to another request"
+                )
+            if self.active_request.phase is not RequestPhase.DISPATCHING:
+                raise InvariantViolation(
+                    "live action dispatch requires dispatching phase"
                 )
         if self.lifecycle is not SessionLifecycle.ACTIVE and (
             self.active_request is not None or self.pending_action is not None
@@ -1007,7 +1107,11 @@ def cancel_active_request(
 ) -> SessionTransition:
     """Atomically cancel live work, invalidate pending state, and advance the barrier."""
 
-    if session.active_request is None and session.pending_action is None:
+    if (
+        session.active_request is None
+        and session.pending_action is None
+        and not any(record.is_live for record in session.action_outbox)
+    ):
         return _transition(
             session,
             session,
@@ -1022,11 +1126,26 @@ def cancel_active_request(
         effects.append("cancel_active_request")
     if pending_id is not None:
         effects.append("invalidate_pending_action")
+    outbox = tuple(
+        replace(
+            record,
+            status=DispatchStatus.CANCELLED,
+            payload=None,
+            preview=None,
+            terminal_at=at,
+        )
+        if record.is_live
+        else record
+        for record in session.action_outbox
+    )
+    if any(record.is_live for record in session.action_outbox):
+        effects.append("close_action_dispatch")
     effects.append("advance_cancellation_generation")
     after = replace(
         session,
         active_request=None,
         pending_action=None,
+        action_outbox=outbox,
         cancellation_generation=session.cancellation_generation + 1,
         last_activity_at=at,
         inactivity_anchor_at=at,
@@ -1068,6 +1187,7 @@ def new_working_session(
     new_conversation = conversation_ref or f"conversation:{new_id}"
     old_request = session.active_request
     old_pending = session.pending_action
+    live_outbox = tuple(record for record in session.action_outbox if record.is_live)
     persistent_permissions = tuple(
         permission
         for permission in session.permissions
@@ -1078,6 +1198,8 @@ def new_working_session(
         effects.append("cancel_active_request")
     if old_pending is not None:
         effects.append("invalidate_pending_action")
+    if live_outbox:
+        effects.append("close_action_dispatch")
     effects.extend(
         (
             "revoke_session_permissions",
@@ -1100,6 +1222,22 @@ def new_working_session(
         default_session_minutes=session.default_session_minutes,
         conversation_ref=new_conversation,
         durable_refs=session.durable_refs,
+        action_outbox=tuple(
+            replace(
+                record,
+                status=(
+                    DispatchStatus.NOT_STARTED
+                    if record.status is DispatchStatus.UNATTEMPTED
+                    else DispatchStatus.UNKNOWN
+                ),
+                payload=None,
+                preview=None,
+                terminal_at=at,
+            )
+            if record.is_live
+            else record
+            for record in session.action_outbox
+        ),
         permissions=persistent_permissions,
         readiness=session.readiness,
         cancellation_generation=session.cancellation_generation + 1,
@@ -1244,6 +1382,8 @@ def approve_pending_action(
         session,
         active_request=replace(request, phase=RequestPhase.DISPATCHING, updated_at=at),
         pending_action=None,
+        action_outbox=session.action_outbox
+        + (ActionDispatchRecord.unattempted(action, approved_at=at),),
         last_activity_at=at,
         inactivity_anchor_at=at,
     )
@@ -1252,6 +1392,100 @@ def approve_pending_action(
         after,
         TransitionKind.PENDING_APPROVED,
         effects=("record_pending_approval", "consume_pending_action"),
+    )
+
+
+def mark_action_dispatch_attempted(
+    session: WorkingSession,
+    *,
+    action_id: str,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Persist the ambiguous side-effect boundary before invoking a dispatcher."""
+
+    at = _now(now)
+    record = next(
+        (item for item in session.action_outbox if item.action_id == action_id), None
+    )
+    if record is None or record.status is not DispatchStatus.UNATTEMPTED:
+        raise InvariantViolation("dispatch attempt is not unattempted")
+    updated = replace(record, status=DispatchStatus.ATTEMPTED, attempted_at=at)
+    after = replace(
+        session,
+        action_outbox=tuple(
+            updated if item.action_id == action_id else item
+            for item in session.action_outbox
+        ),
+        last_activity_at=at,
+        inactivity_anchor_at=at,
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.DISPATCH_ATTEMPTED,
+        effects=("record_dispatch_attempt",),
+    )
+
+
+def complete_action_dispatch(
+    session: WorkingSession,
+    *,
+    action_id: str,
+    status: DispatchStatus,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Close one attempted record and immediately remove its exact payload."""
+
+    if status not in {
+        DispatchStatus.COMPLETED,
+        DispatchStatus.FAILED,
+        DispatchStatus.UNKNOWN,
+        DispatchStatus.NOT_STARTED,
+        DispatchStatus.CANCELLED,
+    }:
+        raise ValueError("action dispatch completion requires a terminal status")
+    at = _now(now)
+    record = next(
+        (item for item in session.action_outbox if item.action_id == action_id), None
+    )
+    if record is None or not record.is_live:
+        raise InvariantViolation("action dispatch record is not live")
+    request = session.active_request
+    if request is None or request.request_id != record.request_id:
+        raise InvariantViolation("action dispatch record does not own the live request")
+    terminal = replace(
+        record,
+        status=status,
+        payload=None,
+        preview=None,
+        terminal_at=at,
+    )
+    outcome = {
+        DispatchStatus.COMPLETED: "action_dispatched",
+        DispatchStatus.FAILED: "action_dispatch_failed",
+        DispatchStatus.UNKNOWN: "action_dispatch_unknown",
+        DispatchStatus.NOT_STARTED: "action_not_started",
+        DispatchStatus.CANCELLED: "action_cancelled",
+    }[status]
+    after = replace(
+        session,
+        active_request=None,
+        action_outbox=tuple(
+            terminal if item.action_id == action_id else item
+            for item in session.action_outbox
+        ),
+        cancellation_generation=session.cancellation_generation + 1,
+        last_activity_at=at,
+        inactivity_anchor_at=at,
+        last_request_id=request.request_id,
+        last_request_outcome=outcome,
+        last_terminal_at=at,
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.DISPATCH_COMPLETED,
+        effects=("close_action_dispatch", "advance_cancellation_generation"),
     )
 
 
@@ -1297,16 +1531,40 @@ def interrupt_for_restart(
 ) -> SessionTransition:
     """Invalidate non-resumable work and session permissions at restart."""
 
-    if session.active_request is None and session.pending_action is None:
+    live_dispatches = tuple(
+        record for record in session.action_outbox if record.is_live
+    )
+    if (
+        session.active_request is None
+        and session.pending_action is None
+        and not live_dispatches
+    ):
         return _transition(
             session, session, TransitionKind.NOOP, reason="no work to interrupt"
         )
     at = _now(now)
     request = session.active_request
+    reconciled_outbox = tuple(
+        replace(
+            record,
+            status=(
+                DispatchStatus.NOT_STARTED
+                if record.status is DispatchStatus.UNATTEMPTED
+                else DispatchStatus.UNKNOWN
+            ),
+            payload=None,
+            preview=None,
+            terminal_at=at,
+        )
+        if record.is_live
+        else record
+        for record in session.action_outbox
+    )
     after = replace(
         session,
         active_request=None,
         pending_action=None,
+        action_outbox=reconciled_outbox,
         permissions=tuple(
             permission
             for permission in session.permissions
@@ -1320,7 +1578,13 @@ def interrupt_for_restart(
             request.request_id if request is not None else session.last_request_id
         ),
         last_request_outcome=(
-            "interrupted" if request is not None else session.last_request_outcome
+            "action_dispatch_unknown"
+            if any(
+                record.status is DispatchStatus.ATTEMPTED for record in live_dispatches
+            )
+            else "interrupted"
+            if request is not None
+            else session.last_request_outcome
         ),
         last_terminal_at=(at if request is not None else session.last_terminal_at),
     )
@@ -1518,6 +1782,16 @@ class WorkingSessionStore(Protocol):
         history: Iterable[HistoryEntry] = (),
     ) -> None: ...
 
+    def compare_and_set_with_audit(
+        self,
+        expected: WorkingSession,
+        updated: WorkingSession,
+        *,
+        audit: object,
+        evidence: AuditEvidence,
+        history: Iterable[HistoryEntry] = (),
+    ) -> None: ...
+
     def append_history(self, entry: HistoryEntry) -> None: ...
 
     def list_history(
@@ -1561,6 +1835,27 @@ class InMemoryWorkingSessionStore:
             entries = tuple(history)
             self._session = updated
             self._history.extend(entries)
+
+    def compare_and_set_with_audit(
+        self,
+        expected: WorkingSession,
+        updated: WorkingSession,
+        *,
+        audit: object,
+        evidence: AuditEvidence,
+        history: Iterable[HistoryEntry] = (),
+    ) -> None:
+        """Commit state and required evidence as one lock-held in-memory operation."""
+
+        append = getattr(audit, "append", None)
+        if not callable(append):
+            raise SessionStoreError("audit boundary does not support append")
+        with self._lock:
+            if self._session != expected:
+                raise SessionStoreError("stale working-session transition")
+            append(evidence)
+            self._session = updated
+            self._history.extend(tuple(history))
 
     def append_history(self, entry: HistoryEntry) -> None:
         with self._lock:
@@ -1637,6 +1932,22 @@ def _session_json(session: WorkingSession) -> str:
                 if session.pending_action is not None
                 else None
             ),
+            "action_outbox": [
+                {
+                    "action_id": record.action_id,
+                    "session_id": record.session_id,
+                    "request_id": record.request_id,
+                    "kind": record.kind,
+                    "digest": record.digest,
+                    "status": record.status,
+                    "approved_at": record.approved_at,
+                    "payload": record.payload,
+                    "preview": record.preview,
+                    "attempted_at": record.attempted_at,
+                    "terminal_at": record.terminal_at,
+                }
+                for record in session.action_outbox
+            ],
             "permissions": [
                 {
                     "permission_id": item.permission_id,
@@ -1720,6 +2031,22 @@ def _session_from_json(value: str) -> WorkingSession:
             if action is not None
             else None
         )
+        action_outbox = tuple(
+            ActionDispatchRecord(
+                action_id=item["action_id"],
+                session_id=item["session_id"],
+                request_id=item["request_id"],
+                kind=item["kind"],
+                digest=item["digest"],
+                status=item["status"],
+                approved_at=_parse_timestamp(item["approved_at"]),
+                payload=item["payload"],
+                preview=item["preview"],
+                attempted_at=_parse_timestamp(item["attempted_at"]),
+                terminal_at=_parse_timestamp(item["terminal_at"]),
+            )
+            for item in payload.get("action_outbox", ())
+        )
         permissions = tuple(
             CommandPermissionState(
                 permission_id=item["permission_id"],
@@ -1755,6 +2082,7 @@ def _session_from_json(value: str) -> WorkingSession:
             durable_refs=DurableStateReferences(**refs),
             active_request=active_request,
             pending_action=pending_action,
+            action_outbox=action_outbox,
             permissions=permissions,
             readiness=ReadinessState(
                 ubuntu=readiness["ubuntu"],
@@ -1877,6 +2205,63 @@ class SQLiteWorkingSessionStore:
             self.connection.rollback()
             raise SessionStoreError(
                 "could not compare and set working session"
+            ) from exc
+
+    def compare_and_set_with_audit(
+        self,
+        expected: WorkingSession,
+        updated: WorkingSession,
+        *,
+        audit: object,
+        evidence: AuditEvidence,
+        history: Iterable[HistoryEntry] = (),
+    ) -> None:
+        """Commit session state, outbox, and audit admission in one transaction.
+
+        When the append-only audit shares this SQLite connection, its record is
+        written inside the same transaction. Independent audit adapters are
+        invoked only while the session transaction is still rollbackable.
+        """
+
+        expected_json = _session_json(expected)
+        updated_json = _session_json(updated)
+        entries = tuple(history)
+        append = getattr(audit, "append", None)
+        shared_append = getattr(audit, "_append_batch_in_transaction", None)
+        if not callable(append):
+            raise SessionStoreError("audit boundary does not support append")
+        if any(not isinstance(entry, HistoryEntry) for entry in entries):
+            raise TypeError("history must contain HistoryEntry values")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self.connection.execute(
+                "SELECT payload FROM working_session_current WHERE slot = 1"
+            ).fetchone()
+            if row is None or row[0] != expected_json:
+                self.connection.rollback()
+                raise SessionStoreError("stale working-session transition")
+            cursor = self.connection.execute(
+                "UPDATE working_session_current SET payload = ? WHERE slot = 1 AND payload = ?",
+                (updated_json, expected_json),
+            )
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                raise SessionStoreError("stale working-session transition")
+            self._append_history_in_transaction(entries)
+            if getattr(audit, "_connection", None) is self.connection and callable(
+                shared_append
+            ):
+                shared_append((evidence,))
+            else:
+                append(evidence)
+            self.connection.commit()
+        except SessionStoreError:
+            raise
+        except Exception as exc:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+            raise SessionStoreError(
+                "could not atomically commit working-session audit admission"
             ) from exc
 
     def append_history(self, entry: HistoryEntry) -> None:

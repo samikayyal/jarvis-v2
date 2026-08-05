@@ -1623,13 +1623,18 @@ class ControlledOrchestrationAdapter:
 class ControlledActionDispatcher:
     """Controlled action edge that records exactly the frozen proposal passed in."""
 
-    def __init__(self, *, failure: str | None = None) -> None:
+    def __init__(
+        self, *, failure: str | None = None, failure_may_have_dispatched: bool = False
+    ) -> None:
         self.failure = failure
+        self.failure_may_have_dispatched = failure_may_have_dispatched
         self.dispatched: list[FrozenActionProposal] = []
 
     def dispatch(self, action: FrozenActionProposal) -> None:
         if self.failure is not None:
-            raise ActionDispatcherError(self.failure)
+            raise ActionDispatcherError(
+                self.failure, may_have_dispatched=self.failure_may_have_dispatched
+            )
         self.dispatched.append(action)
 
 

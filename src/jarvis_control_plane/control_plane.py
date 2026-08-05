@@ -45,6 +45,7 @@ from .ports import (
 )
 from .sessions import (
     CancellationToken,
+    DispatchStatus,
     InMemoryWorkingSessionStore,
     InvariantViolation,
     ModelAvailability,
@@ -57,11 +58,14 @@ from .sessions import (
     WorkingSessionStore,
     apply_request_result,
     approve_pending_action,
+    cancel_active_request,
     cancellation_token_is_current,
+    complete_action_dispatch,
     expire_inactive_session,
     expire_pending_action,
     install_pending_action,
     interrupt_for_restart,
+    mark_action_dispatch_attempted,
     reject_pending_action,
 )
 from .traces import DiagnosticTraceRecorder
@@ -272,6 +276,19 @@ class DeterministicCapabilityBroker:
 
         return self._current_working_session().pending_action
 
+    def _commit_session_with_audit(
+        self,
+        expected: WorkingSession,
+        updated: WorkingSession,
+        **audit_fields: object,
+    ) -> None:
+        """Use the session store's shared transaction for state and evidence."""
+
+        evidence = self._audit_evidence(**audit_fields)  # ty:ignore[invalid-argument-type]
+        self.working_sessions.compare_and_set_with_audit(
+            expected, updated, audit=self.audit, evidence=evidence
+        )
+
     def freeze_action(self, proposal: FrozenActionProposal) -> PendingActionState:
         """Persist one proposal whose exact payload can later be dispatched once."""
 
@@ -284,21 +301,22 @@ class DeterministicCapabilityBroker:
                 proposal, session_id=session.session_id, created_at=self.clock
             )
             transition = install_pending_action(session, action, now=self.clock)
-            self._append_audit(
-                kind="pending_action",
-                event_id=None,
-                request_id=proposal.request_id,
-                outcome="pending",
-                actor="control_plane",
-                operation_type="approval_gated_action",
-                target_category="pending_action",
-                details={"action": action.action_id, "state": "frozen"},
-            )
             try:
-                self.working_sessions.compare_and_set(session, transition.state)
-                return action
+                self._commit_session_with_audit(
+                    session,
+                    transition.state,
+                    kind="pending_action",
+                    event_id=None,
+                    request_id=proposal.request_id,
+                    outcome="pending",
+                    actor="control_plane",
+                    operation_type="approval_gated_action",
+                    target_category="pending_action",
+                    details={"action": action.action_id, "state": "frozen"},
+                )
             except SessionStoreError:
                 continue
+            return action
         raise SessionStoreError("pending action could not be frozen atomically")
 
     def _consume_pending_approval(
@@ -316,7 +334,9 @@ class DeterministicCapabilityBroker:
         if getattr(choice, "value", choice) == "reject":
             transition = reject_pending_action(session, now=self.clock)
             try:
-                self._append_audit(
+                self._commit_session_with_audit(
+                    session,
+                    transition.state,
                     kind="pending_action",
                     event_id=message.event_id,
                     request_id=action.request_id,
@@ -328,7 +348,6 @@ class DeterministicCapabilityBroker:
                     approval_decision="rejected",
                     details={"action": action.action_id, "state": "rejected"},
                 )
-                self.working_sessions.compare_and_set(session, transition.state)
             except (AuditWriteError, SessionStoreError) as exc:
                 return ReceiveResult(
                     status_code=202,
@@ -339,7 +358,9 @@ class DeterministicCapabilityBroker:
 
         transition = approve_pending_action(session, now=self.clock)
         try:
-            self._append_audit(
+            self._commit_session_with_audit(
+                session,
+                transition.state,
                 kind="pending_action",
                 event_id=message.event_id,
                 request_id=action.request_id,
@@ -351,64 +372,105 @@ class DeterministicCapabilityBroker:
                 approval_decision="approved",
                 details={"action": action.action_id, "state": "approved"},
             )
-            self.working_sessions.compare_and_set(session, transition.state)
         except (AuditWriteError, SessionStoreError) as exc:
+            self._close_unattempted_action(action.action_id)
             return ReceiveResult(
                 status_code=202,
                 disposition="audit_blocked",
                 reason=f"pending action approval was not recorded: {exc}",
             )
 
+        dispatching = self._current_working_session()
+        try:
+            attempted = mark_action_dispatch_attempted(
+                dispatching, action_id=action.action_id, now=self.clock
+            )
+            self.working_sessions.compare_and_set(dispatching, attempted.state)
+        except (InvariantViolation, SessionStoreError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_dispatch_not_started",
+                reason=f"dispatch attempt was not durably recorded: {exc}",
+            )
+        record = next(
+            item
+            for item in attempted.state.action_outbox
+            if item.action_id == action.action_id
+        )
         try:
             self.action_dispatcher.dispatch(
                 FrozenActionProposal(
-                    action_id=action.action_id,
-                    request_id=action.request_id,
-                    kind=action.kind,
-                    preview=action.preview or action.summary,
-                    payload=action.payload,
-                    digest=action.digest,
+                    action_id=record.action_id,
+                    request_id=record.request_id,
+                    kind=record.kind,
+                    preview=record.preview or "",
+                    payload=record.payload or "",
+                    digest=record.digest,
                 )
             )
         except ActionDispatcherError as exc:
-            self._finish_frozen_action(action, outcome="action_dispatch_failed")
+            terminal_status = (
+                DispatchStatus.UNKNOWN
+                if exc.may_have_dispatched
+                else DispatchStatus.FAILED
+            )
+            if not self._finish_frozen_action(action.action_id, terminal_status):
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_unknown",
+                    reason="dispatcher failed and terminal state could not be persisted",
+                )
             return ReceiveResult(
                 status_code=202,
-                disposition="action_dispatch_failed",
+                disposition=(
+                    "action_dispatch_unknown"
+                    if exc.may_have_dispatched
+                    else "action_dispatch_failed"
+                ),
                 reason=str(exc),
             )
-        self._finish_frozen_action(action, outcome="action_dispatched")
+        if not self._finish_frozen_action(action.action_id, DispatchStatus.COMPLETED):
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_dispatch_unknown",
+                reason="action completed but terminal state could not be persisted",
+            )
         return ReceiveResult(status_code=202, disposition="action_dispatched")
 
-    def _finish_frozen_action(
-        self, action: PendingActionState, *, outcome: str
-    ) -> None:
+    def _finish_frozen_action(self, action_id: str, status: DispatchStatus) -> bool:
         current = self._current_working_session()
-        request = current.active_request
-        if request is None or request.request_id != action.request_id:
-            return
-        transition = apply_request_result(
-            current,
-            CancellationToken(
-                session_id=current.session_id,
-                request_id=action.request_id,
-                generation=request.generation,
-            ),
-            RequestResult(action.request_id, request.generation, outcome),
-            now=self.clock,
-        )
-        if transition.kind is TransitionKind.RESULT_APPLIED:
-            try:
-                self.working_sessions.compare_and_set(current, transition.state)
-            except SessionStoreError:
-                pass
+        try:
+            transition = complete_action_dispatch(
+                current, action_id=action_id, status=status, now=self.clock
+            )
+            self.working_sessions.compare_and_set(current, transition.state)
+        except (InvariantViolation, SessionStoreError):
+            return False
+        return True
+
+    def _close_unattempted_action(self, action_id: str) -> None:
+        """Fail closed after audit admission fails before the external attempt."""
+
+        current = self._current_working_session()
+        try:
+            transition = complete_action_dispatch(
+                current,
+                action_id=action_id,
+                status=DispatchStatus.NOT_STARTED,
+                now=self.clock,
+            )
+            self.working_sessions.compare_and_set(current, transition.state)
+        except (InvariantViolation, SessionStoreError):
+            pass
 
     def _expire_pending_action(
         self, message: InboundMessage, session: WorkingSession
     ) -> ReceiveResult:
         transition = expire_pending_action(session, now=self.clock)
         try:
-            self._append_audit(
+            self._commit_session_with_audit(
+                session,
+                transition.state,
                 kind="pending_action",
                 event_id=message.event_id,
                 request_id=(
@@ -423,7 +485,6 @@ class DeterministicCapabilityBroker:
                 target_category="pending_action",
                 details={"state": "expired"},
             )
-            self.working_sessions.compare_and_set(session, transition.state)
         except (AuditWriteError, SessionStoreError) as exc:
             return ReceiveResult(
                 status_code=202,
@@ -440,13 +501,25 @@ class DeterministicCapabilityBroker:
         token: CancellationToken,
         error: Exception,
     ) -> ReceiveResult:
-        self._finish_session_request(token, outcome="proposal_failed", message=message)
+        self._close_pending_proposal(token)
         return ReceiveResult(
             status_code=202,
             disposition="failed",
             request=request,
             reason=f"action proposal could not be frozen: {error}",
         )
+
+    def _close_pending_proposal(self, token: CancellationToken) -> None:
+        current = self._current_working_session()
+        if not cancellation_token_is_current(current, token):
+            return
+        transition = cancel_active_request(
+            current, now=self.clock, reason="proposal_audit_unavailable"
+        )
+        try:
+            self.working_sessions.compare_and_set(current, transition.state)
+        except SessionStoreError:
+            pass
 
     def _invalidate_restart_work(self) -> None:
         """A recreated broker must never make a stale proposal executable."""

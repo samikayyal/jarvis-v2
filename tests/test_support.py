@@ -59,6 +59,7 @@ def build_receiver_components(
     ids: DeterministicIdGenerator | None = None,
     trace: DiagnosticTraceRecorder | None = None,
     action_dispatcher: ControlledActionDispatcher | None = None,
+    working_sessions: Any | None = None,
 ) -> ReceiverComponents:
     """Build the repeated receiver/broker graph while preserving test overrides."""
 
@@ -99,6 +100,7 @@ def build_receiver_components(
         trace=trace,
         model_availability_provider=provider,
         action_dispatcher=action_dispatcher,
+        working_sessions=working_sessions,
     )
     receiver = SignedMessageReceiver(
         config=config,

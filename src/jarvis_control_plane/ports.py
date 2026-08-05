@@ -48,6 +48,10 @@ class OrchestrationAdapterError(ControlPlaneError):
 class ActionDispatcherError(ControlPlaneError):
     """A frozen approval-gated action could not be dispatched."""
 
+    def __init__(self, message: str, *, may_have_dispatched: bool = False) -> None:
+        super().__init__(message)
+        self.may_have_dispatched = may_have_dispatched
+
 
 class OutboundConnectorError(ControlPlaneError):
     """The controlled outbound connector rejected or failed a reply."""
