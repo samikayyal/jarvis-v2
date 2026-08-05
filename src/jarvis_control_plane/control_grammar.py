@@ -52,6 +52,10 @@ CONTROL_COMMANDS = (
 _THIS_TIME_APPROVALS = frozenset(
     {"yes", "okay", "ok", "allow", "approve", "confirm", "go ahead", "1"}
 )
+_SESSION_PERMISSION_APPROVALS = frozenset(
+    {"allow for this session", "allow this session", "2"}
+)
+_PERSISTENT_PERMISSION_APPROVALS = frozenset({"allow every time", "always allow", "3"})
 _REJECTIONS = frozenset(
     {
         "no",
@@ -105,6 +109,8 @@ class ControlTransitionKind(str, Enum):
 
 class ApprovalChoice(str, Enum):
     APPROVE = "approve"
+    SESSION_PERMISSION = "session_permission"
+    PERSISTENT_PERMISSION = "persistent_permission"
     REJECT = "reject"
 
 
@@ -195,6 +201,10 @@ def parse_approval_choice(message: str) -> ApprovalChoice | None:
     normalized = normalize_message(message)
     if normalized in _THIS_TIME_APPROVALS:
         return ApprovalChoice.APPROVE
+    if normalized in _SESSION_PERMISSION_APPROVALS:
+        return ApprovalChoice.SESSION_PERMISSION
+    if normalized in _PERSISTENT_PERMISSION_APPROVALS:
+        return ApprovalChoice.PERSISTENT_PERMISSION
     if normalized in _REJECTIONS:
         return ApprovalChoice.REJECT
     return None

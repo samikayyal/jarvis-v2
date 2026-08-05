@@ -8,9 +8,10 @@ from jarvis_control_plane import (
     ControlledOrchestrationAdapter,
     FrozenActionProposal,
     InboundMessage,
+    InMemoryAuditBoundary,
     SignedInboundEvent,
 )
-from jarvis_control_plane.ports import OutboundConnectorError
+from jarvis_control_plane.ports import AuditWriteError, OutboundConnectorError
 
 
 def make_event(text: str, *, suffix: str) -> SignedInboundEvent:
@@ -32,7 +33,7 @@ def make_event(text: str, *, suffix: str) -> SignedInboundEvent:
 
 
 def make_components(
-    *, preview: str, outbound: object | None = None
+    *, preview: str, outbound: object | None = None, audit: object | None = None
 ) -> tuple[object, ControlledActionDispatcher]:
     dispatcher = ControlledActionDispatcher()
     orchestration = ControlledOrchestrationAdapter(
@@ -52,6 +53,7 @@ def make_components(
         id_prefix="ticket08",
         orchestration=orchestration,
         action_dispatcher=dispatcher,
+        audit=audit,
     )
     if outbound is not None:
         components.broker.outbound = outbound
@@ -63,7 +65,7 @@ def test_oversized_proposal_is_delivered_as_one_bounded_digest_bound_sequence() 
 
     presented = components.receiver.receive(make_event("prepare change", suffix="01"))
 
-    assert presented.disposition == "pending_action"
+    assert presented.disposition == "pending_action", presented.reason
     action = components.broker.current_pending_action
     assert action is not None
     assert action.presentation_status.value == "presented"
@@ -101,6 +103,13 @@ class FailOnSecondPresentationSend:
         return self.wrapped.send(reply)
 
 
+class ProposalSendAuditFailure(InMemoryAuditBoundary):
+    def append_batch(self, evidence: object) -> None:
+        if any(item.kind == "outbound_attempt" for item in evidence):
+            raise AuditWriteError("proposal outbound audit is unavailable")
+        super().append_batch(evidence)
+
+
 def test_ambiguous_fragment_outcome_invalidates_the_action_without_retry() -> None:
     seed, _ = make_components(preview="unused")
     outbound = FailOnSecondPresentationSend(seed.outbound)
@@ -114,4 +123,18 @@ def test_ambiguous_fragment_outcome_invalidates_the_action_without_retry() -> No
     assert components.broker.current_pending_action is None
     assert components.broker.working_sessions.load().active_request is None
     assert outbound.calls == 2
+    assert dispatcher.dispatched == []
+
+
+def test_proposal_fragment_never_sends_when_its_audit_admission_fails() -> None:
+    audit = ProposalSendAuditFailure()
+    components, dispatcher = make_components(
+        preview="Change:\n" + "x" * 6_500, audit=audit
+    )
+
+    failed = components.receiver.receive(make_event("prepare change", suffix="audit"))
+
+    assert failed.disposition == "failed"
+    assert components.outbound.sent == []
+    assert components.broker.current_pending_action is None
     assert dispatcher.dispatched == []

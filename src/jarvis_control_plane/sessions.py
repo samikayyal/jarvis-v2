@@ -360,6 +360,7 @@ class PendingActionState:
     digest: str = ""
     preview: str | None = None
     payload: str = ""
+    policy_disposition: str | None = None
     presentation_status: ProposalPresentationStatus | str = (
         ProposalPresentationStatus.PRESENTED
     )
@@ -415,6 +416,8 @@ class PendingActionState:
             if len(fragments) > total:
                 raise InvariantViolation("presentation contains too many fragments")
         object.__setattr__(self, "presentation_fragments", fragments)
+        if self.policy_disposition is not None:
+            _identifier(self.policy_disposition, "policy_disposition")
 
     @classmethod
     def create(
@@ -428,6 +431,7 @@ class PendingActionState:
         created_at: datetime | Clock,
         preview: str | None = None,
         payload: str = "",
+        policy_disposition: str | None = None,
         presentation_status: ProposalPresentationStatus
         | str = ProposalPresentationStatus.PRESENTED,
     ) -> PendingActionState:
@@ -442,6 +446,7 @@ class PendingActionState:
             expires_at=created + PENDING_ACTION_TTL,
             preview=preview,
             payload=payload,
+            policy_disposition=policy_disposition,
             presentation_status=presentation_status,
         )
 
@@ -454,6 +459,7 @@ class PendingActionState:
         created_at: datetime | Clock,
         presentation_status: ProposalPresentationStatus
         | str = ProposalPresentationStatus.PRESENTED,
+        policy_disposition: str | None = None,
     ) -> PendingActionState:
         """Freeze the typed orchestration proposal into durable session state."""
 
@@ -478,6 +484,7 @@ class PendingActionState:
             created_at=created,
             expires_at=created + PENDING_ACTION_TTL,
             presentation_status=presentation_status,
+            policy_disposition=policy_disposition,
         )
         if action.digest != digest:
             raise InvariantViolation("proposal digest does not match pending action")
@@ -2064,6 +2071,7 @@ def _session_json(session: WorkingSession) -> str:
                     "digest": session.pending_action.digest,
                     "preview": session.pending_action.preview,
                     "payload": session.pending_action.payload,
+                    "policy_disposition": session.pending_action.policy_disposition,
                     "presentation_status": session.pending_action.presentation_status,
                     "presentation_fragments": [
                         {
@@ -2173,6 +2181,7 @@ def _session_from_json(value: str) -> WorkingSession:
                 digest=action.get("digest", ""),
                 preview=action.get("preview"),
                 payload=action.get("payload", ""),
+                policy_disposition=action.get("policy_disposition"),
                 presentation_status=action.get(
                     "presentation_status", ProposalPresentationStatus.PRESENTED
                 ),

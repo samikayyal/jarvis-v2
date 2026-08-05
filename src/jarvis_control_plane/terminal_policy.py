@@ -34,6 +34,7 @@ class TerminalComponent:
     executable: str
     arguments: tuple[str, ...] = ()
     operator_before: str = ""
+    redirections: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.executable, str) or not self.executable.strip():
@@ -46,6 +47,10 @@ class TerminalComponent:
         if any(not isinstance(argument, str) or not argument for argument in arguments):
             raise ValueError("terminal arguments must be non-empty strings")
         object.__setattr__(self, "arguments", arguments)
+        redirections = tuple(self.redirections)
+        if any(not isinstance(target, str) or not target for target in redirections):
+            raise ValueError("terminal redirections must have explicit targets")
+        object.__setattr__(self, "redirections", redirections)
 
     @property
     def normalized_command(self) -> str:
@@ -67,6 +72,10 @@ class TerminalAction:
             raise ValueError("terminal host must be non-blank")
         if not isinstance(self.cwd, str) or not self.cwd.strip():
             raise ValueError("terminal cwd must be non-blank")
+        if not _is_canonical_path(self.executable):
+            raise ValueError("terminal executable must be canonical and absolute")
+        if not _is_canonical_path(self.cwd):
+            raise ValueError("terminal cwd must be canonical and absolute")
         root = TerminalComponent(self.executable, tuple(self.arguments))
         raw_components = tuple(self.components)
         components = (
@@ -81,6 +90,12 @@ class TerminalAction:
             raise ValueError("first compound component must match terminal action")
         if components[0].operator_before:
             raise ValueError("first compound component cannot have a leading operator")
+        if any(
+            not _is_canonical_path(component.executable) for component in components
+        ):
+            raise ValueError(
+                "terminal component executable must be canonical and absolute"
+            )
         object.__setattr__(self, "host", self.host.strip())
         object.__setattr__(self, "cwd", self.cwd.strip())
         object.__setattr__(self, "arguments", root.arguments)
@@ -150,7 +165,10 @@ def authorize_terminal_action(
         and permission.normalized_command == action.normalized_command
         for permission in permissions
     )
-    if TerminalDisposition.PROTECTED_APPROVAL in component_dispositions:
+    protected = _uses_protected_resource((action.cwd.casefold(),)) or (
+        TerminalDisposition.PROTECTED_APPROVAL in component_dispositions
+    )
+    if protected:
         return _result(
             TerminalDisposition.EXACT_PERMISSION
             if permission_matches
@@ -159,7 +177,9 @@ def authorize_terminal_action(
         )
     if permission_matches:
         return _result(TerminalDisposition.EXACT_PERMISSION, component_dispositions)
-    if all(item is TerminalDisposition.SAFE_READ for item in component_dispositions):
+    if len(action.components) == 1 and all(
+        item is TerminalDisposition.SAFE_READ for item in component_dispositions
+    ):
         return _result(TerminalDisposition.SAFE_READ, component_dispositions)
     return _result(TerminalDisposition.ORDINARY_APPROVAL, component_dispositions)
 
@@ -178,10 +198,7 @@ def authorize_terminal_proposal(
     if proposal.kind != "terminal":
         raise ValueError("terminal policy accepts only terminal proposals")
     try:
-        payload = json.loads(proposal.payload)
-        if not isinstance(payload, Mapping):
-            raise TypeError("terminal payload must be an object")
-        action = TerminalAction.from_mapping(payload)
+        action = terminal_action_from_proposal(proposal)
     except (TypeError, ValueError, json.JSONDecodeError):
         return TerminalPolicyResult(
             disposition=TerminalDisposition.MANDATORY_FRESH,
@@ -191,6 +208,17 @@ def authorize_terminal_proposal(
     return authorize_terminal_action(action, permissions=permissions)
 
 
+def terminal_action_from_proposal(proposal: FrozenActionProposal) -> TerminalAction:
+    """Recover the exact structured command identity from frozen proposal text."""
+
+    if proposal.kind != "terminal":
+        raise ValueError("terminal policy accepts only terminal proposals")
+    payload = json.loads(proposal.payload)
+    if not isinstance(payload, Mapping):
+        raise TypeError("terminal payload must be an object")
+    return TerminalAction.from_mapping(payload)
+
+
 def _component_from_value(
     value: TerminalComponent | Mapping[str, object],
 ) -> TerminalComponent:
@@ -198,7 +226,12 @@ def _component_from_value(
         return value
     if not isinstance(value, Mapping):
         raise TypeError("terminal components must be TerminalComponent mappings")
-    if set(value) - {"executable", "arguments", "operator_before"} or not {
+    if set(value) - {
+        "executable",
+        "arguments",
+        "operator_before",
+        "redirections",
+    } or not {
         "executable",
         "arguments",
     } <= set(value):
@@ -206,10 +239,16 @@ def _component_from_value(
     arguments = value["arguments"]
     if not isinstance(arguments, (list, tuple)):
         raise TypeError("terminal component arguments must be an ordered sequence")
+    redirections = value.get("redirections", ())
+    if not isinstance(redirections, (list, tuple)):
+        raise TypeError("terminal component redirections must be an ordered sequence")
     return TerminalComponent(
         executable=_string(value["executable"], "executable"),
         arguments=tuple(_string(argument, "argument") for argument in arguments),
         operator_before=_string(value.get("operator_before", ""), "operator_before"),
+        redirections=tuple(
+            _string(redirection, "redirection") for redirection in redirections
+        ),
     )
 
 
@@ -234,6 +273,8 @@ def _classify_component(component: TerminalComponent) -> TerminalDisposition:
         return TerminalDisposition.MANDATORY_FRESH
     if _uses_protected_resource(arguments):
         return TerminalDisposition.PROTECTED_APPROVAL
+    if component.redirections:
+        return TerminalDisposition.ORDINARY_APPROVAL
     if _is_safe_read(command, arguments):
         return TerminalDisposition.SAFE_READ
     return TerminalDisposition.ORDINARY_APPROVAL
@@ -322,7 +363,26 @@ def _is_safe_read(command: str, arguments: tuple[str, ...]) -> bool:
             ("log",),
             ("show",),
         } and not any(argument.startswith("--output") for argument in arguments)
-    return command in {"cat", "head", "tail", "type"} and bool(arguments)
+    return (
+        command in {"cat", "head", "tail", "type"}
+        and len(arguments) == 1
+        and _is_canonical_path(arguments[0])
+    )
+
+
+def _is_canonical_path(value: str) -> bool:
+    """Accept only an already-resolved absolute POSIX or Windows path."""
+
+    normalized = value.replace("\\", "/")
+    absolute = normalized.startswith("/") or (
+        len(normalized) >= 3
+        and normalized[0].isalpha()
+        and normalized[1] == ":"
+        and normalized[2] == "/"
+    )
+    return absolute and all(
+        part not in {"", ".", ".."} for part in normalized.split("/")[1:]
+    )
 
 
 def _result(

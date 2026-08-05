@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from threading import RLock
 
 from .control_grammar import (
+    ApprovalChoice,
     ControlTransition,
     ControlTransitionKind,
     handle_message,
@@ -45,11 +46,13 @@ from .ports import (
 )
 from .sessions import (
     CancellationToken,
+    CommandPermissionState,
     DispatchStatus,
     InMemoryWorkingSessionStore,
     InvariantViolation,
     ModelAvailability,
     PendingActionState,
+    PermissionLifetime,
     ProposalPresentationStatus,
     RequestResult,
     SessionConfig,
@@ -71,7 +74,11 @@ from .sessions import (
     record_proposal_fragment,
     reject_pending_action,
 )
-from .terminal_policy import TerminalDisposition, authorize_terminal_proposal
+from .terminal_policy import (
+    TerminalDisposition,
+    authorize_terminal_proposal,
+    terminal_action_from_proposal,
+)
 from .traces import DiagnosticTraceRecorder
 
 _MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
@@ -257,8 +264,14 @@ class DeterministicCapabilityBroker:
             try:
                 action = self.freeze_action(result.proposal)
                 self._present_action(action, message)
+                if action.policy_disposition in {
+                    TerminalDisposition.SAFE_READ.value,
+                    TerminalDisposition.EXACT_PERMISSION.value,
+                }:
+                    return self._auto_authorize_terminal_action(action, message)
             except (
                 AuditWriteError,
+                DiagnosticTraceError,
                 InvariantViolation,
                 OutboundConnectorError,
                 SessionStoreError,
@@ -311,17 +324,20 @@ class DeterministicCapabilityBroker:
             request = session.active_request
             if request is None or request.request_id != proposal.request_id:
                 raise InvariantViolation("proposal does not belong to the live request")
+            policy_disposition: str | None = None
             if proposal.kind == "terminal":
                 policy = authorize_terminal_proposal(
                     proposal, permissions=session.permissions
                 )
                 if policy.disposition is TerminalDisposition.HARD_PROHIBITED:
                     raise InvariantViolation("terminal action is hard-prohibited")
+                policy_disposition = policy.disposition.value
             action = PendingActionState.from_proposal(
                 proposal,
                 session_id=session.session_id,
                 created_at=self.clock,
                 presentation_status=ProposalPresentationStatus.PRESENTING,
+                policy_disposition=policy_disposition,
             )
             transition = install_pending_action(session, action, now=self.clock)
             try:
@@ -370,16 +386,7 @@ class DeterministicCapabilityBroker:
                     raise InvariantViolation(
                         "proposal envelope exceeded outbound bound"
                     )
-                self.outbound.preflight(reply)
-                delivery = self.outbound.send(reply)
-                outbound_id = getattr(delivery, "outbound_id", None)
-                if getattr(delivery, "accepted", None) is not True or not isinstance(
-                    outbound_id, str
-                ):
-                    raise OutboundConnectorError(
-                        "proposal fragment gateway outcome was unknown",
-                        may_have_sent=True,
-                    )
+                outbound_id = self._send_presented_reply(reply, message=message)
                 self._record_proposal_fragment(
                     action.action_id, number, total, outbound_id
                 )
@@ -392,20 +399,16 @@ class DeterministicCapabilityBroker:
                 body=(
                     f"Proposal {action.action_id} digest {action.digest} "
                     "All proposal fragments were presented. "
-                    "1 Allow this time | 4 Reject "
+                    f"{self._proposal_choices(action)} "
                     f"request_id={action.request_id}"
                 ),
             )
             if len(prompt.body) > _MAX_OUTBOUND_MESSAGE_CHARS:
                 raise InvariantViolation("proposal prompt exceeded outbound bound")
-            self.outbound.preflight(prompt)
-            delivery = self.outbound.send(prompt)
-            if getattr(delivery, "accepted", None) is not True:
-                raise OutboundConnectorError(
-                    "proposal prompt gateway outcome was unknown", may_have_sent=True
-                )
+            self._send_presented_reply(prompt, message=message)
             self._mark_proposal_presented(action.action_id)
         except (
+            DiagnosticTraceError,
             InvariantViolation,
             OutboundConnectorError,
             SessionStoreError,
@@ -413,6 +416,116 @@ class DeterministicCapabilityBroker:
         ):
             self._invalidate_presenting_action(action.action_id)
             raise
+
+    def _send_presented_reply(
+        self, reply: OutboundReply, *, message: InboundMessage
+    ) -> str:
+        """Use the normal audit and trace admission boundary for one envelope send."""
+
+        preflight = getattr(self.outbound, "preflight", None)
+        if not callable(preflight):
+            raise OutboundConnectorError(
+                "outbound connector does not provide audit-safe preflight"
+            )
+        preflight(reply)
+        self.audit.append_batch(
+            (
+                self._audit_evidence(
+                    kind="outbound_attempt",
+                    event_id=message.event_id,
+                    request_id=reply.request_id,
+                    message_id=message.message_id,
+                    outcome="attempted",
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    details={
+                        "channel": "controlled_outbound",
+                        "destination": "configured_operator",
+                    },
+                ),
+                self._audit_evidence(
+                    kind="outbound_result",
+                    event_id=message.event_id,
+                    request_id=reply.request_id,
+                    message_id=message.message_id,
+                    outcome="pending",
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    execution_status="pending",
+                    details={"channel": "controlled_outbound", "result": "pending"},
+                ),
+                self._audit_evidence(
+                    kind="outbound_completion",
+                    event_id=message.event_id,
+                    request_id=reply.request_id,
+                    message_id=message.message_id,
+                    outcome="pending",
+                    actor="controlled_outbound",
+                    operation_type="outbound_message",
+                    target_category="operator_conversation",
+                    execution_status="pending",
+                    details={"result": "pending"},
+                ),
+            )
+        )
+        outbound_id: str | None = None
+
+        def send() -> dict[str, str]:
+            nonlocal outbound_id
+            delivery = self.outbound.send(reply)
+            outbound_id = getattr(delivery, "outbound_id", None)
+            if getattr(delivery, "accepted", None) is not True or not isinstance(
+                outbound_id, str
+            ):
+                raise OutboundConnectorError(
+                    "proposal gateway outcome was unknown", may_have_sent=True
+                )
+            return {"outbound_id": outbound_id, "result": "accepted"}
+
+        try:
+            self._trace.execute(
+                request_id=reply.request_id,
+                operation_id=f"{reply.request_id}:connector:{reply.reply_id}",
+                operation_type="connector",
+                input_payload=reply,
+                arguments={"operation": "send", "channel": "controlled_outbound"},
+                telemetry={"phase": "proposal_presentation"},
+                operation=send,
+                result_limit_bytes=4_096,
+                error_limit_bytes=8_192,
+            )
+        except (DiagnosticTraceError, OutboundConnectorError) as exc:
+            result = "unknown" if getattr(exc, "may_have_sent", False) else "failed"
+            self._best_effort_audit(
+                kind="outbound_result",
+                event_id=message.event_id,
+                request_id=reply.request_id,
+                message_id=message.message_id,
+                outcome=result,
+                actor="controlled_outbound",
+                operation_type="outbound_message",
+                target_category="operator_conversation",
+                execution_status=result,
+                details={"channel": "controlled_outbound", "result": result},
+            )
+            raise
+        self._append_audit(
+            kind="outbound_result",
+            event_id=message.event_id,
+            request_id=reply.request_id,
+            message_id=message.message_id,
+            outcome="accepted",
+            actor="controlled_outbound",
+            operation_type="outbound_message",
+            target_category="operator_conversation",
+            execution_status="accepted",
+            details={"channel": "controlled_outbound", "result": "accepted"},
+        )
+        if outbound_id is None:
+            raise InvariantViolation("accepted proposal delivery did not return an ID")
+        return outbound_id
 
     def _record_proposal_fragment(
         self, action_id: str, number: int, total: int, outbound_id: str
@@ -464,7 +577,8 @@ class DeterministicCapabilityBroker:
         request = session.active_request
         if action is None or request is None:
             return ReceiveResult(status_code=202, disposition="pending_unavailable")
-        if getattr(choice, "value", choice) == "reject":
+        choice_value = getattr(choice, "value", choice)
+        if choice_value == ApprovalChoice.REJECT.value:
             transition = reject_pending_action(session, now=self.clock)
             try:
                 self._commit_session_with_audit(
@@ -490,10 +604,54 @@ class DeterministicCapabilityBroker:
             return ReceiveResult(status_code=202, disposition="action_rejected")
 
         transition = approve_pending_action(session, now=self.clock)
+        approved_state = transition.state
+        approval_decision = "approved"
+        if choice_value in {
+            ApprovalChoice.SESSION_PERMISSION.value,
+            ApprovalChoice.PERSISTENT_PERMISSION.value,
+        }:
+            if action.policy_disposition not in {
+                TerminalDisposition.PROTECTED_APPROVAL.value,
+                TerminalDisposition.ORDINARY_APPROVAL.value,
+            }:
+                return ReceiveResult(status_code=202, disposition="pending_blocked")
+            terminal = terminal_action_from_proposal(
+                FrozenActionProposal(
+                    action_id=action.action_id,
+                    request_id=action.request_id,
+                    kind=action.kind,
+                    preview=action.preview or "",
+                    payload=action.payload,
+                    digest=action.digest,
+                )
+            )
+            lifetime = (
+                PermissionLifetime.SESSION
+                if choice_value == ApprovalChoice.SESSION_PERMISSION.value
+                else PermissionLifetime.PERSISTENT
+            )
+            permission = CommandPermissionState(
+                permission_id=self.ids.new_id("permission"),
+                lifetime=lifetime,
+                host=terminal.host,
+                command=terminal.normalized_command,
+                cwd=terminal.cwd,
+                created_at=self.clock.now(),
+                session_id=(
+                    session.session_id
+                    if lifetime is PermissionLifetime.SESSION
+                    else None
+                ),
+            )
+            approved_state = replace(
+                approved_state,
+                permissions=(*approved_state.permissions, permission),
+            )
+            approval_decision = choice_value
         try:
             self._commit_session_with_audit(
                 session,
-                transition.state,
+                approved_state,
                 kind="pending_action",
                 event_id=message.event_id,
                 request_id=action.request_id,
@@ -502,7 +660,7 @@ class DeterministicCapabilityBroker:
                 actor="control_plane",
                 operation_type="approval_gated_action",
                 target_category="pending_action",
-                approval_decision="approved",
+                approval_decision=approval_decision,
                 details={"action": action.action_id, "state": "approved"},
             )
         except (AuditWriteError, SessionStoreError) as exc:
@@ -569,6 +727,28 @@ class DeterministicCapabilityBroker:
                 reason="action completed but terminal state could not be persisted",
             )
         return ReceiveResult(status_code=202, disposition="action_dispatched")
+
+    def _proposal_choices(self, action: PendingActionState) -> str:
+        if action.policy_disposition in {
+            TerminalDisposition.PROTECTED_APPROVAL.value,
+            TerminalDisposition.ORDINARY_APPROVAL.value,
+        }:
+            return "1 Allow this time | 2 Allow for this session | 3 Allow every time | 4 Reject"
+        if action.policy_disposition in {
+            TerminalDisposition.SAFE_READ.value,
+            TerminalDisposition.EXACT_PERMISSION.value,
+        }:
+            return "Automatically authorized by deterministic terminal policy"
+        return "1 Allow this time | 4 Reject"
+
+    def _auto_authorize_terminal_action(
+        self, action: PendingActionState, message: InboundMessage
+    ) -> ReceiveResult:
+        """Consume safe-read or exact-permission authorization after presentation."""
+
+        return self._consume_pending_approval(
+            message, self._current_working_session(), ApprovalChoice.APPROVE
+        )
 
     def _finish_frozen_action(self, action_id: str, status: DispatchStatus) -> bool:
         current = self._current_working_session()
