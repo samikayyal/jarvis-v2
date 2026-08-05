@@ -5,22 +5,20 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     AuditEvidence,
     ControlledOrchestrationAdapter,
     ControlledOutboundConnector,
     ControlPlaneConfig,
-    DeterministicCapabilityBroker,
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
     FixedClock,
-    FixedModelAvailabilityProvider,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
-    ModelAvailability,
     OutboundReply,
     SignedInboundEvent,
     SignedMessageReceiver,
@@ -94,44 +92,29 @@ def make_components(
     ControlledOutboundConnector,
     SignedMessageReceiver,
 ]:
-    config = ControlPlaneConfig(
-        operator_id=OPERATOR,
-        session_id=SESSION,
-        signing_secret=SECRET,
-    )
     clock = clock or FixedClock(NOW)
     ids = ids or DeterministicIdGenerator("seam")
-    state = state or InMemoryDurableStateStore()
-    audit = audit or InMemoryAuditBoundary()
-    orchestration = orchestration or ControlledOrchestrationAdapter()
-    outbound = ControlledOutboundConnector(
+    components = build_receiver_components(
         operator_id=OPERATOR,
-        session_id=SESSION,
+        transport_session_id=SESSION,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="seam",
+        state=state,  # type: ignore[arg-type]
         audit=audit,  # type: ignore[arg-type]
         clock=clock,
         ids=ids,
-    )
-    trace = make_trace(clock, ids)
-    broker = DeterministicCapabilityBroker(
-        config=config,
-        state=state,  # type: ignore[arg-type]
-        audit=audit,  # type: ignore[arg-type]
         orchestration=orchestration,
-        outbound=outbound,
-        clock=clock,
-        ids=ids,
-        trace=trace,
-        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
+        trace=make_trace(clock, ids),
     )
-    receiver = SignedMessageReceiver(
-        config=config,
-        state=state,  # type: ignore[arg-type]
-        audit=audit,  # type: ignore[arg-type]
-        broker=broker,
-        clock=clock,
-        ids=ids,
+    return (
+        components.config,
+        components.state,
+        components.audit,
+        components.orchestration,
+        components.outbound,
+        components.receiver,
     )
-    return config, state, audit, orchestration, outbound, receiver
 
 
 def test_primary_seam_persists_state_and_audit_and_sends_one_correlated_reply() -> None:

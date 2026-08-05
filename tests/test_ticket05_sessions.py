@@ -5,23 +5,12 @@ from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 
 import pytest
+from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     ControlledOrchestrationAdapter,
-    ControlledOutboundConnector,
-    ControlPlaneConfig,
-    DeterministicCapabilityBroker,
-    DeterministicIdGenerator,
-    DiagnosticTraceRecorder,
-    FixedClock,
-    FixedModelAvailabilityProvider,
     InboundMessage,
-    InMemoryAuditBoundary,
-    InMemoryDiagnosticTraceStore,
-    InMemoryDurableStateStore,
-    ModelAvailability,
     SignedInboundEvent,
-    SignedMessageReceiver,
 )
 from jarvis_control_plane.control_grammar import (
     ControlCommand,
@@ -73,45 +62,24 @@ TRANSPORT_SESSION = "session.test"
 def make_receiver_components(
     *, orchestration: ControlledOrchestrationAdapter | None = None
 ):
-    config = ControlPlaneConfig(
+    components = build_receiver_components(
         operator_id=OPERATOR,
-        session_id=TRANSPORT_SESSION,
+        transport_session_id=TRANSPORT_SESSION,
         signing_secret=SECRET,
-    )
-    clock = FixedClock(NOW)
-    ids = DeterministicIdGenerator("ticket05-receiver")
-    state = InMemoryDurableStateStore()
-    audit = InMemoryAuditBoundary()
-    orchestration = orchestration or ControlledOrchestrationAdapter()
-    outbound = ControlledOutboundConnector(
-        operator_id=OPERATOR,
-        session_id=TRANSPORT_SESSION,
-        audit=audit,
-        clock=clock,
-        ids=ids,
-    )
-    trace_store = InMemoryDiagnosticTraceStore()
-    trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
-    broker = DeterministicCapabilityBroker(
-        config=config,
-        state=state,
-        audit=audit,
+        now=NOW,
+        id_prefix="ticket05-receiver",
         orchestration=orchestration,
-        outbound=outbound,
-        clock=clock,
-        ids=ids,
-        trace=trace,
-        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
-    receiver = SignedMessageReceiver(
-        config=config,
-        state=state,
-        audit=audit,
-        broker=broker,
-        clock=clock,
-        ids=ids,
+    assert components.trace_store is not None
+    return (
+        components.state,
+        components.audit,
+        components.orchestration,
+        components.outbound,
+        components.broker,
+        components.receiver,
+        components.trace_store,
     )
-    return state, audit, orchestration, outbound, broker, receiver, trace_store
 
 
 def make_signed_event(

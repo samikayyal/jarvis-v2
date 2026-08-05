@@ -1,0 +1,117 @@
+"""Shared controlled receiver builder for the Ticket 01–06 test seams."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from jarvis_control_plane import (
+    ControlledOrchestrationAdapter,
+    ControlledOutboundConnector,
+    ControlPlaneConfig,
+    DeterministicCapabilityBroker,
+    DeterministicIdGenerator,
+    DiagnosticTraceRecorder,
+    FixedClock,
+    FixedModelAvailabilityProvider,
+    InMemoryAuditBoundary,
+    InMemoryDiagnosticTraceStore,
+    InMemoryDurableStateStore,
+    ModelAvailability,
+    SignedMessageReceiver,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiverComponents:
+    """One controlled receiver graph with all test-visible collaborators."""
+
+    config: ControlPlaneConfig
+    state: Any
+    audit: Any
+    clock: FixedClock
+    ids: DeterministicIdGenerator
+    provider: FixedModelAvailabilityProvider
+    orchestration: ControlledOrchestrationAdapter
+    outbound: ControlledOutboundConnector
+    broker: DeterministicCapabilityBroker
+    receiver: SignedMessageReceiver
+    trace_store: InMemoryDiagnosticTraceStore | None
+
+
+def build_receiver_components(
+    *,
+    operator_id: str,
+    transport_session_id: str,
+    signing_secret: bytes,
+    now: datetime,
+    id_prefix: str,
+    state: Any | None = None,
+    audit: Any | None = None,
+    orchestration: ControlledOrchestrationAdapter | None = None,
+    availability: ModelAvailability | None = None,
+    working_session_id: str | None = None,
+    clock: FixedClock | None = None,
+    ids: DeterministicIdGenerator | None = None,
+    trace: DiagnosticTraceRecorder | None = None,
+) -> ReceiverComponents:
+    """Build the repeated receiver/broker graph while preserving test overrides."""
+
+    config = ControlPlaneConfig(
+        operator_id=operator_id,
+        session_id=transport_session_id,
+        signing_secret=signing_secret,
+        working_session_id=working_session_id,
+    )
+    clock = clock or FixedClock(now)
+    ids = ids or DeterministicIdGenerator(id_prefix)
+    state = state if state is not None else InMemoryDurableStateStore()
+    audit = audit if audit is not None else InMemoryAuditBoundary()
+    orchestration = orchestration or ControlledOrchestrationAdapter()
+    provider = FixedModelAvailabilityProvider(availability or ModelAvailability())
+    outbound = ControlledOutboundConnector(
+        operator_id=operator_id,
+        session_id=transport_session_id,
+        audit=audit,
+        clock=clock,
+        ids=ids,
+    )
+    trace_store = None
+    if trace is None:
+        trace_store = InMemoryDiagnosticTraceStore()
+        trace = DiagnosticTraceRecorder(
+            writer=trace_store.writer(), clock=clock, ids=ids
+        )
+    broker = DeterministicCapabilityBroker(
+        config=config,
+        state=state,
+        audit=audit,
+        orchestration=orchestration,
+        outbound=outbound,
+        clock=clock,
+        ids=ids,
+        trace=trace,
+        model_availability_provider=provider,
+    )
+    receiver = SignedMessageReceiver(
+        config=config,
+        state=state,
+        audit=audit,
+        broker=broker,
+        clock=clock,
+        ids=ids,
+    )
+    return ReceiverComponents(
+        config=config,
+        state=state,
+        audit=audit,
+        clock=clock,
+        ids=ids,
+        provider=provider,
+        orchestration=orchestration,
+        outbound=outbound,
+        broker=broker,
+        receiver=receiver,
+        trace_store=trace_store,
+    )

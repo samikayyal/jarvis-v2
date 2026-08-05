@@ -7,23 +7,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     ControlledOrchestrationAdapter,
-    ControlledOutboundConnector,
-    ControlPlaneConfig,
-    DeterministicCapabilityBroker,
-    DeterministicIdGenerator,
-    DiagnosticTraceRecorder,
-    FixedClock,
-    FixedModelAvailabilityProvider,
     InboundMessage,
-    InMemoryAuditBoundary,
-    InMemoryDiagnosticTraceStore,
-    InMemoryDurableStateStore,
     ModelAvailability,
     SignedInboundEvent,
-    SignedMessageReceiver,
 )
 from jarvis_control_plane.control_grammar import (
     ControlTransitionKind,
@@ -48,55 +38,26 @@ def make_receiver_components(
     availability: ModelAvailability | None = None,
     orchestration: ControlledOrchestrationAdapter | None = None,
 ):
-    config = ControlPlaneConfig(
+    components = build_receiver_components(
         operator_id=OPERATOR,
-        session_id=TRANSPORT_SESSION,
+        transport_session_id=TRANSPORT_SESSION,
         signing_secret=SECRET,
-    )
-    clock = FixedClock(NOW)
-    ids = DeterministicIdGenerator("ticket06-receiver")
-    state = InMemoryDurableStateStore()
-    audit = InMemoryAuditBoundary()
-    provider = FixedModelAvailabilityProvider(availability or ModelAvailability())
-    orchestration = orchestration or ControlledOrchestrationAdapter()
-    outbound = ControlledOutboundConnector(
-        operator_id=OPERATOR,
-        session_id=TRANSPORT_SESSION,
-        audit=audit,
-        clock=clock,
-        ids=ids,
-    )
-    trace_store = InMemoryDiagnosticTraceStore()
-    trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
-    broker = DeterministicCapabilityBroker(
-        config=config,
-        state=state,
-        audit=audit,
+        now=NOW,
+        id_prefix="ticket06-receiver",
+        availability=availability,
         orchestration=orchestration,
-        outbound=outbound,
-        clock=clock,
-        ids=ids,
-        trace=trace,
-        model_availability_provider=provider,
     )
-    receiver = SignedMessageReceiver(
-        config=config,
-        state=state,
-        audit=audit,
-        broker=broker,
-        clock=clock,
-        ids=ids,
-    )
+    assert components.trace_store is not None
     return (
-        state,
-        audit,
-        clock,
-        provider,
-        orchestration,
-        outbound,
-        broker,
-        receiver,
-        trace_store,
+        components.state,
+        components.audit,
+        components.clock,
+        components.provider,
+        components.orchestration,
+        components.outbound,
+        components.broker,
+        components.receiver,
+        components.trace_store,
     )
 
 

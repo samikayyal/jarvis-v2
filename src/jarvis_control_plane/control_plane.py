@@ -12,6 +12,7 @@ from .models import (
     ConversationMessage,
     InboundMessage,
     OrchestrationRequest,
+    OrchestrationResult,
     OutboundReply,
     ReceiveResult,
     RequestState,
@@ -55,6 +56,14 @@ _MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
 
 class _CancelledBeforeDispatch(OutboundConnectorError):
     """The request lost ownership before its outbound operation started."""
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestAdmission:
+    """The durable request and session token produced by successful admission."""
+
+    request: RequestState
+    cancellation_token: CancellationToken
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +136,7 @@ class DeterministicCapabilityBroker:
         self._session_lifecycle_lock = RLock()
 
     def handle(self, message: InboundMessage) -> ReceiveResult:
-        """Accept one already-admitted message and drive the typed path."""
+        """Accept one already-admitted message and drive its named lifecycle stages."""
 
         session = self._reconcile_inactivity()
         try:
@@ -150,6 +159,54 @@ class DeterministicCapabilityBroker:
         )
         if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
             return self._handle_session_control(message, session, session_transition)
+
+        admission = self._admit_request(
+            message=message,
+            session=session,
+            session_transition=session_transition,
+            request_id=request_id,
+        )
+        if isinstance(admission, ReceiveResult):
+            return admission
+
+        request = admission.request
+        cancellation_token = admission.cancellation_token
+        result = self._run_orchestration(
+            message=message,
+            request=request,
+            cancellation_token=cancellation_token,
+        )
+        if isinstance(result, ReceiveResult):
+            return result
+
+        if not cancellation_token_is_current(
+            self._current_working_session(), cancellation_token
+        ):
+            return self._late_result_result(request, message=message)
+
+        if not self._selected_configuration_is_available(request):
+            return self._configuration_unavailable_result(
+                message=message,
+                request=request,
+                cancellation_token=cancellation_token,
+            )
+
+        return self._complete_outbound_reply(
+            message=message,
+            request=request,
+            cancellation_token=cancellation_token,
+            result=result,
+        )
+
+    def _admit_request(
+        self,
+        *,
+        message: InboundMessage,
+        session: WorkingSession,
+        session_transition: ControlTransition,
+        request_id: str,
+    ) -> _RequestAdmission | ReceiveResult:
+        """Persist one request and claim the matching working-session generation."""
 
         request = RequestState(
             request_id=request_id,
@@ -240,6 +297,20 @@ class DeterministicCapabilityBroker:
 
         cancellation_token = session_transition.cancellation_token
         assert cancellation_token is not None
+
+        return _RequestAdmission(
+            request=request,
+            cancellation_token=cancellation_token,
+        )
+
+    def _run_orchestration(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        cancellation_token: CancellationToken,
+    ) -> OrchestrationResult | ReceiveResult:
+        """Execute and durably observe the controlled orchestration stage."""
 
         orchestration_request = OrchestrationRequest(state=request, text=message.text)
         try:
@@ -359,30 +430,45 @@ class DeterministicCapabilityBroker:
                 reason=str(exc) or "orchestration failed",
             )
 
-        if not cancellation_token_is_current(
-            self._current_working_session(), cancellation_token
-        ):
-            return self._late_result_result(request, message=message)
+        return result
 
-        if not self._selected_configuration_is_available(request):
-            self._finish_session_request(
-                cancellation_token,
-                outcome="model_availability_unavailable",
-                message=message,
-            )
-            failed = self._transition(
-                request,
-                status="failed",
-                phase="orchestration",
-                outcome="orchestration_failed",
-                error_code="model_availability_unavailable",
-            )
-            return ReceiveResult(
-                status_code=202,
-                disposition="model_availability_unavailable",
-                request=failed,
-                reason="selected model or reasoning became unavailable before dispatch",
-            )
+    def _configuration_unavailable_result(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        cancellation_token: CancellationToken,
+    ) -> ReceiveResult:
+        """Finish the request without substituting an unavailable configuration."""
+
+        self._finish_session_request(
+            cancellation_token,
+            outcome="model_availability_unavailable",
+            message=message,
+        )
+        failed = self._transition(
+            request,
+            status="failed",
+            phase="orchestration",
+            outcome="orchestration_failed",
+            error_code="model_availability_unavailable",
+        )
+        return ReceiveResult(
+            status_code=202,
+            disposition="model_availability_unavailable",
+            request=failed,
+            reason="selected model or reasoning became unavailable before dispatch",
+        )
+
+    def _complete_outbound_reply(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        cancellation_token: CancellationToken,
+        result: OrchestrationResult,
+    ) -> ReceiveResult:
+        """Persist, dispatch, and reconcile the correlated outbound reply."""
 
         reply = OutboundReply(
             reply_id=self.ids.new_id("reply"),

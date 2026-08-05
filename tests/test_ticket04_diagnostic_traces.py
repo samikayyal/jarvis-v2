@@ -12,6 +12,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import pytest
+from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     MAX_TRACE_RESERVATION_BYTES,
@@ -25,9 +26,7 @@ from jarvis_control_plane import (
     FixedClock,
     FixedModelAvailabilityProvider,
     InboundMessage,
-    InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
-    InMemoryDurableStateStore,
     ModelAvailability,
     SignedInboundEvent,
     SignedMessageReceiver,
@@ -199,45 +198,31 @@ def make_components(
     ControlledOutboundConnector,
     SignedMessageReceiver,
 ]:
-    config = ControlPlaneConfig(
-        operator_id=OPERATOR,
-        session_id=SESSION,
-        signing_secret=SIGNING_SECRET,
-    )
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket04")
-    state = state if state is not None else InMemoryDurableStateStore()
-    audit = audit if audit is not None else InMemoryAuditBoundary()
-    orchestration = orchestration or ControlledOrchestrationAdapter()
-    outbound = ControlledOutboundConnector(
-        operator_id=OPERATOR,
-        session_id=SESSION,
-        audit=audit,  # type: ignore[arg-type]
-        clock=clock,
-        ids=ids,
-    )
     if trace is None:
         trace = make_default_trace(clock, ids)
-    broker = DeterministicCapabilityBroker(
-        config=config,
-        state=state,  # type: ignore[arg-type]
-        audit=audit,  # type: ignore[arg-type]
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=SESSION,
+        signing_secret=SIGNING_SECRET,
+        now=NOW,
+        id_prefix="ticket04",
+        state=state,
+        audit=audit,
         orchestration=orchestration,
-        outbound=outbound,
         clock=clock,
         ids=ids,
         trace=trace,
-        model_availability_provider=FixedModelAvailabilityProvider(ModelAvailability()),
     )
-    receiver = SignedMessageReceiver(
-        config=config,
-        state=state,  # type: ignore[arg-type]
-        audit=audit,  # type: ignore[arg-type]
-        broker=broker,
-        clock=clock,
-        ids=ids,
+    return (
+        components.config,
+        components.state,
+        components.audit,
+        components.orchestration,
+        components.outbound,
+        components.receiver,
     )
-    return config, state, audit, orchestration, outbound, receiver
 
 
 def make_event(config: ControlPlaneConfig, **changes: object) -> SignedInboundEvent:

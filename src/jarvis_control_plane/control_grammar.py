@@ -16,6 +16,7 @@ from datetime import datetime
 from enum import Enum
 
 from .sessions import (
+    ALLOWED_SESSION_MINUTES,
     CANONICAL_MODELS,
     CANONICAL_REASONING_LEVELS,
     CancellationToken,
@@ -32,6 +33,12 @@ from .sessions import (
     new_working_session,
     status_view,
 )
+
+_SESSION_MINUTE_TOKENS = frozenset(str(minutes) for minutes in ALLOWED_SESSION_MINUTES)
+_MODEL_USAGE_TOKENS = "|".join(CANONICAL_MODELS)
+_MODEL_OPTIONS = ", ".join(CANONICAL_MODELS)
+_REASONING_USAGE_TOKENS = "|".join(CANONICAL_REASONING_LEVELS)
+_REASONING_OPTIONS = ", ".join(CANONICAL_REASONING_LEVELS)
 
 CONTROL_COMMANDS = (
     "/status",
@@ -278,8 +285,8 @@ safe_status = render_status
 
 def _usage(parsed: ParsedControl) -> str:
     usage = {
-        ControlCommand.MODEL: "Usage: /model [gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna]",
-        ControlCommand.REASONING: "Usage: /reasoning [none|low|medium|high|xhigh|max]",
+        ControlCommand.MODEL: f"Usage: /model [{_MODEL_USAGE_TOKENS}]",
+        ControlCommand.REASONING: f"Usage: /reasoning [{_REASONING_USAGE_TOKENS}]",
         ControlCommand.CONFIG: (
             "Usage: /config [model <model>|reasoning <level>|session-minutes <minutes>]"
         ),
@@ -375,10 +382,7 @@ def _apply_control(
                 state=session,
                 parsed=parsed,
                 kind=ControlTransitionKind.STATUS,
-                reply=(
-                    f"Session model: {session.model}. Valid: "
-                    "gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna."
-                ),
+                reply=(f"Session model: {session.model}. Valid: {_MODEL_OPTIONS}."),
             )
         model = parsed.args[0]
         if model not in CANONICAL_MODELS:
@@ -413,7 +417,7 @@ def _apply_control(
                 kind=ControlTransitionKind.STATUS,
                 reply=(
                     f"Session reasoning: {session.reasoning}. Valid: "
-                    "none, low, medium, high, xhigh, max."
+                    f"{_REASONING_OPTIONS}."
                 ),
             )
         reasoning = parsed.args[0]
@@ -515,7 +519,7 @@ def _apply_control(
                 ),
                 effects=("set_default_reasoning",),
             )
-        if key == "session-minutes" and value in {"15", "30", "60", "120", "240"}:
+        if key == "session-minutes" and value in _SESSION_MINUTE_TOKENS:
             minutes = int(value)
             current = _now(now)
             return ControlTransition(
