@@ -4,9 +4,9 @@
 
 **Blocked by:** 14 — Orchestrate natural-language requests through the Agents SDK.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Authorized text history is immutable, correlated to its conversation and request, and searchable through bounded local full-text and deterministic filters.
-- [ ] Inspection and export preserve exact selected content and disclose when retrieved history informed a response.
-- [ ] Credential-like records remain searchable but are excluded from automatic retrieval and model context unless the operator selects them exactly.
+- [x] Authorized text history is immutable, correlated to its conversation and request, and searchable through bounded local full-text and deterministic filters.
+- [x] Inspection and export preserve exact selected content and disclose when retrieved history informed a response.
+- [x] Credential-like records remain searchable but are excluded from automatic retrieval and model context unless the operator selects them exactly.
 

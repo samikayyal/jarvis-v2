@@ -667,11 +667,23 @@ def test_signed_receiver_routes_status_and_new_through_working_session() -> None
         )
         assert completed.disposition == "completed"
         history = state.list_conversation_messages()
-        assert [entry.working_session_id for entry in history] == [
-            original_session_id,
-            original_session_id,
-            broker.current_working_session_id,
-        ]
+        assert len(history) == 6
+        assert (
+            sum(entry.working_session_id == original_session_id for entry in history)
+            == 3
+        )
+        assert (
+            sum(
+                entry.working_session_id == broker.current_working_session_id
+                for entry in history
+            )
+            == 3
+        )
+        assert [entry.direction for entry in history].count("inbound") == 3
+        assert [entry.direction for entry in history].count("outbound") == 3
+        assert {entry.text for entry in history if entry.direction == "outbound"} == {
+            reply.body for reply in outbound.sent
+        }
     finally:
         trace_store._close_writer_service()
 

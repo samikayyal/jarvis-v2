@@ -134,7 +134,7 @@ def test_admission_retains_authorized_text_and_replay_cannot_duplicate_it() -> N
     assert replay.status_code == 204
     assert replay.disposition == "duplicate"
     history = state.list_conversation_messages()  # type: ignore[attr-defined]
-    assert len(history) == 1
+    assert len(history) == 2
     assert history[0].session_id == SESSION
     assert history[0].transport_session_id == SESSION
     assert history[0].working_session_id == "working-session-session.test"
@@ -182,7 +182,7 @@ def test_sqlite_admission_history_and_replay_survive_reconstruction(tmp_path) ->
             )
         )
         history = reconstructed_state.list_conversation_messages()
-        assert len(history) == 1
+        assert len(history) == 2
         assert history[0].text == "Retain this exact authorized text"
         assert history[0].transport_session_id == SESSION
         assert history[0].working_session_id == "working-session-session.test"
@@ -461,7 +461,7 @@ def test_ingress_claim_and_history_are_atomic_when_state_write_fails() -> None:
     assert retry.disposition == "completed"
     assert len(state.list_ingress_claims()) == 1
     assert state.list_ingress_claims()[0].disposition == "admitted"
-    assert len(state.list_conversation_messages()) == 1
+    assert len(state.list_conversation_messages()) == 2
     assert len(state.list_requests()) == 1
     assert len(orchestration.calls) == 1
     assert len(outbound.sent) == 1
@@ -590,7 +590,7 @@ def test_admitted_update_failure_keeps_claim_non_eligible() -> None:
     assert replay.disposition == "completed"
     assert len(state.list_ingress_claims()) == 1
     assert state.list_ingress_claims()[0].disposition == "admitted"
-    assert len(state.list_conversation_messages()) == 1
+    assert len(state.list_conversation_messages()) == 2
     assert len(state.list_requests()) == 1
     assert len(orchestration.calls) == 1
     assert len(outbound.sent) == 1
@@ -616,7 +616,7 @@ def test_claim_write_failure_returns_503_and_retry_processes_once() -> None:
     assert retry.disposition == "completed"
     assert len(state.list_ingress_claims()) == 1
     assert state.list_ingress_claims()[0].disposition == "admitted"
-    assert len(state.list_conversation_messages()) == 1
+    assert len(state.list_conversation_messages()) == 2
     assert len(state.list_requests()) == 1
     assert len(orchestration.calls) == 1
     assert len(outbound.sent) == 1
@@ -713,9 +713,21 @@ def test_history_separates_working_session_from_transport_session() -> None:
     assert [message.working_session_id for message in history] == [
         "working-session-001",
         "working-session-002",
+        "working-session-001",
+        "working-session-002",
     ]
-    assert [message.transport_session_id for message in history] == [SESSION, SESSION]
-    assert [message.session_id for message in history] == [SESSION, SESSION]
+    assert [message.transport_session_id for message in history] == [
+        SESSION,
+        SESSION,
+        SESSION,
+        SESSION,
+    ]
+    assert [message.session_id for message in history] == [
+        SESSION,
+        SESSION,
+        SESSION,
+        SESSION,
+    ]
 
 
 def test_invalid_signature_is_rejected_before_malformed_body_parsing() -> None:

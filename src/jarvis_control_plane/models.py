@@ -192,7 +192,7 @@ class IngressClaim:
 
 @dataclass(frozen=True, slots=True)
 class ConversationMessage:
-    """Immutable authorized-operator text retained by ingress admission."""
+    """One immutable text record in a working-session conversation."""
 
     working_session_id: str
     transport_session_id: str
@@ -203,6 +203,8 @@ class ConversationMessage:
     text: str
     occurred_at: datetime
     direction: str = "inbound"
+    request_id: str | None = None
+    credential_like: bool | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -217,8 +219,22 @@ class ConversationMessage:
             _non_empty_identifier(getattr(self, name), name)
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("conversation text must be non-blank")
-        if self.direction != "inbound":
-            raise ValueError("ticket02 conversation messages must be inbound")
+        if self.direction not in {"inbound", "outbound"}:
+            raise ValueError("conversation direction must be inbound or outbound")
+        if self.request_id is not None:
+            _non_empty_identifier(self.request_id, "request_id")
+        if self.credential_like is not None and not isinstance(
+            self.credential_like, bool
+        ):
+            raise TypeError("credential_like must be a boolean when provided")
+        # Classification is deliberately conservative. Callers cannot mark a
+        # detected secret safe, because automatic history selection must never
+        # expose it to a model without an exact operator selection.
+        object.__setattr__(
+            self,
+            "credential_like",
+            bool(self.credential_like) or _contains_credential_like_text(self.text),
+        )
         object.__setattr__(self, "occurred_at", ensure_utc(self.occurred_at))
 
     @property
@@ -232,6 +248,89 @@ class ConversationMessage:
         """Alias for the durable working-session conversation boundary."""
 
         return self.working_session_id
+
+    @property
+    def history_id(self) -> str:
+        """Stable opaque selector for one record across every transport session."""
+
+        return (
+            f"history-{len(self.transport_session_id)}:"
+            f"{self.transport_session_id}:{self.message_id}"
+        )
+
+    @staticmethod
+    def history_id_parts(value: object) -> tuple[str, str]:
+        """Parse the length-delimited, collision-free history-record selector."""
+
+        if not isinstance(value, str) or not value.startswith("history-"):
+            raise ValueError("history selector is invalid")
+        length_text, separator, remainder = value[8:].partition(":")
+        if not separator or not length_text.isdigit():
+            raise ValueError("history selector is invalid")
+        session_length = int(length_text)
+        transport_session_id = remainder[:session_length]
+        if (
+            session_length < 1
+            or len(transport_session_id) != session_length
+            or remainder[session_length : session_length + 1] != ":"
+        ):
+            raise ValueError("history selector is invalid")
+        message_id = remainder[session_length + 1 :]
+        _non_empty_identifier(transport_session_id, "transport_session_id")
+        _non_empty_identifier(message_id, "message_id")
+        return transport_session_id, message_id
+
+
+_CREDENTIAL_LIKE_PATTERNS = (
+    re.compile(
+        r"\b(?:api[_ -]?key|password|passwd|secret|token|access[_ -]?token|"
+        r"refresh[_ -]?token|id[_ -]?token|client[_ -]?secret|webhook[_ -]?secret)"
+        r"\s*[:=]",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{8,}\b", re.IGNORECASE),
+    # Authorization-shaped text fails closed.  The retained body is not
+    # transformed, but it must never become automatic model context merely
+    # because the credential issuer uses a form not listed above.
+    re.compile(r"\bauthorization\s*:\s*\S+", re.IGNORECASE),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/-]{8,}", re.IGNORECASE),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:whsec|xox[baprs]|EAAG)[-_A-Za-z0-9]{8,}\b", re.IGNORECASE),
+)
+
+
+def _contains_credential_like_text(text: str) -> bool:
+    """Classify common credential-shaped text without transforming retention."""
+
+    return any(
+        pattern.search(text) is not None for pattern in _CREDENTIAL_LIKE_PATTERNS
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class HistorySelection:
+    """Bounded safe history passed to orchestration with its required disclosure."""
+
+    messages: tuple[ConversationMessage, ...]
+
+    def __post_init__(self) -> None:
+        if any(message.credential_like for message in self.messages):
+            raise ValueError("automatic history selection cannot include credentials")
+
+    @property
+    def provenance_disclosure(self) -> str | None:
+        if not self.messages:
+            return None
+        pointers = "; ".join(
+            "conversation "
+            f"{message.working_session_id}, message {message.message_id} at "
+            f"{message.occurred_at.isoformat()}"
+            for message in self.messages
+        )
+        return f"History used: {pointers}."
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,10 +394,13 @@ class OrchestrationRequest:
 
     state: RequestState
     text: str
+    history: tuple[ConversationMessage, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("orchestration text must be non-blank")
+        if any(message.credential_like for message in self.history):
+            raise ValueError("orchestration history cannot contain credentials")
 
     @property
     def model(self) -> str:
