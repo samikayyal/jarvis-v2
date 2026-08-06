@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from subprocess import TimeoutExpired
@@ -30,6 +31,7 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
 )
+from jarvis_control_plane.ports import OrchestrationAdapterError
 
 NOW = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
 
@@ -192,6 +194,7 @@ def test_non_fast_forward_state_never_falls_back_to_a_stale_read(
     "read_request",
     (
         VaultReadInput(path="../outside.md"),
+        VaultReadInput(path="Projects/../Roadmap.md"),
         VaultReadInput(path=".obsidian/private.md"),
         VaultReadInput(path="attachments/private.md"),
     ),
@@ -206,6 +209,21 @@ def test_vault_read_rejects_traversal_hidden_and_excluded_paths(
 
     with pytest.raises(VaultReadError, match="not an ordinary knowledge-vault note"):
         connector.read(read_request)
+
+
+def test_vault_read_rejects_absolute_and_noncanonical_note_selectors(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    for value in ("/Roadmap.md", "C:/Roadmap.md", "Projects//Alpha.md"):
+        with pytest.raises(
+            VaultReadError, match="not an ordinary knowledge-vault note"
+        ):
+            connector.read(VaultReadInput(path=value))
 
 
 def test_vault_read_rejects_a_note_symlink_even_when_its_target_is_markdown(
@@ -250,6 +268,58 @@ def test_vault_read_rejects_nested_excluded_directories_and_submodules(
 
     with pytest.raises(VaultReadError, match="not an ordinary knowledge-vault note"):
         connector.read(VaultReadInput(path=path))
+
+
+def test_exact_title_ignores_title_lines_outside_leading_frontmatter(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    (tmp_path / "BodyTitle.md").write_text(
+        "A body paragraph.\n\n"
+        "title: This is not frontmatter\n\n"
+        "```yaml\n"
+        "title: This is also not frontmatter\n"
+        "```\n\n"
+        "# Actual heading\n",
+        encoding="utf-8",
+    )
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    result = connector.read(VaultReadInput(title="Actual heading"))
+
+    assert [excerpt.path for excerpt in result.excerpts] == ["BodyTitle.md"]
+
+
+def test_vault_read_rejects_oversized_notes_and_total_search_bytes(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    (tmp_path / "TooLarge.md").write_text("x" * (64 * 1024 + 1), encoding="utf-8")
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    with pytest.raises(VaultReadError, match="per-note byte limit"):
+        connector.read(VaultReadInput(path="TooLarge.md"))
+
+    (tmp_path / "TooLarge.md").unlink()
+    for index in range(9):
+        (tmp_path / f"Large-{index}.md").write_text(
+            "scan budget\n" + "x" * (64 * 1024 - 1_024), encoding="utf-8"
+        )
+
+    with pytest.raises(VaultReadError, match="total byte limit"):
+        connector.read(VaultReadInput(query="scan budget"))
+
+    for path in tmp_path.glob("Large-*.md"):
+        path.unlink()
+    for index in range(129):
+        (tmp_path / f"Note-{index}.md").write_text("small note", encoding="utf-8")
+
+    with pytest.raises(VaultReadError, match="note-inspection limit"):
+        connector.read(VaultReadInput(query="small"))
 
 
 def test_production_synchronizer_enforces_dedicated_ssh_config_and_host_verification(
@@ -308,6 +378,67 @@ def test_production_synchronizer_translates_fetch_timeouts_to_remote_unavailable
 
     with pytest.raises(VaultRemoteUnavailable, match="timed out"):
         synchronizer.synchronize(tmp_path, now=NOW)
+
+
+def test_vault_tool_enforces_one_deadline_when_process_runner_is_slow(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    observed_timeouts: list[float] = []
+    invocation_durations: list[float] = []
+
+    def slow_process(*_args: object, **kwargs: object) -> SimpleNamespace:
+        observed_timeouts.append(float(kwargs["timeout"]))
+        time.sleep(0.15)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=PurePosixPath("/usr/bin/git"),
+        ssh_executable=PurePosixPath("/usr/bin/ssh"),
+        ssh_config_path=PurePosixPath("/etc/jarvis/vault-ssh-config"),
+        known_hosts_path=PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        synchronization_state=InMemoryDurableStateStore(),
+        run_process=slow_process,
+    )
+    connector = KnowledgeVaultConnector(
+        root=tmp_path,
+        synchronizer=synchronizer,
+        now=lambda: NOW,
+        read_timeout_seconds=0.05,
+    )
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        loop = asyncio.new_event_loop()
+        started = time.monotonic()
+        try:
+            with pytest.raises(OrchestrationAdapterError, match="overall deadline"):
+                loop.run_until_complete(
+                    agent.tools[1].on_invoke_tool(None, json.dumps({"query": "Alpha"}))
+                )
+        finally:
+            loop.close()
+        invocation_durations.append(time.monotonic() - started)
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="The vault search is complete.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        reasoning_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_config_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        vault_read_tool=connector.as_bounded_read_tool(),
+    )
+
+    adapter.run(_request())
+
+    assert invocation_durations[0] < 0.12
+    assert observed_timeouts and observed_timeouts[0] <= 0.05
 
 
 def test_production_synchronizer_restores_last_successful_sync_from_durable_state(

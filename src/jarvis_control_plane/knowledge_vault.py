@@ -11,16 +11,21 @@ import os
 import re
 import shlex
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from subprocess import DEVNULL, CompletedProcess, TimeoutExpired, run
+from time import monotonic
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _MAX_QUERY_CHARS = 200
-_MAX_RESULTS = 8
+_MAX_RETURNED_EXCERPTS = 8
 _MAX_EXCERPT_CHARS = 600
+_MAX_NOTES_INSPECTED = 128
+_MAX_BYTES_PER_NOTE = 64 * 1024
+_MAX_TOTAL_BYTES_SCANNED = 512 * 1024
 _EXCLUDED_TOP_LEVEL_DIRECTORIES = frozenset(
     {"attachments", "plugins", "templates", "themes", "trash"}
 )
@@ -93,7 +98,7 @@ class KnowledgeVaultReadResult(BaseModel):
     source: Literal["knowledge_vault"] = "knowledge_vault"
     synchronized_at: datetime
     stale_warning: str | None = Field(default=None, max_length=200)
-    excerpts: tuple[VaultExcerpt, ...] = Field(max_length=_MAX_RESULTS)
+    excerpts: tuple[VaultExcerpt, ...] = Field(max_length=_MAX_RETURNED_EXCERPTS)
 
 
 class VaultSynchronizer(Protocol):
@@ -102,9 +107,11 @@ class VaultSynchronizer(Protocol):
     @property
     def last_synchronized_at(self) -> datetime | None: ...
 
-    def is_clean(self, root: Path) -> bool: ...
+    def is_clean(self, root: Path, *, deadline: float | None = None) -> bool: ...
 
-    def synchronize(self, root: Path, *, now: datetime) -> datetime: ...
+    def synchronize(
+        self, root: Path, *, now: datetime, deadline: float | None = None
+    ) -> datetime: ...
 
 
 class SubprocessVaultSynchronizer:
@@ -169,19 +176,22 @@ class SubprocessVaultSynchronizer:
             )
         return synchronized_at
 
-    def is_clean(self, root: Path) -> bool:
+    def is_clean(self, root: Path, *, deadline: float | None = None) -> bool:
         return (
             self._git(
                 root,
                 "status",
                 "--porcelain",
                 failure_type=VaultRepositoryConflict,
+                deadline=deadline,
             ).stdout.strip()
             == ""
         )
 
-    def synchronize(self, root: Path, *, now: datetime) -> datetime:
-        if not self.is_clean(root):
+    def synchronize(
+        self, root: Path, *, now: datetime, deadline: float | None = None
+    ) -> datetime:
+        if not self.is_clean(root, deadline=deadline):
             raise VaultRepositoryConflict("knowledge-vault clone is not clean")
         self._git(
             root,
@@ -190,6 +200,7 @@ class SubprocessVaultSynchronizer:
             "--no-tags",
             "origin",
             failure_type=VaultRemoteUnavailable,
+            deadline=deadline,
         )
         self._git(
             root,
@@ -197,6 +208,7 @@ class SubprocessVaultSynchronizer:
             "--ff-only",
             "FETCH_HEAD",
             failure_type=VaultRepositoryConflict,
+            deadline=deadline,
         )
         self._synchronization_state.save_knowledge_vault_synchronized_at(now)
         return now
@@ -206,7 +218,11 @@ class SubprocessVaultSynchronizer:
         root: Path,
         *arguments: str,
         failure_type: type[VaultSynchronizationError],
+        deadline: float | None,
     ) -> CompletedProcess[str]:
+        timeout = 15.0
+        if deadline is not None:
+            timeout = _remaining_seconds(deadline, failure_type)
         try:
             completed = self._run_process(
                 [str(self._git_executable), "-C", str(root), *arguments],
@@ -214,13 +230,15 @@ class SubprocessVaultSynchronizer:
                 stdin=DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=timeout,
                 env=self._environment,
             )
         except OSError as exc:
             raise failure_type("knowledge-vault Git is unavailable") from exc
         except (TimeoutError, TimeoutExpired) as exc:
             raise failure_type("knowledge-vault synchronization timed out") from exc
+        if deadline is not None:
+            _remaining_seconds(deadline, failure_type)
         if completed.returncode != 0:
             raise failure_type("knowledge-vault synchronization failed")
         return completed
@@ -247,10 +265,14 @@ class ControlledVaultSynchronizer:
     def last_synchronized_at(self) -> datetime | None:
         return self._last_synchronized_at
 
-    def is_clean(self, root: Path) -> bool:
+    def is_clean(self, root: Path, *, deadline: float | None = None) -> bool:
         return self.clean
 
-    def synchronize(self, root: Path, *, now: datetime) -> datetime:
+    def synchronize(
+        self, root: Path, *, now: datetime, deadline: float | None = None
+    ) -> datetime:
+        if deadline is not None:
+            _remaining_seconds(deadline, VaultRepositoryConflict)
         self.calls += 1
         if self.failure is not None:
             raise self.failure
@@ -267,6 +289,7 @@ class KnowledgeVaultConnector:
         root: Path,
         synchronizer: VaultSynchronizer,
         now: Callable[[], datetime],
+        read_timeout_seconds: float = 2.0,
     ) -> None:
         resolved_root = root.resolve(strict=True)
         if not resolved_root.is_dir() or root.is_symlink():
@@ -274,14 +297,31 @@ class KnowledgeVaultConnector:
         self._root = resolved_root
         self._synchronizer = synchronizer
         self._now = now
+        if (
+            isinstance(read_timeout_seconds, bool)
+            or not isinstance(read_timeout_seconds, (float, int))
+            or not 0 < read_timeout_seconds <= 2.0
+        ):
+            raise ValueError("read_timeout_seconds must be within 0 and 2 seconds")
+        self._read_timeout_seconds = float(read_timeout_seconds)
 
-    def read(self, request: VaultReadInput) -> KnowledgeVaultReadResult:
+    def read(
+        self, request: VaultReadInput, *, deadline: float | None = None
+    ) -> KnowledgeVaultReadResult:
         """Synchronize first, then perform one deterministic, bounded local read."""
 
-        self._require_clean_clone()
+        deadline = (
+            deadline
+            if deadline is not None
+            else monotonic() + self._read_timeout_seconds
+        )
+        _remaining_seconds(deadline, VaultRepositoryConflict)
+        self._require_clean_clone(deadline=deadline)
         now = self._now()
         try:
-            synchronized_at = self._synchronizer.synchronize(self._root, now=now)
+            synchronized_at = self._synchronizer.synchronize(
+                self._root, now=now, deadline=deadline
+            )
             stale_warning = None
         except VaultRemoteUnavailable as exc:
             synchronized_at = self._synchronizer.last_synchronized_at
@@ -289,23 +329,24 @@ class KnowledgeVaultConnector:
                 raise VaultReadError(
                     "knowledge-vault reads require a clean synchronized clone"
                 ) from exc
-            self._require_clean_clone()
+            self._require_clean_clone(deadline=deadline)
             stale_warning = _stale_warning(now - synchronized_at)
         except VaultSynchronizationError as exc:
             raise VaultReadError(
                 "knowledge-vault synchronization requires explicit recovery"
             ) from exc
 
-        excerpts = self._select_excerpts(request)
+        read_budget = _VaultReadBudget(deadline=deadline)
+        excerpts = self._select_excerpts(request, read_budget)
         return KnowledgeVaultReadResult(
             synchronized_at=synchronized_at,
             stale_warning=stale_warning,
-            excerpts=tuple(excerpts[:_MAX_RESULTS]),
+            excerpts=tuple(excerpts[:_MAX_RETURNED_EXCERPTS]),
         )
 
-    def _require_clean_clone(self) -> None:
+    def _require_clean_clone(self, *, deadline: float) -> None:
         try:
-            is_clean = self._synchronizer.is_clean(self._root)
+            is_clean = self._synchronizer.is_clean(self._root, deadline=deadline)
         except VaultSynchronizationError as exc:
             raise VaultReadError(
                 "knowledge-vault synchronization requires explicit recovery"
@@ -320,10 +361,12 @@ class KnowledgeVaultConnector:
 
         from .orchestration import BoundedReadTool
 
-        def handler(_request: object, typed_input: BaseModel) -> BaseModel:
+        def handler(
+            _request: object, typed_input: BaseModel, deadline: float
+        ) -> BaseModel:
             if not isinstance(typed_input, VaultReadInput):
                 raise TypeError("read_knowledge_vault received an invalid input model")
-            return self.read(typed_input)
+            return self.read(typed_input, deadline=deadline)
 
         return BoundedReadTool(
             name="read_knowledge_vault",
@@ -334,39 +377,75 @@ class KnowledgeVaultConnector:
             input_model=VaultReadInput,
             output_model=KnowledgeVaultReadResult,
             handler=handler,
+            timeout_seconds=self._read_timeout_seconds,
         )
 
-    def _select_excerpts(self, request: VaultReadInput) -> list[VaultExcerpt]:
+    def _select_excerpts(
+        self, request: VaultReadInput, budget: _VaultReadBudget
+    ) -> list[VaultExcerpt]:
         if request.path is not None:
             note = self._ordinary_note_for_path(request.path)
-            return [self._excerpt(note, request.path)]
+            return [self._excerpt(note, request.path, budget)]
 
-        notes = self._ordinary_notes()
+        notes = self._ordinary_notes(budget)
         if request.title is not None:
-            matches = [note for note in notes if _note_title(note) == request.title]
+            matches = [
+                note
+                for note in notes
+                if _note_title(budget.read(note)) == request.title
+            ]
             if len(matches) != 1:
                 raise VaultReadError("knowledge-vault title is not unambiguous")
-            return [self._excerpt(matches[0], request.title)]
+            return [self._excerpt(matches[0], request.title, budget)]
 
         assert request.query is not None
         query = request.query.casefold()
         matches: list[Path] = []
         for note in notes:
-            content = note.read_text(encoding="utf-8")
+            content = budget.read(note)
             if query in self._relative(note).casefold() or query in content.casefold():
                 matches.append(note)
-                matches.extend(self._link_targets(note, query))
-        return [self._excerpt(note, request.query) for note in _unique_paths(matches)]
+                matches.extend(self._link_targets(note, query, budget))
+        return [
+            self._excerpt(note, request.query, budget)
+            for note in _unique_paths(matches)[:_MAX_RETURNED_EXCERPTS]
+        ]
 
-    def _ordinary_notes(self) -> list[Path]:
-        return sorted(
-            (path for path in self._root.rglob("*.md") if self._is_ordinary_note(path)),
-            key=self._relative,
-        )
+    def _ordinary_notes(self, budget: _VaultReadBudget) -> list[Path]:
+        notes: list[Path] = []
+        for directory, directories, filenames in os.walk(self._root):
+            budget.require_time()
+            directory_path = Path(directory)
+            directories[:] = [
+                name
+                for name in directories
+                if not name.startswith(".")
+                and name not in _EXCLUDED_TOP_LEVEL_DIRECTORIES
+                and not os.path.lexists(directory_path / name / ".git")
+            ]
+            for filename in sorted(filenames):
+                budget.require_time()
+                path = directory_path / filename
+                if path.suffix == ".md" and self._is_ordinary_note(path):
+                    notes.append(path)
+                    if len(notes) > _MAX_NOTES_INSPECTED:
+                        raise VaultReadError(
+                            "knowledge-vault search exceeds the note-inspection limit"
+                        )
+        return sorted(notes, key=self._relative)
 
     def _ordinary_note_for_path(self, value: str) -> Path:
-        candidate = self._root.joinpath(*PurePosixPath(value).parts)
-        if not self._is_ordinary_note(candidate):
+        raw_path = PurePosixPath(value)
+        if (
+            "\\" in value
+            or raw_path.is_absolute()
+            or PureWindowsPath(value).is_absolute()
+            or any(part in {".", ".."} for part in value.split("/"))
+            or raw_path.as_posix() != value
+        ):
+            raise VaultReadError("path is not an ordinary knowledge-vault note")
+        candidate = self._root.joinpath(*raw_path.parts)
+        if not self._is_ordinary_note(candidate) or self._relative(candidate) != value:
             raise VaultReadError("path is not an ordinary knowledge-vault note")
         return candidate
 
@@ -397,8 +476,10 @@ class KnowledgeVaultConnector:
     def _relative(self, path: Path) -> str:
         return path.resolve(strict=True).relative_to(self._root).as_posix()
 
-    def _excerpt(self, note: Path, needle: str) -> VaultExcerpt:
-        lines = note.read_text(encoding="utf-8").splitlines()
+    def _excerpt(
+        self, note: Path, needle: str, budget: _VaultReadBudget
+    ) -> VaultExcerpt:
+        lines = budget.read(note).splitlines()
         needle_folded = needle.casefold()
         match_index = next(
             (
@@ -420,11 +501,13 @@ class KnowledgeVaultConnector:
             text=text,
         )
 
-    def _link_targets(self, note: Path, query: str) -> list[Path]:
+    def _link_targets(
+        self, note: Path, query: str, budget: _VaultReadBudget
+    ) -> list[Path]:
         """Resolve only matching ordinary local links; external targets are ignored."""
 
         targets: list[Path] = []
-        for line in note.read_text(encoding="utf-8").splitlines():
+        for line in budget.read(note).splitlines():
             if query not in line.casefold():
                 continue
             for match in _WIKILINK.finditer(line):
@@ -462,15 +545,66 @@ class KnowledgeVaultConnector:
         ]
 
 
-def _note_title(note: Path) -> str | None:
-    lines = note.read_text(encoding="utf-8").splitlines()
-    for line in lines:
-        if line.startswith("title:"):
-            return line.removeprefix("title:").strip().strip("\"'")
+@dataclass(slots=True)
+class _VaultReadBudget:
+    """Per-read byte, note, and deadline limits for untrusted vault content."""
+
+    deadline: float
+    inspected_notes: int = 0
+    scanned_bytes: int = 0
+    contents: dict[Path, str] = field(default_factory=dict)
+
+    def require_time(self) -> None:
+        _remaining_seconds(self.deadline, VaultReadError)
+
+    def read(self, note: Path) -> str:
+        cached = self.contents.get(note)
+        if cached is not None:
+            return cached
+        self.require_time()
+        if self.inspected_notes >= _MAX_NOTES_INSPECTED:
+            raise VaultReadError(
+                "knowledge-vault search exceeds the note-inspection limit"
+            )
+        self.inspected_notes += 1
+        try:
+            with note.open("rb") as stream:
+                content = stream.read(_MAX_BYTES_PER_NOTE + 1)
+        except OSError as exc:
+            raise VaultReadError("knowledge-vault note could not be read") from exc
+        self.require_time()
+        if len(content) > _MAX_BYTES_PER_NOTE:
+            raise VaultReadError("knowledge-vault note exceeds the per-note byte limit")
+        if self.scanned_bytes + len(content) > _MAX_TOTAL_BYTES_SCANNED:
+            raise VaultReadError("knowledge-vault search exceeds the total byte limit")
+        try:
+            decoded = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise VaultReadError("knowledge-vault note is not valid UTF-8") from exc
+        self.scanned_bytes += len(content)
+        self.contents[note] = decoded
+        return decoded
+
+
+def _note_title(content: str) -> str | None:
+    lines = content.splitlines()
+    if lines and lines[0] == "---":
+        for line in lines[1:]:
+            if line == "---":
+                break
+            if line.startswith("title:"):
+                return line.removeprefix("title:").strip().strip("\"'")
     for line in lines:
         if line.startswith("# "):
             return line.removeprefix("# ").strip()
     return None
+
+
+def _remaining_seconds(deadline: float, error_type: type[Exception]) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise error_type("knowledge-vault read exceeded its overall deadline")
+    return remaining
 
 
 def _stale_warning(age) -> str:

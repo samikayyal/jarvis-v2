@@ -7,9 +7,11 @@ that the deterministic capability broker still validates, audits, and approves.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +29,7 @@ _MAX_TURNS = 4
 _MAX_TOOL_INVOCATIONS = 4
 _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000
+_MAX_READ_TOOL_SECONDS = 2.0
 _CLOSED_READ_TOOL_NAMES = frozenset({"read_request_context", "read_knowledge_vault"})
 _TERMINAL_PAYLOAD_FIELDS = frozenset(
     {"host", "executable", "arguments", "cwd", "components"}
@@ -81,7 +84,8 @@ class BoundedReadTool:
     description: str
     input_model: type[BaseModel]
     output_model: type[BaseModel]
-    handler: Callable[[OrchestrationRequest, BaseModel], BaseModel]
+    handler: Callable[[OrchestrationRequest, BaseModel, float], BaseModel]
+    timeout_seconds: float = _MAX_READ_TOOL_SECONDS
 
     def __post_init__(self) -> None:
         if self.name not in _CLOSED_READ_TOOL_NAMES:
@@ -98,6 +102,14 @@ class BoundedReadTool:
             raise TypeError("bounded read output_model must be a Pydantic model")
         if not callable(self.handler):
             raise TypeError("bounded read handler must be callable")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (float, int))
+            or not 0 < self.timeout_seconds <= _MAX_READ_TOOL_SECONDS
+        ):
+            raise ValueError(
+                f"bounded read timeout must be within 0 and {_MAX_READ_TOOL_SECONDS} seconds"
+            )
 
 
 @dataclass(slots=True)
@@ -297,7 +309,11 @@ class AgentsSdkOrchestrationAdapter:
                 budget.consume()
                 try:
                     typed_input = tool.input_model.model_validate_json(raw_input)
-                    typed_output = tool.handler(request, typed_input)
+                    deadline = monotonic() + tool.timeout_seconds
+                    typed_output = await asyncio.wait_for(
+                        asyncio.to_thread(tool.handler, request, typed_input, deadline),
+                        timeout=tool.timeout_seconds,
+                    )
                     if not isinstance(typed_output, tool.output_model):
                         raise TypeError("bounded read returned an untyped result")
                     bounded_output = tool.output_model.model_validate(typed_output)
@@ -312,6 +328,10 @@ class AgentsSdkOrchestrationAdapter:
                             record_stale_vault_read(synchronized_at, warning)
                 except OrchestrationAdapterError:
                     raise
+                except TimeoutError as exc:
+                    raise OrchestrationAdapterError(
+                        "bounded read tool exceeded its overall deadline"
+                    ) from exc
                 except Exception as exc:
                     raise OrchestrationAdapterError(
                         "bounded read tool returned malformed data"
@@ -332,7 +352,7 @@ class AgentsSdkOrchestrationAdapter:
                     on_invoke_tool=invoke,
                     strict_json_schema=True,
                     needs_approval=False,
-                    timeout_seconds=2.0,
+                    timeout_seconds=read_tool.timeout_seconds,
                     output_json_schema=read_tool.output_model.model_json_schema(),
                 )
             )
@@ -413,7 +433,7 @@ def _stale_vault_disclosure(synchronized_at: datetime, warning: str) -> str:
 
 def _default_read_tool() -> BoundedReadTool:
     def read_request_context(
-        request: OrchestrationRequest, typed_input: BaseModel
+        request: OrchestrationRequest, typed_input: BaseModel, _deadline: float
     ) -> BaseModel:
         if not isinstance(typed_input, BoundedReadInput):
             raise TypeError("read_request_context received an invalid input model")
