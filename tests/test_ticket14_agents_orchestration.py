@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -19,6 +20,9 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
     AgentsSdkProposal,
+    BoundedReadInput,
+    BoundedReadOutput,
+    BoundedReadTool,
 )
 from jarvis_control_plane.ports import OrchestrationAdapterError
 from jarvis_control_plane.sessions import ReadinessState
@@ -177,6 +181,50 @@ def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_a
         "orchestration_started",
         "bounded_read",
     ]
+
+
+def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis_control_plane.orchestration as orchestration_module
+
+    monkeypatch.setattr(orchestration_module, "_READ_TOOL_TIMEOUT_SECONDS", 0.01)
+
+    def delayed_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput
+    ) -> BoundedReadOutput:
+        time.sleep(0.05)
+        return BoundedReadOutput(source="authorized_request", text="late")
+
+    read_tool = BoundedReadTool(
+        "read_request_context",
+        "A deliberately delayed bounded read.",
+        BoundedReadInput,
+        BoundedReadOutput,
+        delayed_read,
+    )
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        with pytest.raises(OrchestrationAdapterError, match="timed out"):
+            asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="The late read was ignored.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=read_tool,
+    ).run(_request("read the current request context"))
+
+    assert result.reply_text.endswith("The late read was ignored.")
 
 
 def test_agents_adapter_enforces_a_per_request_read_invocation_limit() -> None:
