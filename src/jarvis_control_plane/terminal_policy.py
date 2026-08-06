@@ -31,6 +31,24 @@ class TerminalDisposition(str, Enum):
     ORDINARY_APPROVAL = "ordinary_approval"
 
 
+# Auto-authorization is limited to these registered executable identities.  A
+# command name is deliberately insufficient: a proposal for `/tmp/git` must
+# not acquire the authority of the registered Ubuntu git executable.
+_SAFE_READ_EXECUTABLES_BY_HOST = {
+    "ubuntu": frozenset(
+        {
+            "/usr/bin/cat",
+            "/usr/bin/git",
+            "/usr/bin/head",
+            "/usr/bin/ls",
+            "/usr/bin/pwd",
+            "/usr/bin/tail",
+        }
+    ),
+    "windows": frozenset(),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class TerminalComponent:
     """One normalized process in a proposed compound command."""
@@ -172,7 +190,8 @@ def authorize_terminal_action(
     if not isinstance(action, TerminalAction):
         raise TypeError("terminal policy requires a typed TerminalAction")
     component_dispositions = tuple(
-        _classify_component(component) for component in action.components
+        _classify_component(component, host=action.host)
+        for component in action.components
     )
     if TerminalDisposition.HARD_PROHIBITED in component_dispositions:
         return _result(TerminalDisposition.HARD_PROHIBITED, component_dispositions)
@@ -289,7 +308,9 @@ def _string(value: object, name: str) -> str:
     return value
 
 
-def _classify_component(component: TerminalComponent) -> TerminalDisposition:
+def _classify_component(
+    component: TerminalComponent, *, host: str
+) -> TerminalDisposition:
     command = (
         component.executable.rsplit("/", maxsplit=1)[-1]
         .rsplit("\\", maxsplit=1)[-1]
@@ -306,9 +327,17 @@ def _classify_component(component: TerminalComponent) -> TerminalDisposition:
         return TerminalDisposition.PROTECTED_APPROVAL
     if component.redirections:
         return TerminalDisposition.ORDINARY_APPROVAL
-    if _is_safe_read(command, arguments):
+    if _is_registered_safe_read_executable(
+        host, component.executable
+    ) and _is_safe_read(command, arguments):
         return TerminalDisposition.SAFE_READ
     return TerminalDisposition.ORDINARY_APPROVAL
+
+
+def _is_registered_safe_read_executable(host: str, executable: str) -> bool:
+    """Allow automatic reads only through the configured host executable identity."""
+
+    return executable in _SAFE_READ_EXECUTABLES_BY_HOST.get(host, frozenset())
 
 
 def _is_hard_prohibited(command: str, arguments: tuple[str, ...], joined: str) -> bool:
