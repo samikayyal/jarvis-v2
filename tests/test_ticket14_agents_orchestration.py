@@ -183,15 +183,9 @@ def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_a
     ]
 
 
-def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import jarvis_control_plane.orchestration as orchestration_module
-
-    monkeypatch.setattr(orchestration_module, "_READ_TOOL_TIMEOUT_SECONDS", 0.01)
-
+def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> None:
     def delayed_read(
-        _request: OrchestrationRequest, _input: BoundedReadInput
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
     ) -> BoundedReadOutput:
         time.sleep(0.05)
         return BoundedReadOutput(source="authorized_request", text="late")
@@ -202,10 +196,11 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline(
         BoundedReadInput,
         BoundedReadOutput,
         delayed_read,
+        timeout_seconds=0.01,
     )
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
-        with pytest.raises(OrchestrationAdapterError, match="timed out"):
+        with pytest.raises(OrchestrationAdapterError, match="overall deadline"):
             asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
         return SimpleNamespace(
             final_output=AgentsSdkPlan(

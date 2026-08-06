@@ -871,7 +871,9 @@ def _google_read_tools(connector: GoogleReadConnector) -> tuple[BoundedReadTool,
     if not isinstance(connector, GoogleReadConnector):
         raise TypeError("connector must be a GoogleReadConnector")
 
-    def gmail(_request: OrchestrationRequest, input: BaseModel) -> BaseModel:
+    def gmail(
+        _request: OrchestrationRequest, input: BaseModel, _deadline: float
+    ) -> BaseModel:
         if not isinstance(input, GmailReadInput):
             raise TypeError("read_gmail received an invalid input model")
         result = {
@@ -894,7 +896,9 @@ def _google_read_tools(connector: GoogleReadConnector) -> tuple[BoundedReadTool,
         }[input.operation]()
         return _output(result)
 
-    def calendar(_request: OrchestrationRequest, input: BaseModel) -> BaseModel:
+    def calendar(
+        _request: OrchestrationRequest, input: BaseModel, _deadline: float
+    ) -> BaseModel:
         if not isinstance(input, CalendarReadInput):
             raise TypeError("read_google_calendar received an invalid input model")
         if input.operation == "calendar_list":
@@ -914,7 +918,9 @@ def _google_read_tools(connector: GoogleReadConnector) -> tuple[BoundedReadTool,
             )
         return _output(result)
 
-    def drive(_request: OrchestrationRequest, input: BaseModel) -> BaseModel:
+    def drive(
+        _request: OrchestrationRequest, input: BaseModel, _deadline: float
+    ) -> BaseModel:
         if not isinstance(input, DriveReadInput):
             raise TypeError("read_google_drive received an invalid input model")
         if input.operation == "files_list":
