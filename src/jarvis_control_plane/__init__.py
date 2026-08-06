@@ -20,6 +20,15 @@ from .control_plane import (
     DeterministicCapabilityBroker,
     SignedMessageReceiver,
 )
+from .google_calendar import (
+    CALENDAR_WRITE_SCOPE,
+    CalendarActionDispatcher,
+    CalendarWriteProposal,
+    CalendarWriteRequest,
+    ControlledGoogleCalendarWriteProvider,
+    GoogleCalendarWriteProvider,
+    GoogleCalendarWriteProviderError,
+)
 from .google_oauth import (
     GOOGLE_OAUTH_SCOPES,
     GOOGLE_OAUTH_STATE_TTL,
@@ -105,6 +114,7 @@ from .traces import (
 )
 
 __all__ = [
+    "CALENDAR_WRITE_SCOPE",
     "DEFAULT_TRACE_RESERVATION_BYTES",
     "GOOGLE_OAUTH_SCOPES",
     "GOOGLE_OAUTH_STATE_TTL",
@@ -115,10 +125,14 @@ __all__ = [
     "AuditEvidence",
     "AuditFilter",
     "AuditWriteError",
+    "CalendarActionDispatcher",
+    "CalendarWriteProposal",
+    "CalendarWriteRequest",
     "ControlPlane",
     "ControlPlaneConfig",
     "ControlPlaneError",
     "ControlledActionDispatcher",
+    "ControlledGoogleCalendarWriteProvider",
     "ControlledGoogleOAuthProvider",
     "ControlledGoogleReadProvider",
     "ControlledOrchestrationAdapter",
@@ -136,6 +150,8 @@ __all__ = [
     "FixedModelAvailabilityProvider",
     "FrozenActionProposal",
     "GoogleApiReadProvider",
+    "GoogleCalendarWriteProvider",
+    "GoogleCalendarWriteProviderError",
     "GoogleConnectionState",
     "GoogleOAuthError",
     "GoogleOAuthLifecycle",
