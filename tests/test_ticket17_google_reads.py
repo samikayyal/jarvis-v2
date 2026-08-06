@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -376,6 +377,138 @@ def test_live_provider_exports_only_text_and_classifies_invalid_grant() -> None:
         ).read(request=GoogleReadRequest("calendar_list", {}, 1), credential=credential)
 
 
+def test_live_provider_reads_only_inline_textual_gmail_parts() -> None:
+    plain_text = base64.urlsafe_b64encode(b"Please review the proposal.").decode()
+    html_text = base64.urlsafe_b64encode(
+        b"<p>HTML fallback</p><script>do-not-include</script>"
+    ).decode()
+    attachment = base64.urlsafe_b64encode(b"do-not-download-this").decode()
+    transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            _json_response(
+                {
+                    "id": "m1",
+                    "threadId": "t1",
+                    "snippet": "Please review",
+                    "payload": {
+                        "mimeType": "multipart/mixed",
+                        "headers": [
+                            {"name": "Subject", "value": "Proposal"},
+                            {"name": "Bcc", "value": "never-returned@example.test"},
+                        ],
+                        "parts": [
+                            {"mimeType": "text/plain", "body": {"data": plain_text}},
+                            {"mimeType": "text/html", "body": {"data": html_text}},
+                            {
+                                "mimeType": "text/plain",
+                                "filename": "secret.txt",
+                                "body": {"data": attachment},
+                            },
+                            {
+                                "mimeType": "text/plain",
+                                "body": {"attachmentId": "attachment-1"},
+                            },
+                        ],
+                    },
+                }
+            ),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+    result = provider.read(
+        request=GoogleReadRequest("gmail_messages_get", {"message_id": "m1"}, 1),
+        credential=OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=GOOGLE_READ_SCOPES,
+            refresh_token="refresh-token",
+        ),
+    )
+
+    request_query = parse_qs(urlparse(transport.calls[1]["url"]).query)  # type: ignore[arg-type]
+    item = json.loads(result.items[0])
+    assert request_query["format"] == ["full"]
+    assert "body(size,data,attachmentId)" in request_query["fields"][0]
+    assert item == {
+        "body": "Please review the proposal.\n\nHTML fallback",
+        "headers": {"Subject": "Proposal"},
+        "id": "m1",
+        "snippet": "Please review",
+        "threadId": "t1",
+    }
+    assert "do-not-download-this" not in result.items[0]
+    assert "attachment-1" not in result.items[0]
+
+
+def test_live_provider_reads_approved_drive_media_after_metadata_only() -> None:
+    transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            _json_response(
+                {"id": "file1", "name": "notes", "mimeType": "text/markdown"}
+            ),
+            GoogleReadHttpResponse(
+                status_code=200,
+                headers={"Content-Type": "text/markdown; charset=utf-8"},
+                body=b"# Notes\nOnly text is read.",
+            ),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+    credential = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=GOOGLE_READ_SCOPES,
+        refresh_token="refresh-token",
+    )
+
+    result = provider.read(
+        request=GoogleReadRequest("drive_files_get", {"file_id": "file1"}, 1),
+        credential=credential,
+    )
+
+    assert len(transport.calls) == 3
+    assert parse_qs(urlparse(transport.calls[1]["url"]).query)["fields"]  # type: ignore[arg-type]
+    assert parse_qs(urlparse(transport.calls[2]["url"]).query) == {"alt": ["media"]}  # type: ignore[arg-type]
+    assert json.loads(result.items[0]) == {
+        "content": "# Notes\nOnly text is read.",
+        "id": "file1",
+        "mimeType": "text/markdown",
+        "name": "notes",
+    }
+
+
+def test_live_provider_never_downloads_non_text_drive_media() -> None:
+    transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            _json_response({"id": "file1", "name": "photo", "mimeType": "image/png"}),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    result = provider.read(
+        request=GoogleReadRequest("drive_files_get", {"file_id": "file1"}, 1),
+        credential=OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=GOOGLE_READ_SCOPES,
+            refresh_token="refresh-token",
+        ),
+    )
+
+    assert len(transport.calls) == 2
+    assert json.loads(result.items[0]) == {
+        "id": "file1",
+        "mimeType": "image/png",
+        "name": "photo",
+    }
+
+
 def test_google_read_refuses_an_oversized_serialized_result() -> None:
     connector = _connector(
         provider=ControlledGoogleReadProvider(
@@ -483,6 +616,7 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
         "continuation_available": False,
     }
     assert all(tool.needs_approval is False for tool in captured["tools"])
+    assert all(tool.timeout_seconds == 20.0 for tool in captured["tools"])
     assert len(components.outbound.sent) == 1
     assert any(
         record.kind == "google_read" and record.execution_status == "completed"

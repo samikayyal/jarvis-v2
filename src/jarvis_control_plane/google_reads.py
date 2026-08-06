@@ -8,9 +8,11 @@ inside this boundary.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -59,7 +61,10 @@ MAX_ITEM_BYTES = 64 * 1024
 DEFAULT_MAX_RESULT_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 1024 * 1024
 MAX_PROVIDER_RESPONSE_BYTES = 512 * 1024
-GOOGLE_READ_TIMEOUT_SECONDS = 5.0
+# A single blocking HTTPS exchange may take up to five seconds.  The
+# orchestration tool owns the 20-second deadline for the complete, possibly
+# multi-request read (token refresh plus one or more fixed Google calls).
+GOOGLE_HTTP_TIMEOUT_SECONDS = 5.0
 GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES = 2 * 1024 * 1024
 
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -67,6 +72,21 @@ _GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me"
 _CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
 _DRIVE_API_ROOT = "https://www.googleapis.com/drive/v3"
 _TEXT_EXPORT_MIME_TYPES = frozenset({"text/plain", "text/csv", "text/markdown"})
+_TEXT_MEDIA_MIME_TYPES = frozenset(
+    {
+        "text/plain",
+        "text/csv",
+        "text/markdown",
+        "application/json",
+        "application/xml",
+        "text/xml",
+        "application/yaml",
+        "application/x-yaml",
+        "text/yaml",
+    }
+)
+_GMAIL_TEXT_MIME_TYPES = frozenset({"text/plain", "text/html"})
+_GMAIL_METADATA_HEADERS = frozenset({"from", "to", "cc", "subject", "date"})
 
 GoogleReadOperation = Literal[
     "gmail_messages_list",
@@ -220,7 +240,7 @@ class GoogleApiReadProvider:
         client_id: str,
         client_secret: str,
         transport: GoogleReadHttpTransport | None = None,
-        timeout_seconds: float = GOOGLE_READ_TIMEOUT_SECONDS,
+        timeout_seconds: float = GOOGLE_HTTP_TIMEOUT_SECONDS,
     ) -> None:
         self._client_id = _non_blank(client_id, "client_id")
         self._client_secret = _non_blank(client_secret, "client_secret")
@@ -228,7 +248,7 @@ class GoogleApiReadProvider:
         if (
             not isinstance(timeout_seconds, (int, float))
             or isinstance(timeout_seconds, bool)
-            or not 0 < timeout_seconds <= GOOGLE_READ_TIMEOUT_SECONDS
+            or not 0 < timeout_seconds <= GOOGLE_HTTP_TIMEOUT_SECONDS
         ):
             raise ValueError("timeout_seconds must be positive and no greater than 5")
         self._timeout_seconds = float(timeout_seconds)
@@ -241,9 +261,40 @@ class GoogleApiReadProvider:
         if request.operation == "drive_files_export":
             return GoogleReadProviderResult(items=(self._decode_text_export(response),))
         payload = self._json_response(response)
+        if request.operation == "drive_files_get":
+            return self._drive_file_result(request, payload, access_token)
         return GoogleReadProviderResult(
             items=_response_items(request.operation, payload),
             continuation_token=_continuation_token(payload),
+        )
+
+    def _drive_file_result(
+        self,
+        request: GoogleReadRequest,
+        metadata: Mapping[str, object],
+        access_token: str,
+    ) -> GoogleReadProviderResult:
+        """Return metadata and, only for an allowlisted text file, its media.
+
+        Google Workspace files retain the existing explicit ``files.export``
+        route.  For ordinary Drive files, metadata establishes the MIME type
+        before this connector asks for ``alt=media``; binary and unknown types
+        are never downloaded.
+        """
+
+        mime_type = metadata.get("mimeType")
+        result: dict[str, object] = dict(metadata)
+        if mime_type in _TEXT_MEDIA_MIME_TYPES:
+            media = self._authorized_drive_media_get(
+                request.arguments["file_id"], access_token
+            )
+            result["content"] = self._decode_text_media(media, _TEXT_MEDIA_MIME_TYPES)
+        return GoogleReadProviderResult(
+            items=(
+                json.dumps(
+                    result, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                ),
+            )
         )
 
     def _refresh_access_token(self, refresh_token: str) -> str:
@@ -282,6 +333,17 @@ class GoogleApiReadProvider:
             timeout_seconds=self._timeout_seconds,
         )
 
+    def _authorized_drive_media_get(
+        self, file_id: str, access_token: str
+    ) -> GoogleReadHttpResponse:
+        return self._transport.request(
+            method="GET",
+            url=_drive_media_url(file_id),
+            headers={"Authorization": f"Bearer {access_token}"},
+            body=None,
+            timeout_seconds=self._timeout_seconds,
+        )
+
     def _json_response(
         self,
         response: GoogleReadHttpResponse,
@@ -304,11 +366,21 @@ class GoogleApiReadProvider:
         return payload
 
     def _decode_text_export(self, response: GoogleReadHttpResponse) -> str:
+        content_type = _response_mime_type(response)
+        if content_type not in _TEXT_EXPORT_MIME_TYPES:
+            raise GoogleReadProviderError("unavailable", "Google export was not text")
+        return self._decode_text_media(response, _TEXT_EXPORT_MIME_TYPES)
+
+    def _decode_text_media(
+        self,
+        response: GoogleReadHttpResponse,
+        approved_mime_types: frozenset[str],
+    ) -> str:
         _ensure_response_size(response.body)
         if response.status_code != 200:
             _raise_http_failure(response)
-        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-        if content_type not in _TEXT_EXPORT_MIME_TYPES:
+        content_type = _response_mime_type(response)
+        if content_type not in approved_mime_types:
             raise GoogleReadProviderError("unavailable", "Google export was not text")
         try:
             return response.body.decode("utf-8")
@@ -1001,9 +1073,9 @@ def _google_read_url(request: GoogleReadRequest) -> str:
         return _url(
             f"{_GMAIL_API_ROOT}/messages/{quote(arguments['message_id'], safe='')}",
             {
-                "format": "metadata",
+                "format": "full",
                 "metadataHeaders": ("From", "To", "Cc", "Subject", "Date"),
-                "fields": "id,threadId,internalDate,labelIds,sizeEstimate,snippet,payload(headers)",
+                "fields": _gmail_full_fields(),
             },
         )
     if operation == "gmail_threads_list":
@@ -1019,9 +1091,9 @@ def _google_read_url(request: GoogleReadRequest) -> str:
         return _url(
             f"{_GMAIL_API_ROOT}/threads/{quote(arguments['thread_id'], safe='')}",
             {
-                "format": "metadata",
+                "format": "full",
                 "metadataHeaders": ("From", "To", "Cc", "Subject", "Date"),
-                "fields": "id,historyId,messages(id,threadId,internalDate,labelIds,sizeEstimate,snippet,payload(headers))",
+                "fields": "id,historyId,messages(" + _gmail_message_fields() + ")",
             },
         )
     if operation == "calendar_list":
@@ -1100,6 +1172,8 @@ def _response_items(
         "calendar_events_list": "items",
         "drive_files_list": "files",
     }.get(operation)
+    if operation in {"gmail_messages_get", "gmail_threads_get"}:
+        return _gmail_response_items(operation, payload)
     values: object = (
         payload if collection_key is None else payload.get(collection_key, ())
     )
@@ -1116,6 +1190,194 @@ def _response_items(
         json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         for row in rows
     )
+
+
+def _gmail_full_fields() -> str:
+    return _gmail_message_fields()
+
+
+def _gmail_message_fields() -> str:
+    return (
+        "id,threadId,internalDate,labelIds,sizeEstimate,snippet,"
+        "payload(headers,mimeType,filename,body(size,data,attachmentId),"
+        "parts(headers,mimeType,filename,body(size,data,attachmentId),"
+        "parts(headers,mimeType,filename,body(size,data,attachmentId))))"
+    )
+
+
+def _gmail_response_items(
+    operation: GoogleReadOperation, payload: Mapping[str, object]
+) -> tuple[str, ...]:
+    if operation == "gmail_messages_get":
+        messages: object = (payload,)
+    else:
+        messages = payload.get("messages", ())
+    if not isinstance(messages, tuple | list) or not all(
+        isinstance(message, Mapping) for message in messages
+    ):
+        raise GoogleReadProviderError(
+            "unavailable", "Gmail response had invalid messages"
+        )
+    if operation == "gmail_threads_get" and not messages:
+        return (
+            json.dumps(
+                {key: payload[key] for key in ("id", "historyId") if key in payload},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+    return tuple(
+        json.dumps(
+            _gmail_message_with_text(message),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        for message in messages
+    )
+
+
+def _gmail_message_with_text(message: Mapping[str, object]) -> dict[str, object]:
+    result = {
+        key: message[key]
+        for key in (
+            "id",
+            "threadId",
+            "internalDate",
+            "labelIds",
+            "sizeEstimate",
+            "snippet",
+        )
+        if key in message
+    }
+    payload = message.get("payload")
+    if not isinstance(payload, Mapping):
+        return result
+    headers = _gmail_headers(payload)
+    if headers:
+        result["headers"] = headers
+    text = _gmail_payload_text(payload)
+    if text:
+        result["body"] = text
+    return result
+
+
+def _gmail_headers(payload: Mapping[str, object]) -> dict[str, str]:
+    raw_headers = payload.get("headers", ())
+    if not isinstance(raw_headers, tuple | list):
+        return {}
+    headers: dict[str, str] = {}
+    for raw_header in raw_headers:
+        if not isinstance(raw_header, Mapping):
+            continue
+        name = raw_header.get("name")
+        value = raw_header.get("value")
+        if (
+            isinstance(name, str)
+            and isinstance(value, str)
+            and name.lower() in _GMAIL_METADATA_HEADERS
+        ):
+            headers[name] = value
+    return headers
+
+
+def _gmail_payload_text(payload: Mapping[str, object]) -> str:
+    """Extract only inline approved text; attachment bytes stay at Google."""
+
+    text_parts: list[str] = []
+    pending: list[Mapping[str, object]] = [payload]
+    while pending:
+        part = pending.pop()
+        nested = part.get("parts", ())
+        if isinstance(nested, tuple | list):
+            # ``pending`` is LIFO; reverse nested parts so the returned text
+            # stays in the message's original MIME order.
+            pending.extend(
+                reversed([child for child in nested if isinstance(child, Mapping)])
+            )
+        mime_type = part.get("mimeType")
+        if mime_type not in _GMAIL_TEXT_MIME_TYPES or _is_attachment_part(part):
+            continue
+        body = part.get("body")
+        if not isinstance(body, Mapping) or not isinstance(body.get("data"), str):
+            continue
+        decoded = _decode_gmail_part(body["data"])
+        if decoded is None:
+            continue
+        if mime_type == "text/html":
+            decoded = _html_to_text(decoded)
+        if decoded:
+            text_parts.append(decoded)
+    return "\n\n".join(text_parts)
+
+
+def _is_attachment_part(part: Mapping[str, object]) -> bool:
+    if isinstance(part.get("filename"), str) and part["filename"]:
+        return True
+    body = part.get("body")
+    if isinstance(body, Mapping) and body.get("attachmentId") is not None:
+        return True
+    for header in (
+        part.get("headers", ()) if isinstance(part.get("headers"), tuple | list) else ()
+    ):
+        if not isinstance(header, Mapping):
+            continue
+        name = header.get("name")
+        value = header.get("value")
+        if (
+            isinstance(name, str)
+            and isinstance(value, str)
+            and name.lower() == "content-disposition"
+            and value.lower().lstrip().startswith("attachment")
+        ):
+            return True
+    return False
+
+
+def _decode_gmail_part(data: str) -> str | None:
+    try:
+        padding = "=" * (-len(data) % 4)
+        raw = base64.b64decode(data + padding, altchars=b"-_", validate=True)
+        return raw.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+class _HtmlTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+        if tag in {"br", "p", "div", "li", "tr"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)
+
+
+def _html_to_text(value: str) -> str:
+    parser = _HtmlTextExtractor()
+    parser.feed(value)
+    parser.close()
+    return " ".join("".join(parser.parts).split())
+
+
+def _response_mime_type(response: GoogleReadHttpResponse) -> str:
+    return response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+
+
+def _drive_media_url(file_id: str) -> str:
+    return _url(f"{_DRIVE_API_ROOT}/files/{quote(file_id, safe='')}", {"alt": "media"})
 
 
 def _continuation_token(payload: Mapping[str, object]) -> str | None:

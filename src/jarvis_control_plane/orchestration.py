@@ -7,6 +7,7 @@ that the deterministic capability broker still validates, audits, and approves.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -26,6 +27,7 @@ _MAX_TURNS = 4
 _MAX_TOOL_INVOCATIONS = 4
 _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000
+_READ_TOOL_TIMEOUT_SECONDS = 20.0
 _CLOSED_READ_TOOL_NAMES = frozenset(
     {
         "read_request_context",
@@ -290,10 +292,21 @@ class AgentsSdkOrchestrationAdapter:
                 budget.consume()
                 try:
                     typed_input = tool.input_model.model_validate_json(raw_input)
-                    typed_output = tool.handler(request, typed_input)
+                    # Connector handlers use synchronous transports.  Keep them
+                    # off the Agents SDK event loop, while ensuring cancellation
+                    # or the connector deadline prevents a late result from
+                    # re-entering orchestration.
+                    typed_output = await asyncio.wait_for(
+                        asyncio.to_thread(tool.handler, request, typed_input),
+                        timeout=_READ_TOOL_TIMEOUT_SECONDS,
+                    )
                     if not isinstance(typed_output, tool.output_model):
                         raise TypeError("bounded read returned an untyped result")
                     bounded_output = tool.output_model.model_validate(typed_output)
+                except TimeoutError as exc:
+                    raise OrchestrationAdapterError(
+                        "bounded read tool timed out"
+                    ) from exc
                 except OrchestrationAdapterError:
                     raise
                 except Exception as exc:
@@ -315,7 +328,7 @@ class AgentsSdkOrchestrationAdapter:
                 on_invoke_tool=invoke,
                 strict_json_schema=True,
                 needs_approval=False,
-                timeout_seconds=2.0,
+                timeout_seconds=_READ_TOOL_TIMEOUT_SECONDS,
                 output_json_schema=tool.output_model.model_json_schema(),
             )
 
