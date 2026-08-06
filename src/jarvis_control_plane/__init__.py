@@ -37,6 +37,14 @@ from .google_oauth import (
     OAuthGrant,
     SQLiteGoogleOAuthStateStore,
 )
+from .google_reads import (
+    GOOGLE_READ_SCOPES,
+    ControlledGoogleReadProvider,
+    GoogleReadConnector,
+    GoogleReadError,
+    GoogleReadProviderResult,
+    GoogleReadResult,
+)
 from .models import (
     AuditEvidence,
     AuditFilter,
@@ -82,6 +90,7 @@ __all__ = [
     "DEFAULT_TRACE_RESERVATION_BYTES",
     "GOOGLE_OAUTH_SCOPES",
     "GOOGLE_OAUTH_STATE_TTL",
+    "GOOGLE_READ_SCOPES",
     "MAX_TRACE_RESERVATION_BYTES",
     "ActionDispatcherError",
     "AgentsSdkOrchestrationAdapter",
@@ -93,6 +102,7 @@ __all__ = [
     "ControlPlaneError",
     "ControlledActionDispatcher",
     "ControlledGoogleOAuthProvider",
+    "ControlledGoogleReadProvider",
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
     "ConversationMessage",
@@ -109,6 +119,10 @@ __all__ = [
     "GoogleConnectionState",
     "GoogleOAuthError",
     "GoogleOAuthLifecycle",
+    "GoogleReadConnector",
+    "GoogleReadError",
+    "GoogleReadProviderResult",
+    "GoogleReadResult",
     "InMemoryAuditBoundary",
     "InMemoryDiagnosticTraceStore",
     "InMemoryDurableStateStore",
