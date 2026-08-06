@@ -542,6 +542,7 @@ class DeterministicCapabilityBroker:
                 raise OutboundConnectorError(
                     "proposal gateway outcome was unknown", may_have_sent=True
                 )
+            self._accept_outbound_history(reply)
             return {"outbound_id": outbound_id, "result": "accepted"}
 
         try:
@@ -1957,18 +1958,18 @@ class DeterministicCapabilityBroker:
                 )
 
             selected = self.state.search_conversation_messages(
-                message_ids=(args[1],), limit=1
+                history_ids=(args[1],), limit=1
             )
             if len(selected) != 1:
                 return self._dispatch_history_text(
                     message,
-                    "No accessible conversation message has that exact message ID.",
+                    "No accessible conversation message has that exact history ID.",
                     disposition=f"history_{operation}",
                 )
             # The adapter's canonical export is the exact inspection payload:
             # it retains every selected field and is split only at the delivery
             # envelope, never truncated or redacted.
-            payload = self.state.export_conversation_messages(message_ids=(args[1],))
+            payload = self.state.export_conversation_messages(history_ids=(args[1],))
         except AuditWriteError as exc:
             return ReceiveResult(
                 status_code=202,
@@ -1993,9 +1994,9 @@ class DeterministicCapabilityBroker:
             return "No accessible conversation messages matched."
         return "\n".join(
             (
-                "Conversation-history matches (inspect or export by exact message ID):",
+                "Conversation-history matches (inspect or export by exact history ID):",
                 *(
-                    f"{item.message_id} | conversation {item.working_session_id} | "
+                    f"{item.history_id} | conversation {item.working_session_id} | "
                     f"{item.direction} | {item.occurred_at.isoformat()} | "
                     f"request {item.request_id or 'none'}"
                     for item in messages
@@ -2013,6 +2014,8 @@ class DeterministicCapabilityBroker:
         control_id = self.ids.new_id("control")
         body = _bounded_informational_reply(text, request_id=control_id)
         result = self._dispatch_control_text(message, body=body, control_id=control_id)
+        if result.disposition != "control_sent":
+            return result
         return replace(result, disposition=disposition)
 
     def _dispatch_history_export(
@@ -2039,7 +2042,7 @@ class DeterministicCapabilityBroker:
                 message, body=body, control_id=control_id
             )
             if result.disposition != "control_sent":
-                return replace(result, disposition=disposition)
+                return result
         assert result is not None
         return replace(result, disposition=disposition)
 
@@ -2203,9 +2206,9 @@ class DeterministicCapabilityBroker:
                     ),
                 )
             )
-            # The retained immutable body is the dispatch outbox.  It must be
+            # The private outbox record is the dispatch admission gate.  It must be
             # durable before tracing enters the connector operation so a local
-            # history failure is a definite no-send result, not an ambiguous
+            # outbox failure is a definite no-send result, not an ambiguous
             # connector outcome.
             self._reserve_outbound_history(reply, message=message)
             self._trace.execute(
@@ -2295,21 +2298,21 @@ class DeterministicCapabilityBroker:
         self, reply: OutboundReply, *, message: InboundMessage
     ) -> dict[str, str]:
         self.outbound.send(reply)
+        self._accept_outbound_history(reply)
         return {"result": "accepted"}
 
     def _reserve_outbound_history(
         self, reply: OutboundReply, *, message: InboundMessage
     ) -> None:
-        """Durably retain an exact outbound body before its one send attempt.
+        """Reserve an exact outbound body outside accessible history before send.
 
-        The immutable history row is the outbound-history outbox.  Existing
-        request and audit transitions subsequently reconcile it as accepted,
-        failed, or unknown; no recovery path retries an ambiguous connector
-        attempt.
+        Only a gateway-accepted send is promoted into searchable conversation
+        history. Failed, pending, and ambiguous attempts remain in the private
+        outbox and can never become model context or operator-visible history.
         """
 
         try:
-            self.state.append_conversation_message(
+            self.state.reserve_outbound_conversation_message(
                 ConversationMessage(
                     working_session_id=self.current_working_session_id,
                     transport_session_id=reply.session_id,
@@ -2325,7 +2328,21 @@ class DeterministicCapabilityBroker:
             )
         except StateStoreError as exc:
             raise OutboundConnectorError(
-                "outbound reply history could not be reserved before dispatch",
+                "outbound reply could not be reserved before dispatch",
+            ) from exc
+
+    def _accept_outbound_history(self, reply: OutboundReply) -> None:
+        """Atomically promote an accepted outbox record into accessible history."""
+
+        try:
+            self.state.accept_reserved_outbound_conversation_message(
+                transport_session_id=reply.session_id,
+                message_id=reply.reply_id,
+            )
+        except StateStoreError as exc:
+            raise OutboundConnectorError(
+                "outbound delivery was accepted but history promotion is pending",
+                may_have_sent=True,
             ) from exc
 
     def _send_request_and_finish(
@@ -2346,6 +2363,7 @@ class DeterministicCapabilityBroker:
                     "request was cancelled before outbound dispatch"
                 )
             self.outbound.send(reply)
+            self._accept_outbound_history(reply)
             if not self._finish_session_request(
                 token,
                 outcome=outcome,

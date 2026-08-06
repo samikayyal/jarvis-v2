@@ -144,6 +144,17 @@ class DurableStateStore(Protocol):
 
     def append_conversation_message(self, message: ConversationMessage) -> None: ...
 
+    def reserve_outbound_conversation_message(
+        self, message: ConversationMessage
+    ) -> None: ...
+
+    def accept_reserved_outbound_conversation_message(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+    ) -> None: ...
+
     def search_conversation_messages(
         self,
         *,
@@ -151,7 +162,7 @@ class DurableStateStore(Protocol):
         working_session_id: str | None = None,
         request_id: str | None = None,
         direction: str | None = None,
-        message_ids: tuple[str, ...] = (),
+        history_ids: tuple[str, ...] = (),
         limit: int = 50,
     ) -> tuple[ConversationMessage, ...]: ...
 

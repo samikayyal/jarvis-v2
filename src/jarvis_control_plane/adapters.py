@@ -9,6 +9,7 @@ that production adapters will later implement.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -110,6 +111,7 @@ class InMemoryDurableStateStore:
     def __init__(self) -> None:
         self.claims: dict[tuple[str, str], IngressClaim] = {}
         self.conversation_messages: dict[tuple[str, str], ConversationMessage] = {}
+        self.outbound_outbox: dict[tuple[str, str], ConversationMessage] = {}
         self.requests: dict[str, RequestState] = {}
         self.fail_claim = False
         self.fail_conversation = False
@@ -271,6 +273,38 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("conversation message identifier already exists")
             self.conversation_messages[key] = message
 
+    def reserve_outbound_conversation_message(
+        self, message: ConversationMessage
+    ) -> None:
+        if message.direction != "outbound":
+            raise StateStoreError(
+                "only outbound messages can enter the outbound outbox"
+            )
+        with self._lock:
+            if self.fail_conversation:
+                raise StateStoreError("controlled conversation write failure")
+            key = (message.transport_session_id, message.message_id)
+            if key in self.conversation_messages or key in self.outbound_outbox:
+                raise StateStoreError("conversation message identifier already exists")
+            self.outbound_outbox[key] = message
+
+    def accept_reserved_outbound_conversation_message(
+        self, *, transport_session_id: str, message_id: str
+    ) -> None:
+        with self._lock:
+            if self.fail_conversation:
+                raise StateStoreError("controlled conversation write failure")
+            key = (transport_session_id, message_id)
+            message = self.outbound_outbox.get(key)
+            if message is None:
+                raise StateStoreError(
+                    "reserved outbound conversation message does not exist"
+                )
+            if key in self.conversation_messages:
+                raise StateStoreError("conversation message identifier already exists")
+            self.conversation_messages[key] = message
+            del self.outbound_outbox[key]
+
     def search_conversation_messages(
         self,
         *,
@@ -278,7 +312,7 @@ class InMemoryDurableStateStore:
         working_session_id: str | None = None,
         request_id: str | None = None,
         direction: str | None = None,
-        message_ids: tuple[str, ...] = (),
+        history_ids: tuple[str, ...] = (),
         limit: int = 50,
     ) -> tuple[ConversationMessage, ...]:
         return _filter_conversation_messages(
@@ -287,7 +321,7 @@ class InMemoryDurableStateStore:
             working_session_id=working_session_id,
             request_id=request_id,
             direction=direction,
-            message_ids=message_ids,
+            history_ids=history_ids,
             limit=limit,
         )
 
@@ -416,6 +450,25 @@ class SQLiteDurableStateStore:
                     message_id UNINDEXED,
                     text
                 );
+                CREATE TABLE IF NOT EXISTS outbound_conversation_outbox (
+                    transport_session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    working_session_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    credential_like INTEGER NOT NULL CHECK (credential_like IN (0, 1)),
+                    PRIMARY KEY (transport_session_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS conversation_history_by_working_session
+                    ON conversation_history(working_session_id, occurred_at, transport_session_id, message_id);
+                CREATE INDEX IF NOT EXISTS conversation_history_by_request
+                    ON conversation_history(request_id, occurred_at, transport_session_id, message_id);
+                CREATE INDEX IF NOT EXISTS conversation_history_by_direction
+                    ON conversation_history(direction, occurred_at, transport_session_id, message_id);
                 """
             )
             self.connection.commit()
@@ -685,19 +738,18 @@ class SQLiteDurableStateStore:
                 """,
                 values,
             )
-        if not conversation_message.credential_like:
-            self.connection.execute(
-                """
-                INSERT INTO conversation_history_fts(
-                    transport_session_id, message_id, text
-                ) VALUES (?, ?, ?)
-                """,
-                (
-                    conversation_message.transport_session_id,
-                    conversation_message.message_id,
-                    conversation_message.text,
-                ),
-            )
+        self.connection.execute(
+            """
+            INSERT INTO conversation_history_fts(
+                transport_session_id, message_id, text
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                conversation_message.transport_session_id,
+                conversation_message.message_id,
+                conversation_message.text,
+            ),
+        )
 
     def claim_ingress(
         self,
@@ -949,6 +1001,102 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not append conversation history") from exc
 
+    def reserve_outbound_conversation_message(
+        self, message: ConversationMessage
+    ) -> None:
+        if message.direction != "outbound":
+            raise StateStoreError(
+                "only outbound messages can enter the outbound outbox"
+            )
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                INSERT INTO outbound_conversation_outbox(
+                    transport_session_id, message_id, working_session_id, event_id,
+                    chat_id, sender_id, text, occurred_at, request_id, credential_like
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message.transport_session_id,
+                    message.message_id,
+                    message.working_session_id,
+                    message.event_id,
+                    message.chat_id,
+                    message.sender_id,
+                    message.text,
+                    ensure_utc(message.occurred_at).isoformat(),
+                    message.request_id,
+                    int(message.credential_like),
+                ),
+            )
+            self.connection.commit()
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "conversation message identifier already exists"
+            ) from exc
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "could not reserve outbound conversation history"
+            ) from exc
+
+    def accept_reserved_outbound_conversation_message(
+        self, *, transport_session_id: str, message_id: str
+    ) -> None:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self.connection.execute(
+                """
+                SELECT transport_session_id, working_session_id, message_id, event_id,
+                       chat_id, sender_id, text, occurred_at, request_id, credential_like
+                FROM outbound_conversation_outbox
+                WHERE transport_session_id = ? AND message_id = ?
+                """,
+                (transport_session_id, message_id),
+            ).fetchone()
+            if row is None:
+                raise StateStoreError(
+                    "reserved outbound conversation message does not exist"
+                )
+            self._insert_conversation_message(
+                ConversationMessage(
+                    working_session_id=row["working_session_id"],
+                    transport_session_id=row["transport_session_id"],
+                    message_id=row["message_id"],
+                    event_id=row["event_id"],
+                    chat_id=row["chat_id"],
+                    sender_id=row["sender_id"],
+                    text=row["text"],
+                    occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                    direction="outbound",
+                    request_id=row["request_id"],
+                    credential_like=bool(row["credential_like"]),
+                )
+            )
+            self.connection.execute(
+                """
+                DELETE FROM outbound_conversation_outbox
+                WHERE transport_session_id = ? AND message_id = ?
+                """,
+                (transport_session_id, message_id),
+            )
+            self.connection.commit()
+        except StateStoreError:
+            self.connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "conversation message identifier already exists"
+            ) from exc
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "could not accept outbound conversation history"
+            ) from exc
+
     def search_conversation_messages(
         self,
         *,
@@ -956,24 +1104,73 @@ class SQLiteDurableStateStore:
         working_session_id: str | None = None,
         request_id: str | None = None,
         direction: str | None = None,
-        message_ids: tuple[str, ...] = (),
+        history_ids: tuple[str, ...] = (),
         limit: int = 50,
     ) -> tuple[ConversationMessage, ...]:
-        # FTS is deliberately not a second selection rule.  It uses a
-        # tokenizer whose candidate semantics differ from the portable
-        # deterministic filter (notably for punctuation and Unicode).  The
-        # same normalized query must therefore decide results in both durable
-        # stores; the local index remains an implementation detail for future
-        # query plans that can prove that equivalence.
-        return _filter_conversation_messages(
-            self.list_conversation_messages(),
+        _validate_history_query(
+            text=text,
+            direction=direction,
+            history_ids=history_ids,
+            limit=limit,
+        )
+        terms = _history_search_terms(text or "")
+        if text is not None and not terms:
+            return ()
+        clauses: list[str] = []
+        values: list[object] = []
+        join = ""
+        if terms:
+            join = (
+                " JOIN conversation_history_fts AS f "
+                "ON f.transport_session_id = h.transport_session_id "
+                "AND f.message_id = h.message_id "
+            )
+            clauses.append("f.text MATCH ?")
+            values.append(_fts_history_query(terms))
+        if history_ids:
+            selectors = tuple(
+                ConversationMessage.history_id_parts(value) for value in history_ids
+            )
+            clauses.append(
+                "("
+                + " OR ".join(
+                    "(h.transport_session_id = ? AND h.message_id = ?)"
+                    for _ in selectors
+                )
+                + ")"
+            )
+            values.extend(item for selector in selectors for item in selector)
+        if working_session_id is not None:
+            clauses.append("h.working_session_id = ?")
+            values.append(working_session_id)
+        if request_id is not None:
+            clauses.append("h.request_id = ?")
+            values.append(request_id)
+        if direction is not None:
+            clauses.append("h.direction = ?")
+            values.append(direction)
+        rows = self.connection.execute(
+            """
+            SELECT h.transport_session_id, h.working_session_id, h.message_id,
+                   h.event_id, h.chat_id, h.sender_id, h.text, h.occurred_at,
+                   h.direction, h.request_id, h.credential_like
+            FROM conversation_history AS h
+            """
+            + join
+            + (" WHERE " + " AND ".join(clauses) if clauses else "")
+            + " ORDER BY h.occurred_at, h.transport_session_id, h.message_id LIMIT ?",
+            [*values, limit],
+        ).fetchall()
+        matches = _filter_conversation_messages(
+            tuple(_conversation_message_from_row(row) for row in rows),
             text=text,
             working_session_id=working_session_id,
             request_id=request_id,
             direction=direction,
-            message_ids=message_ids,
+            history_ids=history_ids,
             limit=limit,
         )
+        return matches
 
     def export_conversation_messages(self, **query: object) -> str:
         return _export_conversation_messages(
@@ -987,17 +1184,37 @@ class SQLiteDurableStateStore:
         excluding_working_session_id: str,
         limit: int = 5,
     ) -> HistorySelection:
-        matches = self.search_conversation_messages(
-            text=text,
-            limit=_MAX_HISTORY_RESULTS,
-        )
+        _validate_history_query(text=text, direction=None, history_ids=(), limit=limit)
+        terms = _history_search_terms(text)
+        if not terms:
+            return HistorySelection(())
+        rows = self.connection.execute(
+            """
+            SELECT h.transport_session_id, h.working_session_id, h.message_id,
+                   h.event_id, h.chat_id, h.sender_id, h.text, h.occurred_at,
+                   h.direction, h.request_id, h.credential_like
+            FROM conversation_history AS h
+            JOIN conversation_history_fts AS f
+              ON f.transport_session_id = h.transport_session_id
+             AND f.message_id = h.message_id
+            WHERE f.text MATCH ?
+              AND h.working_session_id != ?
+              AND h.credential_like = 0
+            ORDER BY h.occurred_at, h.transport_session_id, h.message_id
+            LIMIT ?
+            """,
+            (
+                _fts_history_query(terms),
+                excluding_working_session_id,
+                _MAX_HISTORY_RESULTS,
+            ),
+        ).fetchall()
         return HistorySelection(
-            tuple(
-                message
-                for message in matches
-                if message.working_session_id != excluding_working_session_id
-                and not message.credential_like
-            )[:limit]
+            _filter_conversation_messages(
+                tuple(_conversation_message_from_row(row) for row in rows),
+                text=text,
+                limit=limit,
+            )
         )
 
     def _rebuild_conversation_history_for_outbound(self) -> None:
@@ -1037,6 +1254,16 @@ class SQLiteDurableStateStore:
             """
         )
         self.connection.execute("DROP TABLE conversation_history_legacy")
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS conversation_history_by_working_session
+                ON conversation_history(working_session_id, occurred_at, transport_session_id, message_id);
+            CREATE INDEX IF NOT EXISTS conversation_history_by_request
+                ON conversation_history(request_id, occurred_at, transport_session_id, message_id);
+            CREATE INDEX IF NOT EXISTS conversation_history_by_direction
+                ON conversation_history(direction, occurred_at, transport_session_id, message_id);
+            """
+        )
         self.connection.commit()
 
     def _classify_and_index_conversation_history(self) -> None:
@@ -1070,15 +1297,14 @@ class SQLiteDurableStateStore:
                     row["message_id"],
                 ),
             )
-            if not message.credential_like:
-                self.connection.execute(
-                    """
-                    INSERT INTO conversation_history_fts(
-                        transport_session_id, message_id, text
-                    ) VALUES (?, ?, ?)
-                    """,
-                    (row["transport_session_id"], row["message_id"], row["text"]),
-                )
+            self.connection.execute(
+                """
+                INSERT INTO conversation_history_fts(
+                    transport_session_id, message_id, text
+                ) VALUES (?, ?, ?)
+                """,
+                (row["transport_session_id"], row["message_id"], row["text"]),
+            )
         self.connection.commit()
 
     def close(self) -> None:
@@ -1133,9 +1359,39 @@ def _filter_conversation_messages(
     working_session_id: str | None = None,
     request_id: str | None = None,
     direction: str | None = None,
-    message_ids: tuple[str, ...] = (),
+    history_ids: tuple[str, ...] = (),
     limit: int = _MAX_HISTORY_RESULTS,
 ) -> tuple[ConversationMessage, ...]:
+    _validate_history_query(
+        text=text,
+        direction=direction,
+        history_ids=history_ids,
+        limit=limit,
+    )
+    terms = _history_search_terms(text or "")
+    selected_ids = set(history_ids)
+    results = tuple(
+        message
+        for message in messages
+        if (
+            working_session_id is None
+            or message.working_session_id == working_session_id
+        )
+        and (request_id is None or message.request_id == request_id)
+        and (direction is None or message.direction == direction)
+        and (not selected_ids or message.history_id in selected_ids)
+        and (text is None or (bool(terms) and _matches_history_terms(message, terms)))
+    )
+    return results[:limit]
+
+
+def _validate_history_query(
+    *,
+    text: str | None,
+    direction: str | None,
+    history_ids: tuple[str, ...],
+    limit: int,
+) -> None:
     if (
         isinstance(limit, bool)
         or not isinstance(limit, int)
@@ -1147,28 +1403,17 @@ def _filter_conversation_messages(
     if text is not None and (not isinstance(text, str) or not text.strip()):
         raise ValueError("history text query must be non-blank when provided")
     if any(
-        not isinstance(message_id, str) or not message_id for message_id in message_ids
+        not isinstance(history_id, str) or not history_id for history_id in history_ids
     ):
         raise ValueError("history message selectors must be non-blank strings")
+    for history_id in history_ids:
+        ConversationMessage.history_id_parts(history_id)
 
-    terms = _history_search_terms(text or "")
-    selected_ids = set(message_ids)
-    results = tuple(
-        message
-        for message in messages
-        if (
-            working_session_id is None
-            or message.working_session_id == working_session_id
-        )
-        and (request_id is None or message.request_id == request_id)
-        and (direction is None or message.direction == direction)
-        and (not selected_ids or message.message_id in selected_ids)
-        and (
-            text is None
-            or (bool(terms) and any(term in message.text.casefold() for term in terms))
-        )
-    )
-    return results[:limit]
+
+def _matches_history_terms(
+    message: ConversationMessage, terms: tuple[str, ...]
+) -> bool:
+    return any(term in _history_search_terms(message.text) for term in terms)
 
 
 def _select_history_for_context(
@@ -1178,19 +1423,18 @@ def _select_history_for_context(
     excluding_working_session_id: str,
     limit: int,
 ) -> HistorySelection:
+    eligible = tuple(
+        message
+        for message in messages
+        if message.working_session_id != excluding_working_session_id
+        and not message.credential_like
+    )
     matches = _filter_conversation_messages(
-        messages,
+        eligible,
         text=text,
         limit=_MAX_HISTORY_RESULTS,
     )
-    return HistorySelection(
-        tuple(
-            message
-            for message in matches
-            if message.working_session_id != excluding_working_session_id
-            and not message.credential_like
-        )[:limit]
-    )
+    return HistorySelection(matches[:limit])
 
 
 def _export_conversation_messages(messages: tuple[ConversationMessage, ...]) -> str:
@@ -1200,6 +1444,7 @@ def _export_conversation_messages(messages: tuple[ConversationMessage, ...]) -> 
                 "conversation_id": message.working_session_id,
                 "direction": message.direction,
                 "event_id": message.event_id,
+                "history_id": message.history_id,
                 "message_id": message.message_id,
                 "occurred_at": message.occurred_at.isoformat(),
                 "request_id": message.request_id,
@@ -1216,10 +1461,29 @@ def _export_conversation_messages(messages: tuple[ConversationMessage, ...]) -> 
 
 def _history_search_terms(text: str) -> tuple[str, ...]:
     return tuple(
-        term.casefold().strip(".,:;!?()[]{}\"'")
-        for term in text.split()
-        if len(term.strip(".,:;!?()[]{}\"'")) > 2
-        and term.casefold().strip(".,:;!?()[]{}\"'") not in _HISTORY_SEARCH_STOPWORDS
+        term
+        for term in re.findall(r"\w+", text.casefold())
+        if len(term) > 2 and term not in _HISTORY_SEARCH_STOPWORDS
+    )
+
+
+def _fts_history_query(terms: tuple[str, ...]) -> str:
+    return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+
+
+def _conversation_message_from_row(row: sqlite3.Row) -> ConversationMessage:
+    return ConversationMessage(
+        working_session_id=row["working_session_id"],
+        transport_session_id=row["transport_session_id"],
+        message_id=row["message_id"],
+        event_id=row["event_id"],
+        chat_id=row["chat_id"],
+        sender_id=row["sender_id"],
+        text=row["text"],
+        occurred_at=datetime.fromisoformat(row["occurred_at"]),
+        direction=row["direction"],
+        request_id=row["request_id"],
+        credential_like=bool(row["credential_like"]),
     )
 
 

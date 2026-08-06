@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -15,6 +16,7 @@ from jarvis_control_plane import (
     SignedInboundEvent,
     SQLiteDurableStateStore,
 )
+from jarvis_control_plane.ports import OutboundConnectorError
 
 NOW = datetime(2026, 8, 6, 9, 0, tzinfo=UTC)
 OPERATOR = "operator.test"
@@ -75,13 +77,14 @@ def test_sqlite_history_searches_filters_inspects_and_exports_exact_content() ->
         ) == (matches[1],)
 
         exported = json.loads(
-            state.export_conversation_messages(message_ids=("out-001",))
+            state.export_conversation_messages(history_ids=(matches[1].history_id,))
         )
         assert exported == [
             {
                 "conversation_id": "conversation-001",
                 "direction": "outbound",
                 "event_id": "event-out-001",
+                "history_id": matches[1].history_id,
                 "message_id": "out-001",
                 "occurred_at": "2026-08-06T09:00:01+00:00",
                 "request_id": "request-001",
@@ -120,7 +123,11 @@ def test_automatic_history_selection_excludes_credential_like_content_but_exact_
             excluding_working_session_id="conversation-current",
             limit=10,
         )
-        exact = state.search_conversation_messages(message_ids=("secret-001",))
+        exact = state.search_conversation_messages(
+            history_ids=(
+                _message(message_id="secret-001", text="placeholder").history_id,
+            )
+        )
 
         assert [message.message_id for message in automatic.messages] == ["safe-001"]
         assert automatic.provenance_disclosure == (
@@ -272,7 +279,11 @@ def test_credential_class_material_is_never_automatic_model_context(text: str) -
             excluding_working_session_id="conversation-current",
             limit=10,
         )
-        exact = state.search_conversation_messages(message_ids=("credential-001",))
+        exact = state.search_conversation_messages(
+            history_ids=(
+                _message(message_id="credential-001", text="placeholder").history_id,
+            )
+        )
 
         assert selected.messages == ()
         assert exact[0].credential_like is True
@@ -314,13 +325,12 @@ def test_authorized_operator_can_search_then_exactly_inspect_credential_history(
     None
 ):
     state = SQLiteDurableStateStore()
-    state.append_conversation_message(
-        _message(
-            message_id="secret-001",
-            working_session_id="conversation-earlier",
-            text="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
-        )
+    secret = _message(
+        message_id="secret-001",
+        working_session_id="conversation-earlier",
+        text="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
     )
+    state.append_conversation_message(secret)
     components = build_receiver_components(
         operator_id=OPERATOR,
         transport_session_id=TRANSPORT_SESSION,
@@ -357,7 +367,7 @@ def test_authorized_operator_can_search_then_exactly_inspect_credential_history(
         assert "secret-001" in searched.reply.body
         assert "eyJhbGci" not in searched.reply.body
 
-        inspected = receive("/history inspect secret-001", "inspect")
+        inspected = receive(f"/history inspect {secret.history_id}", "inspect")
         assert inspected.disposition == "history_inspect"
         assert inspected.reply is not None
         assert "eyJhbGciOiJIUzI1NiJ9" in inspected.reply.body
@@ -407,3 +417,212 @@ def test_outbound_history_write_failure_blocks_connector_before_dispatch() -> No
     assert [message.message_id for message in state.list_conversation_messages()] == [
         "outbound-history-message"
     ]
+
+
+def test_failed_outbound_attempt_remains_only_in_private_outbox() -> None:
+    state = InMemoryDurableStateStore()
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket20-failed-outbound-secret",
+        now=NOW,
+        id_prefix="ticket20-failed-outbound",
+        state=state,
+    )
+
+    def fail_after_preflight(_reply: object) -> object:
+        raise OutboundConnectorError("controlled gateway failure")
+
+    components.outbound.send = fail_after_preflight  # type: ignore[method-assign]
+    event = SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id=TRANSPORT_SESSION,
+            event_id="failed-outbound-event",
+            message_id="failed-outbound-message",
+            sender_id=OPERATOR,
+            chat_id=OPERATOR,
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text="send a reply",
+        ),
+        components.config.signing_secret,
+    )
+
+    result = components.receiver.receive(event)
+
+    assert result.disposition == "failed"
+    assert state.search_conversation_messages(direction="outbound") == ()
+    assert len(state.outbound_outbox) == 1
+
+
+def test_history_selector_is_stable_and_exact_across_transport_sessions() -> None:
+    state = SQLiteDurableStateStore()
+    try:
+        selected = _message(message_id="shared-message", text="first record")
+        duplicate = replace(
+            selected,
+            transport_session_id="other.transport.session",
+            working_session_id="conversation-other",
+            text="other record",
+        )
+        state.append_conversation_message(selected)
+        state.append_conversation_message(duplicate)
+
+        matches = state.search_conversation_messages(
+            history_ids=(selected.history_id,), limit=1
+        )
+        exported = json.loads(
+            state.export_conversation_messages(history_ids=(selected.history_id,))
+        )
+
+        assert matches == (selected,)
+        assert exported[0]["history_id"] == selected.history_id
+        assert exported[0]["text"] == "first record"
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize(
+    "store_type", (InMemoryDurableStateStore, SQLiteDurableStateStore)
+)
+def test_context_candidate_limit_is_applied_after_safety_exclusions(
+    store_type: object,
+) -> None:
+    state = store_type()  # type: ignore[operator]
+    try:
+        for number in range(50):
+            state.append_conversation_message(  # type: ignore[union-attr]
+                _message(
+                    message_id=f"excluded-{number}",
+                    text="release plan",
+                    working_session_id="conversation-current",
+                    occurred_at=NOW + timedelta(seconds=number),
+                )
+            )
+        safe = _message(
+            message_id="safe-after-exclusions",
+            text="release plan",
+            working_session_id="conversation-prior",
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+        state.append_conversation_message(safe)  # type: ignore[union-attr]
+
+        selected = state.select_history_for_context(  # type: ignore[union-attr]
+            text="release plan",
+            excluding_working_session_id="conversation-current",
+            limit=1,
+        )
+
+        assert selected.messages == (safe,)
+    finally:
+        close = getattr(state, "close", None)
+        if callable(close):
+            close()
+
+
+def test_history_command_preserves_failed_delivery_disposition() -> None:
+    state = SQLiteDurableStateStore()
+    state.append_conversation_message(_message(message_id="prior", text="release plan"))
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket20-history-delivery-secret",
+        now=NOW,
+        id_prefix="ticket20-history-delivery",
+        state=state,
+    )
+    components.outbound.failure = "controlled gateway failure"
+    event = SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id=TRANSPORT_SESSION,
+            event_id="history-delivery-event",
+            message_id="history-delivery-message",
+            sender_id=OPERATOR,
+            chat_id=OPERATOR,
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text="/history search release",
+        ),
+        components.config.signing_secret,
+    )
+    try:
+        result = components.receiver.receive(event)
+
+        assert result.disposition == "failed"
+    finally:
+        state.close()
+
+
+def test_sqlite_history_search_uses_indexed_candidates_without_listing_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SQLiteDurableStateStore()
+    try:
+        state.append_conversation_message(
+            _message(message_id="indexed", text="find the release plan")
+        )
+
+        def archive_must_not_be_loaded() -> tuple[ConversationMessage, ...]:
+            raise AssertionError("SQLite history search must query bounded candidates")
+
+        monkeypatch.setattr(
+            state, "list_conversation_messages", archive_must_not_be_loaded
+        )
+
+        matches = state.search_conversation_messages(text="release", limit=1)
+
+        assert [message.message_id for message in matches] == ["indexed"]
+    finally:
+        state.close()
+
+
+def test_multipart_history_export_preserves_second_fragment_failure() -> None:
+    state = SQLiteDurableStateStore()
+    record = _message(message_id="large-export", text="x" * 8_000)
+    state.append_conversation_message(record)
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket20-multipart-delivery-secret",
+        now=NOW,
+        id_prefix="ticket20-multipart-delivery",
+        state=state,
+    )
+    original_send = components.outbound.send
+    calls = 0
+
+    def fail_second_fragment(reply: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OutboundConnectorError("controlled second-fragment failure")
+        return original_send(reply)  # type: ignore[arg-type]
+
+    components.outbound.send = fail_second_fragment  # type: ignore[method-assign]
+    event = SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id=TRANSPORT_SESSION,
+            event_id="multipart-history-event",
+            message_id="multipart-history-message",
+            sender_id=OPERATOR,
+            chat_id=OPERATOR,
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text=f"/history export {record.history_id}",
+        ),
+        components.config.signing_secret,
+    )
+    try:
+        result = components.receiver.receive(event)
+
+        assert calls == 2
+        assert result.disposition == "failed"
+        assert len(components.outbound.sent) == 1
+    finally:
+        state.close()

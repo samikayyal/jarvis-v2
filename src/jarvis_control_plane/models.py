@@ -249,6 +249,37 @@ class ConversationMessage:
 
         return self.working_session_id
 
+    @property
+    def history_id(self) -> str:
+        """Stable opaque selector for one record across every transport session."""
+
+        return (
+            f"history-{len(self.transport_session_id)}:"
+            f"{self.transport_session_id}:{self.message_id}"
+        )
+
+    @staticmethod
+    def history_id_parts(value: object) -> tuple[str, str]:
+        """Parse the length-delimited, collision-free history-record selector."""
+
+        if not isinstance(value, str) or not value.startswith("history-"):
+            raise ValueError("history selector is invalid")
+        length_text, separator, remainder = value[8:].partition(":")
+        if not separator or not length_text.isdigit():
+            raise ValueError("history selector is invalid")
+        session_length = int(length_text)
+        transport_session_id = remainder[:session_length]
+        if (
+            session_length < 1
+            or len(transport_session_id) != session_length
+            or remainder[session_length : session_length + 1] != ":"
+        ):
+            raise ValueError("history selector is invalid")
+        message_id = remainder[session_length + 1 :]
+        _non_empty_identifier(transport_session_id, "transport_session_id")
+        _non_empty_identifier(message_id, "message_id")
+        return transport_session_id, message_id
+
 
 _CREDENTIAL_LIKE_PATTERNS = (
     re.compile(
