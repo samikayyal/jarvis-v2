@@ -103,6 +103,16 @@ from .traces import (
     SQLiteDiagnosticTraceStore,
     TraceReservation,
 )
+from .worker_gateway import (
+    ControlledWorkerTransport,
+    WorkerExecutionError,
+    WorkerExecutionLimits,
+    WorkerExecutionResult,
+    WorkerExecutionStatus,
+    WorkerGateway,
+    WorkerIdentity,
+    WorkerInvocation,
+)
 
 __all__ = [
     "DEFAULT_TRACE_RESERVATION_BYTES",
@@ -124,6 +134,7 @@ __all__ = [
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
     "ControlledVaultSynchronizer",
+    "ControlledWorkerTransport",
     "ConversationMessage",
     "DeterministicCapabilityBroker",
     "DeterministicIdGenerator",
@@ -190,6 +201,13 @@ __all__ = [
     "VaultRepositoryConflict",
     "VaultSynchronizationError",
     "VaultSynchronizationMetadataStore",
+    "WorkerExecutionError",
+    "WorkerExecutionLimits",
+    "WorkerExecutionResult",
+    "WorkerExecutionStatus",
+    "WorkerGateway",
+    "WorkerIdentity",
+    "WorkerInvocation",
     "build_live_google_read_connector",
     "sign_body",
 ]

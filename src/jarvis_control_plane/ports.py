@@ -208,7 +208,7 @@ class OrchestrationAdapter(Protocol):
 class ActionDispatcher(Protocol):
     """Closed side-effect boundary for a broker-approved frozen action."""
 
-    def dispatch(self, action: FrozenActionProposal) -> None: ...
+    def dispatch(self, action: FrozenActionProposal) -> object | None: ...
 
 
 class ModelAvailabilityProvider(Protocol):

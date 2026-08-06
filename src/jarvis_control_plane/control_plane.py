@@ -890,21 +890,55 @@ class DeterministicCapabilityBroker:
             for item in attempted.state.action_outbox
             if item.action_id == action.action_id
         )
+        frozen_dispatch = FrozenActionProposal(
+            action_id=record.action_id,
+            request_id=record.request_id,
+            kind=record.kind,
+            preview=record.preview or "",
+            payload=record.payload or "",
+            digest=record.digest,
+        )
         try:
-            self.action_dispatcher.dispatch(
-                FrozenActionProposal(
-                    action_id=record.action_id,
-                    request_id=record.request_id,
-                    kind=record.kind,
-                    preview=record.preview or "",
-                    payload=record.payload or "",
-                    digest=record.digest,
+            self._trace.execute(
+                request_id=record.request_id,
+                operation_id=f"{record.action_id}:dispatch",
+                operation_type="worker" if record.kind == "terminal" else "connector",
+                input_payload=frozen_dispatch,
+                arguments={"operation": "dispatch", "kind": record.kind},
+                telemetry={"phase": "dispatch"},
+                operation=lambda: self.action_dispatcher.dispatch(frozen_dispatch),
+                result_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
+                error_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
+            )
+        except DiagnosticTraceError as exc:
+            terminal_status = (
+                DispatchStatus.UNKNOWN
+                if isinstance(exc, TraceWriteError) and exc.operation_started
+                else DispatchStatus.NOT_STARTED
+            )
+            if not self._finish_frozen_action(action.action_id, terminal_status):
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_unknown",
+                    reason="worker trace failure could not be durably closed",
                 )
+            return ReceiveResult(
+                status_code=202,
+                disposition=(
+                    "action_dispatch_unknown"
+                    if terminal_status is DispatchStatus.UNKNOWN
+                    else "action_dispatch_not_started"
+                ),
+                reason=f"worker dispatch was blocked by trace retention: {exc}",
             )
         except ActionDispatcherError as exc:
             terminal_status = (
                 DispatchStatus.UNKNOWN
                 if exc.may_have_dispatched
+                or (
+                    isinstance(exc.__cause__, TraceWriteError)
+                    and exc.__cause__.operation_started
+                )
                 else DispatchStatus.FAILED
             )
             if not self._finish_frozen_action(action.action_id, terminal_status):
@@ -2087,6 +2121,11 @@ class DeterministicCapabilityBroker:
         expected: WorkingSession,
         transition: ControlTransition,
     ) -> ReceiveResult:
+        terminal_dispatches_to_cancel = tuple(
+            record.action_id
+            for record in expected.action_outbox
+            if record.is_live and record.kind == "terminal"
+        )
         audit_kind = {
             ControlTransitionKind.STATUS: "working_session_status_viewed",
             ControlTransitionKind.CANCELLED: "working_session_cancelled",
@@ -2130,10 +2169,29 @@ class DeterministicCapabilityBroker:
                     disposition="failed",
                     reason=f"working-session control lost a concurrent race: {exc}",
                 )
+            if transition.kind in {
+                ControlTransitionKind.CANCELLED,
+                ControlTransitionKind.NEW_SESSION,
+            }:
+                self._cancel_terminal_dispatches(terminal_dispatches_to_cancel)
 
         if transition.reply is None:
             return ReceiveResult(status_code=202, disposition=transition.kind.value)
         return self._dispatch_control_reply(message, transition)
+
+    def _cancel_terminal_dispatches(self, action_ids: tuple[str, ...]) -> None:
+        """Ask a cancellable worker edge to stop only its live terminal scope."""
+
+        cancel = getattr(self.action_dispatcher, "cancel", None)
+        if not callable(cancel):
+            return
+        for action_id in action_ids:
+            try:
+                cancel(action_id=action_id)
+            except (ActionDispatcherError, TypeError):
+                # The state transition already closed the action. A later worker
+                # result cannot restore it or cause a new dispatch.
+                continue
 
     def _dispatch_control_reply(
         self,
