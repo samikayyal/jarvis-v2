@@ -20,6 +20,16 @@ from .control_plane import (
     DeterministicCapabilityBroker,
     SignedMessageReceiver,
 )
+from .gmail_writes import (
+    GMAIL_SEND_SCOPE,
+    ControlledGmailWriteProvider,
+    GmailApiWriteProvider,
+    GmailSendProviderResult,
+    GmailWriteConnector,
+    build_live_gmail_write_connector,
+    create_gmail_send_proposal,
+    gmail_send_request_from_proposal,
+)
 from .google_oauth import (
     GOOGLE_OAUTH_SCOPES,
     GOOGLE_OAUTH_STATE_TTL,
@@ -106,6 +116,7 @@ from .traces import (
 
 __all__ = [
     "DEFAULT_TRACE_RESERVATION_BYTES",
+    "GMAIL_SEND_SCOPE",
     "GOOGLE_OAUTH_SCOPES",
     "GOOGLE_OAUTH_STATE_TTL",
     "GOOGLE_READ_SCOPES",
@@ -119,6 +130,7 @@ __all__ = [
     "ControlPlaneConfig",
     "ControlPlaneError",
     "ControlledActionDispatcher",
+    "ControlledGmailWriteProvider",
     "ControlledGoogleOAuthProvider",
     "ControlledGoogleReadProvider",
     "ControlledOrchestrationAdapter",
@@ -135,6 +147,9 @@ __all__ = [
     "FixedClock",
     "FixedModelAvailabilityProvider",
     "FrozenActionProposal",
+    "GmailApiWriteProvider",
+    "GmailSendProviderResult",
+    "GmailWriteConnector",
     "GoogleApiReadProvider",
     "GoogleConnectionState",
     "GoogleOAuthError",
@@ -190,6 +205,9 @@ __all__ = [
     "VaultRepositoryConflict",
     "VaultSynchronizationError",
     "VaultSynchronizationMetadataStore",
+    "build_live_gmail_write_connector",
     "build_live_google_read_connector",
+    "create_gmail_send_proposal",
+    "gmail_send_request_from_proposal",
     "sign_body",
 ]

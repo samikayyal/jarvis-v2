@@ -50,7 +50,7 @@ class AgentsSdkProposal(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["terminal"]
+    kind: Literal["terminal", "gmail_send", "gmail_reply"]
     preview: str = Field(min_length=1, max_length=2_000)
     payload: dict[str, object]
 
@@ -396,30 +396,43 @@ class AgentsSdkOrchestrationAdapter:
         if plan.proposal is None:
             return None
         payload = plan.proposal.payload
-        if set(payload) - _TERMINAL_PAYLOAD_FIELDS:
-            raise OrchestrationAdapterError(
-                "model proposed fields outside terminal authority"
-            )
-        if payload.get("host") != host:
-            raise OrchestrationAdapterError(
-                "terminal proposal selected a different host"
-            )
         try:
-            candidate = FrozenActionProposal.create(
-                action_id=f"{request.state.request_id}:proposal",
-                request_id=request.state.request_id,
-                kind=plan.proposal.kind,
-                preview=(
-                    f"Execution host: {host}. "
-                    f"Reason: {_HOST_REASON_TEXT[plan.host_reason_code]}\n"
-                    f"{plan.proposal.preview}"
-                ),
-                payload=payload,
-            )
-            terminal_action_from_proposal(candidate)
+            if plan.proposal.kind == "terminal":
+                if set(payload) - _TERMINAL_PAYLOAD_FIELDS:
+                    raise OrchestrationAdapterError(
+                        "model proposed fields outside terminal authority"
+                    )
+                if payload.get("host") != host:
+                    raise OrchestrationAdapterError(
+                        "terminal proposal selected a different host"
+                    )
+                candidate = FrozenActionProposal.create(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    kind=plan.proposal.kind,
+                    preview=(
+                        f"Execution host: {host}. "
+                        f"Reason: {_HOST_REASON_TEXT[plan.host_reason_code]}\n"
+                        f"{plan.proposal.preview}"
+                    ),
+                    payload=payload,
+                )
+                terminal_action_from_proposal(candidate)
+            else:
+                from .gmail_writes import create_gmail_send_proposal
+
+                candidate = create_gmail_send_proposal(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    **payload,
+                )
+                if candidate.kind != plan.proposal.kind:
+                    raise OrchestrationAdapterError(
+                        "model selected a Gmail action type that does not match its fields"
+                    )
         except (TypeError, ValueError, KeyError) as exc:
             raise OrchestrationAdapterError(
-                "model returned a malformed terminal proposal"
+                "model returned a malformed action proposal"
             ) from exc
         return candidate
 
@@ -453,8 +466,8 @@ def _instructions(*, has_vault_read: bool) -> str:
         "request explicitly selects the authorized operator's Windows laptop or "
         "depends on it; a mere platform or file-format mention is not a dependency. "
         "For a Windows selection, use only explicit_windows or windows_dependency. "
-        "For a terminal action, emit one complete terminal proposal; it will still "
-        "be independently checked and require the broker's policy and approval flow. "
+        "For a terminal action or Gmail send/reply, emit one complete typed proposal; "
+        "it will still be independently checked and require the broker's approval flow. "
         "Every exposed read tool has a closed typed schema and bounded result. "
         + (
             "The read_knowledge_vault tool is a local, deterministic, read-only "

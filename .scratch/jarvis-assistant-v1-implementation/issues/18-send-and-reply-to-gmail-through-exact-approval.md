@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 — Present oversized proposals through the universal envelope; 17 — Read bounded Gmail, Calendar, and Drive content.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] New-send proposals freeze all recipients, subject, body, MIME, and other delivery-affecting fields in the exact preview.
 - [ ] Reply proposals additionally freeze the source message, source thread, reply headers, and threading behavior.
