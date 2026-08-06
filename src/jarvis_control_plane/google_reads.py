@@ -1103,7 +1103,7 @@ def _response_items(
     values: object = (
         payload if collection_key is None else payload.get(collection_key, ())
     )
-    if not isinstance(values, Mapping | list | tuple):
+    if not isinstance(values, (Mapping, list, tuple)):
         raise GoogleReadProviderError(
             "unavailable", "Google response had an invalid result shape"
         )
