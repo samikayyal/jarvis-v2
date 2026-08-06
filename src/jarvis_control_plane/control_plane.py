@@ -951,7 +951,7 @@ class DeterministicCapabilityBroker:
                 status_code=202,
                 disposition=(
                     "action_dispatch_unknown"
-                    if exc.may_have_dispatched
+                    if terminal_status is DispatchStatus.UNKNOWN
                     else "action_dispatch_failed"
                 ),
                 reason=str(exc),

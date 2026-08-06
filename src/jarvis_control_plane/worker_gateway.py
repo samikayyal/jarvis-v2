@@ -98,6 +98,7 @@ class WorkerExecutionResult:
     status: WorkerExecutionStatus
     started_components: tuple[int, ...] = ()
     completed_components: tuple[int, ...] = ()
+    process_tree_stopped: bool = False
     stdout: str = ""
     stderr: str = ""
 
@@ -115,12 +116,19 @@ class WorkerExecutionResult:
             object.__setattr__(self, name, value)
         if not set(self.completed_components) <= set(self.started_components):
             raise ValueError("only started components may be completed")
+        if not isinstance(self.process_tree_stopped, bool):
+            raise TypeError("worker process-tree stop confirmation must be boolean")
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
             raise TypeError("worker output must be text")
 
     @classmethod
     def completed(cls, *, stdout: str = "", stderr: str = "") -> WorkerExecutionResult:
-        return cls(status=WorkerExecutionStatus.COMPLETED, stdout=stdout, stderr=stderr)
+        return cls(
+            status=WorkerExecutionStatus.COMPLETED,
+            process_tree_stopped=True,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 class WorkerExecutionError(ActionDispatcherError):
@@ -166,7 +174,7 @@ class WorkerGateway:
         self._workers = dict(workers)
         self._registered_identities = dict(registered_identities)
         self._limits = limits or WorkerExecutionLimits()
-        self._running: dict[str, WorkerTransport] = {}
+        self._running: dict[str, tuple[object, WorkerTransport]] = {}
         self._lock = RLock()
 
     def dispatch(self, action: FrozenActionProposal) -> WorkerExecutionResult:
@@ -191,11 +199,12 @@ class WorkerGateway:
             stderr_limit_bytes=self._limits.stderr_limit_bytes,
             cancellation_grace_seconds=self._limits.cancellation_grace_seconds,
         )
-        with self._lock:
-            self._running[action.action_id] = worker
         finished = Event()
         result: WorkerExecutionResult | None = None
         failure: BaseException | None = None
+        execution = object()
+        with self._lock:
+            self._running[action.action_id] = (execution, worker)
 
         def execute() -> None:
             nonlocal failure, result
@@ -205,9 +214,20 @@ class WorkerGateway:
                 failure = exc
             finally:
                 finished.set()
+                with self._lock:
+                    if self._running.get(action.action_id) == (execution, worker):
+                        del self._running[action.action_id]
 
         thread = Thread(target=execute, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except BaseException as exc:
+            with self._lock:
+                if self._running.get(action.action_id) == (execution, worker):
+                    del self._running[action.action_id]
+            raise ActionDispatcherError(
+                "worker execution thread could not start"
+            ) from exc
         deadline_expired = not finished.wait(timeout=self._limits.deadline_seconds)
         if deadline_expired:
             worker.cancel(action_id=action.action_id)
@@ -217,30 +237,29 @@ class WorkerGateway:
                     started_components=(0,),
                 )
                 raise WorkerExecutionError(unknown)
-        try:
-            if failure is not None:
-                if isinstance(failure, ActionDispatcherError):
-                    raise failure
-                raise ActionDispatcherError(
-                    "worker transport failed after execution started",
-                    may_have_dispatched=True,
-                ) from failure
-            if result is None:
-                raise ActionDispatcherError(
-                    "worker completed without a terminal result",
-                    may_have_dispatched=True,
-                )
-            result = _bounded_result(
-                result,
-                limits=self._limits,
-                component_count=len(terminal.components),
+        if failure is not None:
+            raise WorkerExecutionError(
+                WorkerExecutionResult(status=WorkerExecutionStatus.UNKNOWN)
+            ) from failure
+        if result is None:
+            raise ActionDispatcherError(
+                "worker completed without a terminal result",
+                may_have_dispatched=True,
             )
-            if deadline_expired:
-                result = replace(result, status=WorkerExecutionStatus.TIMED_OUT)
-        finally:
-            with self._lock:
-                if finished.is_set():
-                    self._running.pop(action.action_id, None)
+        result = _bounded_result(
+            result,
+            limits=self._limits,
+            component_count=len(terminal.components),
+        )
+        if deadline_expired and result.status is not WorkerExecutionStatus.UNKNOWN:
+            result = replace(
+                result,
+                status=(
+                    WorkerExecutionStatus.TIMED_OUT
+                    if result.process_tree_stopped
+                    else WorkerExecutionStatus.UNKNOWN
+                ),
+            )
         if result.status is WorkerExecutionStatus.COMPLETED:
             return result
         raise WorkerExecutionError(result)
@@ -249,8 +268,9 @@ class WorkerGateway:
         """Forward cancellation only to a worker currently executing that action."""
 
         with self._lock:
-            worker = self._running.get(action_id)
-        if worker is not None:
+            running = self._running.get(action_id)
+        if running is not None:
+            _, worker = running
             worker.cancel(action_id=action_id)
 
 
