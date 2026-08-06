@@ -20,7 +20,9 @@ from jarvis_control_plane import (
     OAuthCredentialRecord,
     OAuthGrant,
     SQLiteGoogleOAuthStateStore,
+    TraceWriteError,
 )
+from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.traces import DiagnosticTraceRecorder
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
@@ -40,6 +42,7 @@ def build_lifecycle(
     | SQLiteGoogleOAuthStateStore
     | None = None,
     audit: InMemoryAuditBoundary | None = None,
+    trace: DiagnosticTraceRecorder | None = None,
 ):
     clock = clock or FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket16")
@@ -58,7 +61,8 @@ def build_lifecycle(
             )
         ),
         audit=audit or InMemoryAuditBoundary(),
-        trace=DiagnosticTraceRecorder(
+        trace=trace
+        or DiagnosticTraceRecorder(
             writer=trace_store.writer(),
             clock=clock,
             ids=ids,
@@ -123,6 +127,35 @@ def test_callback_consumes_state_once_and_replaces_connector_credential() -> Non
         )
         assert lifecycle.connection.connected
         assert lifecycle.connection.generation == 1
+    finally:
+        trace_store._close_writer_service()
+
+
+def test_manual_trace_retains_complete_oauth_exchange_and_revocation_payloads() -> None:
+    credentials = InMemoryGoogleCredentialStore()
+    lifecycle, trace_store = build_lifecycle(credentials=credentials)
+    try:
+        authorization = lifecycle.start_authorization(
+            operation_id="connect-google", requested_scopes=READ_SCOPES
+        )
+
+        assert (
+            lifecycle.handle_callback(
+                method="GET", query={"state": authorization.state, "code": "code-1"}
+            ).status_code
+            == 204
+        )
+        lifecycle.disconnect()
+
+        manual = _open_manual_trace_boundary(trace_store)
+        exchange = manual.list_traces(request_id="connect-google")[0]
+        revocation = manual.list_traces(request_id="google-oauth-disconnect")[0]
+        exchange_payload = str(exchange.to_mapping())
+        revocation_payload = str(revocation.to_mapping())
+        assert "code-1" in exchange_payload
+        assert "controlled-access-token" in exchange_payload
+        assert "controlled-refresh-token" in exchange_payload
+        assert "controlled-refresh-token" in revocation_payload
     finally:
         trace_store._close_writer_service()
 
@@ -215,6 +248,55 @@ def test_audit_admission_failure_blocks_code_exchange() -> None:
         assert credentials.current is None
     finally:
         trace_store._close_writer_service()
+
+
+def test_trace_write_failure_after_oauth_rejection_returns_degraded_response() -> None:
+    class FailingAppendWriter:
+        def __init__(self, writer: object) -> None:
+            self._writer = writer
+
+        def reserve(self, **kwargs: object):
+            return self._writer.reserve(**kwargs)  # type: ignore[attr-defined]
+
+        def append(self, *_: object) -> None:
+            raise TraceWriteError(
+                "controlled trace append failure", operation_started=True
+            )
+
+        def release(self, reservation: object) -> None:
+            self._writer.release(reservation)  # type: ignore[attr-defined]
+
+    provider = ControlledGoogleOAuthProvider(
+        grant=OAuthGrant(
+            subject=IDENTITY,
+            granted_scopes=frozenset(READ_SCOPES),
+            access_token="controlled-access-token",
+            refresh_token="controlled-refresh-token",
+        ),
+        exchange_failure="wrong_identity",
+    )
+    failing_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(
+        writer=FailingAppendWriter(failing_store.writer()),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket16-failing-trace"),
+    )
+    lifecycle, unused_trace_store = build_lifecycle(provider=provider, trace=trace)
+    try:
+        authorization = lifecycle.start_authorization(
+            operation_id="connect-google", requested_scopes=READ_SCOPES
+        )
+
+        response = lifecycle.handle_callback(
+            method="GET", query={"state": authorization.state, "code": "code-1"}
+        )
+
+        assert response.status_code == 503
+        assert response.body == b""
+        assert len(provider.exchange_calls) == 1
+    finally:
+        unused_trace_store._close_writer_service()
+        failing_store._close_writer_service()
 
 
 def test_callback_state_store_failure_is_content_free_and_never_exchanges_code() -> (

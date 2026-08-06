@@ -25,10 +25,12 @@ from .ports import (
     Clock,
     DiagnosticTraceError,
     IdGenerator,
+    TraceWriteError,
 )
 from .traces import DiagnosticTraceRecorder
 
 GOOGLE_OAUTH_STATE_TTL = timedelta(minutes=10)
+GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES = 32 * 1024
 GOOGLE_OAUTH_SCOPES = frozenset(
     {
         "https://www.googleapis.com/auth/gmail.readonly",
@@ -537,9 +539,17 @@ class ControlledGoogleOAuthProvider:
 
 @dataclass(frozen=True, slots=True)
 class _ExchangeReceipt:
-    """Safe trace result; credential-class material never enters trace arguments/results."""
+    """Complete connector result retained only in the diagnostic trace boundary."""
 
-    granted_scopes: frozenset[str]
+    grant: OAuthGrant
+
+
+@dataclass(frozen=True, slots=True)
+class _RevocationReceipt:
+    """Complete revocation input and result retained only in diagnostic traces."""
+
+    credential: OAuthCredentialRecord | None
+    provider_result: None = None
 
 
 class GoogleOAuthConnector:
@@ -577,16 +587,23 @@ class GoogleOAuthConnector:
                 refresh_token=grant.refresh_token,
             )
         )
-        return _ExchangeReceipt(granted_scopes=grant.granted_scopes)
+        return _ExchangeReceipt(grant=grant)
 
-    def disconnect(self) -> None:
+    @property
+    def current_credential(self) -> OAuthCredentialRecord | None:
+        """Expose the current credential only to the isolated trace call site."""
+
+        return self._credential_store.current
+
+    def disconnect(self) -> _RevocationReceipt:
         credential = self._credential_store.current
         if credential is None:
-            return
+            return _RevocationReceipt(credential=None)
         try:
             self._provider.revoke(refresh_token=credential.refresh_token)
         finally:
             self._credential_store.delete()
+        return _RevocationReceipt(credential=credential)
 
     def discard_local_credential(self) -> None:
         self._credential_store.delete()
@@ -693,12 +710,16 @@ class GoogleOAuthLifecycle:
                 ),
                 arguments={
                     "flow": "authorization_code",
-                    "requested_scope_count": len(authorization.requested_scopes),
+                    "authorization_code": query["code"],
+                    "requested_scopes": authorization.requested_scopes,
                 },
-                result_limit_bytes=1_024,
-                error_limit_bytes=1_024,
+                result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
             )
-        except OAuthExchangeError:
+        except OAuthExchangeError as exc:
+            if self._has_trace_write_failure(exc):
+                self._invalidate_connection()
+                return OAuthCallbackResponse(status_code=503)
             self._append_callback_rejection(authorization.operation_id)
             return OAuthCallbackResponse(status_code=400)
         except (DiagnosticTraceError, GoogleOAuthError, OSError):
@@ -709,7 +730,7 @@ class GoogleOAuthLifecycle:
 
         try:
             self._state_store.set_connection(
-                connected=True, granted_scopes=receipt.granted_scopes
+                connected=True, granted_scopes=receipt.grant.granted_scopes
             )
         except GoogleOAuthError:
             self._invalidate_connection()
@@ -746,14 +767,20 @@ class GoogleOAuthLifecycle:
             outcome="attempted",
             execution_status="attempted",
         )
+        credential = self._connector.current_credential
         try:
             self._trace.execute(
                 request_id="google-oauth-disconnect",
                 operation_type="google_oauth_revocation",
-                operation=lambda: self._connector.disconnect() or "revoked",
-                arguments={"flow": "revocation"},
-                result_limit_bytes=1_024,
-                error_limit_bytes=1_024,
+                operation=self._connector.disconnect,
+                arguments={
+                    "flow": "revocation",
+                    "refresh_token": (
+                        credential.refresh_token if credential is not None else None
+                    ),
+                },
+                result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
             )
         finally:
             state = self._state_store.set_connection(connected=False)
@@ -789,6 +816,17 @@ class GoogleOAuthLifecycle:
             self._state_store.set_connection(connected=False)
         except GoogleOAuthError:
             pass
+
+    @staticmethod
+    def _has_trace_write_failure(error: BaseException) -> bool:
+        """Keep degraded trace retention distinct from an ordinary OAuth rejection."""
+
+        cause = error.__cause__
+        while cause is not None:
+            if isinstance(cause, TraceWriteError):
+                return True
+            cause = cause.__cause__
+        return False
 
     def _append_audit(
         self,
