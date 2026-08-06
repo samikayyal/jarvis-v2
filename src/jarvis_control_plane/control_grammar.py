@@ -51,6 +51,7 @@ CONTROL_COMMANDS = (
     "/config",
     "/permissions",
     "/revoke",
+    "/history",
 )
 
 _THIS_TIME_APPROVALS = frozenset(
@@ -83,6 +84,7 @@ class ControlCommand(str, Enum):
     CONFIG = "config"
     PERMISSIONS = "permissions"
     REVOKE = "revoke"
+    HISTORY = "history"
 
 
 class MessageKind(str, Enum):
@@ -114,6 +116,7 @@ class ControlTransitionKind(str, Enum):
     PERMISSIONS_LISTED = "permissions_listed"
     PERMISSION_REVOKED = "permission_revoked"
     PERMISSION_NOT_ACTIVE = "permission_not_active"
+    HISTORY_REQUEST = "history_request"
 
 
 class ApprovalChoice(str, Enum):
@@ -229,6 +232,7 @@ def _known_command(value: str) -> ControlCommand | None:
         "/config": ControlCommand.CONFIG,
         "/permissions": ControlCommand.PERMISSIONS,
         "/revoke": ControlCommand.REVOKE,
+        "/history": ControlCommand.HISTORY,
     }.get(value)
 
 
@@ -258,8 +262,19 @@ def parse_control(message: str) -> ParsedControl:
         ControlCommand.CONFIG: {0, 2},
         ControlCommand.PERMISSIONS: {0},
         ControlCommand.REVOKE: {1},
+        ControlCommand.HISTORY: set(range(2, 1_000)),
     }
-    if len(parts) - 1 not in allowed_argument_counts[command]:
+    history_is_valid = (
+        command is ControlCommand.HISTORY
+        and parts[1] in {"search", "inspect", "export", "conversation"}
+        and (
+            (parts[1] == "search" and len(parts) >= 3)
+            or (parts[1] != "search" and len(parts) == 3)
+        )
+    )
+    if len(parts) - 1 not in allowed_argument_counts[command] or (
+        command is ControlCommand.HISTORY and not history_is_valid
+    ):
         return ParsedControl(
             normalized,
             MessageKind.MALFORMED_COMMAND,
@@ -368,12 +383,16 @@ def _usage(parsed: ParsedControl) -> str:
         ),
         ControlCommand.PERMISSIONS: "Usage: /permissions",
         ControlCommand.REVOKE: "Usage: /revoke <permission-id|session|persistent|all>",
+        ControlCommand.HISTORY: (
+            "Usage: /history search <text> | /history conversation <conversation-id> | "
+            "/history inspect <message-id> | /history export <message-id>"
+        ),
     }
     if parsed.command is not None:
         return usage.get(parsed.command, f"Usage: /{parsed.command.value}")
     return (
         "Unknown or malformed control command. Valid: /new, /status, /cancel, "
-        "/model, /reasoning, /config, /permissions, /revoke."
+        "/model, /reasoning, /config, /permissions, /revoke, /history."
     )
 
 
@@ -653,6 +672,15 @@ def _apply_control(
             transition,
             kind=ControlTransitionKind.PERMISSION_REVOKED,
             reply=f"Revoked {revoked_count} command permission(s) matching {selector}.",
+        )
+
+    if parsed.command is ControlCommand.HISTORY:
+        # The broker owns the authorized store read and outbound delivery;
+        # this pure grammar only reserves the exact command shape.
+        return ControlTransition(
+            state=session,
+            parsed=parsed,
+            kind=ControlTransitionKind.HISTORY_REQUEST,
         )
 
     raise AssertionError("_apply_control called without a complete control command")

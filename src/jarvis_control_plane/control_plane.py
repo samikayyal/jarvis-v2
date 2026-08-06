@@ -8,10 +8,12 @@ from threading import RLock
 
 from .control_grammar import (
     ApprovalChoice,
+    ControlCommand,
     ControlTransition,
     ControlTransitionKind,
     handle_message,
     parse_approval_choice,
+    parse_control,
 )
 from .models import (
     AuditEvidence,
@@ -226,6 +228,9 @@ class DeterministicCapabilityBroker:
                     if current.pending_action.is_expired(self.clock):
                         return self._expire_pending_action(message, current)
                     return self._consume_pending_approval(message, current, choice)
+        parsed = parse_control(message.text)
+        if parsed.is_command and parsed.command is ControlCommand.HISTORY:
+            return self._handle_history_control(message, parsed.args)
         try:
             model_availability = self._model_availability()
         except (TypeError, ValueError, RuntimeError) as exc:
@@ -524,6 +529,7 @@ class DeterministicCapabilityBroker:
                 ),
             )
         )
+        self._reserve_outbound_history(reply, message=message)
         outbound_id: str | None = None
 
         def send() -> dict[str, str]:
@@ -536,7 +542,6 @@ class DeterministicCapabilityBroker:
                 raise OutboundConnectorError(
                     "proposal gateway outcome was unknown", may_have_sent=True
                 )
-            self._retain_sent_outbound(reply, message=message)
             return {"outbound_id": outbound_id, "result": "accepted"}
 
         try:
@@ -1602,6 +1607,7 @@ class DeterministicCapabilityBroker:
                     ),
                 )
             )
+            self._reserve_outbound_history(reply, message=message)
             self._trace.execute(
                 request_id=request.request_id,
                 operation_id=f"{request.request_id}:connector:outbound",
@@ -1906,6 +1912,137 @@ class DeterministicCapabilityBroker:
             raise TypeError("model availability provider returned an invalid value")
         return availability
 
+    def _handle_history_control(
+        self,
+        message: InboundMessage,
+        args: tuple[str, ...],
+    ) -> ReceiveResult:
+        """Serve bounded history reads only for the admitted operator command.
+
+        Search returns opaque record pointers.  Content, including
+        credential-like content, is released only by the exact message-id
+        selector used by ``inspect`` and ``export``.
+        """
+
+        operation = args[0]
+        try:
+            self._append_audit(
+                kind=f"conversation_history_{operation}",
+                event_id=message.event_id,
+                request_id=None,
+                message_id=message.message_id,
+                outcome="requested",
+                actor="configured_operator",
+                operation_type="conversation_history",
+                target_category="operator_conversation",
+                details={},
+            )
+            if operation == "search":
+                matches = self.state.search_conversation_messages(
+                    text=" ".join(args[1:]), limit=20
+                )
+                return self._dispatch_history_text(
+                    message,
+                    self._render_history_search(matches),
+                    disposition="history_search",
+                )
+            if operation == "conversation":
+                matches = self.state.search_conversation_messages(
+                    working_session_id=args[1], limit=20
+                )
+                return self._dispatch_history_text(
+                    message,
+                    self._render_history_search(matches),
+                    disposition="history_conversation",
+                )
+
+            selected = self.state.search_conversation_messages(
+                message_ids=(args[1],), limit=1
+            )
+            if len(selected) != 1:
+                return self._dispatch_history_text(
+                    message,
+                    "No accessible conversation message has that exact message ID.",
+                    disposition=f"history_{operation}",
+                )
+            # The adapter's canonical export is the exact inspection payload:
+            # it retains every selected field and is split only at the delivery
+            # envelope, never truncated or redacted.
+            payload = self.state.export_conversation_messages(message_ids=(args[1],))
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"conversation-history read was blocked by audit: {exc}",
+            )
+        except (StateStoreError, ValueError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"conversation-history read failed: {exc}",
+            )
+        return self._dispatch_history_export(
+            message,
+            payload,
+            disposition=f"history_{operation}",
+        )
+
+    @staticmethod
+    def _render_history_search(messages: tuple[ConversationMessage, ...]) -> str:
+        if not messages:
+            return "No accessible conversation messages matched."
+        return "\n".join(
+            (
+                "Conversation-history matches (inspect or export by exact message ID):",
+                *(
+                    f"{item.message_id} | conversation {item.working_session_id} | "
+                    f"{item.direction} | {item.occurred_at.isoformat()} | "
+                    f"request {item.request_id or 'none'}"
+                    for item in messages
+                ),
+            )
+        )
+
+    def _dispatch_history_text(
+        self,
+        message: InboundMessage,
+        text: str,
+        *,
+        disposition: str,
+    ) -> ReceiveResult:
+        control_id = self.ids.new_id("control")
+        body = _bounded_informational_reply(text, request_id=control_id)
+        result = self._dispatch_control_text(message, body=body, control_id=control_id)
+        return replace(result, disposition=disposition)
+
+    def _dispatch_history_export(
+        self,
+        message: InboundMessage,
+        payload: str,
+        *,
+        disposition: str,
+    ) -> ReceiveResult:
+        control_id = self.ids.new_id("control")
+        fragments = tuple(
+            payload[index : index + _PROPOSAL_FRAGMENT_PAYLOAD_CHARS]
+            for index in range(0, len(payload), _PROPOSAL_FRAGMENT_PAYLOAD_CHARS)
+        )
+        if not fragments:
+            raise InvariantViolation("history export payload must be non-blank")
+        result: ReceiveResult | None = None
+        for number, fragment in enumerate(fragments, start=1):
+            body = (
+                f"Conversation-history export part {number}/{len(fragments)} "
+                f"request_id={control_id}\n{fragment}"
+            )
+            result = self._dispatch_control_text(
+                message, body=body, control_id=control_id
+            )
+            if result.disposition != "control_sent":
+                return replace(result, disposition=disposition)
+        assert result is not None
+        return replace(result, disposition=disposition)
+
     def _selected_configuration_is_available(self, request: RequestState) -> bool:
         try:
             return self._model_availability().supports(
@@ -2001,12 +2138,29 @@ class DeterministicCapabilityBroker:
         transition: ControlTransition,
     ) -> ReceiveResult:
         control_id = self.ids.new_id("control")
+        return self._dispatch_control_text(
+            message,
+            body=_bounded_informational_reply(
+                transition.reply or "Control completed.", request_id=control_id
+            ),
+            control_id=control_id,
+            disposition=transition.kind.value,
+        )
+
+    def _dispatch_control_text(
+        self,
+        message: InboundMessage,
+        *,
+        body: str,
+        control_id: str,
+        disposition: str = "control_sent",
+    ) -> ReceiveResult:
         reply = OutboundReply(
             reply_id=self.ids.new_id("reply"),
             request_id=control_id,
             session_id=self.config.session_id,
             recipient_id=message.chat_id,
-            body=f"{transition.reply or 'Control completed.'} (request_id={control_id})",
+            body=body,
         )
         try:
             self.outbound.preflight(reply)
@@ -2049,6 +2203,11 @@ class DeterministicCapabilityBroker:
                     ),
                 )
             )
+            # The retained immutable body is the dispatch outbox.  It must be
+            # durable before tracing enters the connector operation so a local
+            # history failure is a definite no-send result, not an ambiguous
+            # connector outcome.
+            self._reserve_outbound_history(reply, message=message)
             self._trace.execute(
                 request_id=control_id,
                 operation_id=f"{control_id}:connector:outbound",
@@ -2089,7 +2248,7 @@ class DeterministicCapabilityBroker:
             )
         return ReceiveResult(
             status_code=202,
-            disposition=transition.kind.value,
+            disposition=disposition,
             reply=reply,
         )
 
@@ -2136,13 +2295,18 @@ class DeterministicCapabilityBroker:
         self, reply: OutboundReply, *, message: InboundMessage
     ) -> dict[str, str]:
         self.outbound.send(reply)
-        self._retain_sent_outbound(reply, message=message)
         return {"result": "accepted"}
 
-    def _retain_sent_outbound(
+    def _reserve_outbound_history(
         self, reply: OutboundReply, *, message: InboundMessage
     ) -> None:
-        """Durably retain text only after the outbound connector accepted it."""
+        """Durably retain an exact outbound body before its one send attempt.
+
+        The immutable history row is the outbound-history outbox.  Existing
+        request and audit transitions subsequently reconcile it as accepted,
+        failed, or unknown; no recovery path retries an ambiguous connector
+        attempt.
+        """
 
         try:
             self.state.append_conversation_message(
@@ -2161,8 +2325,7 @@ class DeterministicCapabilityBroker:
             )
         except StateStoreError as exc:
             raise OutboundConnectorError(
-                "outbound reply was accepted but conversation history could not be retained",
-                may_have_sent=True,
+                "outbound reply history could not be reserved before dispatch",
             ) from exc
 
     def _send_request_and_finish(
@@ -2183,7 +2346,6 @@ class DeterministicCapabilityBroker:
                     "request was cancelled before outbound dispatch"
                 )
             self.outbound.send(reply)
-            self._retain_sent_outbound(reply, message=message)
             if not self._finish_session_request(
                 token,
                 outcome=outcome,

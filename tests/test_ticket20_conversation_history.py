@@ -4,12 +4,14 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     ControlledOrchestrationAdapter,
     ConversationMessage,
     InboundMessage,
+    InMemoryDurableStateStore,
     SignedInboundEvent,
     SQLiteDurableStateStore,
 )
@@ -242,3 +244,166 @@ def test_history_provenance_survives_the_bounded_informational_reply() -> None:
         "History used: conversation conversation-earlier, message prior-bound-001"
     )
     assert "[truncated]" in result.reply.body
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+        "refresh_token=1//0g-realistic-oauth-refresh-token",
+        "AWS access key AKIAIOSFODNN7EXAMPLE belongs to the deployer",
+        "webhook_secret=whsec_9AaBbCcDdEeFfGgHhIiJjKk",
+    ),
+)
+def test_credential_class_material_is_never_automatic_model_context(text: str) -> None:
+    state = SQLiteDurableStateStore()
+    try:
+        state.append_conversation_message(
+            _message(
+                message_id="credential-001",
+                working_session_id="conversation-earlier",
+                text=text,
+            )
+        )
+
+        selected = state.select_history_for_context(
+            text="deployer realistic oauth",
+            excluding_working_session_id="conversation-current",
+            limit=10,
+        )
+        exact = state.search_conversation_messages(message_ids=("credential-001",))
+
+        assert selected.messages == ()
+        assert exact[0].credential_like is True
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize(
+    "store_type", (InMemoryDurableStateStore, SQLiteDurableStateStore)
+)
+def test_history_search_contract_is_identical_for_stopwords_and_unicode(
+    store_type: object,
+) -> None:
+    state = store_type()  # type: ignore[operator]
+    try:
+        state.append_conversation_message(  # type: ignore[union-attr]
+            _message(message_id="safe-001", text="Café release plan is ready.")
+        )
+        state.append_conversation_message(  # type: ignore[union-attr]
+            _message(message_id="secret-001", text="password=hidden release plan")
+        )
+
+        assert state.search_conversation_messages(text="what is it") == ()  # type: ignore[union-attr]
+        assert [
+            message.message_id
+            for message in state.search_conversation_messages(text="CAFÉ")  # type: ignore[union-attr]
+        ] == ["safe-001"]
+        assert [
+            message.message_id
+            for message in state.search_conversation_messages(text="release!")  # type: ignore[union-attr]
+        ] == ["safe-001", "secret-001"]
+    finally:
+        close = getattr(state, "close", None)
+        if callable(close):
+            close()
+
+
+def test_authorized_operator_can_search_then_exactly_inspect_credential_history() -> (
+    None
+):
+    state = SQLiteDurableStateStore()
+    state.append_conversation_message(
+        _message(
+            message_id="secret-001",
+            working_session_id="conversation-earlier",
+            text="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+        )
+    )
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket20-history-command-secret",
+        now=NOW,
+        id_prefix="ticket20-history-command",
+        state=state,
+        working_session_id="conversation-current",
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id=TRANSPORT_SESSION,
+                    event_id=f"history-event-{suffix}",
+                    message_id=f"history-message-{suffix}",
+                    sender_id=OPERATOR,
+                    chat_id=OPERATOR,
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                components.config.signing_secret,
+            )
+        )
+
+    try:
+        searched = receive("/history search bearer", "search")
+        assert searched.disposition == "history_search", searched.reason
+        assert searched.reply is not None
+        assert "secret-001" in searched.reply.body
+        assert "eyJhbGci" not in searched.reply.body
+
+        inspected = receive("/history inspect secret-001", "inspect")
+        assert inspected.disposition == "history_inspect"
+        assert inspected.reply is not None
+        assert "eyJhbGciOiJIUzI1NiJ9" in inspected.reply.body
+        assert "Conversation-history export part 1/1" in inspected.reply.body
+    finally:
+        state.close()
+
+
+def test_outbound_history_write_failure_blocks_connector_before_dispatch() -> None:
+    state = InMemoryDurableStateStore()
+
+    def fail_history_before_reply(_request: object) -> str:
+        state.fail_conversation = True
+        return "This reply must not reach the connector."
+
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket20-pre-dispatch-secret",
+        now=NOW,
+        id_prefix="ticket20-pre-dispatch",
+        state=state,
+        orchestration=ControlledOrchestrationAdapter(
+            response_factory=fail_history_before_reply
+        ),
+    )
+    event = SignedInboundEvent.from_message(
+        InboundMessage(
+            event_type="message.received",
+            session_id=TRANSPORT_SESSION,
+            event_id="outbound-history-event",
+            message_id="outbound-history-message",
+            sender_id=OPERATOR,
+            chat_id=OPERATOR,
+            chat_type="direct",
+            message_type="text",
+            from_me=False,
+            text="send a reply",
+        ),
+        components.config.signing_secret,
+    )
+
+    result = components.receiver.receive(event)
+
+    assert result.disposition == "failed"
+    assert components.outbound.sent == []
+    assert [message.message_id for message in state.list_conversation_messages()] == [
+        "outbound-history-message"
+    ]

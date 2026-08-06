@@ -264,6 +264,8 @@ class InMemoryDurableStateStore:
 
     def append_conversation_message(self, message: ConversationMessage) -> None:
         with self._lock:
+            if self.fail_conversation:
+                raise StateStoreError("controlled conversation write failure")
             key = (message.transport_session_id, message.message_id)
             if key in self.conversation_messages:
                 raise StateStoreError("conversation message identifier already exists")
@@ -957,11 +959,13 @@ class SQLiteDurableStateStore:
         message_ids: tuple[str, ...] = (),
         limit: int = 50,
     ) -> tuple[ConversationMessage, ...]:
-        # The local FTS index accelerates non-secret retrieval. Secret-bearing
-        # records intentionally do not enter that index, so exact inspection
-        # and deterministic search additionally check retained rows directly.
-        indexed_keys = set(self._fts_candidates(text)) if text is not None else set()
-        matches = _filter_conversation_messages(
+        # FTS is deliberately not a second selection rule.  It uses a
+        # tokenizer whose candidate semantics differ from the portable
+        # deterministic filter (notably for punctuation and Unicode).  The
+        # same normalized query must therefore decide results in both durable
+        # stores; the local index remains an implementation detail for future
+        # query plans that can prove that equivalence.
+        return _filter_conversation_messages(
             self.list_conversation_messages(),
             text=text,
             working_session_id=working_session_id,
@@ -969,14 +973,6 @@ class SQLiteDurableStateStore:
             direction=direction,
             message_ids=message_ids,
             limit=limit,
-        )
-        if text is None:
-            return matches
-        return tuple(
-            message
-            for message in matches
-            if message.credential_like
-            or (message.transport_session_id, message.message_id) in indexed_keys
         )
 
     def export_conversation_messages(self, **query: object) -> str:
@@ -1003,23 +999,6 @@ class SQLiteDurableStateStore:
                 and not message.credential_like
             )[:limit]
         )
-
-    def _fts_candidates(self, text: str) -> tuple[tuple[str, str], ...]:
-        query = _fts_query(text)
-        if not query:
-            return ()
-        try:
-            rows = self.connection.execute(
-                """
-                SELECT transport_session_id, message_id
-                FROM conversation_history_fts
-                WHERE conversation_history_fts MATCH ?
-                """,
-                (query,),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise StateStoreError("could not search local conversation index") from exc
-        return tuple((row[0], row[1]) for row in rows)
 
     def _rebuild_conversation_history_for_outbound(self) -> None:
         self.connection.execute("BEGIN IMMEDIATE")
@@ -1184,7 +1163,10 @@ def _filter_conversation_messages(
         and (request_id is None or message.request_id == request_id)
         and (direction is None or message.direction == direction)
         and (not selected_ids or message.message_id in selected_ids)
-        and (not terms or any(term in message.text.casefold() for term in terms))
+        and (
+            text is None
+            or (bool(terms) and any(term in message.text.casefold() for term in terms))
+        )
     )
     return results[:limit]
 
@@ -1230,10 +1212,6 @@ def _export_conversation_messages(messages: tuple[ConversationMessage, ...]) -> 
         ensure_ascii=False,
         separators=(",", ":"),
     )
-
-
-def _fts_query(text: str) -> str:
-    return " OR ".join(f'"{term}"' for term in _history_search_terms(text))
 
 
 def _history_search_terms(text: str) -> tuple[str, ...]:

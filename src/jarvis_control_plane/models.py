@@ -252,10 +252,22 @@ class ConversationMessage:
 
 _CREDENTIAL_LIKE_PATTERNS = (
     re.compile(
-        r"\b(?:api[_ -]?key|password|passwd|secret|token)\s*[:=]", re.IGNORECASE
+        r"\b(?:api[_ -]?key|password|passwd|secret|token|access[_ -]?token|"
+        r"refresh[_ -]?token|id[_ -]?token|client[_ -]?secret|webhook[_ -]?secret)"
+        r"\s*[:=]",
+        re.IGNORECASE,
     ),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{8,}\b", re.IGNORECASE),
+    # Authorization-shaped text fails closed.  The retained body is not
+    # transformed, but it must never become automatic model context merely
+    # because the credential issuer uses a form not listed above.
+    re.compile(r"\bauthorization\s*:\s*\S+", re.IGNORECASE),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/-]{8,}", re.IGNORECASE),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:whsec|xox[baprs]|EAAG)[-_A-Za-z0-9]{8,}\b", re.IGNORECASE),
 )
 
 
