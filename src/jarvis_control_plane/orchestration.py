@@ -298,7 +298,7 @@ class AgentsSdkOrchestrationAdapter:
                     raise
                 except Exception as exc:
                     raise OrchestrationAdapterError(
-                        "bounded read tool returned a safe failure"
+                        "bounded read tool returned malformed data"
                     ) from exc
                 milestones.append(
                     OrchestrationMilestone(
