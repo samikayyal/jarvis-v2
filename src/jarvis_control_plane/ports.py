@@ -16,6 +16,7 @@ from .models import (
     AuditFilter,
     ConversationMessage,
     FrozenActionProposal,
+    HistorySelection,
     IngressAdmissionResult,
     IngressClaim,
     OrchestrationRequest,
@@ -140,6 +141,29 @@ class DurableStateStore(Protocol):
     ) -> None: ...
 
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]: ...
+
+    def append_conversation_message(self, message: ConversationMessage) -> None: ...
+
+    def search_conversation_messages(
+        self,
+        *,
+        text: str | None = None,
+        working_session_id: str | None = None,
+        request_id: str | None = None,
+        direction: str | None = None,
+        message_ids: tuple[str, ...] = (),
+        limit: int = 50,
+    ) -> tuple[ConversationMessage, ...]: ...
+
+    def export_conversation_messages(self, **query: object) -> str: ...
+
+    def select_history_for_context(
+        self,
+        *,
+        text: str,
+        excluding_working_session_id: str,
+        limit: int = 5,
+    ) -> HistorySelection: ...
 
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
 

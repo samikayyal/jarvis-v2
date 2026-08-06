@@ -84,6 +84,22 @@ from .traces import DiagnosticTraceRecorder
 _MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
 _PROPOSAL_FRAGMENT_PAYLOAD_CHARS = 3_000
 _MAX_OUTBOUND_MESSAGE_CHARS = 4_096
+_INFORMATIONAL_TRUNCATION_MARKER = " [truncated]"
+
+
+def _bounded_informational_reply(reply_text: str, *, request_id: str) -> str:
+    """Keep a non-approval response within the fixed outbound message ceiling."""
+
+    suffix = f" (request_id={request_id})"
+    body = f"{reply_text}{suffix}"
+    if len(body) <= _MAX_OUTBOUND_MESSAGE_CHARS:
+        return body
+    content_limit = (
+        _MAX_OUTBOUND_MESSAGE_CHARS
+        - len(_INFORMATIONAL_TRUNCATION_MARKER)
+        - len(suffix)
+    )
+    return f"{reply_text[:content_limit]}{_INFORMATIONAL_TRUNCATION_MARKER}{suffix}"
 
 
 class _CancelledBeforeDispatch(OutboundConnectorError):
@@ -520,6 +536,7 @@ class DeterministicCapabilityBroker:
                 raise OutboundConnectorError(
                     "proposal gateway outcome was unknown", may_have_sent=True
                 )
+            self._retain_sent_outbound(reply, message=message)
             return {"outbound_id": outbound_id, "result": "accepted"}
 
         try:
@@ -1206,8 +1223,17 @@ class DeterministicCapabilityBroker:
     ) -> OrchestrationResult | ReceiveResult:
         """Execute and durably observe the controlled orchestration stage."""
 
-        orchestration_request = OrchestrationRequest(state=request, text=message.text)
         try:
+            history = self.state.select_history_for_context(
+                text=message.text,
+                excluding_working_session_id=self.current_working_session_id,
+                limit=5,
+            )
+            orchestration_request = OrchestrationRequest(
+                state=request,
+                text=message.text,
+                history=history.messages,
+            )
             result = self._trace.execute(
                 request_id=request.request_id,
                 operation_id=f"{request.request_id}:model",
@@ -1248,11 +1274,17 @@ class DeterministicCapabilityBroker:
                     "reasoning": request.reasoning,
                 },
             )
+            if history.provenance_disclosure is not None:
+                result = replace(
+                    result,
+                    reply_text=f"{history.provenance_disclosure}\n{result.reply_text}",
+                )
         except (
             DiagnosticTraceError,
             OrchestrationAdapterError,
             AuditWriteError,
             SessionStoreError,
+            StateStoreError,
             ValueError,
         ) as exc:
             trace_failed = isinstance(exc, (TraceCapacityError, TraceWriteError))
@@ -1460,7 +1492,10 @@ class DeterministicCapabilityBroker:
             request_id=request.request_id,
             session_id=self.config.session_id,
             recipient_id=message.chat_id,
-            body=f"{result.reply_text} (request_id={request.request_id})",
+            body=_bounded_informational_reply(
+                result.reply_text,
+                request_id=request.request_id,
+            ),
         )
         try:
             # This is the persistence gate for outbound dispatch.  A connector
@@ -2021,7 +2056,7 @@ class DeterministicCapabilityBroker:
                 input_payload=reply,
                 arguments={"operation": "send", "channel": "controlled_outbound"},
                 telemetry={"phase": "control_reply"},
-                operation=lambda: self._send_and_confirm(reply),
+                operation=lambda: self._send_and_confirm(reply, message=message),
                 result_limit_bytes=4_096,
                 error_limit_bytes=8_192,
             )
@@ -2097,9 +2132,38 @@ class DeterministicCapabilityBroker:
                 continue
         return False
 
-    def _send_and_confirm(self, reply: OutboundReply) -> dict[str, str]:
+    def _send_and_confirm(
+        self, reply: OutboundReply, *, message: InboundMessage
+    ) -> dict[str, str]:
         self.outbound.send(reply)
+        self._retain_sent_outbound(reply, message=message)
         return {"result": "accepted"}
+
+    def _retain_sent_outbound(
+        self, reply: OutboundReply, *, message: InboundMessage
+    ) -> None:
+        """Durably retain text only after the outbound connector accepted it."""
+
+        try:
+            self.state.append_conversation_message(
+                ConversationMessage(
+                    working_session_id=self.current_working_session_id,
+                    transport_session_id=reply.session_id,
+                    message_id=reply.reply_id,
+                    event_id=message.event_id,
+                    chat_id=reply.recipient_id,
+                    sender_id="jarvis",
+                    text=reply.body,
+                    occurred_at=self.clock.now(),
+                    direction="outbound",
+                    request_id=reply.request_id,
+                )
+            )
+        except StateStoreError as exc:
+            raise OutboundConnectorError(
+                "outbound reply was accepted but conversation history could not be retained",
+                may_have_sent=True,
+            ) from exc
 
     def _send_request_and_finish(
         self,
@@ -2119,6 +2183,7 @@ class DeterministicCapabilityBroker:
                     "request was cancelled before outbound dispatch"
                 )
             self.outbound.send(reply)
+            self._retain_sent_outbound(reply, message=message)
             if not self._finish_session_request(
                 token,
                 outcome=outcome,
