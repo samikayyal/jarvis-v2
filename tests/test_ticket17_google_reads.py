@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from test_support import build_receiver_components
@@ -21,19 +22,37 @@ from jarvis_control_plane.google_reads import (
     GMAIL_READ_SCOPE,
     GOOGLE_READ_SCOPES,
     ControlledGoogleReadProvider,
+    GoogleApiReadProvider,
     GoogleReadConnector,
     GoogleReadError,
+    GoogleReadHttpResponse,
+    GoogleReadProviderError,
     GoogleReadProviderResult,
+    GoogleReadRequest,
 )
+from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.models import InboundMessage, SignedInboundEvent
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
 )
 from jarvis_control_plane.ports import AuditWriteError
+from jarvis_control_plane.traces import (
+    DiagnosticTraceRecorder,
+    InMemoryDiagnosticTraceStore,
+)
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
+
+
+def _trace() -> DiagnosticTraceRecorder:
+    store = InMemoryDiagnosticTraceStore()
+    return DiagnosticTraceRecorder(
+        writer=store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("trace"),
+    )
 
 
 class _FakeReasoning:
@@ -51,18 +70,58 @@ class _FakeRunConfig:
         self.values = values
 
 
+class _RecordingGoogleTransport:
+    def __init__(self, responses: list[GoogleReadHttpResponse]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    def request(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout_seconds: float,
+    ) -> GoogleReadHttpResponse:
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "body": body,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return self.responses.pop(0)
+
+
+def _json_response(
+    payload: object, *, status_code: int = 200
+) -> GoogleReadHttpResponse:
+    return GoogleReadHttpResponse(
+        status_code=status_code,
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(payload).encode("utf-8"),
+    )
+
+
 def _connector(
     *,
-    provider: ControlledGoogleReadProvider | None = None,
+    provider: object | None = None,
     identity: str = IDENTITY,
     scopes: frozenset[str] = GOOGLE_READ_SCOPES,
     audit: InMemoryAuditBoundary | None = None,
     clock: FixedClock | None = None,
     ids: DeterministicIdGenerator | None = None,
+    trace: DiagnosticTraceRecorder | None = None,
+    credential_store: InMemoryGoogleCredentialStore | None = None,
+    on_invalid_grant: object | None = None,
 ) -> GoogleReadConnector:
     return GoogleReadConnector(
         configured_identity=IDENTITY,
-        credential_store=InMemoryGoogleCredentialStore(
+        credential_store=credential_store
+        or InMemoryGoogleCredentialStore(
             OAuthCredentialRecord(
                 subject=identity,
                 granted_scopes=scopes,
@@ -71,8 +130,10 @@ def _connector(
         ),
         provider=provider or ControlledGoogleReadProvider(),
         audit=audit or InMemoryAuditBoundary(),
+        trace=trace or _trace(),
         clock=clock or FixedClock(NOW),
         ids=ids or DeterministicIdGenerator("ticket17-google"),
+        on_invalid_grant=on_invalid_grant,  # type: ignore[arg-type]
     )
 
 
@@ -150,6 +211,171 @@ def test_google_read_failures_are_sanitized(failure: str, expected: str) -> None
     assert "controlled-refresh-token" not in str(caught.value)
 
 
+def test_invalid_grant_discards_the_credential_before_reporting_disconnection() -> None:
+    store = InMemoryGoogleCredentialStore(
+        OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=GOOGLE_READ_SCOPES,
+            refresh_token="controlled-refresh-token",
+        )
+    )
+    invalidations: list[str] = []
+
+    def invalidate() -> None:
+        store.delete()
+        invalidations.append("invalidated")
+
+    with pytest.raises(GoogleReadError, match="google_read_disconnected"):
+        _connector(
+            credential_store=store,
+            provider=ControlledGoogleReadProvider(failure="invalid_grant"),
+            on_invalid_grant=invalidate,
+        ).calendar_list(request_id="request-001")
+
+    assert store.current is None
+    assert invalidations == ["invalidated"]
+
+
+@pytest.mark.parametrize(
+    ("read_request", "response_payload", "expected_path", "page_size_key"),
+    (
+        (
+            GoogleReadRequest("gmail_messages_list", {"query": "from:inbox"}, 2),
+            {"messages": [{"id": "m1"}], "nextPageToken": "next"},
+            "/gmail/v1/users/me/messages",
+            "maxResults",
+        ),
+        (
+            GoogleReadRequest("gmail_messages_get", {"message_id": "m1"}, 1),
+            {"id": "m1", "snippet": "bounded"},
+            "/gmail/v1/users/me/messages/m1",
+            None,
+        ),
+        (
+            GoogleReadRequest("gmail_threads_list", {"query": "label:inbox"}, 2),
+            {"threads": [{"id": "t1"}]},
+            "/gmail/v1/users/me/threads",
+            "maxResults",
+        ),
+        (
+            GoogleReadRequest("gmail_threads_get", {"thread_id": "t1"}, 1),
+            {"id": "t1", "messages": []},
+            "/gmail/v1/users/me/threads/t1",
+            None,
+        ),
+        (
+            GoogleReadRequest("calendar_list", {}, 2),
+            {"items": [{"id": "primary"}]},
+            "/calendar/v3/users/me/calendarList",
+            "maxResults",
+        ),
+        (
+            GoogleReadRequest(
+                "calendar_events_list", {"calendar_id": "primary", "query": "review"}, 2
+            ),
+            {"items": [{"id": "event1"}]},
+            "/calendar/v3/calendars/primary/events",
+            "maxResults",
+        ),
+        (
+            GoogleReadRequest(
+                "calendar_events_get",
+                {"calendar_id": "primary", "event_id": "event1"},
+                1,
+            ),
+            {"id": "event1"},
+            "/calendar/v3/calendars/primary/events/event1",
+            None,
+        ),
+        (
+            GoogleReadRequest("drive_files_list", {"query": "name contains 'plan'"}, 2),
+            {"files": [{"id": "file1"}]},
+            "/drive/v3/files",
+            "pageSize",
+        ),
+        (
+            GoogleReadRequest("drive_files_get", {"file_id": "file1"}, 1),
+            {"id": "file1", "name": "plan"},
+            "/drive/v3/files/file1",
+            None,
+        ),
+    ),
+)
+def test_live_provider_uses_only_the_fixed_google_read_operations(
+    read_request: GoogleReadRequest,
+    response_payload: object,
+    expected_path: str,
+    page_size_key: str | None,
+) -> None:
+    transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            _json_response(response_payload),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    result = provider.read(
+        request=read_request,
+        credential=OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=GOOGLE_READ_SCOPES,
+            refresh_token="refresh-token",
+        ),
+    )
+
+    assert len(transport.calls) == 2
+    call = transport.calls[1]
+    parsed = urlparse(call["url"])  # type: ignore[arg-type]
+    query = parse_qs(parsed.query)
+    assert call["method"] == "GET"
+    assert parsed.path == expected_path
+    assert "pageToken" not in query
+    assert "fields" in query
+    if page_size_key is not None:
+        assert query[page_size_key] == [str(read_request.max_results)]
+    assert result.items
+
+
+def test_live_provider_exports_only_text_and_classifies_invalid_grant() -> None:
+    export_transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            GoogleReadHttpResponse(
+                status_code=200,
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+                body=b"plain document",
+            ),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=export_transport
+    )
+    credential = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=GOOGLE_READ_SCOPES,
+        refresh_token="refresh-token",
+    )
+    assert provider.read(
+        request=GoogleReadRequest(
+            "drive_files_export", {"file_id": "doc1", "mime_type": "text/plain"}, 1
+        ),
+        credential=credential,
+    ).items == ("plain document",)
+
+    invalid_grant_transport = _RecordingGoogleTransport(
+        [_json_response({"error": "invalid_grant"}, status_code=400)]
+    )
+    with pytest.raises(GoogleReadProviderError, match="invalid_grant"):
+        GoogleApiReadProvider(
+            client_id="client-id",
+            client_secret="client-secret",
+            transport=invalid_grant_transport,
+        ).read(request=GoogleReadRequest("calendar_list", {}, 1), credential=credential)
+
+
 def test_google_read_refuses_an_oversized_serialized_result() -> None:
     connector = _connector(
         provider=ControlledGoogleReadProvider(
@@ -180,11 +406,14 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
     audit = InMemoryAuditBoundary()
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket17-broker")
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
     connector = _connector(
         provider=ControlledGoogleReadProvider(
             result=GoogleReadProviderResult(items=("Subject: bounded mail",))
         ),
         audit=audit,
+        trace=trace,
         clock=clock,
         ids=ids,
     )
@@ -240,6 +469,7 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
         clock=clock,
         ids=ids,
         orchestration=adapter,  # type: ignore[arg-type]
+        trace=trace,
     )
 
     result = components.receiver.receive(_event("read my inbox"))
@@ -258,3 +488,9 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
         record.kind == "google_read" and record.execution_status == "completed"
         for record in audit.records
     )
+    traces = _open_manual_trace_boundary(trace_store).list_traces(
+        operation_type="google_read_connector"
+    )
+    assert len(traces) == 1
+    assert traces[0].arguments is not None
+    assert traces[0].result is not None

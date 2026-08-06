@@ -40,10 +40,14 @@ from .google_oauth import (
 from .google_reads import (
     GOOGLE_READ_SCOPES,
     ControlledGoogleReadProvider,
+    GoogleApiReadProvider,
     GoogleReadConnector,
     GoogleReadError,
+    GoogleReadHttpResponse,
     GoogleReadProviderResult,
     GoogleReadResult,
+    UrllibGoogleReadHttpTransport,
+    build_live_google_read_connector,
 )
 from .models import (
     AuditEvidence,
@@ -116,11 +120,13 @@ __all__ = [
     "FixedClock",
     "FixedModelAvailabilityProvider",
     "FrozenActionProposal",
+    "GoogleApiReadProvider",
     "GoogleConnectionState",
     "GoogleOAuthError",
     "GoogleOAuthLifecycle",
     "GoogleReadConnector",
     "GoogleReadError",
+    "GoogleReadHttpResponse",
     "GoogleReadProviderResult",
     "GoogleReadResult",
     "InMemoryAuditBoundary",
@@ -156,6 +162,8 @@ __all__ = [
     "TraceCapacityError",
     "TraceReservation",
     "TraceWriteError",
+    "UrllibGoogleReadHttpTransport",
     "UuidIdGenerator",
+    "build_live_google_read_connector",
     "sign_body",
 ]
