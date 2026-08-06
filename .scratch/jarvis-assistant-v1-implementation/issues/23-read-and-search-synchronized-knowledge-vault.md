@@ -4,7 +4,7 @@
 
 **Blocked by:** 14 — Orchestrate natural-language requests through the Agents SDK.
 
-**Status:** ready-for-agent
+**Status:** complete
 
 - [ ] A clean clone fetches and fast-forwards before fresh reads; unavailable synchronization permits only a clean stale read with visible age and warning.
 - [ ] Bounded path, filename, Markdown, tag, frontmatter, and link-aware searches return referenced excerpts through the control-plane seam.

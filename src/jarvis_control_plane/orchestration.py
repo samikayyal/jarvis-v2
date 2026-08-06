@@ -26,7 +26,7 @@ _MAX_TURNS = 4
 _MAX_TOOL_INVOCATIONS = 4
 _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000
-_CLOSED_READ_TOOL_NAMES = frozenset({"read_request_context"})
+_CLOSED_READ_TOOL_NAMES = frozenset({"read_request_context", "read_knowledge_vault"})
 _TERMINAL_PAYLOAD_FIELDS = frozenset(
     {"host", "executable", "arguments", "cwd", "components"}
 )
@@ -145,6 +145,7 @@ class AgentsSdkOrchestrationAdapter:
         max_turns: int = _MAX_TURNS,
         max_tool_invocations: int = _MAX_TOOL_INVOCATIONS,
         read_tool: BoundedReadTool | None = None,
+        vault_read_tool: BoundedReadTool | None = None,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -185,9 +186,21 @@ class AgentsSdkOrchestrationAdapter:
         self._run_config_factory = run_config_factory
         self._max_turns = max_turns
         self._max_tool_invocations = max_tool_invocations
-        self._read_tool = read_tool or _default_read_tool()
-        if not isinstance(self._read_tool, BoundedReadTool):
+        default_read_tool = read_tool or _default_read_tool()
+        if not isinstance(default_read_tool, BoundedReadTool):
             raise TypeError("read_tool must be a BoundedReadTool")
+        if vault_read_tool is not None and not isinstance(
+            vault_read_tool, BoundedReadTool
+        ):
+            raise TypeError("vault_read_tool must be a BoundedReadTool")
+        if (
+            vault_read_tool is not None
+            and vault_read_tool.name != "read_knowledge_vault"
+        ):
+            raise ValueError("vault read tool is outside the closed tool set")
+        self._read_tools = (default_read_tool,) + (
+            (vault_read_tool,) if vault_read_tool is not None else ()
+        )
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
         milestones = [
@@ -201,7 +214,7 @@ class AgentsSdkOrchestrationAdapter:
             tools = self._build_tools(request, milestones, budget)
             agent = self._agent_factory(
                 name="Jarvis orchestration agent",
-                instructions=_instructions(),
+                instructions=_instructions(has_vault_read=len(self._read_tools) > 1),
                 model=request.model,
                 model_settings=self._model_settings_factory(
                     reasoning=self._reasoning_factory(effort=request.reasoning),
@@ -258,42 +271,46 @@ class AgentsSdkOrchestrationAdapter:
 
         from agents import FunctionTool
 
-        async def invoke(_context: Any, raw_input: str) -> dict[str, object]:
-            budget.consume()
-            try:
-                typed_input = self._read_tool.input_model.model_validate_json(raw_input)
-                typed_output = self._read_tool.handler(request, typed_input)
-                if not isinstance(typed_output, self._read_tool.output_model):
-                    raise TypeError("bounded read returned an untyped result")
-                bounded_output = self._read_tool.output_model.model_validate(
-                    typed_output
-                )
-            except OrchestrationAdapterError:
-                raise
-            except Exception as exc:
-                raise OrchestrationAdapterError(
-                    "bounded read tool returned malformed data"
-                ) from exc
-            milestones.append(
-                OrchestrationMilestone(
-                    stage="bounded_read",
-                    message=f"Completed bounded read with {self._read_tool.name}.",
-                )
-            )
-            return bounded_output.model_dump(mode="json")
+        tools: list[Any] = []
+        for read_tool in self._read_tools:
 
-        return [
-            FunctionTool(
-                name=self._read_tool.name,
-                description=self._read_tool.description,
-                params_json_schema=self._read_tool.input_model.model_json_schema(),
-                on_invoke_tool=invoke,
-                strict_json_schema=True,
-                needs_approval=False,
-                timeout_seconds=2.0,
-                output_json_schema=self._read_tool.output_model.model_json_schema(),
+            async def invoke(
+                _context: Any, raw_input: str, *, tool: BoundedReadTool = read_tool
+            ) -> dict[str, object]:
+                budget.consume()
+                try:
+                    typed_input = tool.input_model.model_validate_json(raw_input)
+                    typed_output = tool.handler(request, typed_input)
+                    if not isinstance(typed_output, tool.output_model):
+                        raise TypeError("bounded read returned an untyped result")
+                    bounded_output = tool.output_model.model_validate(typed_output)
+                except OrchestrationAdapterError:
+                    raise
+                except Exception as exc:
+                    raise OrchestrationAdapterError(
+                        "bounded read tool returned malformed data"
+                    ) from exc
+                milestones.append(
+                    OrchestrationMilestone(
+                        stage="bounded_read",
+                        message=f"Completed bounded read with {tool.name}.",
+                    )
+                )
+                return bounded_output.model_dump(mode="json")
+
+            tools.append(
+                FunctionTool(
+                    name=read_tool.name,
+                    description=read_tool.description,
+                    params_json_schema=read_tool.input_model.model_json_schema(),
+                    on_invoke_tool=invoke,
+                    strict_json_schema=True,
+                    needs_approval=False,
+                    timeout_seconds=2.0,
+                    output_json_schema=read_tool.output_model.model_json_schema(),
+                )
             )
-        ]
+        return tools
 
     @staticmethod
     def _frozen_proposal(
@@ -332,7 +349,7 @@ class AgentsSdkOrchestrationAdapter:
         return candidate
 
 
-def _instructions() -> str:
+def _instructions(*, has_vault_read: bool) -> str:
     """Keep the model on a closed planning contract with no authority tools."""
 
     return (
@@ -346,9 +363,15 @@ def _instructions() -> str:
         "For a Windows selection, use only explicit_windows or windows_dependency. "
         "For a terminal action, emit one complete terminal proposal; it will still "
         "be independently checked and require the broker's policy and approval flow. "
-        "The only read tool is read_request_context; it accepts max_chars from 1 "
-        "through 1000 and returns only bounded authorized-request context. "
-        "Read tools never mutate, dispatch, approve, or create permissions."
+        "The read_request_context tool accepts max_chars from 1 through 1000 and "
+        "returns only bounded authorized-request context. "
+        + (
+            "The read_knowledge_vault tool is a local, deterministic, read-only "
+            "search of the configured vault and returns only bounded excerpts. "
+            if has_vault_read
+            else ""
+        )
+        + "Read tools never mutate, dispatch, approve, or create permissions."
     )
 
 

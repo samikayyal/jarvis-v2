@@ -31,5 +31,16 @@
       "suggestion": 0
     },
     "scope": "src/jarvis_control_plane/terminal_policy.py and tests/test_ticket14_agents_orchestration.py"
+  },
+  {
+    "date": "2026-08-06",
+    "mode": "PR Review",
+    "score": 100,
+    "findings": {
+      "critical": 0,
+      "warning": 0,
+      "suggestion": 0
+    },
+    "scope": "Ticket 23 knowledge-vault connector and orchestration read tool"
   }
 ]

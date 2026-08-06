@@ -1,0 +1,306 @@
+"""Ticket 23 contract tests for the bounded knowledge-vault read connector."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+
+import pytest
+
+from jarvis_control_plane.knowledge_vault import (
+    ControlledVaultSynchronizer,
+    KnowledgeVaultConnector,
+    SubprocessVaultSynchronizer,
+    VaultReadError,
+    VaultReadInput,
+)
+from jarvis_control_plane.models import OrchestrationRequest, RequestState
+from jarvis_control_plane.orchestration import (
+    AgentsSdkOrchestrationAdapter,
+    AgentsSdkPlan,
+)
+
+NOW = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
+
+
+def _request() -> OrchestrationRequest:
+    return OrchestrationRequest(
+        state=RequestState(
+            request_id="request-ticket23",
+            event_id="event-ticket23",
+            message_id="message-ticket23",
+            operator_id="operator.test",
+            session_id="working-session-ticket23",
+            chat_id="operator.test",
+            created_at=NOW,
+            updated_at=NOW,
+            status="accepted",
+            phase="orchestration",
+            model="gpt-5.6-terra",
+            reasoning="high",
+        ),
+        text="Search the knowledge vault for the Alpha plan.",
+    )
+
+
+def _vault(root: Path) -> None:
+    (root / "Projects").mkdir(parents=True)
+    (root / "Guides").mkdir()
+    (root / ".obsidian").mkdir()
+    (root / "attachments").mkdir()
+    (root / "Projects" / "Alpha.md").write_text(
+        "---\n"
+        "title: Alpha Plan\n"
+        "owner: Sam\n"
+        "tags:\n"
+        "  - work\n"
+        "  - priority\n"
+        "---\n\n"
+        "# Alpha plan\n\n"
+        "Use [[Roadmap]] and [the guide](../Guides/How.md).\n",
+        encoding="utf-8",
+    )
+    (root / "Roadmap.md").write_text(
+        "# Roadmap\n\nThe Alpha milestone is scheduled.\n", encoding="utf-8"
+    )
+    (root / "Guides" / "How.md").write_text(
+        "# How\n\nGuide content.\n", encoding="utf-8"
+    )
+    (root / ".obsidian" / "private.md").write_text(
+        "should never appear", encoding="utf-8"
+    )
+    (root / "attachments" / "private.md").write_text(
+        "should never appear", encoding="utf-8"
+    )
+
+
+def _connector(
+    root: Path, synchronizer: ControlledVaultSynchronizer
+) -> KnowledgeVaultConnector:
+    return KnowledgeVaultConnector(
+        root=root,
+        synchronizer=synchronizer,
+        now=lambda: NOW,
+    )
+
+
+def test_clean_vault_syncs_before_bounded_path_text_tag_frontmatter_and_link_reads(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    synchronizer = ControlledVaultSynchronizer(
+        last_synchronized_at=NOW - timedelta(hours=1)
+    )
+    connector = _connector(tmp_path, synchronizer)
+
+    by_path = connector.read(VaultReadInput(query="Projects/Alpha"))
+    by_tag = connector.read(VaultReadInput(query="work"))
+    by_frontmatter = connector.read(VaultReadInput(query="Sam"))
+    by_link = connector.read(VaultReadInput(query="Roadmap"))
+    by_link_label = connector.read(VaultReadInput(query="the guide"))
+    exact_title = connector.read(VaultReadInput(title="Alpha Plan"))
+
+    assert synchronizer.calls == 6
+    assert by_path.synchronized_at == NOW
+    assert by_path.stale_warning is None
+    assert [excerpt.path for excerpt in by_path.excerpts] == ["Projects/Alpha.md"]
+    assert [excerpt.path for excerpt in by_tag.excerpts] == ["Projects/Alpha.md"]
+    assert [excerpt.path for excerpt in by_frontmatter.excerpts] == [
+        "Projects/Alpha.md"
+    ]
+    assert {excerpt.path for excerpt in by_link.excerpts} == {
+        "Projects/Alpha.md",
+        "Roadmap.md",
+    }
+    assert [excerpt.path for excerpt in by_link_label.excerpts] == [
+        "Projects/Alpha.md",
+        "Guides/How.md",
+    ]
+    assert [excerpt.path for excerpt in exact_title.excerpts] == ["Projects/Alpha.md"]
+    assert all(
+        excerpt.start_line >= 1 and excerpt.end_line >= excerpt.start_line
+        for excerpt in by_link.excerpts
+    )
+    assert all(len(excerpt.text) <= 600 for excerpt in by_link.excerpts)
+
+
+def test_unavailable_sync_permits_only_a_clean_stale_read_with_age_disclosure(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    last_sync = NOW - timedelta(hours=2, minutes=5)
+    connector = _connector(
+        tmp_path,
+        ControlledVaultSynchronizer(
+            last_synchronized_at=last_sync,
+            failure="remote unavailable",
+        ),
+    )
+
+    stale = connector.read(VaultReadInput(query="Alpha"))
+
+    assert stale.synchronized_at == last_sync
+    assert (
+        stale.stale_warning
+        == "Knowledge-vault synchronization is unavailable; results may be stale (age: 2h 5m)."
+    )
+    assert [excerpt.path for excerpt in stale.excerpts] == [
+        "Projects/Alpha.md",
+        "Roadmap.md",
+    ]
+
+    dirty = _connector(
+        tmp_path,
+        ControlledVaultSynchronizer(
+            last_synchronized_at=last_sync,
+            failure="remote unavailable",
+            clean=False,
+        ),
+    )
+    with pytest.raises(VaultReadError, match="clean synchronized clone"):
+        dirty.read(VaultReadInput(query="Alpha"))
+
+
+@pytest.mark.parametrize(
+    "read_request",
+    (
+        VaultReadInput(path="../outside.md"),
+        VaultReadInput(path=".obsidian/private.md"),
+        VaultReadInput(path="attachments/private.md"),
+    ),
+)
+def test_vault_read_rejects_traversal_hidden_and_excluded_paths(
+    tmp_path: Path, read_request: VaultReadInput
+) -> None:
+    _vault(tmp_path)
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    with pytest.raises(VaultReadError, match="not an ordinary knowledge-vault note"):
+        connector.read(read_request)
+
+
+def test_vault_read_rejects_a_note_symlink_even_when_its_target_is_markdown(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.md"
+    outside.write_text("outside vault", encoding="utf-8")
+    link = tmp_path / "Projects" / "linked.md"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        pytest.skip("the test host does not permit creating symlinks")
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    with pytest.raises(VaultReadError, match="not an ordinary knowledge-vault note"):
+        connector.read(VaultReadInput(path="Projects/linked.md"))
+
+
+def test_production_synchronizer_enforces_dedicated_ssh_config_and_host_verification(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def run_process(*args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append({"args": args, "kwargs": kwargs})
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=PurePosixPath("/usr/bin/git"),
+        ssh_executable=PurePosixPath("/usr/bin/ssh"),
+        ssh_config_path=PurePosixPath("/etc/jarvis/vault-ssh-config"),
+        known_hosts_path=PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        run_process=run_process,
+    )
+
+    synchronized_at = synchronizer.synchronize(tmp_path, now=NOW)
+
+    assert synchronized_at == NOW
+    assert [call["args"][0][-1] for call in calls] == [
+        "--porcelain",
+        "origin",
+        "FETCH_HEAD",
+    ]
+    environment = calls[0]["kwargs"]["env"]
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["GIT_SSH_COMMAND"] == (
+        "/usr/bin/ssh -F /etc/jarvis/vault-ssh-config -o BatchMode=yes "
+        "-o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
+        "-o UserKnownHostsFile=/etc/jarvis/vault-known-hosts "
+        "-o GlobalKnownHostsFile=/dev/null"
+    )
+
+
+def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+    captured: dict[str, object] = {}
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        tools = _agent.tools
+        assert [tool.name for tool in tools] == [
+            "read_request_context",
+            "read_knowledge_vault",
+        ]
+        vault_tool = tools[1]
+        captured["vault_result"] = asyncio.run(
+            vault_tool.on_invoke_tool(None, json.dumps({"query": "Alpha"}))
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="The vault search is complete.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+                proposal=None,
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        reasoning_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_config_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        vault_read_tool=connector.as_bounded_read_tool(),
+    )
+
+    result = adapter.run(_request())
+
+    assert captured["vault_result"]["source"] == "knowledge_vault"
+    assert captured["vault_result"]["stale_warning"] is None
+    assert [entry["path"] for entry in captured["vault_result"]["excerpts"]] == [
+        "Projects/Alpha.md",
+        "Roadmap.md",
+    ]
+    assert [milestone.stage for milestone in result.milestones] == [
+        "orchestration_started",
+        "bounded_read",
+    ]
+
+
+def test_orchestration_rejects_a_vault_tool_outside_its_closed_contract(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+    tool = connector.as_bounded_read_tool()
+    object.__setattr__(tool, "name", "execute_arbitrary_path")
+
+    with pytest.raises(ValueError, match="outside the closed tool set"):
+        AgentsSdkOrchestrationAdapter(
+            vault_read_tool=tool,
+        )
