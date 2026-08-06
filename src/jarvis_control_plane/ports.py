@@ -157,6 +157,12 @@ class DurableStateStore(Protocol):
 
     def list_ingress_claims(self) -> tuple[IngressClaim, ...]: ...
 
+    def load_knowledge_vault_synchronized_at(self) -> datetime | None: ...
+
+    def save_knowledge_vault_synchronized_at(
+        self, synchronized_at: datetime
+    ) -> None: ...
+
 
 class OrchestrationAdapter(Protocol):
     """Non-authoritative planner boundary."""

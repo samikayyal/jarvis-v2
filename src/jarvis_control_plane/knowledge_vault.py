@@ -13,7 +13,7 @@ import shlex
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from subprocess import DEVNULL, CompletedProcess, run
+from subprocess import DEVNULL, CompletedProcess, TimeoutExpired, run
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -34,6 +34,24 @@ class VaultReadError(Exception):
 
 class VaultSynchronizationError(VaultReadError):
     """The dedicated clone could not be synchronized safely."""
+
+
+class VaultRemoteUnavailable(VaultSynchronizationError):
+    """The remote could not be reached; a known clean clone may be read stale."""
+
+
+class VaultRepositoryConflict(VaultSynchronizationError):
+    """The local clone requires explicit administrator recovery."""
+
+
+class VaultSynchronizationMetadataStore(Protocol):
+    """Authoritative durable metadata for the last successful vault sync."""
+
+    def load_knowledge_vault_synchronized_at(self) -> datetime | None: ...
+
+    def save_knowledge_vault_synchronized_at(
+        self, synchronized_at: datetime
+    ) -> None: ...
 
 
 class VaultReadInput(BaseModel):
@@ -104,6 +122,7 @@ class SubprocessVaultSynchronizer:
         ssh_executable: Path,
         ssh_config_path: Path,
         known_hosts_path: Path,
+        synchronization_state: VaultSynchronizationMetadataStore,
         run_process: Callable[..., CompletedProcess[str]] = run,
     ) -> None:
         for path, name in (
@@ -116,6 +135,7 @@ class SubprocessVaultSynchronizer:
                 raise ValueError(f"{name} must be an absolute deployment path")
         self._git_executable = git_executable
         self._run_process = run_process
+        self._synchronization_state = synchronization_state
         self._environment = {
             **os.environ,
             "GIT_TERMINAL_PROMPT": "0",
@@ -137,24 +157,56 @@ class SubprocessVaultSynchronizer:
                 )
             ),
         }
-        self._last_synchronized_at: datetime | None = None
 
     @property
     def last_synchronized_at(self) -> datetime | None:
-        return self._last_synchronized_at
+        synchronized_at = (
+            self._synchronization_state.load_knowledge_vault_synchronized_at()
+        )
+        if synchronized_at is not None and synchronized_at.tzinfo is None:
+            raise VaultRepositoryConflict(
+                "knowledge-vault synchronization metadata is invalid"
+            )
+        return synchronized_at
 
     def is_clean(self, root: Path) -> bool:
-        return self._git(root, "status", "--porcelain").stdout.strip() == ""
+        return (
+            self._git(
+                root,
+                "status",
+                "--porcelain",
+                failure_type=VaultRepositoryConflict,
+            ).stdout.strip()
+            == ""
+        )
 
     def synchronize(self, root: Path, *, now: datetime) -> datetime:
         if not self.is_clean(root):
-            raise VaultSynchronizationError("knowledge-vault clone is not clean")
-        self._git(root, "fetch", "--prune", "--no-tags", "origin")
-        self._git(root, "merge", "--ff-only", "FETCH_HEAD")
-        self._last_synchronized_at = now
+            raise VaultRepositoryConflict("knowledge-vault clone is not clean")
+        self._git(
+            root,
+            "fetch",
+            "--prune",
+            "--no-tags",
+            "origin",
+            failure_type=VaultRemoteUnavailable,
+        )
+        self._git(
+            root,
+            "merge",
+            "--ff-only",
+            "FETCH_HEAD",
+            failure_type=VaultRepositoryConflict,
+        )
+        self._synchronization_state.save_knowledge_vault_synchronized_at(now)
         return now
 
-    def _git(self, root: Path, *arguments: str):
+    def _git(
+        self,
+        root: Path,
+        *arguments: str,
+        failure_type: type[VaultSynchronizationError],
+    ) -> CompletedProcess[str]:
         try:
             completed = self._run_process(
                 [str(self._git_executable), "-C", str(root), *arguments],
@@ -166,15 +218,11 @@ class SubprocessVaultSynchronizer:
                 env=self._environment,
             )
         except OSError as exc:
-            raise VaultSynchronizationError(
-                "knowledge-vault Git is unavailable"
-            ) from exc
-        except TimeoutError as exc:
-            raise VaultSynchronizationError(
-                "knowledge-vault synchronization timed out"
-            ) from exc
+            raise failure_type("knowledge-vault Git is unavailable") from exc
+        except (TimeoutError, TimeoutExpired) as exc:
+            raise failure_type("knowledge-vault synchronization timed out") from exc
         if completed.returncode != 0:
-            raise VaultSynchronizationError("knowledge-vault synchronization failed")
+            raise failure_type("knowledge-vault synchronization failed")
         return completed
 
 
@@ -185,11 +233,13 @@ class ControlledVaultSynchronizer:
         self,
         *,
         last_synchronized_at: datetime | None = None,
-        failure: str | None = None,
+        failure: str | VaultSynchronizationError | None = None,
         clean: bool = True,
     ) -> None:
         self._last_synchronized_at = last_synchronized_at
-        self.failure = failure
+        self.failure = (
+            VaultRemoteUnavailable(failure) if isinstance(failure, str) else failure
+        )
         self.clean = clean
         self.calls = 0
 
@@ -203,7 +253,7 @@ class ControlledVaultSynchronizer:
     def synchronize(self, root: Path, *, now: datetime) -> datetime:
         self.calls += 1
         if self.failure is not None:
-            raise VaultSynchronizationError(self.failure)
+            raise self.failure
         self._last_synchronized_at = now
         return now
 
@@ -228,21 +278,23 @@ class KnowledgeVaultConnector:
     def read(self, request: VaultReadInput) -> KnowledgeVaultReadResult:
         """Synchronize first, then perform one deterministic, bounded local read."""
 
-        if not self._synchronizer.is_clean(self._root):
-            raise VaultReadError(
-                "knowledge-vault reads require a clean synchronized clone"
-            )
+        self._require_clean_clone()
         now = self._now()
         try:
             synchronized_at = self._synchronizer.synchronize(self._root, now=now)
             stale_warning = None
-        except VaultSynchronizationError as exc:
+        except VaultRemoteUnavailable as exc:
             synchronized_at = self._synchronizer.last_synchronized_at
-            if synchronized_at is None or not self._synchronizer.is_clean(self._root):
+            if synchronized_at is None:
                 raise VaultReadError(
                     "knowledge-vault reads require a clean synchronized clone"
                 ) from exc
+            self._require_clean_clone()
             stale_warning = _stale_warning(now - synchronized_at)
+        except VaultSynchronizationError as exc:
+            raise VaultReadError(
+                "knowledge-vault synchronization requires explicit recovery"
+            ) from exc
 
         excerpts = self._select_excerpts(request)
         return KnowledgeVaultReadResult(
@@ -250,6 +302,18 @@ class KnowledgeVaultConnector:
             stale_warning=stale_warning,
             excerpts=tuple(excerpts[:_MAX_RESULTS]),
         )
+
+    def _require_clean_clone(self) -> None:
+        try:
+            is_clean = self._synchronizer.is_clean(self._root)
+        except VaultSynchronizationError as exc:
+            raise VaultReadError(
+                "knowledge-vault synchronization requires explicit recovery"
+            ) from exc
+        if not is_clean:
+            raise VaultReadError(
+                "knowledge-vault reads require a clean synchronized clone"
+            )
 
     def as_bounded_read_tool(self):
         """Return the closed orchestration tool without importing Agents at module load."""
@@ -321,7 +385,14 @@ class KnowledgeVaultConnector:
         parts = relative.parts
         if not parts or any(part.startswith(".") for part in parts):
             return False
-        return parts[0] not in _EXCLUDED_TOP_LEVEL_DIRECTORIES
+        if any(part in _EXCLUDED_TOP_LEVEL_DIRECTORIES for part in parts):
+            return False
+        return not any(
+            os.path.lexists(directory / ".git")
+            for directory in (
+                self._root.joinpath(*parts[:index]) for index in range(1, len(parts))
+            )
+        )
 
     def _relative(self, path: Path) -> str:
         return path.resolve(strict=True).relative_to(self._root).as_posix()

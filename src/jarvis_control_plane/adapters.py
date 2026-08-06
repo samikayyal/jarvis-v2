@@ -110,6 +110,7 @@ class InMemoryDurableStateStore:
         self.claims: dict[tuple[str, str], IngressClaim] = {}
         self.conversation_messages: dict[tuple[str, str], ConversationMessage] = {}
         self.requests: dict[str, RequestState] = {}
+        self._knowledge_vault_synchronized_at: datetime | None = None
         self.fail_claim = False
         self.fail_conversation = False
         self.fail_save = False
@@ -297,6 +298,14 @@ class InMemoryDurableStateStore:
         with self._lock:
             return tuple(self.claims.values())
 
+    def load_knowledge_vault_synchronized_at(self) -> datetime | None:
+        with self._lock:
+            return self._knowledge_vault_synchronized_at
+
+    def save_knowledge_vault_synchronized_at(self, synchronized_at: datetime) -> None:
+        with self._lock:
+            self._knowledge_vault_synchronized_at = ensure_utc(synchronized_at)
+
 
 class SQLiteDurableStateStore:
     """Small SQLite-backed durable state adapter for the primary seam."""
@@ -349,6 +358,10 @@ class SQLiteDurableStateStore:
                     occurred_at TEXT NOT NULL,
                     direction TEXT NOT NULL CHECK (direction = 'inbound'),
                     PRIMARY KEY (transport_session_id, message_id)
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_vault_synchronization (
+                    slot INTEGER PRIMARY KEY CHECK (slot = 1),
+                    synchronized_at TEXT NOT NULL
                 );
                 """
             )
@@ -799,6 +812,43 @@ class SQLiteDurableStateStore:
             )
             for row in rows
         )
+
+    def load_knowledge_vault_synchronized_at(self) -> datetime | None:
+        try:
+            row = self.connection.execute(
+                "SELECT synchronized_at FROM knowledge_vault_synchronization WHERE slot = 1"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StateStoreError(
+                "could not read knowledge-vault synchronization"
+            ) from exc
+        if row is None:
+            return None
+        try:
+            synchronized_at = datetime.fromisoformat(row["synchronized_at"])
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError(
+                "knowledge-vault synchronization metadata is invalid"
+            ) from exc
+        if synchronized_at.tzinfo is None:
+            raise StateStoreError("knowledge-vault synchronization metadata is invalid")
+        return ensure_utc(synchronized_at)
+
+    def save_knowledge_vault_synchronized_at(self, synchronized_at: datetime) -> None:
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO knowledge_vault_synchronization(slot, synchronized_at)
+                VALUES (1, ?)
+                ON CONFLICT(slot) DO UPDATE SET synchronized_at = excluded.synchronized_at
+                """,
+                (ensure_utc(synchronized_at).isoformat(),),
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            raise StateStoreError(
+                "could not save knowledge-vault synchronization"
+            ) from exc
 
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]:
         try:

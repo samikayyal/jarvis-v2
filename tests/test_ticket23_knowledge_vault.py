@@ -7,16 +7,23 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from subprocess import TimeoutExpired
 from types import SimpleNamespace
 
 import pytest
 
+from jarvis_control_plane.adapters import (
+    InMemoryDurableStateStore,
+    SQLiteDurableStateStore,
+)
 from jarvis_control_plane.knowledge_vault import (
     ControlledVaultSynchronizer,
     KnowledgeVaultConnector,
     SubprocessVaultSynchronizer,
     VaultReadError,
     VaultReadInput,
+    VaultRemoteUnavailable,
+    VaultRepositoryConflict,
 )
 from jarvis_control_plane.models import OrchestrationRequest, RequestState
 from jarvis_control_plane.orchestration import (
@@ -165,6 +172,22 @@ def test_unavailable_sync_permits_only_a_clean_stale_read_with_age_disclosure(
         dirty.read(VaultReadInput(query="Alpha"))
 
 
+def test_non_fast_forward_state_never_falls_back_to_a_stale_read(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    connector = _connector(
+        tmp_path,
+        ControlledVaultSynchronizer(
+            last_synchronized_at=NOW - timedelta(hours=2),
+            failure=VaultRepositoryConflict("fast-forward merge failed"),
+        ),
+    )
+
+    with pytest.raises(VaultReadError, match="explicit recovery"):
+        connector.read(VaultReadInput(query="Alpha"))
+
+
 @pytest.mark.parametrize(
     "read_request",
     (
@@ -204,6 +227,31 @@ def test_vault_read_rejects_a_note_symlink_even_when_its_target_is_markdown(
         connector.read(VaultReadInput(path="Projects/linked.md"))
 
 
+@pytest.mark.parametrize(
+    "path",
+    ("Projects/attachments/Private.md", "nested-module/Private.md"),
+)
+def test_vault_read_rejects_nested_excluded_directories_and_submodules(
+    tmp_path: Path, path: str
+) -> None:
+    _vault(tmp_path)
+    (tmp_path / "Projects" / "attachments").mkdir()
+    (tmp_path / "Projects" / "attachments" / "Private.md").write_text(
+        "private", encoding="utf-8"
+    )
+    (tmp_path / "nested-module").mkdir()
+    (tmp_path / "nested-module" / ".git").write_text(
+        "gitdir: ../.git/modules/nested-module", encoding="utf-8"
+    )
+    (tmp_path / "nested-module" / "Private.md").write_text("private", encoding="utf-8")
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    with pytest.raises(VaultReadError, match="not an ordinary knowledge-vault note"):
+        connector.read(VaultReadInput(path=path))
+
+
 def test_production_synchronizer_enforces_dedicated_ssh_config_and_host_verification(
     tmp_path: Path,
 ) -> None:
@@ -218,6 +266,7 @@ def test_production_synchronizer_enforces_dedicated_ssh_config_and_host_verifica
         ssh_executable=PurePosixPath("/usr/bin/ssh"),
         ssh_config_path=PurePosixPath("/etc/jarvis/vault-ssh-config"),
         known_hosts_path=PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        synchronization_state=InMemoryDurableStateStore(),
         run_process=run_process,
     )
 
@@ -237,6 +286,60 @@ def test_production_synchronizer_enforces_dedicated_ssh_config_and_host_verifica
         "-o UserKnownHostsFile=/etc/jarvis/vault-known-hosts "
         "-o GlobalKnownHostsFile=/dev/null"
     )
+
+
+def test_production_synchronizer_translates_fetch_timeouts_to_remote_unavailable(
+    tmp_path: Path,
+) -> None:
+    def run_process(*args: object, **_kwargs: object) -> SimpleNamespace:
+        command = args[0]
+        if command[-1] == "origin":
+            raise TimeoutExpired(command, 15)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=PurePosixPath("/usr/bin/git"),
+        ssh_executable=PurePosixPath("/usr/bin/ssh"),
+        ssh_config_path=PurePosixPath("/etc/jarvis/vault-ssh-config"),
+        known_hosts_path=PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        synchronization_state=InMemoryDurableStateStore(),
+        run_process=run_process,
+    )
+
+    with pytest.raises(VaultRemoteUnavailable, match="timed out"):
+        synchronizer.synchronize(tmp_path, now=NOW)
+
+
+def test_production_synchronizer_restores_last_successful_sync_from_durable_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    state = SQLiteDurableStateStore(database)
+
+    def run_process(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    arguments = {
+        "git_executable": PurePosixPath("/usr/bin/git"),
+        "ssh_executable": PurePosixPath("/usr/bin/ssh"),
+        "ssh_config_path": PurePosixPath("/etc/jarvis/vault-ssh-config"),
+        "known_hosts_path": PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        "synchronization_state": state,
+        "run_process": run_process,
+    }
+    try:
+        SubprocessVaultSynchronizer(**arguments).synchronize(tmp_path, now=NOW)
+    finally:
+        state.close()
+    restored_state = SQLiteDurableStateStore(database)
+    try:
+        restored = SubprocessVaultSynchronizer(
+            **{**arguments, "synchronization_state": restored_state}
+        )
+
+        assert restored.last_synchronized_at == NOW
+    finally:
+        restored_state.close()
 
 
 def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
@@ -288,6 +391,49 @@ def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
         "orchestration_started",
         "bounded_read",
     ]
+
+
+def test_orchestration_deterministically_discloses_a_stale_vault_read(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    last_sync = NOW - timedelta(hours=2, minutes=5)
+    connector = _connector(
+        tmp_path,
+        ControlledVaultSynchronizer(
+            last_synchronized_at=last_sync,
+            failure="remote unavailable",
+        ),
+    )
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(
+            _agent.tools[1].on_invoke_tool(None, json.dumps({"query": "Alpha"}))
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="The vault search is complete.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        reasoning_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_config_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        vault_read_tool=connector.as_bounded_read_tool(),
+    )
+
+    result = adapter.run(_request())
+
+    assert "Knowledge-vault synchronization is unavailable" in result.reply_text
+    assert (
+        "Last successful synchronization: 2026-08-06T07:55:00+00:00"
+        in result.reply_text
+    )
 
 
 def test_orchestration_rejects_a_vault_tool_outside_its_closed_contract(

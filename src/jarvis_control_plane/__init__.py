@@ -45,7 +45,10 @@ from .knowledge_vault import (
     VaultExcerpt,
     VaultReadError,
     VaultReadInput,
+    VaultRemoteUnavailable,
+    VaultRepositoryConflict,
     VaultSynchronizationError,
+    VaultSynchronizationMetadataStore,
 )
 from .models import (
     AuditEvidence,
@@ -160,6 +163,9 @@ __all__ = [
     "VaultExcerpt",
     "VaultReadError",
     "VaultReadInput",
+    "VaultRemoteUnavailable",
+    "VaultRepositoryConflict",
     "VaultSynchronizationError",
+    "VaultSynchronizationMetadataStore",
     "sign_body",
 ]

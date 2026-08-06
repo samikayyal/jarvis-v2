@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -210,8 +211,20 @@ class AgentsSdkOrchestrationAdapter:
             )
         ]
         budget = _ToolInvocationBudget(self._max_tool_invocations)
+        stale_vault_read: tuple[datetime, str] | None = None
+
+        def record_stale_vault_read(synchronized_at: datetime, warning: str) -> None:
+            nonlocal stale_vault_read
+            if stale_vault_read is None:
+                stale_vault_read = (synchronized_at, warning)
+
         try:
-            tools = self._build_tools(request, milestones, budget)
+            tools = self._build_tools(
+                request,
+                milestones,
+                budget,
+                record_stale_vault_read=record_stale_vault_read,
+            )
             agent = self._agent_factory(
                 name="Jarvis orchestration agent",
                 instructions=_instructions(has_vault_read=len(self._read_tools) > 1),
@@ -250,10 +263,13 @@ class AgentsSdkOrchestrationAdapter:
         host, host_reason = _validate_host_selection(plan)
 
         proposal = self._frozen_proposal(request, plan, host)
+        reply_text = f"[{host}: {host_reason}] {plan.reply_text}"
+        if stale_vault_read is not None:
+            reply_text += _stale_vault_disclosure(*stale_vault_read)
         return OrchestrationResult(
             request_id=request.state.request_id,
             outcome="completed",
-            reply_text=f"[{host}: {host_reason}] {plan.reply_text}",
+            reply_text=reply_text,
             adapter="agents_sdk_responses",
             proposal=proposal,
             execution_host=host,
@@ -266,6 +282,7 @@ class AgentsSdkOrchestrationAdapter:
         request: OrchestrationRequest,
         milestones: list[OrchestrationMilestone],
         budget: _ToolInvocationBudget,
+        record_stale_vault_read: Callable[[datetime, str], None],
     ) -> list[Any]:
         """Build the closed tool list anew for each request and invocation budget."""
 
@@ -284,6 +301,15 @@ class AgentsSdkOrchestrationAdapter:
                     if not isinstance(typed_output, tool.output_model):
                         raise TypeError("bounded read returned an untyped result")
                     bounded_output = tool.output_model.model_validate(typed_output)
+                    if tool.name == "read_knowledge_vault":
+                        warning = getattr(bounded_output, "stale_warning", None)
+                        synchronized_at = getattr(
+                            bounded_output, "synchronized_at", None
+                        )
+                        if isinstance(warning, str) and isinstance(
+                            synchronized_at, datetime
+                        ):
+                            record_stale_vault_read(synchronized_at, warning)
                 except OrchestrationAdapterError:
                     raise
                 except Exception as exc:
@@ -372,6 +398,16 @@ def _instructions(*, has_vault_read: bool) -> str:
             else ""
         )
         + "Read tools never mutate, dispatch, approve, or create permissions."
+    )
+
+
+def _stale_vault_disclosure(synchronized_at: datetime, warning: str) -> str:
+    """Keep mandatory stale status outside model-controlled reply prose."""
+
+    return (
+        "\n\nKnowledge-vault status: "
+        f"{warning[:200]} Last successful synchronization: "
+        f"{synchronized_at.astimezone(UTC).isoformat()}."
     )
 
 
