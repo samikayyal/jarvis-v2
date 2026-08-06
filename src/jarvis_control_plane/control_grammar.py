@@ -266,6 +266,7 @@ def parse_control(message: str) -> ParsedControl:
     }
     history_is_valid = (
         command is ControlCommand.HISTORY
+        and len(parts) >= 2
         and parts[1] in {"search", "inspect", "export", "conversation"}
         and (
             (parts[1] == "search" and len(parts) >= 3)
