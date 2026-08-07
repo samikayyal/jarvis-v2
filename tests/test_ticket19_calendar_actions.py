@@ -9,7 +9,9 @@ from test_support import build_receiver_components
 from jarvis_control_plane import (
     CALENDAR_WRITE_SCOPE,
     CalendarActionDispatcher,
+    CalendarEventSnapshot,
     CalendarWriteProposal,
+    CalendarWriteRequest,
     ControlledGoogleCalendarWriteProvider,
     ControlledOrchestrationAdapter,
     DeterministicIdGenerator,
@@ -22,6 +24,7 @@ from jarvis_control_plane import (
     OAuthCredentialRecord,
     SignedInboundEvent,
 )
+from jarvis_control_plane.google_calendar import GoogleCalendarWriteProviderError
 from jarvis_control_plane.ports import ActionDispatcherError
 
 IDENTITY = "operator@example.test"
@@ -88,8 +91,8 @@ def test_update_freezes_complete_event_and_dispatches_the_stored_operation_once(
         request_id="request-1",
         calendar_id="primary",
         event_id="event-1",
-        complete_event=event(),
-        etag='"etag-1"',
+        snapshot=CalendarEventSnapshot(event=event(), etag='"etag-1"'),
+        changes={},
         notification="all",
         connection_generation=state.get_connection().generation,
     )
@@ -142,13 +145,12 @@ def test_reviewed_patch_requires_complete_array_values_and_never_retries_ambiguo
 ):
     dispatcher, provider, state = connected_dispatcher()
     with pytest.raises(ValueError, match="complete event"):
-        CalendarWriteProposal.patch(
-            action_id="calendar-action-3",
-            request_id="request-3",
+        CalendarWriteRequest(
+            operation="patch",
             calendar_id="primary",
             event_id="event-3",
             complete_event=event(),
-            reviewed_patch={"attendees": [{"email": "different@example.test"}]},
+            reviewed_patch={"summary": "Changed"},
             etag='"etag-3"',
             notification="externalOnly",
             connection_generation=state.get_connection().generation,
@@ -159,9 +161,11 @@ def test_reviewed_patch_requires_complete_array_values_and_never_retries_ambiguo
         request_id="request-4",
         calendar_id="primary",
         event_id="event-4",
-        complete_event=event(),
-        reviewed_patch={"summary": "Changed", "attendees": event()["attendees"]},
-        etag='"etag-4"',
+        snapshot=CalendarEventSnapshot(event=event(), etag='"etag-4"'),
+        reviewed_patch={
+            "summary": "Changed",
+            "attendees": event()["attendees"],
+        },
         notification="externalOnly",
         connection_generation=state.get_connection().generation,
     )
@@ -172,6 +176,151 @@ def test_reviewed_patch_requires_complete_array_values_and_never_retries_ambiguo
 
     assert error.value.may_have_dispatched is True
     assert len(provider.calls) == 1
+
+
+def test_complete_event_requires_explicit_material_calendar_fields() -> None:
+    _, _, state = connected_dispatcher()
+    sparse_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+    }
+
+    with pytest.raises(ValueError, match="attendees"):
+        CalendarWriteProposal.insert(
+            action_id="calendar-sparse",
+            request_id="request-sparse",
+            calendar_id="primary",
+            complete_event=sparse_event,
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+
+
+def test_update_from_snapshot_derives_one_complete_result_and_preserves_material_fields() -> (
+    None
+):
+    _, _, state = connected_dispatcher()
+    current = event(summary="Existing summary")
+    proposal = CalendarWriteProposal.update_from_snapshot(
+        action_id="calendar-snapshot",
+        request_id="request-snapshot",
+        calendar_id="primary",
+        event_id="event-snapshot",
+        snapshot=CalendarEventSnapshot(event=current, etag='"etag-snapshot"'),
+        changes={"summary": "Changed summary"},
+        notification="all",
+        connection_generation=state.get_connection().generation,
+    )
+
+    payload = json.loads(proposal.payload)
+    assert payload["complete_event"]["summary"] == "Changed summary"
+    assert payload["complete_event"]["attendees"] == current["attendees"]
+    assert payload["complete_event"]["recurrence"] == current["recurrence"]
+    assert payload["complete_event"]["reminders"] == current["reminders"]
+    assert payload["complete_event"]["visibility"] == current["visibility"]
+    assert payload["etag"] == '"etag-snapshot"'
+
+
+def test_fetched_snapshot_makes_google_omissions_explicit() -> None:
+    snapshot = CalendarEventSnapshot(
+        event={
+            "summary": "No optional fields returned",
+            "start": {"dateTime": "2026-08-10T10:00:00Z"},
+            "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        },
+        etag='"etag-defaults"',
+    )
+
+    assert snapshot.event["attendees"] == []
+    assert snapshot.event["recurrence"] == []
+    assert snapshot.event["visibility"] == "default"
+    assert snapshot.event["reminders"] == {
+        "useDefault": True,
+        "overrides": [],
+    }
+
+
+def test_snapshot_binds_identity_and_excludes_server_only_fields_from_writable_result() -> (
+    None
+):
+    _, _, state = connected_dispatcher()
+    current = {**event(), "id": "event-bound", "etag": '"etag-bound"'}
+    snapshot = CalendarEventSnapshot(event=current, etag='"etag-bound"')
+
+    with pytest.raises(ValueError, match="identity"):
+        CalendarWriteProposal.update_from_snapshot(
+            action_id="calendar-wrong-event",
+            request_id="request-wrong-event",
+            calendar_id="primary",
+            event_id="different-event",
+            snapshot=snapshot,
+            changes={},
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+
+    proposal = CalendarWriteProposal.update_from_snapshot(
+        action_id="calendar-bound-event",
+        request_id="request-bound-event",
+        calendar_id="primary",
+        event_id="event-bound",
+        snapshot=snapshot,
+        changes={},
+        notification="none",
+        connection_generation=state.get_connection().generation,
+    )
+    writable_event = json.loads(proposal.payload)["complete_event"]
+    assert "id" not in writable_event
+    assert "etag" not in writable_event
+
+
+def test_calendar_invalid_grant_cleanup_receives_the_failed_generation() -> None:
+    dispatcher, provider, state = connected_dispatcher()
+    failed_generation = state.get_connection().generation
+    received: list[int] = []
+
+    class InvalidGrantProvider(ControlledGoogleCalendarWriteProvider):
+        def write(self, **kwargs: object):
+            self.calls.append((kwargs["request"], kwargs["credential"]))  # type: ignore[arg-type]
+            raise GoogleCalendarWriteProviderError("invalid_grant")
+
+    def on_invalid_grant(connection_generation: int) -> None:
+        received.append(connection_generation)
+
+    provider = InvalidGrantProvider()
+    dispatcher = CalendarActionDispatcher(
+        configured_identity=IDENTITY,
+        connection_state=state,
+        credential_store=InMemoryGoogleCredentialStore(
+            OAuthCredentialRecord(
+                subject=IDENTITY,
+                granted_scopes=frozenset({CALENDAR_WRITE_SCOPE}),
+                refresh_token="controlled-refresh-token",
+                connection_generation=failed_generation,
+            )
+        ),
+        provider=provider,
+        trace=DiagnosticTraceRecorder(
+            writer=InMemoryDiagnosticTraceStore().writer(),
+            clock=FixedClock(NOW),
+            ids=DeterministicIdGenerator("ticket19-invalid-grant"),
+        ),
+        on_invalid_grant=on_invalid_grant,
+    )
+    proposal = CalendarWriteProposal.insert(
+        action_id="calendar-invalid-grant",
+        request_id="request-invalid-grant",
+        calendar_id="primary",
+        complete_event=event(),
+        notification="none",
+        connection_generation=failed_generation,
+    )
+
+    with pytest.raises(ActionDispatcherError, match="invalid_grant"):
+        dispatcher.dispatch(proposal)
+
+    assert received == [failed_generation]
 
 
 def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:

@@ -10,6 +10,7 @@ import pytest
 from jarvis_control_plane import (
     CALENDAR_WRITE_SCOPE,
     CalendarActionDispatcher,
+    CalendarEventSnapshot,
     CalendarWriteProposal,
     CalendarWriteRequest,
     ControlledGoogleCalendarWriteProvider,
@@ -91,7 +92,15 @@ def request(operation: str = "update") -> CalendarWriteRequest:
         "connection_generation": connection.generation,
     }
     if operation != "insert":
-        kwargs.update({"event_id": "event-1", "etag": '"etag-1"'})
+        kwargs.update(
+            {
+                "event_id": "event-1",
+                "snapshot": CalendarEventSnapshot(event=event(), etag='"etag-1"'),
+            }
+        )
+        kwargs.pop("complete_event", None)
+        if operation == "update":
+            kwargs["changes"] = {}
     if operation == "patch":
         kwargs["reviewed_patch"] = {"summary": "Design review"}
     return CalendarWriteRequest.from_proposal(proposal_factory(**kwargs))

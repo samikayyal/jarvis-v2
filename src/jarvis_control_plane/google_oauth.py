@@ -7,6 +7,7 @@ Google connector's credential record for the configured Google subject.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -469,6 +470,12 @@ class FileGoogleCredentialStore:
     def _path(self) -> Path:
         return self._directory / self._filename
 
+    @property
+    def _metadata_path(self) -> Path:
+        """Versioned generation metadata kept beside the legacy-readable record."""
+
+        return self._directory / f"{self._filename}.meta"
+
     def _restrict_directory(self) -> None:
         if os.name != "nt":
             os.chmod(self._directory, 0o700)
@@ -479,30 +486,78 @@ class FileGoogleCredentialStore:
             return None
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
-            if set(payload) != {
+            fields = set(payload)
+            if fields == {
+                "granted_scopes",
+                "refresh_token",
+                "subject",
+            }:
+                connection_generation = self._legacy_generation(payload)
+            elif fields == {
                 "connection_generation",
                 "granted_scopes",
                 "refresh_token",
                 "subject",
             }:
+                # Read the format emitted by the first Ticket 19 revision so
+                # an in-place upgrade can migrate it without losing access.
+                connection_generation = payload["connection_generation"]
+            else:
                 raise ValueError("credential record has an unexpected shape")
             return OAuthCredentialRecord(
                 subject=payload["subject"],
                 granted_scopes=frozenset(payload["granted_scopes"]),
                 refresh_token=payload["refresh_token"],
-                connection_generation=payload["connection_generation"],
+                connection_generation=connection_generation,
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise GoogleOAuthError("credential_store_unavailable") from exc
 
     def replace(self, credential: OAuthCredentialRecord) -> None:
-        temporary = self._directory / f".{self._filename}.{secrets.token_hex(16)}.tmp"
         payload = {
-            "connection_generation": credential.connection_generation,
             "granted_scopes": sorted(credential.granted_scopes),
             "refresh_token": credential.refresh_token,
             "subject": credential.subject,
         }
+        metadata = {
+            "connection_generation": credential.connection_generation,
+            "refresh_token_sha256": hashlib.sha256(
+                credential.refresh_token.encode("utf-8")
+            ).hexdigest(),
+            "schema": "google_oauth_credential_metadata_v1",
+        }
+        # The primary file intentionally remains the historical three-field
+        # wire format so an older release can still read it during rollback.
+        self._atomic_write(self._path, payload)
+        self._atomic_write(self._metadata_path, metadata)
+
+    def _legacy_generation(self, payload: Mapping[str, object]) -> int:
+        if not self._metadata_path.exists():
+            return 0
+        metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
+        if (
+            set(metadata)
+            != {
+                "connection_generation",
+                "refresh_token_sha256",
+                "schema",
+            }
+            or metadata["schema"] != "google_oauth_credential_metadata_v1"
+        ):
+            raise ValueError("credential metadata has an unexpected shape")
+        refresh_token = payload.get("refresh_token")
+        if not isinstance(refresh_token, str):
+            raise TypeError("credential record has an invalid refresh token")
+        fingerprint = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+        if metadata["refresh_token_sha256"] != fingerprint:
+            # An older release may have replaced the legacy record without
+            # knowing about the metadata sidecar.  Treat its generation as
+            # unbound instead of reusing metadata for a different token.
+            return 0
+        return metadata["connection_generation"]
+
+    def _atomic_write(self, path: Path, payload: Mapping[str, object]) -> None:
+        temporary = self._directory / f".{path.name}.{secrets.token_hex(16)}.tmp"
         try:
             with temporary.open("x", encoding="utf-8") as stream:
                 if os.name != "nt":
@@ -510,9 +565,9 @@ class FileGoogleCredentialStore:
                 json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._path)
+            os.replace(temporary, path)
             if os.name != "nt":
-                os.chmod(self._path, 0o600)
+                os.chmod(path, 0o600)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -520,6 +575,7 @@ class FileGoogleCredentialStore:
     def delete(self) -> None:
         try:
             self._path.unlink(missing_ok=True)
+            self._metadata_path.unlink(missing_ok=True)
         except OSError as exc:
             raise GoogleOAuthError("credential_store_unavailable") from exc
 
@@ -737,9 +793,12 @@ class GoogleOAuthLifecycle:
         except AuditWriteError:
             return OAuthCallbackResponse(status_code=503)
 
+        previous_generation: int | None = None
+        next_generation: int | None = None
         try:
             with self._state_store.dispatch_lease():
-                next_generation = self.connection.generation + 1
+                previous_generation = self.connection.generation
+                next_generation = previous_generation + 1
                 receipt = self._trace.execute(
                     request_id=authorization.operation_id,
                     operation_type="google_oauth_code_exchange",
@@ -761,14 +820,20 @@ class GoogleOAuthLifecycle:
                 )
         except OAuthExchangeError as exc:
             if self._has_trace_write_failure(exc):
-                self._invalidate_connection()
+                self._invalidate_connection(
+                    connection_generation=next_generation,
+                    previous_generation=previous_generation,
+                )
                 return OAuthCallbackResponse(status_code=503)
             self._append_callback_rejection(authorization.operation_id)
             return OAuthCallbackResponse(status_code=400)
         except (DiagnosticTraceError, GoogleOAuthError, OSError):
             # A failed trace reservation or write makes the exchange outcome
             # unusable.  Delete the private credential and force reconnect.
-            self._invalidate_connection()
+            self._invalidate_connection(
+                connection_generation=next_generation,
+                previous_generation=previous_generation,
+            )
             return OAuthCallbackResponse(status_code=503)
 
         try:
@@ -779,21 +844,43 @@ class GoogleOAuthLifecycle:
                 execution_status="completed",
             )
         except AuditWriteError:
-            self._invalidate_connection()
+            self._invalidate_connection(connection_generation=next_generation)
             return OAuthCallbackResponse(status_code=503)
         return OAuthCallbackResponse(status_code=204)
 
-    def handle_refresh_failure(self, error_code: str) -> GoogleConnectionState:
+    def handle_refresh_failure(
+        self, error_code: str, *, connection_generation: int
+    ) -> GoogleConnectionState:
         if error_code != "invalid_grant":
             raise ValueError("only invalid_grant can invalidate the OAuth credential")
+        if (
+            not isinstance(connection_generation, int)
+            or isinstance(connection_generation, bool)
+            or connection_generation < 0
+        ):
+            raise ValueError("connection_generation must be a non-negative integer")
         with self._state_store.dispatch_lease():
-            self._connector.discard_local_credential()
-            state = self._state_store.set_connection(connected=False)
+            current = self._state_store.get_connection()
+            credential = self._connector.current_credential
+            if (
+                current.generation == connection_generation
+                and credential is not None
+                and credential.connection_generation == connection_generation
+            ):
+                self._connector.discard_local_credential()
+                state = self._state_store.set_connection(connected=False)
+                outcome = "invalidated"
+            else:
+                # A provider failure from an older request must not tear down a
+                # credential that has already been reconnected under a newer
+                # generation.
+                state = current
+                outcome = "stale_ignored"
         self._append_audit(
             kind="google_oauth_refresh_invalidated",
             request_id="google-oauth-refresh",
-            outcome="invalidated",
-            execution_status="failed",
+            outcome=outcome,
+            execution_status="failed" if outcome == "invalidated" else "ignored",
         )
         return state
 
@@ -843,19 +930,45 @@ class GoogleOAuthLifecycle:
             # content-free response remains available while audit is down.
             pass
 
-    def _invalidate_connection(self) -> None:
+    def _invalidate_connection(
+        self,
+        *,
+        connection_generation: int | None,
+        previous_generation: int | None = None,
+    ) -> None:
         """Remove a possibly replaced credential without leaking state-store failures."""
 
+        if connection_generation is None:
+            return
         try:
             with self._state_store.dispatch_lease():
+                current = self._state_store.get_connection()
+                credential = self._connector.current_credential
+                if credential is None or (
+                    credential.connection_generation != connection_generation
+                ):
+                    return
+                if current.generation == connection_generation:
+                    should_disconnect = True
+                elif previous_generation is not None and (
+                    current.generation == previous_generation
+                ):
+                    # The exchange replaced a private credential before its
+                    # connection state was published.  Remove only that
+                    # unpublished credential; a newer published generation
+                    # still wins the race and fails the generation check above.
+                    should_disconnect = False
+                else:
+                    return
                 try:
                     self._connector.discard_local_credential()
                 except GoogleOAuthError:
                     pass
-                try:
-                    self._state_store.set_connection(connected=False)
-                except GoogleOAuthError:
-                    pass
+                if should_disconnect:
+                    try:
+                        self._state_store.set_connection(connected=False)
+                    except GoogleOAuthError:
+                        pass
         except GoogleOAuthError:
             pass
 

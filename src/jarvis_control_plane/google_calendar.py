@@ -11,10 +11,16 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
 
+from .google_http import (
+    GOOGLE_HTTP_TIMEOUT_SECONDS,
+    GoogleAccessTokenRefresher,
+    GoogleHttpResponse,
+    GoogleHttpTransport,
+    GoogleTokenRefreshError,
+    UrllibGoogleHttpTransport,
+)
 from .google_oauth import (
     GoogleCredentialStore,
     GoogleOAuthError,
@@ -34,12 +40,14 @@ CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 CalendarWriteOperation = Literal["insert", "update", "patch"]
 CalendarNotification = Literal["none", "all", "externalOnly"]
 _WRITE_KINDS = frozenset({"calendar_insert", "calendar_update", "calendar_patch"})
-_ARRAY_FIELDS = frozenset({"attendees", "recurrence", "reminders"})
+_REQUIRED_COMPLETE_EVENT_FIELDS = frozenset(
+    {"attendees", "recurrence", "reminders", "visibility"}
+)
+_VISIBILITY_VALUES = frozenset({"default", "public", "private", "confidential"})
 GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES = 32 * 1024
-_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
 _MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
-_GOOGLE_HTTP_TIMEOUT_SECONDS = 5.0
+_GOOGLE_HTTP_TIMEOUT_SECONDS = GOOGLE_HTTP_TIMEOUT_SECONDS
 
 
 def _text(value: object, name: str) -> str:
@@ -63,17 +71,62 @@ def _event(value: object) -> dict[str, object]:
     event = _canonical_json(value, "complete_event")
     if not isinstance(event, dict):
         raise TypeError("complete_event must be an object")
+    missing = _REQUIRED_COMPLETE_EVENT_FIELDS - set(event)
+    if missing:
+        raise ValueError(
+            "complete_event requires explicit material fields: "
+            + ", ".join(sorted(missing))
+        )
     for endpoint in ("start", "end"):
         value = event.get(endpoint)
-        if not isinstance(value, dict) or not any(
-            isinstance(value.get(field), str) and value[field].strip()
-            for field in ("date", "dateTime")
+        if (
+            not isinstance(value, dict)
+            or sum(
+                isinstance(value.get(field), str) and bool(value[field].strip())
+                for field in ("date", "dateTime")
+            )
+            != 1
         ):
             raise ValueError(f"complete_event requires a {endpoint} date or dateTime")
-    for field in _ARRAY_FIELDS:
-        if field in event and not isinstance(event[field], (list, dict)):
-            raise ValueError(f"complete_event {field} has an invalid shape")
+    if not isinstance(event["attendees"], list):
+        raise TypeError("complete_event attendees has an invalid shape")
+    if not isinstance(event["recurrence"], list):
+        raise TypeError("complete_event recurrence has an invalid shape")
+    visibility = event["visibility"]
+    if not isinstance(visibility, str) or visibility not in _VISIBILITY_VALUES:
+        raise ValueError("complete_event visibility has an invalid value")
+    reminders = event["reminders"]
+    if not isinstance(reminders, dict) or set(reminders) != {
+        "overrides",
+        "useDefault",
+    }:
+        raise ValueError(
+            "complete_event reminders must explicitly contain useDefault and overrides"
+        )
+    if not isinstance(reminders["useDefault"], bool) or not isinstance(
+        reminders["overrides"], list
+    ):
+        raise TypeError("complete_event reminders has an invalid shape")
     return event
+
+
+def _snapshot_event(value: object) -> dict[str, object]:
+    """Normalize Google's omitted optional fields before complete-event validation."""
+
+    event = _canonical_json(value, "current_event")
+    if not isinstance(event, dict):
+        raise TypeError("current_event must be an object")
+    event.setdefault("attendees", [])
+    event.setdefault("recurrence", [])
+    event.setdefault("visibility", "default")
+    if "reminders" not in event:
+        event["reminders"] = {"useDefault": True, "overrides": []}
+    elif isinstance(event["reminders"], dict) and "overrides" not in event["reminders"]:
+        reminders = dict(event["reminders"])
+        if reminders.get("useDefault") is True:
+            reminders["overrides"] = []
+        event["reminders"] = reminders
+    return _event(event)
 
 
 def _patch(value: object, complete_event: Mapping[str, object]) -> dict[str, object]:
@@ -82,12 +135,45 @@ def _patch(value: object, complete_event: Mapping[str, object]) -> dict[str, obj
         raise ValueError("reviewed_patch must be a non-empty object")
     if {"id", "etag"} & set(patch):
         raise ValueError("reviewed_patch cannot replace event identity or ETag")
-    for field in _ARRAY_FIELDS & set(patch):
+    for field in patch:
         if field not in complete_event or patch[field] != complete_event[field]:
             raise ValueError(
                 f"reviewed_patch {field} must equal the complete event value"
             )
     return patch
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarEventSnapshot:
+    """An ETag-bound, already complete event fetched before a change proposal."""
+
+    event: dict[str, object]
+    etag: str
+
+    def __post_init__(self) -> None:
+        normalized = _snapshot_event(self.event)
+        _text(self.etag, "etag")
+        if "etag" in normalized and normalized["etag"] != self.etag:
+            raise ValueError("Calendar event snapshot ETag does not match its event")
+        object.__setattr__(self, "event", normalized)
+
+    def resulting_event(self, changes: Mapping[str, object]) -> dict[str, object]:
+        normalized_changes = _canonical_json(changes, "event_changes")
+        if not isinstance(normalized_changes, dict):
+            raise TypeError("event_changes must be an object")
+        if {"id", "etag"} & set(normalized_changes):
+            raise ValueError("event_changes cannot replace event identity or ETag")
+        result = {
+            key: value for key, value in self.event.items() if key not in {"id", "etag"}
+        }
+        result.update(normalized_changes)
+        return _event(result)
+
+    def require_event_id(self, event_id: str) -> None:
+        _text(event_id, "event_id")
+        source_event_id = self.event.get("id")
+        if source_event_id is not None and source_event_id != event_id:
+            raise ValueError("Calendar event snapshot identity does not match event_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +211,11 @@ class CalendarWriteRequest:
         else:
             _text(self.event_id, "event_id")
             _text(self.etag, "etag")
+            if (
+                "id" in self.complete_event
+                and self.complete_event["id"] != self.event_id
+            ):
+                raise ValueError("complete_event identity does not match event_id")
             if self.operation == "patch":
                 if self.reviewed_patch is None:
                     raise ValueError("Calendar patch requires a reviewed patch")
@@ -205,22 +296,53 @@ class CalendarWriteProposal:
         request_id: str,
         calendar_id: str,
         event_id: str,
-        complete_event: Mapping[str, object],
-        etag: str,
+        snapshot: CalendarEventSnapshot,
+        changes: Mapping[str, object],
         notification: CalendarNotification,
         connection_generation: int,
     ) -> FrozenActionProposal:
+        if not isinstance(snapshot, CalendarEventSnapshot):
+            raise TypeError("Calendar update requires an ETag-bound event snapshot")
+        snapshot.require_event_id(event_id)
         return cls._create(
             action_id=action_id,
             request_id=request_id,
             operation="update",
             calendar_id=calendar_id,
             event_id=event_id,
-            complete_event=complete_event,
-            etag=etag,
+            complete_event=snapshot.resulting_event(changes),
+            etag=snapshot.etag,
             notification=notification,
             connection_generation=connection_generation,
             reviewed_patch=None,
+        )
+
+    @classmethod
+    def update_from_snapshot(
+        cls,
+        *,
+        action_id: str,
+        request_id: str,
+        calendar_id: str,
+        event_id: str,
+        snapshot: CalendarEventSnapshot,
+        changes: Mapping[str, object],
+        notification: CalendarNotification,
+        connection_generation: int,
+    ) -> FrozenActionProposal:
+        """Derive a complete PUT body from the fetched ETag-bound event."""
+
+        if not isinstance(snapshot, CalendarEventSnapshot):
+            raise TypeError("Calendar update requires an ETag-bound event snapshot")
+        return cls.update(
+            action_id=action_id,
+            request_id=request_id,
+            calendar_id=calendar_id,
+            event_id=event_id,
+            snapshot=snapshot,
+            changes=changes,
+            notification=notification,
+            connection_generation=connection_generation,
         )
 
     @classmethod
@@ -231,23 +353,53 @@ class CalendarWriteProposal:
         request_id: str,
         calendar_id: str,
         event_id: str,
-        complete_event: Mapping[str, object],
+        snapshot: CalendarEventSnapshot,
         reviewed_patch: Mapping[str, object],
-        etag: str,
         notification: CalendarNotification,
         connection_generation: int,
     ) -> FrozenActionProposal:
+        if not isinstance(snapshot, CalendarEventSnapshot):
+            raise TypeError("Calendar patch requires an ETag-bound event snapshot")
+        snapshot.require_event_id(event_id)
         return cls._create(
             action_id=action_id,
             request_id=request_id,
             operation="patch",
             calendar_id=calendar_id,
             event_id=event_id,
-            complete_event=complete_event,
-            etag=etag,
+            complete_event=snapshot.resulting_event(reviewed_patch),
+            etag=snapshot.etag,
             notification=notification,
             connection_generation=connection_generation,
             reviewed_patch=reviewed_patch,
+        )
+
+    @classmethod
+    def patch_from_snapshot(
+        cls,
+        *,
+        action_id: str,
+        request_id: str,
+        calendar_id: str,
+        event_id: str,
+        snapshot: CalendarEventSnapshot,
+        reviewed_patch: Mapping[str, object],
+        notification: CalendarNotification,
+        connection_generation: int,
+    ) -> FrozenActionProposal:
+        """Freeze a reviewed PATCH against the exact fetched event snapshot."""
+
+        if not isinstance(snapshot, CalendarEventSnapshot):
+            raise TypeError("Calendar patch requires an ETag-bound event snapshot")
+        return cls.patch(
+            action_id=action_id,
+            request_id=request_id,
+            calendar_id=calendar_id,
+            event_id=event_id,
+            snapshot=snapshot,
+            reviewed_patch=reviewed_patch,
+            notification=notification,
+            connection_generation=connection_generation,
         )
 
     @staticmethod
@@ -326,58 +478,17 @@ class GoogleCalendarWriteProviderResult:
         object.__setattr__(self, "event", _event(self.event))
 
 
-@dataclass(frozen=True, slots=True)
-class GoogleCalendarHttpResponse:
-    """Bounded response returned by the concrete Calendar HTTP edge."""
-
-    status_code: int
-    headers: Mapping[str, str]
-    body: bytes
+GoogleCalendarHttpResponse = GoogleHttpResponse
+GoogleCalendarHttpTransport = GoogleHttpTransport
 
 
-class GoogleCalendarHttpTransport(Protocol):
-    """The only HTTP surface exposed to the Calendar write provider."""
+class UrllibGoogleCalendarHttpTransport(UrllibGoogleHttpTransport):
+    """Calendar view of the shared bounded Google HTTPS transport."""
 
-    def request(
-        self,
-        *,
-        method: Literal["POST", "PUT", "PATCH"],
-        url: str,
-        headers: Mapping[str, str],
-        body: bytes,
-        timeout_seconds: float,
-    ) -> GoogleCalendarHttpResponse: ...
-
-
-class UrllibGoogleCalendarHttpTransport:
-    """Production HTTPS transport; the provider owns outcome classification."""
-
-    def request(
-        self,
-        *,
-        method: Literal["POST", "PUT", "PATCH"],
-        url: str,
-        headers: Mapping[str, str],
-        body: bytes,
-        timeout_seconds: float,
-    ) -> GoogleCalendarHttpResponse:
-        request = Request(url, data=body, headers=dict(headers), method=method)
-        try:
-            response = urlopen(request, timeout=timeout_seconds)
-        except HTTPError as error:
-            return GoogleCalendarHttpResponse(
-                status_code=error.code,
-                headers=dict(error.headers.items()),
-                body=_read_bounded_body(error),
-            )
-        try:
-            return GoogleCalendarHttpResponse(
-                status_code=response.getcode(),
-                headers=dict(response.headers.items()),
-                body=_read_bounded_body(response),
-            )
-        finally:
-            response.close()
+    def __init__(
+        self, *, max_response_bytes: int = _MAX_PROVIDER_RESPONSE_BYTES
+    ) -> None:
+        super().__init__(max_response_bytes=max_response_bytes)
 
 
 class GoogleApiCalendarWriteProvider:
@@ -391,16 +502,14 @@ class GoogleApiCalendarWriteProvider:
         transport: GoogleCalendarHttpTransport | None = None,
         timeout_seconds: float = _GOOGLE_HTTP_TIMEOUT_SECONDS,
     ) -> None:
-        self._client_id = _text(client_id, "client_id")
-        self._client_secret = _text(client_secret, "client_secret")
         self._transport = transport or UrllibGoogleCalendarHttpTransport()
-        if (
-            not isinstance(timeout_seconds, (int, float))
-            or isinstance(timeout_seconds, bool)
-            or not 0 < timeout_seconds <= _GOOGLE_HTTP_TIMEOUT_SECONDS
-        ):
-            raise ValueError("timeout_seconds must be positive and no greater than 5")
-        self._timeout_seconds = float(timeout_seconds)
+        self._token_refresher = GoogleAccessTokenRefresher(
+            client_id=client_id,
+            client_secret=client_secret,
+            transport=self._transport,
+            timeout_seconds=timeout_seconds,
+        )
+        self._timeout_seconds = self._token_refresher.timeout_seconds
 
     def write(
         self, *, request: CalendarWriteRequest, credential: OAuthCredentialRecord
@@ -408,7 +517,7 @@ class GoogleApiCalendarWriteProvider:
         access_token = self._refresh_access_token(credential.refresh_token)
         try:
             response = self._authorized_write(request, access_token)
-        except (TimeoutError, URLError, OSError) as exc:
+        except OSError as exc:
             raise GoogleCalendarWriteProviderError(
                 "transport_failure", str(exc), may_have_dispatched=True
             ) from exc
@@ -417,33 +526,13 @@ class GoogleApiCalendarWriteProvider:
         return GoogleCalendarWriteProviderResult(event=payload)
 
     def _refresh_access_token(self, refresh_token: str) -> str:
-        body = urlencode(
-            {
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }
-        ).encode("ascii")
         try:
-            response = self._transport.request(
-                method="POST",
-                url=_GOOGLE_TOKEN_URL,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                body=body,
-                timeout_seconds=self._timeout_seconds,
+            return self._token_refresher.refresh(refresh_token)
+        except GoogleTokenRefreshError as exc:
+            code = (
+                "invalid_grant" if exc.code == "invalid_grant" else "token_unavailable"
             )
-        except (TimeoutError, URLError, OSError) as exc:
-            raise GoogleCalendarWriteProviderError(
-                "token_unavailable", str(exc)
-            ) from exc
-        payload = self._token_response(response)
-        token = payload.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise GoogleCalendarWriteProviderError(
-                "token_unavailable", "token response lacked access_token"
-            )
-        return token
+            raise GoogleCalendarWriteProviderError(code, str(exc)) from exc
 
     def _authorized_write(
         self, request: CalendarWriteRequest, access_token: str
@@ -481,22 +570,6 @@ class GoogleApiCalendarWriteProvider:
             ).encode("utf-8"),
             timeout_seconds=self._timeout_seconds,
         )
-
-    @staticmethod
-    def _token_response(response: GoogleCalendarHttpResponse) -> Mapping[str, object]:
-        if response.status_code != 200:
-            detail = response.body.decode("utf-8", errors="replace")
-            try:
-                payload = json.loads(detail)
-            except json.JSONDecodeError:
-                payload = None
-            code = (
-                "invalid_grant"
-                if isinstance(payload, dict) and payload.get("error") == "invalid_grant"
-                else "token_unavailable"
-            )
-            raise GoogleCalendarWriteProviderError(code, detail)
-        return _json_object(response.body, "token response")
 
     @staticmethod
     def _write_response(response: GoogleCalendarHttpResponse) -> Mapping[str, object]:
@@ -575,7 +648,7 @@ class CalendarActionDispatcher:
         credential_store: GoogleCredentialStore,
         provider: GoogleCalendarWriteProvider,
         trace: DiagnosticTraceRecorder,
-        on_invalid_grant: Callable[[], object] | None = None,
+        on_invalid_grant: Callable[[int], object] | None = None,
     ) -> None:
         self._configured_identity = _text(configured_identity, "configured_identity")
         self._connection_state = connection_state
@@ -635,7 +708,7 @@ class CalendarActionDispatcher:
         except GoogleCalendarWriteProviderError as exc:
             if exc.code == "invalid_grant" and self._on_invalid_grant is not None:
                 try:
-                    self._on_invalid_grant()
+                    self._on_invalid_grant(request.connection_generation)
                 except (GoogleOAuthError, OSError) as cleanup_error:
                     raise ActionDispatcherError(
                         "Calendar credential invalidation failed"
@@ -669,7 +742,7 @@ def build_live_calendar_action_dispatcher(
     configured_identity: str,
     connection_state: GoogleOAuthStateStore,
     credential_store: GoogleCredentialStore,
-    on_invalid_grant: Callable[[], object],
+    on_invalid_grant: Callable[[int], object],
     client_id: str,
     client_secret: str,
     trace: DiagnosticTraceRecorder,
@@ -689,13 +762,6 @@ def build_live_calendar_action_dispatcher(
         trace=trace,
         on_invalid_grant=on_invalid_grant,
     )
-
-
-def _read_bounded_body(response: object) -> bytes:
-    body = response.read(_MAX_PROVIDER_RESPONSE_BYTES + 1)  # type: ignore[attr-defined]
-    if not isinstance(body, bytes) or len(body) > _MAX_PROVIDER_RESPONSE_BYTES:
-        raise OSError("Calendar response exceeded the fixed limit")
-    return body
 
 
 def _json_object(body: bytes, name: str) -> Mapping[str, object]:

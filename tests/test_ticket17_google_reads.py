@@ -222,7 +222,8 @@ def test_invalid_grant_discards_the_credential_before_reporting_disconnection() 
     )
     invalidations: list[str] = []
 
-    def invalidate() -> None:
+    def invalidate(connection_generation: int) -> None:
+        assert connection_generation == 0
         store.delete()
         invalidations.append("invalidated")
 

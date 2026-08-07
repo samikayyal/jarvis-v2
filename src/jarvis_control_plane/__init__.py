@@ -23,6 +23,7 @@ from .control_plane import (
 from .google_calendar import (
     CALENDAR_WRITE_SCOPE,
     CalendarActionDispatcher,
+    CalendarEventSnapshot,
     CalendarWriteProposal,
     CalendarWriteRequest,
     ControlledGoogleCalendarWriteProvider,
@@ -129,6 +130,7 @@ __all__ = [
     "AuditFilter",
     "AuditWriteError",
     "CalendarActionDispatcher",
+    "CalendarEventSnapshot",
     "CalendarWriteProposal",
     "CalendarWriteRequest",
     "ControlPlane",
