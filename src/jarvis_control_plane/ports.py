@@ -48,7 +48,7 @@ class OrchestrationAdapterError(ControlPlaneError):
 
 
 class ActionDispatcherError(ControlPlaneError):
-    """A frozen approval-gated action could not be dispatched."""
+    """A frozen approval-gated action lifecycle could not proceed."""
 
     def __init__(self, message: str, *, may_have_dispatched: bool = False) -> None:
         super().__init__(message)
@@ -206,9 +206,19 @@ class OrchestrationAdapter(Protocol):
 
 
 class ActionDispatcher(Protocol):
-    """Closed side-effect boundary for a broker-approved frozen action."""
+    """Complete lifecycle boundary for one broker-approved frozen action."""
 
-    def dispatch(self, action: FrozenActionProposal) -> None: ...
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Add immutable connector state before the proposal is presented."""
+        ...
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """Reject a frozen action whose connector state changed after binding."""
+        ...
+
+    def dispatch(self, action: FrozenActionProposal) -> None:
+        """Attempt the one permitted side effect for the approved proposal."""
+        ...
 
 
 class ModelAvailabilityProvider(Protocol):

@@ -341,7 +341,7 @@ class GmailApiWriteProvider:
 
 
 class GmailWriteConnector:
-    """Action dispatcher that permits exactly Gmail new-send and typed replies."""
+    """Complete action lifecycle for exactly Gmail sends and typed replies."""
 
     def __init__(
         self,
@@ -406,6 +406,29 @@ class GmailWriteConnector:
             raise ActionDispatcherError("Google connection changed after proposal")
 
     def dispatch(self, action: FrozenActionProposal) -> None:
+        """Run the one-shot Gmail lifecycle with explicit security phases."""
+
+        request, credential = self._prepare_dispatch(action)
+        try:
+            result = self._attempt_provider_once(
+                action=action,
+                request=request,
+                credential=credential,
+            )
+            self._classify_provider_result(request, result)
+        except GmailWriteProviderError as exc:
+            self._raise_provider_failure(action, exc)
+        except (DiagnosticTraceError, TraceCapacityError, TraceWriteError) as exc:
+            self._raise_unknown_provider_failure(action, exc)
+        except Exception as exc:  # noqa: BLE001 - unknown provider failures are ambiguous
+            self._raise_unknown_provider_failure(action, exc)
+        self._record_completed_delivery(action)
+
+    def _prepare_dispatch(
+        self, action: FrozenActionProposal
+    ) -> tuple[GmailSendRequest, OAuthCredentialRecord]:
+        """Reconstruct, admit, and revalidate before any provider attempt."""
+
         try:
             request = gmail_send_request_from_proposal(action, require_binding=True)
             self.validate_pending_action(action)
@@ -418,55 +441,80 @@ class GmailWriteConnector:
             raise ActionDispatcherError(
                 str(exc) or "Gmail dispatch was blocked"
             ) from exc
-        try:
-            result = self._trace.execute(
-                request_id=f"{action.request_id}:gmail:{action.action_id}",
-                operation_id=f"{action.request_id}:connector:gmail:{action.action_id}",
-                operation_type="gmail_write_connector",
-                input_payload={"action": action, "request": request},
-                arguments={"operation": request.operation},
-                telemetry={"service": "gmail"},
-                operation=lambda: self._provider.send(
-                    request=request, credential=credential
-                ),
-                result_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
-                error_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
-            )
-            if not isinstance(result, GmailWriteProviderResult):
-                raise GmailWriteProviderError("invalid_response", may_have_sent=True)
-            if (
-                request.operation == "gmail_reply"
-                and result.delivery.thread_id != request.thread_id
-            ):
-                raise GmailWriteProviderError("thread_mismatch", may_have_sent=True)
-        except GmailWriteProviderError as exc:
-            if exc.code == "invalid_grant":
-                try:
-                    self._on_invalid_grant()
-                except (OSError, RuntimeError, ValueError) as cleanup_error:
-                    self._record_terminal(action, outcome="failed")
-                    raise ActionDispatcherError(
-                        "Gmail connection could not be invalidated safely"
-                    ) from cleanup_error
-            self._record_terminal(
-                action, outcome="unknown" if exc.may_have_sent else "failed"
-            )
-            raise ActionDispatcherError(
-                "Gmail delivery outcome is unknown"
-                if exc.may_have_sent
-                else "Gmail delivery was not accepted",
-                may_have_dispatched=exc.may_have_sent,
-            ) from exc
-        except (DiagnosticTraceError, TraceCapacityError, TraceWriteError) as exc:
-            self._record_terminal(action, outcome="unknown")
-            raise ActionDispatcherError(
-                "Gmail delivery outcome is unknown", may_have_dispatched=True
-            ) from exc
-        except Exception as exc:
-            self._record_terminal(action, outcome="unknown")
-            raise ActionDispatcherError(
-                "Gmail delivery outcome is unknown", may_have_dispatched=True
-            ) from exc
+
+        return request, credential
+
+    def _attempt_provider_once(
+        self,
+        *,
+        action: FrozenActionProposal,
+        request: GmailSendRequest,
+        credential: OAuthCredentialRecord,
+    ) -> GmailWriteProviderResult:
+        """Make the single traced provider attempt for this frozen action."""
+
+        return self._trace.execute(
+            request_id=f"{action.request_id}:gmail:{action.action_id}",
+            operation_id=f"{action.request_id}:connector:gmail:{action.action_id}",
+            operation_type="gmail_write_connector",
+            input_payload={"action": action, "request": request},
+            arguments={"operation": request.operation},
+            telemetry={"service": "gmail"},
+            operation=lambda: self._provider.send(
+                request=request, credential=credential
+            ),
+            result_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
+            error_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
+        )
+
+    @staticmethod
+    def _classify_provider_result(request: GmailSendRequest, result: object) -> None:
+        """Classify acknowledgement validity and frozen reply-thread integrity."""
+
+        if not isinstance(result, GmailWriteProviderResult):
+            raise GmailWriteProviderError("invalid_response", may_have_sent=True)
+        if (
+            request.operation == "gmail_reply"
+            and result.delivery.thread_id != request.thread_id
+        ):
+            raise GmailWriteProviderError("thread_mismatch", may_have_sent=True)
+
+    def _raise_provider_failure(
+        self, action: FrozenActionProposal, error: GmailWriteProviderError
+    ) -> None:
+        """Record a definite or unknown provider outcome and stop dispatch."""
+
+        if error.code == "invalid_grant":
+            try:
+                self._on_invalid_grant()
+            except (OSError, RuntimeError, ValueError) as cleanup_error:
+                self._record_terminal(action, outcome="failed")
+                raise ActionDispatcherError(
+                    "Gmail connection could not be invalidated safely"
+                ) from cleanup_error
+        self._record_terminal(
+            action, outcome="unknown" if error.may_have_sent else "failed"
+        )
+        raise ActionDispatcherError(
+            "Gmail delivery outcome is unknown"
+            if error.may_have_sent
+            else "Gmail delivery was not accepted",
+            may_have_dispatched=error.may_have_sent,
+        ) from error
+
+    def _raise_unknown_provider_failure(
+        self, action: FrozenActionProposal, error: Exception
+    ) -> None:
+        """Fail closed when trace or an unexpected provider edge is ambiguous."""
+
+        self._record_terminal(action, outcome="unknown")
+        raise ActionDispatcherError(
+            "Gmail delivery outcome is unknown", may_have_dispatched=True
+        ) from error
+
+    def _record_completed_delivery(self, action: FrozenActionProposal) -> None:
+        """Record terminal success; missing evidence keeps the outcome unknown."""
+
         try:
             self._append_audit(
                 action, outcome="completed", execution_status="completed"

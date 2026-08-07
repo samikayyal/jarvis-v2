@@ -1,5 +1,6 @@
 """Ticket01 signed-message seam with the ticket03 audit boundary."""
 
+from .action_dispatch import RoutedActionDispatcher
 from .adapters import (
     ControlledActionDispatcher,
     ControlledOrchestrationAdapter,
@@ -92,6 +93,7 @@ from .models import (
 )
 from .orchestration import AgentsSdkOrchestrationAdapter
 from .ports import (
+    ActionDispatcher,
     ActionDispatcherError,
     AuditWriteError,
     ControlPlaneError,
@@ -121,6 +123,7 @@ __all__ = [
     "GOOGLE_OAUTH_STATE_TTL",
     "GOOGLE_READ_SCOPES",
     "MAX_TRACE_RESERVATION_BYTES",
+    "ActionDispatcher",
     "ActionDispatcherError",
     "AgentsSdkOrchestrationAdapter",
     "AuditEvidence",
@@ -184,6 +187,7 @@ __all__ = [
     "OutboundReply",
     "ReceiveResult",
     "RequestState",
+    "RoutedActionDispatcher",
     "SQLiteAuditBoundary",
     "SQLiteDiagnosticTraceStore",
     "SQLiteDurableStateStore",

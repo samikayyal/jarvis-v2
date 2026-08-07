@@ -111,6 +111,16 @@ class _CancelledBeforeDispatch(OutboundConnectorError):
 class _UnavailableActionDispatcher:
     """Fail closed until a later ticket supplies a concrete capability edge."""
 
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Leave freezing intact so the missing edge fails at dispatch time."""
+
+        return action
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """There is no changing connector state to validate."""
+
+        return
+
     def dispatch(self, action: FrozenActionProposal) -> None:
         raise ActionDispatcherError("no action dispatcher is configured")
 
@@ -294,6 +304,7 @@ class DeterministicCapabilityBroker:
                     return self._auto_authorize_terminal_action(action, message)
             except (
                 AuditWriteError,
+                ActionDispatcherError,
                 DiagnosticTraceError,
                 InvariantViolation,
                 OutboundConnectorError,
@@ -420,12 +431,9 @@ class DeterministicCapabilityBroker:
     def _bind_action_proposal(
         self, proposal: FrozenActionProposal
     ) -> FrozenActionProposal:
-        """Let a closed connector add its current immutable proposal binding."""
+        """Let the typed action surface add its current immutable binding."""
 
-        binder = getattr(self.action_dispatcher, "bind_proposal", None)
-        if not callable(binder):
-            return proposal
-        bound = binder(proposal)
+        bound = self.action_dispatcher.bind_proposal(proposal)
         if not isinstance(bound, FrozenActionProposal):
             raise InvariantViolation("action dispatcher returned an invalid proposal")
         return bound
@@ -998,9 +1006,6 @@ class DeterministicCapabilityBroker:
     ) -> ReceiveResult | None:
         """Invalidate a pending connector action that no longer matches its binding."""
 
-        validator = getattr(self.action_dispatcher, "validate_pending_action", None)
-        if not callable(validator):
-            return None
         frozen = FrozenActionProposal(
             action_id=action.action_id,
             request_id=action.request_id,
@@ -1010,7 +1015,7 @@ class DeterministicCapabilityBroker:
             digest=action.digest,
         )
         try:
-            validator(frozen)
+            self.action_dispatcher.validate_pending_action(frozen)
         except ActionDispatcherError:
             transition = reject_pending_action(session, now=self.clock)
             try:

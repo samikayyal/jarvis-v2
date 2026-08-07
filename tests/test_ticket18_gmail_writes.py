@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -8,7 +9,9 @@ import pytest
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
+    ActionDispatcher,
     ActionDispatcherError,
+    ControlledActionDispatcher,
     ControlledGmailWriteProvider,
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
@@ -27,6 +30,7 @@ from jarvis_control_plane import (
     OAuthCredentialRecord,
     OrchestrationRequest,
     RequestState,
+    RoutedActionDispatcher,
     SignedInboundEvent,
     create_gmail_send_proposal,
 )
@@ -36,6 +40,7 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkPlan,
     AgentsSdkProposal,
 )
+from jarvis_control_plane.sessions import ReadinessState
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
@@ -128,9 +133,22 @@ def _proposal(*, reply: bool = False) -> FrozenActionProposal:
     )
 
 
-def _components(
-    proposal: FrozenActionProposal, dispatcher: GmailWriteConnector
-) -> object:
+def _terminal_proposal() -> FrozenActionProposal:
+    return FrozenActionProposal.create(
+        action_id="terminal-action-001",
+        request_id="request-001",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/touch",
+            "arguments": ["/workspace/output.txt"],
+            "cwd": "/workspace",
+        },
+    )
+
+
+def _components(proposal: FrozenActionProposal, dispatcher: ActionDispatcher) -> object:
     from jarvis_control_plane import ControlledOrchestrationAdapter
 
     return build_receiver_components(
@@ -531,3 +549,103 @@ def test_orchestration_rebuilds_a_canonical_gmail_preview() -> None:
         "Gmail new send\nTo: recipient@example.com"
     )
     assert "untrusted model prose" not in result.proposal.preview
+
+
+def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
+    terminal_dispatcher = ControlledActionDispatcher()
+    gmail_provider = ControlledGmailWriteProvider(
+        result=GmailSendProviderResult(message_id="sent-routed", thread_id="thread-new")
+    )
+
+    terminal_components = _components(
+        _terminal_proposal(),
+        RoutedActionDispatcher(
+            terminal=terminal_dispatcher,
+            gmail=_dispatcher(gmail_provider),
+        ),
+    )
+    terminal_pending = terminal_components.receiver.receive(
+        _event("run the terminal action", suffix="routed-terminal-01")
+    )
+    terminal_session = terminal_components.broker.working_sessions.load()
+    assert terminal_session is not None
+    terminal_components.broker.working_sessions.compare_and_set(
+        terminal_session,
+        replace(
+            terminal_session,
+            readiness=ReadinessState(ubuntu="ready", windows="unavailable"),
+        ),
+    )
+    terminal_approved = terminal_components.receiver.receive(
+        _event("yes", suffix="routed-terminal-02")
+    )
+
+    gmail_components = _components(
+        _proposal(),
+        RoutedActionDispatcher(
+            terminal=ControlledActionDispatcher(),
+            gmail=_dispatcher(gmail_provider),
+        ),
+    )
+    gmail_pending = gmail_components.receiver.receive(
+        _event("send the email", suffix="routed-gmail-01")
+    )
+    gmail_approved = gmail_components.receiver.receive(
+        _event("yes", suffix="routed-gmail-02")
+    )
+
+    assert terminal_pending.disposition == "pending_action"
+    assert terminal_approved.disposition == "action_dispatched"
+    assert len(terminal_dispatcher.dispatched) == 1
+    assert gmail_pending.disposition == "pending_action"
+    assert gmail_approved.disposition == "action_dispatched"
+    assert len(gmail_provider.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("connection_state", "case"),
+    [
+        pytest.param(
+            lambda: GoogleConnectionState(
+                connected=False,
+                generation=1,
+                granted_scopes=frozenset(),
+            ),
+            "disconnected",
+        ),
+        pytest.param(
+            lambda: GoogleConnectionState(
+                connected=True,
+                generation=1,
+                granted_scopes=frozenset(
+                    {"https://www.googleapis.com/auth/calendar.events"}
+                ),
+            ),
+            "missing-gmail-send",
+        ),
+        pytest.param(
+            lambda: (_ for _ in ()).throw(RuntimeError("connection store unavailable")),
+            "connection-state-unavailable",
+        ),
+    ],
+)
+def test_gmail_binding_failures_are_bounded_and_close_the_active_request(
+    connection_state: object, case: str
+) -> None:
+    components = _components(
+        _proposal(),
+        _dispatcher(
+            ControlledGmailWriteProvider(),
+            connection_state=connection_state,
+        ),
+    )
+
+    result = components.receiver.receive(_event("send", suffix=f"binding-{case}"))
+
+    assert result.status_code == 202
+    assert result.disposition == "failed"
+    assert result.request is not None
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    assert session.active_request is None
+    assert session.pending_action is None

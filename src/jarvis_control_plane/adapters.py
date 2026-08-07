@@ -2316,6 +2316,16 @@ class ControlledActionDispatcher:
         self.failure_may_have_dispatched = failure_may_have_dispatched
         self.dispatched: list[FrozenActionProposal] = []
 
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Terminal controlled actions have no external connection binding."""
+
+        return action
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """Terminal controlled actions have no changing connector binding."""
+
+        return
+
     def dispatch(self, action: FrozenActionProposal) -> None:
         if self.failure is not None:
             raise ActionDispatcherError(
