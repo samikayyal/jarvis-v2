@@ -33,6 +33,7 @@ from .ports import (
     ActionDispatcher,
     ActionDispatcherError,
     ActionDispatchHandle,
+    ActionFinalizer,
     AuditBoundary,
     AuditWriteError,
     Clock,
@@ -154,6 +155,15 @@ class _PreparedActionDispatch:
 
     action: FrozenActionProposal
     handle: ActionDispatchHandle
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovedActionDispatch:
+    """Approved action metadata whose external preparation may run unlocked."""
+
+    action: PendingActionState
+    terminal: TerminalAction | None
+    permission_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,8 +696,9 @@ class DeterministicCapabilityBroker:
         """Consume approval and wait for dispatch outside the broker lock."""
 
         # Both human approval and deterministic auto-authorization use this one
-        # lifecycle.  The lock covers approval, the durable ATTEMPTED boundary,
-        # and dispatcher registration; it never covers worker completion.
+        # lifecycle. The lock covers the durable approval boundary, while the
+        # external dispatcher preparation runs unlocked so a stalled transport
+        # cannot block /cancel or /new.
         with self._dispatch_lock:
             current = self._current_working_session()
             if current.pending_action is None:
@@ -697,20 +708,34 @@ class DeterministicCapabilityBroker:
                 )
             if current.pending_action.is_expired(self.clock):
                 return self._expire_pending_action(message, current)
-            prepared_or_result = self._approve_and_prepare_pending_action(
-                message, current, choice
-            )
+            approved_or_result = self._approve_pending_action(message, current, choice)
+        if isinstance(approved_or_result, ReceiveResult):
+            return approved_or_result
+        prepared_or_result = self._prepare_approved_dispatch(
+            message=message,
+            action=approved_or_result.action,
+            terminal=approved_or_result.terminal,
+            permission_id=approved_or_result.permission_id,
+        )
         if isinstance(prepared_or_result, ReceiveResult):
             return prepared_or_result
+        if not self._dispatch_is_still_attempted(prepared_or_result.action.action_id):
+            self._release_prepared_dispatch(prepared_or_result.action.action_id)
+            self._finalize_dispatch(prepared_or_result.action.action_id)
+            return self._late_action_result(
+                message,
+                prepared_or_result,
+                reason="worker registration completed after cancellation",
+            )
         return self._run_prepared_action(message, prepared_or_result)
 
-    def _approve_and_prepare_pending_action(
+    def _approve_pending_action(
         self,
         message: InboundMessage,
         session: WorkingSession,
         choice: object,
-    ) -> _PreparedActionDispatch | ReceiveResult:
-        """Own approval semantics and publish one cancellable dispatch handle."""
+    ) -> _ApprovedActionDispatch | ReceiveResult:
+        """Own approval semantics before any external dispatcher is called."""
 
         action = session.pending_action
         request = session.active_request
@@ -876,8 +901,7 @@ class DeterministicCapabilityBroker:
                 reason=f"pending action approval was not recorded: {exc}",
             )
 
-        return self._prepare_approved_dispatch(
-            message=message,
+        return _ApprovedActionDispatch(
             action=action,
             terminal=terminal,
             permission_id=permission_id,
@@ -891,7 +915,47 @@ class DeterministicCapabilityBroker:
         terminal: TerminalAction | None,
         permission_id: str | None,
     ) -> _PreparedActionDispatch | ReceiveResult:
-        """Run readiness and atomically publish the cancellable dispatch handle."""
+        """Prepare a dispatcher outside the broker's cancellation barrier."""
+
+        with self._dispatch_lock:
+            frozen_or_result = self._prepare_approved_dispatch_boundary(
+                message=message,
+                action=action,
+                terminal=terminal,
+                permission_id=permission_id,
+            )
+        if isinstance(frozen_or_result, ReceiveResult):
+            return frozen_or_result
+        try:
+            handle = self.action_dispatcher.prepare(frozen_or_result)
+            if not isinstance(handle, ActionDispatchHandle):
+                raise ActionDispatcherError(
+                    "action dispatcher returned an invalid dispatch handle"
+                )
+        except ActionDispatcherError as exc:
+            terminal_status = _dispatch_failure_status(exc)
+            if not self._finish_frozen_action(action.action_id, terminal_status):
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_unknown",
+                    reason="dispatcher failed and terminal state could not be persisted",
+                )
+            return ReceiveResult(
+                status_code=202,
+                disposition=_dispatch_disposition(terminal_status),
+                reason=str(exc),
+            )
+        return _PreparedActionDispatch(action=frozen_or_result, handle=handle)
+
+    def _prepare_approved_dispatch_boundary(
+        self,
+        *,
+        message: InboundMessage,
+        action: PendingActionState,
+        terminal: TerminalAction | None,
+        permission_id: str | None,
+    ) -> FrozenActionProposal | ReceiveResult:
+        """Run readiness and record the durable dispatch-attempt boundary."""
 
         dispatching = self._current_working_session()
         if permission_id is not None:
@@ -993,26 +1057,7 @@ class DeterministicCapabilityBroker:
             payload=record.payload or "",
             digest=record.digest,
         )
-        try:
-            handle = self.action_dispatcher.prepare(frozen_dispatch)
-            if not isinstance(handle, ActionDispatchHandle):
-                raise ActionDispatcherError(
-                    "action dispatcher returned an invalid dispatch handle"
-                )
-        except ActionDispatcherError as exc:
-            terminal_status = _dispatch_failure_status(exc)
-            if not self._finish_frozen_action(action.action_id, terminal_status):
-                return ReceiveResult(
-                    status_code=202,
-                    disposition="action_dispatch_unknown",
-                    reason="dispatcher failed and terminal state could not be persisted",
-                )
-            return ReceiveResult(
-                status_code=202,
-                disposition=_dispatch_disposition(terminal_status),
-                reason=str(exc),
-            )
-        return _PreparedActionDispatch(action=frozen_dispatch, handle=handle)
+        return frozen_dispatch
 
     def _run_prepared_action(
         self, message: InboundMessage, prepared: _PreparedActionDispatch
@@ -1055,6 +1100,17 @@ class DeterministicCapabilityBroker:
             )
         return ReceiveResult(status_code=202, disposition="action_dispatched")
 
+    def _dispatch_is_still_attempted(self, action_id: str) -> bool:
+        """Check that cancellation did not close the edge while it prepared."""
+
+        with self._dispatch_lock:
+            current = self._current_working_session()
+            record = next(
+                (item for item in current.action_outbox if item.action_id == action_id),
+                None,
+            )
+            return record is not None and record.status is DispatchStatus.ATTEMPTED
+
     def _release_prepared_dispatch(self, action_id: str) -> None:
         """Close a prepared edge when trace admission fails before dispatch."""
 
@@ -1083,6 +1139,7 @@ class DeterministicCapabilityBroker:
             None,
         )
         if record is not None and record.status is DispatchStatus.CANCELLED:
+            self._finalize_dispatch(prepared.action.action_id)
             self._best_effort_audit(
                 kind="late_result_ignored",
                 event_id=message.event_id,
@@ -1103,12 +1160,16 @@ class DeterministicCapabilityBroker:
             DispatchStatus.CANCELLING,
             DispatchStatus.UNKNOWN,
         }:
+            if record.status is DispatchStatus.UNKNOWN:
+                self._finalize_dispatch(prepared.action.action_id)
             return ReceiveResult(
                 status_code=202,
                 disposition="action_dispatch_unknown",
                 reason="worker result arrived after an uncertain cancellation: "
                 + reason,
             )
+        if record is not None and not record.is_open:
+            self._finalize_dispatch(prepared.action.action_id)
         return ReceiveResult(
             status_code=202,
             disposition="action_dispatch_unknown",
@@ -1186,7 +1247,18 @@ class DeterministicCapabilityBroker:
                 self.working_sessions.compare_and_set(current, transition.state)
             except (InvariantViolation, SessionStoreError):
                 return False
-            return True
+        self._finalize_dispatch(action_id)
+        return True
+
+    def _finalize_dispatch(self, action_id: str) -> None:
+        """Run an optional transport retirement handshake after durable closure."""
+
+        if not isinstance(self.action_dispatcher, ActionFinalizer):
+            return
+        try:
+            self.action_dispatcher.finalize(action_id=action_id)
+        except Exception:  # noqa: BLE001 - bounded retention is the fallback
+            return
 
     @staticmethod
     def _unavailable_terminal_host(

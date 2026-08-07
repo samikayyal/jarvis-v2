@@ -68,6 +68,8 @@ class WorkerExecutionLimits:
     stderr_limit_bytes: int = 1024 * 1024
     cancellation_grace_seconds: int = 10
     authentication_timeout_seconds: int = 10
+    registration_timeout_seconds: int = 10
+    action_state_retention_seconds: int = 15 * 60
     progress_event_limit: int = 128
     milestone_limit_bytes: int = 4 * 1024
 
@@ -80,6 +82,8 @@ class WorkerExecutionLimits:
                 self.stderr_limit_bytes,
                 self.cancellation_grace_seconds,
                 self.authentication_timeout_seconds,
+                self.registration_timeout_seconds,
+                self.action_state_retention_seconds,
                 self.progress_event_limit,
                 self.milestone_limit_bytes,
             )
@@ -93,6 +97,16 @@ class WorkerExecutionLimits:
             raise ValueError(
                 "worker authentication timeout must be between one and 30 seconds"
             )
+        if not 1 <= self.registration_timeout_seconds <= 30:
+            raise ValueError(
+                "worker registration timeout must be between one and 30 seconds"
+            )
+        if not self.registration_timeout_seconds <= self.action_state_retention_seconds:
+            raise ValueError(
+                "worker action-state retention must cover registration timeout"
+            )
+        if self.action_state_retention_seconds > 30 * 24 * 60 * 60:
+            raise ValueError("worker action-state retention cannot exceed 30 days")
         if self.stdout_limit_bytes != 1024 * 1024:
             raise ValueError("worker stdout limit is fixed at one MiB")
         if self.stderr_limit_bytes != 1024 * 1024:
@@ -249,18 +263,31 @@ class WorkerTransport(Protocol):
     """Authenticated, readiness-checking transport for one registered worker.
 
     ``register_execution`` creates a transport-owned pending record for the
-    action identifier. ``execute`` and ``cancel`` must atomically compete for
-    that record: cancellation that wins creates a tombstone, returns
+    action identifier and must enforce the supplied deadline internally. The
+    action-state retention bound is part of the reservation contract: terminal
+    states and cancellation tombstones may be retained for that period, but
+    not indefinitely. ``execute`` and ``cancel`` must atomically compete for
+    the record: cancellation that wins creates a tombstone, returns
     ``NOT_STARTED``, and prevents any later execute for the same identifier
-    from starting. ``authenticate`` must perform the transport's readiness
-    probe and enforce its supplied deadline internally. ``cancel`` has the
-    same deadline obligation; the gateway never abandons an unbounded
-    transport call in a helper thread. All methods must return an identity,
-    execution result, or cancellation result only when the transport has
-    enough evidence to do so.
+    from starting. ``finalize_execution`` is the broker's explicit retirement
+    handshake after durable terminal reconciliation. It must make a late
+    registration or execution for the finalized identifier non-executable and
+    may retain only a bounded retirement marker. Action identifiers are never
+    reused by the broker after finalization. ``authenticate`` must perform the
+    transport's readiness probe and enforce its supplied deadline internally.
+    ``cancel`` has the same deadline obligation; the gateway never abandons an
+    unbounded transport call in a helper thread. All methods must return an
+    identity, execution result, or cancellation result only when the transport
+    has enough evidence to do so.
     """
 
-    def register_execution(self, *, action_id: str) -> None: ...
+    def register_execution(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> None: ...
 
     def authenticate(
         self, *, selected_host: str, timeout_seconds: int
@@ -271,8 +298,20 @@ class WorkerTransport(Protocol):
     ) -> WorkerExecutionResult: ...
 
     def cancel(
-        self, *, action_id: str, timeout_seconds: int
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
     ) -> ActionCancellationResult: ...
+
+    def finalize_execution(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> None: ...
 
 
 class _WorkerDispatchHandle:
@@ -287,6 +326,7 @@ class _WorkerDispatchHandle:
         expected_identity: WorkerIdentity,
         limits: WorkerExecutionLimits,
         unregister: Callable[[str, _WorkerDispatchHandle], None],
+        forget: Callable[[str, _WorkerDispatchHandle], None],
     ) -> None:
         self.action = action
         self.terminal = terminal
@@ -294,6 +334,7 @@ class _WorkerDispatchHandle:
         self.expected_identity = expected_identity
         self.limits = limits
         self._unregister = unregister
+        self._forget = forget
         self._lock = RLock()
         self._cancel_lock = RLock()
         self._cancel_requested = Event()
@@ -302,6 +343,8 @@ class _WorkerDispatchHandle:
         self._run_called = False
         self._execute_submitted = False
         self._cancel_result: ActionCancellationResult | None = None
+        self._finalize_requested = False
+        self._transport_finalized = False
         self._result: WorkerExecutionResult | None = None
         self._failure: BaseException | None = None
         self._progress_lock = RLock()
@@ -316,6 +359,10 @@ class _WorkerDispatchHandle:
                 raise ActionDispatcherError(
                     "worker dispatch handle was already consumed",
                     may_have_dispatched=True,
+                )
+            if self._finalize_requested or self._transport_finalized:
+                raise ActionDispatcherError(
+                    "worker dispatch handle was finalized before execution"
                 )
             self._run_called = True
             if self._cancel_requested.is_set():
@@ -357,6 +404,7 @@ class _WorkerDispatchHandle:
                 self._finished.set()
                 self._wake.set()
                 self._unregister(self.action.action_id, self)
+                self._finalize_if_requested()
 
         try:
             Thread(target=execute, daemon=True).start()
@@ -427,6 +475,7 @@ class _WorkerDispatchHandle:
                 value = self.worker.cancel(
                     action_id=self.action.action_id,
                     timeout_seconds=self.limits.cancellation_grace_seconds,
+                    retention_seconds=self.limits.action_state_retention_seconds,
                 )
             except (ActionDispatcherError, TimeoutError, TypeError, ValueError):
                 value = None
@@ -439,6 +488,38 @@ class _WorkerDispatchHandle:
             if not run_called:
                 self._unregister(self.action.action_id, self)
             return result
+
+    def finalize(self) -> None:
+        """Retire the transport state after durable broker reconciliation."""
+
+        with self._lock:
+            if self._transport_finalized:
+                return
+            self._finalize_requested = True
+            if self._execute_submitted and not self._finished.is_set():
+                return
+        self._finalize_transport()
+
+    def _finalize_if_requested(self) -> None:
+        with self._lock:
+            if not self._finalize_requested or self._transport_finalized:
+                return
+        self._finalize_transport()
+
+    def _finalize_transport(self) -> None:
+        try:
+            self.worker.finalize_execution(
+                action_id=self.action.action_id,
+                timeout_seconds=self.limits.registration_timeout_seconds,
+                retention_seconds=self.limits.action_state_retention_seconds,
+            )
+        except BaseException:  # noqa: BLE001 - cleanup cannot change the outcome
+            # The transport owns the bounded fallback retention policy. A
+            # cleanup failure must not change the already durable action result.
+            return
+        with self._lock:
+            self._transport_finalized = True
+        self._forget(self.action.action_id, self)
 
     def _wait_for_completion(self, timeout_seconds: int) -> str:
         deadline = monotonic() + timeout_seconds
@@ -579,6 +660,7 @@ class WorkerGateway:
         self._registered_identities = dict(registered_identities)
         self._limits = limits or WorkerExecutionLimits()
         self._running: dict[str, _WorkerDispatchHandle] = {}
+        self._handles: dict[str, _WorkerDispatchHandle] = {}
         self._lock = RLock()
 
     def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
@@ -596,15 +678,43 @@ class WorkerGateway:
             expected_identity=expected,
             limits=self._limits,
             unregister=self._unregister,
+            forget=self._forget_handle,
         )
         with self._lock:
-            if action.action_id in self._running:
+            if action.action_id in self._handles:
                 raise ActionDispatcherError(
                     f"worker action {action.action_id} is already prepared",
                     may_have_dispatched=True,
                 )
-            worker.register_execution(action_id=action.action_id)
+            # Publish the local cancellation handle before entering the
+            # transport. A bounded or stalled registration must remain
+            # cancellable and cannot hide behind this lock.
+            self._handles[action.action_id] = handle
             self._running[action.action_id] = handle
+        try:
+            worker.register_execution(
+                action_id=action.action_id,
+                timeout_seconds=self._limits.registration_timeout_seconds,
+                retention_seconds=self._limits.action_state_retention_seconds,
+            )
+        except TimeoutError as exc:
+            handle.finalize()
+            raise ActionDispatcherError(
+                f"worker action {action.action_id} registration timed out"
+            ) from exc
+        except ActionDispatcherError:
+            handle.finalize()
+            raise
+        except (TypeError, ValueError) as exc:
+            handle.finalize()
+            raise ActionDispatcherError(
+                f"worker action {action.action_id} registration failed"
+            ) from exc
+        except BaseException as exc:
+            handle.finalize()
+            raise ActionDispatcherError(
+                f"worker action {action.action_id} registration failed"
+            ) from exc
         return handle
 
     def dispatch(self, action: FrozenActionProposal) -> WorkerExecutionResult:
@@ -621,10 +731,23 @@ class WorkerGateway:
             return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         return running.cancel()
 
+    def finalize(self, *, action_id: str) -> None:
+        """Retire transport state after the broker durably closes an action."""
+
+        with self._lock:
+            handle = self._handles.get(action_id)
+        if handle is not None:
+            handle.finalize()
+
     def _unregister(self, action_id: str, handle: _WorkerDispatchHandle) -> None:
         with self._lock:
             if self._running.get(action_id) is handle:
                 del self._running[action_id]
+
+    def _forget_handle(self, action_id: str, handle: _WorkerDispatchHandle) -> None:
+        with self._lock:
+            if self._handles.get(action_id) is handle:
+                del self._handles[action_id]
 
 
 class _WorkerTransportActionState(str, Enum):
@@ -634,6 +757,21 @@ class _WorkerTransportActionState(str, Enum):
     RUNNING = "running"
     CANCELLATION_TOMBSTONE = "cancellation_tombstone"
     TERMINAL = "terminal"
+    FINALIZED = "finalized"
+
+
+@dataclass(slots=True)
+class _WorkerTransportActionRecord:
+    state: _WorkerTransportActionState
+    retention_seconds: int
+    expires_at: float | None = None
+    finalize_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedCancellation:
+    result: ActionCancellationResult
+    expires_at: float
 
 
 class ControlledWorkerTransport:
@@ -648,6 +786,7 @@ class ControlledWorkerTransport:
         | None = None,
         progress_hook: Callable[[WorkerProgressSink], None] | None = None,
         on_cancel: Callable[[str], ActionCancellationResult | None] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.identities = dict(identities)
         self.result = result or WorkerExecutionResult.completed()
@@ -657,20 +796,35 @@ class ControlledWorkerTransport:
         self.invocations: list[WorkerInvocation] = []
         self.executions: list[TerminalAction] = []
         self.cancelled: list[str] = []
+        self.registrations: list[tuple[str, int, int]] = []
+        self.finalizations: list[str] = []
+        self._clock = clock or monotonic
         self._action_state_lock = RLock()
-        self._action_states: dict[str, _WorkerTransportActionState] = {}
-        self._cancel_results: dict[str, ActionCancellationResult] = {}
+        self._action_states: dict[str, _WorkerTransportActionRecord] = {}
+        self._cancel_results: dict[str, _RetainedCancellation] = {}
 
-    def register_execution(self, *, action_id: str) -> None:
+    def register_execution(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> None:
         """Reserve an action ID before the gateway exposes its handle."""
 
         with self._action_state_lock:
+            self._prune_expired_locked()
             if action_id in self._action_states:
                 raise ActionDispatcherError(
                     f"worker action {action_id} is already registered",
                     may_have_dispatched=True,
                 )
-            self._action_states[action_id] = _WorkerTransportActionState.RESERVED
+            self._validate_retention(retention_seconds)
+            self.registrations.append((action_id, timeout_seconds, retention_seconds))
+            self._action_states[action_id] = _WorkerTransportActionRecord(
+                state=_WorkerTransportActionState.RESERVED,
+                retention_seconds=retention_seconds,
+            )
 
     def authenticate(
         self, *, selected_host: str, timeout_seconds: int
@@ -686,7 +840,9 @@ class ControlledWorkerTransport:
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
     ) -> WorkerExecutionResult:
         with self._action_state_lock:
-            state = self._action_states.get(invocation.action_id)
+            self._prune_expired_locked()
+            record = self._action_states.get(invocation.action_id)
+            state = record.state if record is not None else None
             if state is _WorkerTransportActionState.CANCELLATION_TOMBSTONE:
                 return WorkerExecutionResult(
                     status=WorkerExecutionStatus.CANCELLED,
@@ -701,9 +857,8 @@ class ControlledWorkerTransport:
                         _WorkerTransportActionState.TERMINAL,
                     },
                 )
-            self._action_states[invocation.action_id] = (
-                _WorkerTransportActionState.RUNNING
-            )
+            assert record is not None
+            record.state = _WorkerTransportActionState.RUNNING
             self.invocations.append(invocation)
             self.executions.append(invocation.action)
         try:
@@ -714,33 +869,57 @@ class ControlledWorkerTransport:
             return self.result
         finally:
             with self._action_state_lock:
-                self._action_states[invocation.action_id] = (
-                    _WorkerTransportActionState.TERMINAL
-                )
+                record = self._action_states.get(invocation.action_id)
+                if record is not None:
+                    record.state = (
+                        _WorkerTransportActionState.FINALIZED
+                        if record.finalize_requested
+                        else _WorkerTransportActionState.TERMINAL
+                    )
+                    record.expires_at = self._clock() + record.retention_seconds
 
     def cancel(
-        self, *, action_id: str, timeout_seconds: int
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
     ) -> ActionCancellationResult:
         with self._action_state_lock:
+            self._prune_expired_locked()
             cached = self._cancel_results.get(action_id)
             if cached is not None:
-                return cached
-            state = self._action_states.get(action_id)
+                return cached.result
+            self._validate_retention(retention_seconds)
+            record = self._action_states.get(action_id)
+            state = record.state if record is not None else None
             if state in {
                 None,
                 _WorkerTransportActionState.RESERVED,
                 _WorkerTransportActionState.CANCELLATION_TOMBSTONE,
             }:
-                self._action_states[action_id] = (
-                    _WorkerTransportActionState.CANCELLATION_TOMBSTONE
-                )
+                if record is None:
+                    record = _WorkerTransportActionRecord(
+                        state=_WorkerTransportActionState.CANCELLATION_TOMBSTONE,
+                        retention_seconds=retention_seconds,
+                    )
+                    self._action_states[action_id] = record
+                else:
+                    record.state = _WorkerTransportActionState.CANCELLATION_TOMBSTONE
+                record.expires_at = self._clock() + record.retention_seconds
                 result = ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
-                self._cancel_results[action_id] = result
+                self._retain_cancellation_locked(action_id, result, record)
+                self.cancelled.append(action_id)
+                return result
+            if state is _WorkerTransportActionState.FINALIZED:
+                result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+                self._retain_cancellation_locked(action_id, result, record)
                 self.cancelled.append(action_id)
                 return result
             if state is _WorkerTransportActionState.TERMINAL:
                 result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
-                self._cancel_results[action_id] = result
+                assert record is not None
+                self._retain_cancellation_locked(action_id, result, record)
                 self.cancelled.append(action_id)
                 return result
             self.cancelled.append(action_id)
@@ -756,8 +935,85 @@ class ControlledWorkerTransport:
         else:
             result = ActionCancellationResult(ActionCancellationStatus.STOPPED)
         with self._action_state_lock:
-            self._cancel_results[action_id] = result
+            record = self._action_states.get(action_id)
+            if record is not None:
+                self._retain_cancellation_locked(action_id, result, record)
         return result
+
+    def finalize_execution(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> None:
+        """Retire terminal state while fencing delayed registration/execution."""
+
+        del timeout_seconds  # The controlled transport has no remote hop.
+        with self._action_state_lock:
+            self._prune_expired_locked()
+            self._validate_retention(retention_seconds)
+            record = self._action_states.get(action_id)
+            if record is None:
+                record = _WorkerTransportActionRecord(
+                    state=_WorkerTransportActionState.FINALIZED,
+                    retention_seconds=retention_seconds,
+                )
+                self._action_states[action_id] = record
+            elif record.state is _WorkerTransportActionState.RUNNING:
+                if not record.finalize_requested:
+                    record.finalize_requested = True
+                    self.finalizations.append(action_id)
+                record.expires_at = self._clock() + record.retention_seconds
+                return
+            else:
+                if record.state is _WorkerTransportActionState.FINALIZED:
+                    return
+                record.state = _WorkerTransportActionState.FINALIZED
+            record.expires_at = self._clock() + record.retention_seconds
+            self._cancel_results.pop(action_id, None)
+            self.finalizations.append(action_id)
+
+    def _prune_expired_locked(self) -> None:
+        now = self._clock()
+        expired_cancellations = tuple(
+            action_id
+            for action_id, retained in self._cancel_results.items()
+            if retained.expires_at <= now
+        )
+        for action_id in expired_cancellations:
+            self._cancel_results.pop(action_id, None)
+        expired = tuple(
+            action_id
+            for action_id, record in self._action_states.items()
+            if record.expires_at is not None and record.expires_at <= now
+        )
+        for action_id in expired:
+            self._action_states.pop(action_id, None)
+            self._cancel_results.pop(action_id, None)
+
+    @staticmethod
+    def _validate_retention(retention_seconds: int) -> None:
+        if (
+            isinstance(retention_seconds, bool)
+            or not isinstance(retention_seconds, int)
+            or retention_seconds < 1
+        ):
+            raise ValueError("worker action-state retention must be positive")
+
+    def _retain_cancellation_locked(
+        self,
+        action_id: str,
+        result: ActionCancellationResult,
+        record: _WorkerTransportActionRecord,
+    ) -> None:
+        expires_at = record.expires_at
+        if expires_at is None:
+            expires_at = self._clock() + record.retention_seconds
+        self._cancel_results[action_id] = _RetainedCancellation(
+            result=result,
+            expires_at=expires_at,
+        )
 
 
 def _terminal_action(action: FrozenActionProposal) -> TerminalAction:

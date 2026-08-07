@@ -86,6 +86,7 @@ from .ports import (
     ActionCancellationStatus,
     ActionDispatcherError,
     ActionDispatchHandle,
+    ActionFinalizer,
     AuditWriteError,
     ControlPlaneError,
     DiagnosticTraceError,
@@ -119,6 +120,7 @@ from .worker_gateway import (
     WorkerProgressEvent,
     WorkerProgressKind,
     WorkerProgressSink,
+    WorkerTransport,
 )
 
 __all__ = [
@@ -131,6 +133,7 @@ __all__ = [
     "ActionCancellationStatus",
     "ActionDispatchHandle",
     "ActionDispatcherError",
+    "ActionFinalizer",
     "AgentsSdkOrchestrationAdapter",
     "AuditEvidence",
     "AuditFilter",
@@ -222,6 +225,7 @@ __all__ = [
     "WorkerProgressEvent",
     "WorkerProgressKind",
     "WorkerProgressSink",
+    "WorkerTransport",
     "build_live_google_read_connector",
     "sign_body",
 ]

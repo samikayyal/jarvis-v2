@@ -249,6 +249,13 @@ class ActionDispatcher(Protocol):
     def cancel(self, *, action_id: str) -> ActionCancellationResult: ...
 
 
+@runtime_checkable
+class ActionFinalizer(Protocol):
+    """Optional retirement handshake for dispatchers with transport state."""
+
+    def finalize(self, *, action_id: str) -> None: ...
+
+
 class ModelAvailabilityProvider(Protocol):
     """Authoritative provider access/availability check for exact runtime choices."""
 
