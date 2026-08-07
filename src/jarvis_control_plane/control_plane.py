@@ -285,7 +285,7 @@ class DeterministicCapabilityBroker:
 
         if result.proposal is not None:
             try:
-                action = self.freeze_action(result.proposal)
+                action = self.freeze_action(self._bind_action_proposal(result.proposal))
                 self._present_action(action, message)
                 if action.policy_disposition in {
                     TerminalDisposition.SAFE_READ.value,
@@ -416,6 +416,19 @@ class DeterministicCapabilityBroker:
                 continue
             return action
         raise SessionStoreError("pending action could not be frozen atomically")
+
+    def _bind_action_proposal(
+        self, proposal: FrozenActionProposal
+    ) -> FrozenActionProposal:
+        """Let a closed connector add its current immutable proposal binding."""
+
+        binder = getattr(self.action_dispatcher, "bind_proposal", None)
+        if not callable(binder):
+            return proposal
+        bound = binder(proposal)
+        if not isinstance(bound, FrozenActionProposal):
+            raise InvariantViolation("action dispatcher returned an invalid proposal")
+        return bound
 
     def _present_action(
         self, action: PendingActionState, message: InboundMessage
@@ -663,6 +676,12 @@ class DeterministicCapabilityBroker:
                     reason=f"pending action rejection was not recorded: {exc}",
                 )
             return ReceiveResult(status_code=202, disposition="action_rejected")
+
+        invalidated = self._invalidate_changed_connector_action(
+            message, session, action
+        )
+        if invalidated is not None:
+            return invalidated
 
         transition = approve_pending_action(session, now=self.clock)
         approved_state = transition.state
@@ -970,6 +989,57 @@ class DeterministicCapabilityBroker:
             disposition="permission_revoked",
             reason="the exact command permission was revoked before dispatch",
         )
+
+    def _invalidate_changed_connector_action(
+        self,
+        message: InboundMessage,
+        session: WorkingSession,
+        action: PendingActionState,
+    ) -> ReceiveResult | None:
+        """Invalidate a pending connector action that no longer matches its binding."""
+
+        validator = getattr(self.action_dispatcher, "validate_pending_action", None)
+        if not callable(validator):
+            return None
+        frozen = FrozenActionProposal(
+            action_id=action.action_id,
+            request_id=action.request_id,
+            kind=action.kind,
+            preview=action.preview or "",
+            payload=action.payload,
+            digest=action.digest,
+        )
+        try:
+            validator(frozen)
+        except ActionDispatcherError:
+            transition = reject_pending_action(session, now=self.clock)
+            try:
+                self._commit_session_with_audit(
+                    session,
+                    transition.state,
+                    kind="pending_action",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome="rejected",
+                    actor="control_plane",
+                    operation_type="approval_gated_action",
+                    target_category="pending_action",
+                    approval_decision="invalidated",
+                    details={"action": action.action_id, "state": "rejected"},
+                )
+            except (AuditWriteError, SessionStoreError) as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"changed connector action was not invalidated: {exc}",
+                )
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_invalidated",
+                reason="connector connection changed after the proposal was frozen",
+            )
+        return None
 
     def _proposal_choices(self, action: PendingActionState) -> str:
         if action.policy_disposition in {

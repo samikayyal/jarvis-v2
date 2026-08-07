@@ -17,17 +17,20 @@ from jarvis_control_plane import (
     GmailApiWriteProvider,
     GmailSendProviderResult,
     GmailWriteConnector,
+    GoogleConnectionState,
     GoogleReadHttpResponse,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryGoogleCredentialStore,
+    InMemoryGoogleOAuthStateStore,
     OAuthCredentialRecord,
     OrchestrationRequest,
     RequestState,
     SignedInboundEvent,
     create_gmail_send_proposal,
 )
+from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
@@ -71,7 +74,15 @@ def _dispatcher(
     provider: ControlledGmailWriteProvider,
     *,
     audit: InMemoryAuditBoundary | None = None,
+    connection_state: object | None = None,
 ) -> GmailWriteConnector:
+    connection_state = connection_state or (
+        lambda: GoogleConnectionState(
+            connected=True,
+            generation=1,
+            granted_scopes=frozenset({"https://www.googleapis.com/auth/gmail.send"}),
+        )
+    )
     return GmailWriteConnector(
         configured_identity=IDENTITY,
         credential_store=InMemoryGoogleCredentialStore(
@@ -88,6 +99,7 @@ def _dispatcher(
         trace=_trace(),
         clock=FixedClock(NOW),
         ids=DeterministicIdGenerator("ticket18-gmail"),
+        connection_state=connection_state,  # type: ignore[arg-type]
     )
 
 
@@ -226,6 +238,180 @@ def test_mismatched_thread_is_unknown_and_a_replay_never_sends_a_replacement() -
     assert len(provider.calls) == 1
 
 
+def test_reconnected_google_generation_invalidates_a_frozen_gmail_action() -> None:
+    connection = InMemoryGoogleOAuthStateStore()
+    connected = connection.set_connection(
+        connected=True,
+        granted_scopes=frozenset({"https://www.googleapis.com/auth/gmail.send"}),
+    )
+    provider = ControlledGmailWriteProvider()
+    components = _components(
+        _proposal(),
+        _dispatcher(provider, connection_state=connection.get_connection),
+    )
+
+    pending = components.receiver.receive(_event("send", suffix="01"))
+    action = components.broker.current_pending_action
+    assert pending.disposition == "pending_action"
+    assert action is not None
+    assert json.loads(action.payload or "{}") == {
+        "bcc": ["blind@example.com"],
+        "body": "Hello\n\nPlease review the attached plan.",
+        "cc": ["copy@example.com"],
+        "connection_generation": connected.generation,
+        "google_subject": IDENTITY,
+        "mime_type": "text/plain",
+        "subject": "Quarterly check-in",
+        "threading": "new_message",
+        "to": ["recipient@example.com"],
+    }
+    connection.set_connection(
+        connected=True,
+        granted_scopes=frozenset({"https://www.googleapis.com/auth/gmail.send"}),
+    )
+
+    stale = components.receiver.receive(_event("yes", suffix="02"))
+
+    assert stale.disposition == "action_invalidated"
+    assert provider.calls == []
+
+
+def test_manual_trace_retains_complete_credential_bearing_gmail_provider_exchange() -> (
+    None
+):
+    class Transport:
+        def __init__(self) -> None:
+            self.responses = [
+                GoogleReadHttpResponse(
+                    status_code=200,
+                    headers={"Content-Type": "application/json"},
+                    body=b'{"access_token":"controlled-access-token"}',
+                ),
+                GoogleReadHttpResponse(
+                    status_code=200,
+                    headers={"Content-Type": "application/json"},
+                    body=b'{"id":"sent-traced","threadId":"thread-new"}',
+                ),
+            ]
+
+        def request(self, **_kwargs: object) -> GoogleReadHttpResponse:
+            return self.responses.pop(0)
+
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(
+        writer=trace_store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-trace-evidence"),
+    )
+    connection = InMemoryGoogleOAuthStateStore()
+    connection.set_connection(
+        connected=True,
+        granted_scopes=frozenset({"https://www.googleapis.com/auth/gmail.send"}),
+    )
+    connector = GmailWriteConnector(
+        configured_identity=IDENTITY,
+        credential_store=InMemoryGoogleCredentialStore(
+            OAuthCredentialRecord(
+                subject=IDENTITY,
+                granted_scopes=frozenset(
+                    {"https://www.googleapis.com/auth/gmail.send"}
+                ),
+                refresh_token="controlled-refresh-token",
+            )
+        ),
+        provider=GmailApiWriteProvider(
+            client_id="controlled-client-id",
+            client_secret="controlled-client-secret",
+            transport=Transport(),
+        ),
+        audit=InMemoryAuditBoundary(),
+        trace=trace,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-gmail-evidence"),
+        connection_state=connection.get_connection,
+    )
+
+    connector.dispatch(connector.bind_proposal(_proposal()))
+
+    trace_payload = str(
+        _open_manual_trace_boundary(trace_store)
+        .list_traces(operation_type="gmail_write_connector")[0]
+        .to_mapping()
+    )
+    assert "controlled-refresh-token" in trace_payload
+    assert "controlled-access-token" in trace_payload
+    assert "controlled-client-secret" in trace_payload
+    assert "sent-traced" in trace_payload
+
+
+def test_manual_trace_retains_gmail_provider_error_evidence() -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.responses = [
+                GoogleReadHttpResponse(
+                    status_code=200,
+                    headers={"Content-Type": "application/json"},
+                    body=b'{"access_token":"controlled-access-token"}',
+                ),
+                GoogleReadHttpResponse(
+                    status_code=503,
+                    headers={"Content-Type": "application/json"},
+                    body=b'{"error":"controlled-provider-failure"}',
+                ),
+            ]
+
+        def request(self, **_kwargs: object) -> GoogleReadHttpResponse:
+            return self.responses.pop(0)
+
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(
+        writer=trace_store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-trace-failure"),
+    )
+    connection = InMemoryGoogleOAuthStateStore()
+    connection.set_connection(
+        connected=True,
+        granted_scopes=frozenset({"https://www.googleapis.com/auth/gmail.send"}),
+    )
+    connector = GmailWriteConnector(
+        configured_identity=IDENTITY,
+        credential_store=InMemoryGoogleCredentialStore(
+            OAuthCredentialRecord(
+                subject=IDENTITY,
+                granted_scopes=frozenset(
+                    {"https://www.googleapis.com/auth/gmail.send"}
+                ),
+                refresh_token="controlled-refresh-token",
+            )
+        ),
+        provider=GmailApiWriteProvider(
+            client_id="controlled-client-id",
+            client_secret="controlled-client-secret",
+            transport=Transport(),
+        ),
+        audit=InMemoryAuditBoundary(),
+        trace=trace,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-gmail-failure"),
+        connection_state=connection.get_connection,
+    )
+
+    with pytest.raises(ActionDispatcherError) as caught:
+        connector.dispatch(connector.bind_proposal(_proposal()))
+
+    assert caught.value.may_have_dispatched is True
+    trace_payload = str(
+        _open_manual_trace_boundary(trace_store)
+        .list_traces(operation_type="gmail_write_connector")[0]
+        .to_mapping()
+    )
+    assert "controlled-refresh-token" in trace_payload
+    assert "controlled-access-token" in trace_payload
+    assert "controlled-client-secret" in trace_payload
+    assert "controlled-provider-failure" in trace_payload
+
+
 def test_terminal_audit_failure_after_a_send_is_reported_unknown_without_retry() -> (
     None
 ):
@@ -239,7 +425,7 @@ def test_terminal_audit_failure_after_a_send_is_reported_unknown_without_retry()
     dispatcher = _dispatcher(provider, audit=CompletedWriteAuditFailure())
 
     with pytest.raises(ActionDispatcherError) as caught:
-        dispatcher.dispatch(_proposal())
+        dispatcher.dispatch(dispatcher.bind_proposal(_proposal()))
 
     assert caught.value.may_have_dispatched is True
     assert len(provider.calls) == 1
@@ -270,7 +456,7 @@ def test_live_provider_posts_only_raw_frozen_rfc822_message_and_thread_id() -> N
     )
     dispatcher = _dispatcher(provider)  # type: ignore[arg-type]
 
-    dispatcher.dispatch(_proposal(reply=True))
+    dispatcher.dispatch(dispatcher.bind_proposal(_proposal(reply=True)))
 
     assert len(transport.calls) == 2
     send = transport.calls[1]

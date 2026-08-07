@@ -12,13 +12,14 @@ import base64
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.message import EmailMessage
 from email.policy import SMTP
 from typing import Literal, Protocol
 from urllib.parse import urlencode
 
 from .google_oauth import (
+    GoogleConnectionState,
     GoogleCredentialStore,
     GoogleOAuthLifecycle,
     OAuthCredentialRecord,
@@ -62,9 +63,16 @@ GmailWriteOperation = Literal["gmail_send", "gmail_reply"]
 class GmailWriteProviderError(RuntimeError):
     """Private provider-edge error with whether an external send may exist."""
 
-    def __init__(self, code: str, *, may_have_sent: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        may_have_sent: bool = False,
+        trace_payload: Mapping[str, object] | None = None,
+    ) -> None:
         self.code = code
         self.may_have_sent = may_have_sent
+        self.trace_payload = dict(trace_payload or {})
         super().__init__(code)
 
 
@@ -85,6 +93,8 @@ class GmailSendRequest:
     source_thread_id: str | None = None
     in_reply_to: str | None = None
     references: tuple[str, ...] = ()
+    google_subject: str | None = None
+    connection_generation: int | None = None
 
     def __post_init__(self) -> None:
         if self.operation == "gmail_send":
@@ -123,6 +133,15 @@ class GmailSendRequest:
                 raise ValueError("Gmail reply references must end with In-Reply-To")
         else:
             raise ValueError("Gmail operation is not allowed")
+        if (self.google_subject is None) != (self.connection_generation is None):
+            raise ValueError("Google action bindings require subject and generation")
+        if self.google_subject is not None:
+            _canonical_string(self.google_subject, "google_subject")
+            if (
+                not isinstance(self.connection_generation, int)
+                or self.connection_generation < 0
+            ):
+                raise ValueError("connection_generation must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,12 +156,25 @@ class GmailSendProviderResult:
         _identifier(self.thread_id, "thread_id")
 
 
+@dataclass(frozen=True, slots=True)
+class GmailWriteProviderResult:
+    """Delivery acknowledgement plus complete provider evidence for the trace."""
+
+    delivery: GmailSendProviderResult
+    provider_trace: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.delivery, GmailSendProviderResult):
+            raise TypeError("delivery must be a GmailSendProviderResult")
+        object.__setattr__(self, "provider_trace", dict(self.provider_trace))
+
+
 class GmailWriteProvider(Protocol):
     """The deliberately narrow provider edge: it only sends frozen mail."""
 
     def send(
         self, *, request: GmailSendRequest, credential: OAuthCredentialRecord
-    ) -> GmailSendProviderResult: ...
+    ) -> GmailWriteProviderResult: ...
 
 
 class ControlledGmailWriteProvider:
@@ -162,14 +194,18 @@ class ControlledGmailWriteProvider:
 
     def send(
         self, *, request: GmailSendRequest, credential: OAuthCredentialRecord
-    ) -> GmailSendProviderResult:
-        del credential
+    ) -> GmailWriteProviderResult:
         self.calls.append(request)
         if self.failure is not None:
             raise GmailWriteProviderError(
-                self.failure, may_have_sent=self.may_have_sent
+                self.failure,
+                may_have_sent=self.may_have_sent,
+                trace_payload={"credential": credential, "request": request},
             )
-        return self.result
+        return GmailWriteProviderResult(
+            delivery=self.result,
+            provider_trace={"credential": credential, "request": request},
+        )
 
 
 class GmailApiWriteProvider:
@@ -196,48 +232,85 @@ class GmailApiWriteProvider:
 
     def send(
         self, *, request: GmailSendRequest, credential: OAuthCredentialRecord
-    ) -> GmailSendProviderResult:
-        token = self._refresh_access_token(credential.refresh_token)
-        envelope: dict[str, str] = {"raw": _encode_rfc822(request)}
-        if request.thread_id is not None:
-            envelope["threadId"] = request.thread_id
-        response = self._request(
-            method="POST",
-            url=_GMAIL_SEND_URL,
-            headers={
+    ) -> GmailWriteProviderResult:
+        provider_trace: dict[str, object] = {
+            "credential": credential,
+            "request": request,
+        }
+        try:
+            token = self._refresh_access_token(credential.refresh_token, provider_trace)
+            envelope: dict[str, str] = {"raw": _encode_rfc822(request)}
+            if request.thread_id is not None:
+                envelope["threadId"] = request.thread_id
+            body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+            headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-            },
-            body=json.dumps(envelope, separators=(",", ":")).encode("utf-8"),
-            may_have_sent=True,
-        )
-        payload = _json_object(response, may_have_sent=True)
-        message_id = payload.get("id")
-        thread_id = payload.get("threadId")
-        if not isinstance(message_id, str) or not isinstance(thread_id, str):
-            raise GmailWriteProviderError("invalid_response", may_have_sent=True)
-        try:
-            return GmailSendProviderResult(message_id=message_id, thread_id=thread_id)
-        except ValueError as exc:
-            raise GmailWriteProviderError(
-                "invalid_response", may_have_sent=True
-            ) from exc
+            }
+            provider_trace["gmail_request"] = {
+                "method": "POST",
+                "url": _GMAIL_SEND_URL,
+                "headers": headers,
+                "body": body,
+            }
+            response = self._request(
+                method="POST",
+                url=_GMAIL_SEND_URL,
+                headers=headers,
+                body=body,
+                may_have_sent=True,
+            )
+            provider_trace["gmail_response"] = _response_trace(response)
+            payload = _json_object(response, may_have_sent=True)
+            message_id = payload.get("id")
+            thread_id = payload.get("threadId")
+            if not isinstance(message_id, str) or not isinstance(thread_id, str):
+                raise GmailWriteProviderError("invalid_response", may_have_sent=True)
+            try:
+                delivery = GmailSendProviderResult(
+                    message_id=message_id, thread_id=thread_id
+                )
+            except ValueError as exc:
+                raise GmailWriteProviderError(
+                    "invalid_response", may_have_sent=True
+                ) from exc
+            return GmailWriteProviderResult(
+                delivery=delivery, provider_trace=provider_trace
+            )
+        except GmailWriteProviderError as exc:
+            exc.trace_payload = provider_trace
+            raise
 
-    def _refresh_access_token(self, refresh_token: str) -> str:
+    def _refresh_access_token(
+        self, refresh_token: str, provider_trace: dict[str, object]
+    ) -> str:
+        form = {
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        body = urlencode(form).encode()
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        provider_trace["token_request"] = {
+            "method": "POST",
+            "url": _GOOGLE_TOKEN_URL,
+            "headers": headers,
+            "body": body,
+            # Keep a decoded representation beside the exact wire body.  The
+            # diagnostic encoder stores bytes losslessly as base64, whereas
+            # manual incident review needs the controlled credential inputs
+            # directly inspectable without reconstituting the request.
+            "form": form,
+        }
         response = self._request(
             method="POST",
             url=_GOOGLE_TOKEN_URL,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=urlencode(
-                {
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                }
-            ).encode(),
+            headers=headers,
+            body=body,
             may_have_sent=False,
         )
+        provider_trace["token_response"] = _response_trace(response)
         payload = _json_object(response, token_exchange=True, may_have_sent=False)
         token = payload.get("access_token")
         if not isinstance(token, str) or not token:
@@ -280,6 +353,7 @@ class GmailWriteConnector:
         trace: DiagnosticTraceRecorder,
         clock: Clock,
         ids: IdGenerator,
+        connection_state: Callable[[], GoogleConnectionState],
         on_invalid_grant: Callable[[], object] | None = None,
     ) -> None:
         self._configured_identity = _canonical_string(
@@ -293,16 +367,54 @@ class GmailWriteConnector:
         self._trace = trace
         self._clock = clock
         self._ids = ids
+        if not callable(connection_state):
+            raise TypeError("connection_state must return GoogleConnectionState")
+        self._connection_state = connection_state
         self._on_invalid_grant = on_invalid_grant or credential_store.delete
+
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Freeze the current Google connection generation before presentation."""
+
+        request = gmail_send_request_from_proposal(action)
+        if request.google_subject is not None:
+            raise ValueError("only the Gmail connector may bind a Google action")
+        connection = self._current_connection()
+        self._require_usable_connection(connection)
+        bound_request = replace(
+            request,
+            google_subject=self._configured_identity,
+            connection_generation=connection.generation,
+        )
+        return FrozenActionProposal.create(
+            action_id=action.action_id,
+            request_id=action.request_id,
+            kind=action.kind,
+            preview=_preview(bound_request),
+            payload=_payload(bound_request),
+        )
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """Refuse a frozen Gmail action if its OAuth connection changed."""
+
+        request = gmail_send_request_from_proposal(action, require_binding=True)
+        connection = self._current_connection()
+        self._require_usable_connection(connection)
+        if (
+            request.google_subject != self._configured_identity
+            or request.connection_generation != connection.generation
+        ):
+            raise ActionDispatcherError("Google connection changed after proposal")
 
     def dispatch(self, action: FrozenActionProposal) -> None:
         try:
-            request = gmail_send_request_from_proposal(action)
+            request = gmail_send_request_from_proposal(action, require_binding=True)
+            self.validate_pending_action(action)
             credential = self._credential()
             self._append_audit(
                 action, outcome="attempted", execution_status="attempted"
             )
-        except (ValueError, TypeError, AuditWriteError) as exc:
+            self.validate_pending_action(action)
+        except (ActionDispatcherError, ValueError, TypeError, AuditWriteError) as exc:
             raise ActionDispatcherError(
                 str(exc) or "Gmail dispatch was blocked"
             ) from exc
@@ -320,11 +432,11 @@ class GmailWriteConnector:
                 result_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
                 error_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
             )
-            if not isinstance(result, GmailSendProviderResult):
+            if not isinstance(result, GmailWriteProviderResult):
                 raise GmailWriteProviderError("invalid_response", may_have_sent=True)
             if (
                 request.operation == "gmail_reply"
-                and result.thread_id != request.thread_id
+                and result.delivery.thread_id != request.thread_id
             ):
                 raise GmailWriteProviderError("thread_mismatch", may_have_sent=True)
         except GmailWriteProviderError as exc:
@@ -380,6 +492,25 @@ class GmailWriteConnector:
             raise ValueError("Gmail send scope is unavailable")
         return credential
 
+    def _current_connection(self) -> GoogleConnectionState:
+        try:
+            connection = self._connection_state()
+        except Exception as exc:
+            raise ActionDispatcherError(
+                "Google connection state is unavailable"
+            ) from exc
+        if not isinstance(connection, GoogleConnectionState):
+            raise ActionDispatcherError("Google connection state is unavailable")
+        return connection
+
+    @staticmethod
+    def _require_usable_connection(connection: GoogleConnectionState) -> None:
+        if (
+            not connection.connected
+            or GMAIL_SEND_SCOPE not in connection.granted_scopes
+        ):
+            raise ActionDispatcherError("Gmail connection is unavailable")
+
     def _record_terminal(self, action: FrozenActionProposal, *, outcome: str) -> None:
         try:
             self._append_audit(
@@ -429,6 +560,8 @@ def create_gmail_send_proposal(
     source_thread_id: str | None = None,
     in_reply_to: str | None = None,
     references: Sequence[str] = (),
+    google_subject: str | None = None,
+    connection_generation: int | None = None,
 ) -> FrozenActionProposal:
     """Create the only canonical Gmail action proposal accepted by the dispatcher."""
 
@@ -456,6 +589,12 @@ def create_gmail_send_proposal(
         ),
         in_reply_to=_message_id(in_reply_to) if is_reply else None,
         references=_message_ids(references) if is_reply else (),
+        google_subject=(
+            _canonical_string(google_subject, "google_subject")
+            if google_subject is not None
+            else None
+        ),
+        connection_generation=connection_generation,
     )
     return FrozenActionProposal.create(
         action_id=action_id,
@@ -466,7 +605,9 @@ def create_gmail_send_proposal(
     )
 
 
-def gmail_send_request_from_proposal(action: FrozenActionProposal) -> GmailSendRequest:
+def gmail_send_request_from_proposal(
+    action: FrozenActionProposal, *, require_binding: bool = False
+) -> GmailSendRequest:
     """Parse and re-validate a frozen proposal before its sole provider attempt."""
 
     if action.kind not in {"gmail_send", "gmail_reply"}:
@@ -478,6 +619,8 @@ def gmail_send_request_from_proposal(action: FrozenActionProposal) -> GmailSendR
     if not isinstance(payload, dict):
         raise TypeError("Gmail proposal payload must be an object")
     request = _request_from_payload(action.kind, payload)
+    if require_binding and request.google_subject is None:
+        raise ValueError("Gmail proposal is missing its Google connection binding")
     if action.preview != _preview(request):
         raise ValueError("Gmail proposal preview does not match its frozen payload")
     return request
@@ -508,6 +651,7 @@ def build_live_gmail_write_connector(
         trace=trace,
         clock=clock,
         ids=ids,
+        connection_state=lambda: oauth_lifecycle.connection,
         on_invalid_grant=lambda: oauth_lifecycle.handle_refresh_failure(
             "invalid_grant"
         ),
@@ -532,6 +676,12 @@ def _request_from_payload(kind: str, payload: Mapping[str, object]) -> GmailSend
             "in_reply_to",
             "references",
         }
+    binding_fields = {"google_subject", "connection_generation"}
+    supplied_binding_fields = set(payload) & binding_fields
+    if supplied_binding_fields and supplied_binding_fields != binding_fields:
+        raise ValueError("Gmail proposal has an incomplete Google connection binding")
+    if supplied_binding_fields:
+        expected |= binding_fields
     if set(payload) != expected:
         raise ValueError(
             "Gmail proposal payload has missing or unknown delivery fields"
@@ -559,6 +709,16 @@ def _request_from_payload(kind: str, payload: Mapping[str, object]) -> GmailSend
         ),
         in_reply_to=_message_id(payload["in_reply_to"]) if reply else None,
         references=_message_ids(payload["references"]) if reply else (),
+        google_subject=(
+            _canonical_string(payload["google_subject"], "google_subject")
+            if supplied_binding_fields
+            else None
+        ),
+        connection_generation=(
+            _connection_generation(payload["connection_generation"])
+            if supplied_binding_fields
+            else None
+        ),
     )
 
 
@@ -582,6 +742,13 @@ def _payload(request: GmailSendRequest) -> dict[str, object]:
                 "references": request.references,
             }
         )
+    if request.google_subject is not None:
+        payload.update(
+            {
+                "google_subject": request.google_subject,
+                "connection_generation": request.connection_generation,
+            }
+        )
     return payload
 
 
@@ -595,6 +762,13 @@ def _preview(request: GmailSendRequest) -> str:
         f"MIME: {request.mime_type}",
         f"Threading: {request.threading}",
     ]
+    if request.google_subject is not None:
+        lines.extend(
+            (
+                f"Google subject: {request.google_subject}",
+                f"Google connection generation: {request.connection_generation}",
+            )
+        )
     if request.operation == "gmail_reply":
         lines.extend(
             (
@@ -647,6 +821,20 @@ def _json_object(
     return value
 
 
+def _response_trace(response: GoogleReadHttpResponse) -> dict[str, object]:
+    trace: dict[str, object] = {
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "body": response.body,
+    }
+    try:
+        trace["body_text"] = response.body.decode("utf-8")
+    except UnicodeDecodeError:
+        # The bytes above remain the lossless evidence for a non-text result.
+        pass
+    return trace
+
+
 def _canonical_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(f"{name} must be a non-blank canonical string")
@@ -657,6 +845,12 @@ def _identifier(value: object, name: str) -> str:
     value = _canonical_string(value, name)
     if not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"{name} must be a canonical identifier")
+    return value
+
+
+def _connection_generation(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("connection_generation must be a non-negative integer")
     return value
 
 
