@@ -142,6 +142,71 @@ def test_live_provider_uses_only_exact_update_method_etag_and_notification() -> 
     assert json.loads(write["body"]) == expected_request_event
 
 
+def test_live_provider_sends_insert_identity_and_event_type_in_the_body() -> None:
+    complete_event = {**event(), "eventType": "focusTime", "id": "eventid"}
+    returned = dict(complete_event)
+    transport = ControlledCalendarTransport(
+        [response(200, {"access_token": "access-token"}), response(200, returned)]
+    )
+    provider = GoogleApiCalendarWriteProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    provider.write(
+        request=request(operation="insert", event_value=complete_event),
+        credential=credential(),
+    )
+
+    write = transport.calls[1]
+    parsed = urlparse(write["url"])
+    assert parsed.path.endswith("/calendars/primary/events")
+    assert "eventid" not in parsed.path
+    body = json.loads(write["body"])
+    assert body["id"] == "eventid"
+    assert body["eventType"] == "focusTime"
+
+
+def test_returned_attendees_and_reminder_overrides_are_verified_by_semantic_value() -> (
+    None
+):
+    complete_event = {
+        **event(),
+        "attendees": [
+            {"email": "first@example.test", "optional": False},
+            {"email": "second@example.test", "optional": True},
+        ],
+        "reminders": {
+            "useDefault": False,
+            "overrides": [
+                {"method": "email", "minutes": 30},
+                {"method": "popup", "minutes": 10},
+            ],
+        },
+    }
+    returned = {
+        "id": "event-1",
+        **complete_event,
+        "attendees": list(reversed(complete_event["attendees"])),
+        "reminders": {
+            "useDefault": False,
+            "overrides": list(reversed(complete_event["reminders"]["overrides"])),
+        },
+    }
+    transport = ControlledCalendarTransport(
+        [response(200, {"access_token": "access-token"}), response(200, returned)]
+    )
+    provider = GoogleApiCalendarWriteProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    result = provider.write(
+        request=request(operation="update", event_value=complete_event),
+        credential=credential(),
+    )
+
+    assert result.event == returned
+
+
 def test_live_provider_preserves_conference_data_and_attachments_on_full_update() -> (
     None
 ):

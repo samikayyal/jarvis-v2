@@ -630,6 +630,12 @@ class _ExchangeReceipt:
     grant: OAuthGrant
 
 
+@dataclass(slots=True)
+class _CallbackExchangeContext:
+    previous_generation: int | None = None
+    next_generation: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class _RevocationReceipt:
     """Complete revocation input and result retained only in diagnostic traces."""
@@ -792,49 +798,83 @@ class GoogleOAuthLifecycle:
         except AuditWriteError:
             return OAuthCallbackResponse(status_code=503)
 
-        previous_generation: int | None = None
-        next_generation: int | None = None
+        context = _CallbackExchangeContext()
         try:
-            with self._state_store.dispatch_lease():
-                previous_generation = self.connection.generation
-                next_generation = previous_generation + 1
-                receipt = self._trace.execute(
-                    request_id=authorization.operation_id,
-                    operation_type="google_oauth_code_exchange",
-                    operation=lambda: self._connector.exchange_and_replace(
-                        code=query["code"],
-                        requested_scopes=authorization.requested_scopes,
-                        connection_generation=next_generation,
-                    ),
-                    arguments={
-                        "flow": "authorization_code",
-                        "authorization_code": query["code"],
-                        "requested_scopes": authorization.requested_scopes,
-                    },
-                    result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-                    error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-                )
-                self._state_store.set_connection(
-                    connected=True, granted_scopes=receipt.grant.granted_scopes
-                )
+            self._exchange_and_publish(
+                authorization=authorization,
+                code=query["code"],
+                context=context,
+            )
         except OAuthExchangeError as exc:
-            if self._has_trace_write_failure(exc):
-                self._invalidate_connection(
-                    connection_generation=next_generation,
-                    previous_generation=previous_generation,
-                )
-                return OAuthCallbackResponse(status_code=503)
-            self._append_callback_rejection(authorization.operation_id)
-            return OAuthCallbackResponse(status_code=400)
+            return self._handle_exchange_rejection(
+                authorization=authorization,
+                error=exc,
+                context=context,
+            )
         except (DiagnosticTraceError, GoogleOAuthError, OSError):
             # A failed trace reservation or write makes the exchange outcome
             # unusable.  Delete the private credential and force reconnect.
             self._invalidate_connection(
-                connection_generation=next_generation,
-                previous_generation=previous_generation,
+                connection_generation=context.next_generation,
+                previous_generation=context.previous_generation,
             )
             return OAuthCallbackResponse(status_code=503)
+        return self._complete_exchange_callback(
+            authorization=authorization, context=context
+        )
 
+    def _exchange_and_publish(
+        self,
+        *,
+        authorization: OAuthAuthorization,
+        code: str,
+        context: _CallbackExchangeContext,
+    ) -> None:
+        with self._state_store.dispatch_lease():
+            context.previous_generation = self.connection.generation
+            context.next_generation = context.previous_generation + 1
+            receipt = self._trace.execute(
+                request_id=authorization.operation_id,
+                operation_type="google_oauth_code_exchange",
+                operation=lambda: self._connector.exchange_and_replace(
+                    code=code,
+                    requested_scopes=authorization.requested_scopes,
+                    connection_generation=context.next_generation,
+                ),
+                arguments={
+                    "flow": "authorization_code",
+                    "authorization_code": code,
+                    "requested_scopes": authorization.requested_scopes,
+                },
+                result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+            )
+            self._state_store.set_connection(
+                connected=True, granted_scopes=receipt.grant.granted_scopes
+            )
+
+    def _handle_exchange_rejection(
+        self,
+        *,
+        authorization: OAuthAuthorization,
+        error: OAuthExchangeError,
+        context: _CallbackExchangeContext,
+    ) -> OAuthCallbackResponse:
+        if self._has_trace_write_failure(error):
+            self._invalidate_connection(
+                connection_generation=context.next_generation,
+                previous_generation=context.previous_generation,
+            )
+            return OAuthCallbackResponse(status_code=503)
+        self._append_callback_rejection(authorization.operation_id)
+        return OAuthCallbackResponse(status_code=400)
+
+    def _complete_exchange_callback(
+        self,
+        *,
+        authorization: OAuthAuthorization,
+        context: _CallbackExchangeContext,
+    ) -> OAuthCallbackResponse:
         try:
             self._append_audit(
                 kind="google_oauth_code_exchange_completed",
@@ -843,7 +883,7 @@ class GoogleOAuthLifecycle:
                 execution_status="completed",
             )
         except AuditWriteError:
-            self._invalidate_connection(connection_generation=next_generation)
+            self._invalidate_connection(connection_generation=context.next_generation)
             return OAuthCallbackResponse(status_code=503)
         return OAuthCallbackResponse(status_code=204)
 

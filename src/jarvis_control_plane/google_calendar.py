@@ -45,6 +45,17 @@ _REQUIRED_COMPLETE_EVENT_FIELDS = frozenset(
 )
 _VISIBILITY_VALUES = frozenset({"default", "public", "private", "confidential"})
 _STATUS_VALUES = frozenset({"confirmed", "tentative", "cancelled"})
+_EVENT_TYPE_VALUES = frozenset(
+    {
+        "birthday",
+        "default",
+        "focusTime",
+        "fromGmail",
+        "outOfOffice",
+        "workingLocation",
+    }
+)
+_INSERT_EVENT_TYPE_VALUES = _EVENT_TYPE_VALUES - {"fromGmail"}
 _EVENT_IDENTITY_FIELDS = frozenset({"id", "etag"})
 # A complete Event GET also returns server-managed fields.  They are removed
 # from mutation snapshots explicitly so a full PUT preserves writable state
@@ -63,13 +74,21 @@ _READ_ONLY_EVENT_FIELDS = frozenset(
         "hangoutLink",
         "locked",
         "privateCopy",
-        "eventType",
     }
 )
 GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES = 32 * 1024
 _CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
 _MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
 _GOOGLE_HTTP_TIMEOUT_SECONDS = GOOGLE_HTTP_TIMEOUT_SECONDS
+_UNORDERED_COLLECTION_PATHS = frozenset(
+    {
+        ("attendees",),
+        ("attachments",),
+        ("conferenceData", "entryPoints"),
+        ("recurrence",),
+        ("reminders", "overrides"),
+    }
+)
 
 
 def _text(value: object, name: str) -> str:
@@ -89,22 +108,38 @@ def _canonical_json(value: object, name: str) -> object:
     return canonical
 
 
-def _event(value: object) -> dict[str, object]:
-    event = _canonical_json(value, "complete_event")
-    if not isinstance(event, dict):
-        raise TypeError("complete_event must be an object")
-    identity_fields = _EVENT_IDENTITY_FIELDS & set(event)
-    if identity_fields:
+def _validate_event_structure(
+    event: dict[str, object], operation: CalendarWriteOperation
+) -> None:
+    if "etag" in event or ("id" in event and operation != "insert"):
+        identity_fields = _EVENT_IDENTITY_FIELDS & set(event)
         raise ValueError(
             "complete_event cannot replace event identity or ETag: "
             + ", ".join(sorted(identity_fields))
         )
-    read_only_fields = _READ_ONLY_EVENT_FIELDS & set(event)
-    if read_only_fields:
+    if "id" in event:
+        _text(event["id"], "complete_event id")
+
+    rejected_fields = _READ_ONLY_EVENT_FIELDS & set(event)
+    if rejected_fields:
         raise ValueError(
             "complete_event contains read-only fields: "
-            + ", ".join(sorted(read_only_fields))
+            + ", ".join(sorted(rejected_fields))
         )
+
+    if "eventType" in event and (
+        not isinstance(event["eventType"], str)
+        or event["eventType"] not in _EVENT_TYPE_VALUES
+    ):
+        raise ValueError("complete_event eventType has an invalid value")
+    if operation == "insert" and event.get("eventType") not in {
+        None,
+        *_INSERT_EVENT_TYPE_VALUES,
+    }:
+        raise ValueError("complete_event eventType cannot be created")
+
+
+def _validate_event_status(event: Mapping[str, object]) -> None:
     status = event.get("status")
     if status is not None and (
         not isinstance(status, str) or status not in _STATUS_VALUES
@@ -112,6 +147,9 @@ def _event(value: object) -> dict[str, object]:
         raise ValueError("complete_event status has an invalid value")
     if status == "cancelled":
         raise ValueError("complete_event cannot represent a cancelled/deleted event")
+
+
+def _validate_event_material_fields(event: Mapping[str, object]) -> None:
     if "attendeesOmitted" in event:
         if not isinstance(event["attendeesOmitted"], bool):
             raise TypeError("complete_event attendeesOmitted has an invalid shape")
@@ -125,6 +163,20 @@ def _event(value: object) -> dict[str, object]:
             "complete_event requires explicit material fields: "
             + ", ".join(sorted(missing))
         )
+    _validate_event_endpoints(event)
+    attendees = event["attendees"]
+    if not isinstance(attendees, list):
+        raise TypeError("complete_event attendees has an invalid shape")
+    recurrence = event["recurrence"]
+    if not isinstance(recurrence, list):
+        raise TypeError("complete_event recurrence has an invalid shape")
+    visibility = event["visibility"]
+    if not isinstance(visibility, str) or visibility not in _VISIBILITY_VALUES:
+        raise ValueError("complete_event visibility has an invalid value")
+    _validate_event_reminders(event["reminders"])
+
+
+def _validate_event_endpoints(event: Mapping[str, object]) -> None:
     for endpoint in ("start", "end"):
         value = event.get(endpoint)
         if (
@@ -136,29 +188,34 @@ def _event(value: object) -> dict[str, object]:
             != 1
         ):
             raise ValueError(f"complete_event requires a {endpoint} date or dateTime")
-    if not isinstance(event["attendees"], list):
-        raise TypeError("complete_event attendees has an invalid shape")
-    if not isinstance(event["recurrence"], list):
-        raise TypeError("complete_event recurrence has an invalid shape")
-    visibility = event["visibility"]
-    if not isinstance(visibility, str) or visibility not in _VISIBILITY_VALUES:
-        raise ValueError("complete_event visibility has an invalid value")
-    reminders = event["reminders"]
-    if not isinstance(reminders, dict) or set(reminders) != {
-        "overrides",
-        "useDefault",
-    }:
+
+
+def _validate_event_reminders(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {"overrides", "useDefault"}:
         raise ValueError(
             "complete_event reminders must explicitly contain useDefault and overrides"
         )
-    if not isinstance(reminders["useDefault"], bool) or not isinstance(
-        reminders["overrides"], list
+    if not isinstance(value["useDefault"], bool) or not isinstance(
+        value["overrides"], list
     ):
         raise TypeError("complete_event reminders has an invalid shape")
+
+
+def _event(
+    value: object, *, operation: CalendarWriteOperation = "update"
+) -> dict[str, object]:
+    event = _canonical_json(value, "complete_event")
+    if not isinstance(event, dict):
+        raise TypeError("complete_event must be an object")
+    _validate_event_structure(event, operation)
+    _validate_event_status(event)
+    _validate_event_material_fields(event)
     return event
 
 
-def _snapshot_event(value: object) -> dict[str, object]:
+def _snapshot_event(
+    value: object, *, operation: CalendarWriteOperation = "update"
+) -> dict[str, object]:
     """Normalize Google's omitted optional fields before complete-event validation."""
 
     raw_event = _canonical_json(value, "current_event")
@@ -191,7 +248,7 @@ def _snapshot_event(value: object) -> dict[str, object]:
         reminders = dict(event["reminders"])
         reminders["overrides"] = []
         event["reminders"] = reminders
-    normalized = _event(event)
+    normalized = _event(event, operation=operation)
     normalized.update(identity)
     return normalized
 
@@ -202,7 +259,7 @@ def _patch(value: object, complete_event: Mapping[str, object]) -> dict[str, obj
         raise ValueError("reviewed_patch must be a non-empty object")
     if _EVENT_IDENTITY_FIELDS & set(patch):
         raise ValueError("reviewed_patch cannot replace event identity or ETag")
-    read_only_fields = _READ_ONLY_EVENT_FIELDS & set(patch)
+    read_only_fields = (_READ_ONLY_EVENT_FIELDS | {"eventType"}) & set(patch)
     if read_only_fields:
         raise ValueError(
             "reviewed_patch contains read-only fields: "
@@ -238,11 +295,15 @@ class CalendarEventSnapshot:
             raise TypeError("event_changes must be an object")
         if _EVENT_IDENTITY_FIELDS & set(normalized_changes):
             raise ValueError("event_changes cannot replace event identity or ETag")
+        if "eventType" in normalized_changes and normalized_changes[
+            "eventType"
+        ] != self.event.get("eventType"):
+            raise ValueError("eventType cannot be changed after event creation")
         result = {
             key: value for key, value in self.event.items() if key not in {"id", "etag"}
         }
         result.update(normalized_changes)
-        return _event(result)
+        return _event(result, operation="update")
 
     def require_event_id(self, event_id: str) -> None:
         _text(event_id, "event_id")
@@ -268,7 +329,8 @@ class CalendarWriteRequest:
         if self.operation not in {"insert", "update", "patch"}:
             raise ValueError("Calendar operation is not allowed")
         _text(self.calendar_id, "calendar_id")
-        _event(self.complete_event)
+        normalized_event = _event(self.complete_event, operation=self.operation)
+        object.__setattr__(self, "complete_event", normalized_event)
         if (
             not isinstance(self.connection_generation, int)
             or self.connection_generation < 0
@@ -277,12 +339,21 @@ class CalendarWriteRequest:
         if self.notification not in {"none", "all", "externalOnly"}:
             raise ValueError("Calendar notification is not allowed")
         if self.operation == "insert":
-            if (
-                self.event_id is not None
-                or self.etag is not None
-                or self.reviewed_patch is not None
-            ):
+            if self.etag is not None or self.reviewed_patch is not None:
                 raise ValueError("Calendar insert cannot carry existing-event fields")
+            event_identity = normalized_event.get("id")
+            if self.event_id is not None:
+                _text(self.event_id, "event_id")
+                if event_identity is None:
+                    normalized_event["id"] = self.event_id
+                    event_identity = self.event_id
+                elif event_identity != self.event_id:
+                    raise ValueError(
+                        "Calendar insert event identity does not match complete_event"
+                    )
+            if event_identity is not None:
+                _text(event_identity, "complete_event id")
+                object.__setattr__(self, "event_id", event_identity)
         else:
             _text(self.event_id, "event_id")
             _text(self.etag, "etag")
@@ -344,13 +415,14 @@ class CalendarWriteProposal:
         complete_event: Mapping[str, object],
         notification: CalendarNotification,
         connection_generation: int,
+        event_id: str | None = None,
     ) -> FrozenActionProposal:
         return cls._create(
             action_id=action_id,
             request_id=request_id,
             operation="insert",
             calendar_id=calendar_id,
-            event_id=None,
+            event_id=event_id,
             complete_event=complete_event,
             etag=None,
             notification=notification,
@@ -486,19 +558,31 @@ class CalendarWriteProposal:
         connection_generation: int,
         reviewed_patch: Mapping[str, object] | None,
     ) -> FrozenActionProposal:
+        normalized_event = _event(complete_event, operation=operation)
+        if operation == "insert" and event_id is None:
+            candidate_event_id = normalized_event.get("id")
+            if candidate_event_id is not None:
+                event_id = _text(candidate_event_id, "complete_event id")
+        if (
+            operation == "insert"
+            and event_id is not None
+            and "id" not in normalized_event
+        ):
+            normalized_event["id"] = event_id
+        normalized_patch = (
+            _patch(reviewed_patch, normalized_event)
+            if reviewed_patch is not None
+            else None
+        )
         request = CalendarWriteRequest(
             operation=operation,
             calendar_id=calendar_id,
             event_id=event_id,
-            complete_event=_event(complete_event),
+            complete_event=normalized_event,
             etag=etag,
             notification=notification,
             connection_generation=connection_generation,
-            reviewed_patch=(
-                _patch(reviewed_patch, _event(complete_event))
-                if reviewed_patch is not None
-                else None
-            ),
+            reviewed_patch=normalized_patch,
         )
         payload = {
             "schema": "calendar_write_v1",
@@ -616,7 +700,9 @@ class GoogleApiCalendarWriteProvider:
             "patch": "PATCH",
         }[request.operation]
         event_path = (
-            "" if request.event_id is None else "/" + quote(request.event_id, safe="")
+            ""
+            if request.operation == "insert"
+            else "/" + quote(request.event_id, safe="")
         )
         body_payload = (
             request.reviewed_patch
@@ -680,8 +766,10 @@ class GoogleApiCalendarWriteProvider:
                 may_have_dispatched=True,
             )
         try:
-            expected = _snapshot_event(request.complete_event)
-            actual = _snapshot_event(returned)
+            expected = _snapshot_event(
+                request.complete_event, operation=request.operation
+            )
+            actual = _snapshot_event(returned, operation=request.operation)
         except (TypeError, ValueError) as exc:
             raise GoogleCalendarWriteProviderError(
                 "returned_event_mismatch",
@@ -726,6 +814,11 @@ class ControlledGoogleCalendarWriteProvider:
         return GoogleCalendarWriteProviderResult(event=event)
 
 
+@dataclass(slots=True)
+class _CalendarDispatchContext:
+    provider_started: bool = False
+
+
 class CalendarActionDispatcher:
     """Dispatches only a current, frozen Calendar write through the closed provider."""
 
@@ -749,81 +842,110 @@ class CalendarActionDispatcher:
         self._on_invalid_grant = on_invalid_grant
 
     def dispatch(self, action: FrozenActionProposal) -> None:
-        try:
-            request = CalendarWriteRequest.from_proposal(action)
-        except (TypeError, ValueError) as exc:
-            raise ActionDispatcherError("Calendar proposal is invalid") from exc
-        provider_started = False
-
-        def invoke_provider() -> GoogleCalendarWriteProviderResult:
-            nonlocal provider_started
-            provider_started = True
-            return self._provider.write(request=request, credential=credential)
-
+        request = self._parse_request(action)
+        context = _CalendarDispatchContext()
         try:
             with self._connection_state.dispatch_lease():
-                connection = self._connection_state.get_connection()
-                credential = self._credential_store.current
-                if (
-                    not connection.connected
-                    or connection.generation != request.connection_generation
-                    or CALENDAR_WRITE_SCOPE not in connection.granted_scopes
-                ):
-                    raise ActionDispatcherError("Calendar proposal is stale")
-                if (
-                    credential is None
-                    or credential.subject != self._configured_identity
-                    or CALENDAR_WRITE_SCOPE not in credential.granted_scopes
-                    or credential.connection_generation != connection.generation
-                ):
-                    raise ActionDispatcherError("Calendar connection is unavailable")
-                self._trace.execute(
-                    request_id=action.request_id,
-                    operation_id=f"{action.action_id}:calendar:{request.operation}",
-                    operation_type="google_calendar_write",
-                    input_payload=request,
-                    arguments={
-                        "action_id": action.action_id,
-                        "operation": request.operation,
-                        "calendar_id": request.calendar_id,
-                        "event_id": request.event_id,
-                        "connection_generation": request.connection_generation,
-                    },
-                    telemetry={"service": "calendar", "operation": request.operation},
-                    operation=invoke_provider,
-                    result_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
-                    error_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
+                credential = self._require_current_connection(request)
+                self._execute_traced_write(
+                    action=action,
+                    request=request,
+                    credential=credential,
+                    context=context,
                 )
         except GoogleCalendarWriteProviderError as exc:
-            if exc.code == "invalid_grant" and self._on_invalid_grant is not None:
-                try:
-                    self._on_invalid_grant(request.connection_generation)
-                except (GoogleOAuthError, OSError) as cleanup_error:
-                    raise ActionDispatcherError(
-                        "Calendar credential invalidation failed"
-                    ) from cleanup_error
-            raise ActionDispatcherError(
-                str(exc), may_have_dispatched=exc.may_have_dispatched
-            ) from exc
-        except TraceCapacityError as exc:
-            raise ActionDispatcherError(
-                "Calendar trace admission is unavailable"
-            ) from exc
-        except TraceWriteError as exc:
-            raise ActionDispatcherError(
-                "Calendar trace retention failed",
-                may_have_dispatched=exc.operation_started,
-            ) from exc
-        except DiagnosticTraceError as exc:
-            raise ActionDispatcherError(
-                "Calendar trace admission is unavailable"
-            ) from exc
+            self._raise_provider_error(request, exc)
+        except (TraceCapacityError, TraceWriteError, DiagnosticTraceError) as exc:
+            self._raise_trace_error(exc)
         except ActionDispatcherError:
             raise
         except Exception as exc:
             raise ActionDispatcherError(
-                "Calendar provider is unavailable", may_have_dispatched=provider_started
+                "Calendar provider is unavailable",
+                may_have_dispatched=context.provider_started,
             ) from exc
+
+    @staticmethod
+    def _parse_request(action: FrozenActionProposal) -> CalendarWriteRequest:
+        try:
+            return CalendarWriteRequest.from_proposal(action)
+        except (TypeError, ValueError) as exc:
+            raise ActionDispatcherError("Calendar proposal is invalid") from exc
+
+    def _require_current_connection(
+        self, request: CalendarWriteRequest
+    ) -> OAuthCredentialRecord:
+        connection = self._connection_state.get_connection()
+        if (
+            not connection.connected
+            or connection.generation != request.connection_generation
+            or CALENDAR_WRITE_SCOPE not in connection.granted_scopes
+        ):
+            raise ActionDispatcherError("Calendar proposal is stale")
+        credential = self._credential_store.current
+        if (
+            credential is None
+            or credential.subject != self._configured_identity
+            or CALENDAR_WRITE_SCOPE not in credential.granted_scopes
+            or credential.connection_generation != connection.generation
+        ):
+            raise ActionDispatcherError("Calendar connection is unavailable")
+        return credential
+
+    def _execute_traced_write(
+        self,
+        *,
+        action: FrozenActionProposal,
+        request: CalendarWriteRequest,
+        credential: OAuthCredentialRecord,
+        context: _CalendarDispatchContext,
+    ) -> None:
+        def invoke_provider() -> GoogleCalendarWriteProviderResult:
+            context.provider_started = True
+            return self._provider.write(request=request, credential=credential)
+
+        self._trace.execute(
+            request_id=action.request_id,
+            operation_id=f"{action.action_id}:calendar:{request.operation}",
+            operation_type="google_calendar_write",
+            input_payload=request,
+            arguments={
+                "action_id": action.action_id,
+                "operation": request.operation,
+                "calendar_id": request.calendar_id,
+                "event_id": request.event_id,
+                "connection_generation": request.connection_generation,
+            },
+            telemetry={"service": "calendar", "operation": request.operation},
+            operation=invoke_provider,
+            result_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
+            error_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
+        )
+
+    def _raise_provider_error(
+        self, request: CalendarWriteRequest, error: GoogleCalendarWriteProviderError
+    ) -> None:
+        if error.code == "invalid_grant" and self._on_invalid_grant is not None:
+            try:
+                self._on_invalid_grant(request.connection_generation)
+            except (GoogleOAuthError, OSError) as cleanup_error:
+                raise ActionDispatcherError(
+                    "Calendar credential invalidation failed"
+                ) from cleanup_error
+        raise ActionDispatcherError(
+            str(error), may_have_dispatched=error.may_have_dispatched
+        ) from error
+
+    @staticmethod
+    def _raise_trace_error(error: BaseException) -> None:
+        if isinstance(error, TraceWriteError):
+            raise ActionDispatcherError(
+                "Calendar trace retention failed",
+                may_have_dispatched=error.operation_started,
+            ) from error
+        raise ActionDispatcherError(
+            "Calendar trace admission is unavailable"
+        ) from error
 
 
 def build_live_calendar_action_dispatcher(
@@ -871,20 +993,79 @@ def _json_object(body: bytes, name: str) -> Mapping[str, object]:
     return payload
 
 
-def _contains_complete(expected: object, actual: object) -> bool:
-    """Accept provider-added fields while proving every frozen event field survived."""
+def _contains_complete(
+    expected: object, actual: object, *, path: tuple[str, ...] = ()
+) -> bool:
+    """Accept provider-added fields without making unordered Calendar collections positional."""
 
     if isinstance(expected, Mapping):
         return isinstance(actual, Mapping) and all(
-            key in actual and _contains_complete(value, actual[key])
+            key in actual
+            and _contains_complete(value, actual[key], path=(*path, str(key)))
             for key, value in expected.items()
         )
     if isinstance(expected, list):
-        return (
-            isinstance(actual, list)
-            and len(expected) == len(actual)
-            and all(
-                _contains_complete(left, right) for left, right in zip(expected, actual)
-            )
+        if not isinstance(actual, list) or len(expected) != len(actual):
+            return False
+        if path in _UNORDERED_COLLECTION_PATHS:
+            return _contains_unordered_collection(expected, actual, path=path)
+        return all(
+            _contains_complete(left, right, path=(*path, str(index)))
+            for index, (left, right) in enumerate(zip(expected, actual))
         )
+    if (
+        path[:2] == ("attendees", "item")
+        and path[-1] == "email"
+        and isinstance(expected, str)
+        and isinstance(actual, str)
+    ):
+        return expected.casefold() == actual.casefold()
     return expected == actual
+
+
+def _contains_unordered_collection(
+    expected: list[object], actual: list[object], *, path: tuple[str, ...]
+) -> bool:
+    unmatched = list(actual)
+    for expected_item in expected:
+        expected_key = _collection_item_key(expected_item, path=path)
+        match_index = next(
+            (
+                index
+                for index, actual_item in enumerate(unmatched)
+                if _collection_item_key(actual_item, path=path) == expected_key
+                and _contains_complete(expected_item, actual_item, path=(*path, "item"))
+            ),
+            None,
+        )
+        if match_index is None:
+            return False
+        unmatched.pop(match_index)
+    return not unmatched
+
+
+def _collection_item_key(value: object, *, path: tuple[str, ...]) -> object:
+    if path == ("attendees",) and isinstance(value, Mapping):
+        email = value.get("email")
+        if isinstance(email, str):
+            return ("email", email.casefold())
+    if path == ("reminders", "overrides") and isinstance(value, Mapping):
+        method = value.get("method")
+        minutes = value.get("minutes")
+        if isinstance(method, str) and isinstance(minutes, int):
+            return ("reminder", method, minutes)
+    if path == ("attachments",) and isinstance(value, Mapping):
+        file_url = value.get("fileUrl")
+        if isinstance(file_url, str):
+            return ("attachment", "fileUrl", file_url)
+        file_id = value.get("fileId")
+        if isinstance(file_id, str):
+            return ("attachment", "fileId", file_id)
+    if path == ("conferenceData", "entryPoints") and isinstance(value, Mapping):
+        entry_point_type = value.get("entryPointType")
+        uri = value.get("uri")
+        if isinstance(entry_point_type, str) and isinstance(uri, str):
+            return ("entryPoint", entry_point_type, uri)
+    if path == ("recurrence",) and isinstance(value, str):
+        return ("recurrence", value)
+    return ("value", json.dumps(value, ensure_ascii=False, sort_keys=True))

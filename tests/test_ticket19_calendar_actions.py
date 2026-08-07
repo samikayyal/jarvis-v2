@@ -198,6 +198,51 @@ def test_complete_event_requires_explicit_material_calendar_fields() -> None:
         )
 
 
+def test_insert_freezes_client_identity_and_insert_only_event_type() -> None:
+    _, _, state = connected_dispatcher()
+    proposal = CalendarWriteProposal.insert(
+        action_id="calendar-special-insert",
+        request_id="request-special-insert",
+        calendar_id="primary",
+        event_id="eventid",
+        complete_event={**event(), "eventType": "focusTime"},
+        notification="none",
+        connection_generation=state.get_connection().generation,
+    )
+
+    request = CalendarWriteRequest.from_proposal(proposal)
+
+    assert request.event_id == "eventid"
+    assert request.complete_event["id"] == "eventid"
+    assert request.complete_event["eventType"] == "focusTime"
+
+    current = {**event(), "id": "eventid", "eventType": "focusTime"}
+    snapshot = CalendarEventSnapshot(event=current, etag='"etag-special"')
+    unchanged = CalendarWriteProposal.update(
+        action_id="calendar-special-update",
+        request_id="request-special-update",
+        calendar_id="primary",
+        event_id="eventid",
+        snapshot=snapshot,
+        changes={},
+        notification="none",
+        connection_generation=state.get_connection().generation,
+    )
+    assert json.loads(unchanged.payload)["complete_event"]["eventType"] == "focusTime"
+
+    with pytest.raises(ValueError, match="cannot be changed"):
+        CalendarWriteProposal.update(
+            action_id="calendar-special-update-invalid",
+            request_id="request-special-update-invalid",
+            calendar_id="primary",
+            event_id="eventid",
+            snapshot=snapshot,
+            changes={"eventType": "outOfOffice"},
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+
+
 def test_update_from_snapshot_derives_one_complete_result_and_preserves_material_fields() -> (
     None
 ):

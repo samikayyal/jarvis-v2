@@ -13,3 +13,9 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
 Edit the right-hand column to match whatever vocabulary you actually use.
+
+## Implementation lifecycle
+
+Implementation tickets also use the lifecycle status `complete` after all of their
+acceptance checkboxes are satisfied. `complete` is a terminal implementation status,
+not a triage role; it does not replace the five triage labels above.
