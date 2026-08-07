@@ -454,7 +454,12 @@ class InMemoryGoogleCredentialStore:
 
 
 class FileGoogleCredentialStore:
-    """One 0600 credential file replaced atomically within a private directory."""
+    """One 0600 generation-bound credential record in a private directory.
+
+    Legacy three-field records may still use the metadata sidecar while they
+    are being read, but new replacements commit the refresh token and its
+    connection generation together in one file rename.
+    """
 
     def __init__(
         self, directory: str | Path, *, filename: str = "google-oauth.json"
@@ -472,7 +477,7 @@ class FileGoogleCredentialStore:
 
     @property
     def _metadata_path(self) -> Path:
-        """Versioned generation metadata kept beside the legacy-readable record."""
+        """Compatibility metadata used only when reading legacy records."""
 
         return self._directory / f"{self._filename}.meta"
 
@@ -515,21 +520,15 @@ class FileGoogleCredentialStore:
 
     def replace(self, credential: OAuthCredentialRecord) -> None:
         payload = {
+            "connection_generation": credential.connection_generation,
             "granted_scopes": sorted(credential.granted_scopes),
             "refresh_token": credential.refresh_token,
             "subject": credential.subject,
         }
-        metadata = {
-            "connection_generation": credential.connection_generation,
-            "refresh_token_sha256": hashlib.sha256(
-                credential.refresh_token.encode("utf-8")
-            ).hexdigest(),
-            "schema": "google_oauth_credential_metadata_v1",
-        }
-        # The primary file intentionally remains the historical three-field
-        # wire format so an older release can still read it during rollback.
+        # The generation is authoritative in the same record as the refresh
+        # token.  A single rename therefore cannot leave a new token bound to
+        # an old or missing generation sidecar.
         self._atomic_write(self._path, payload)
-        self._atomic_write(self._metadata_path, metadata)
 
     def _legacy_generation(self, payload: Mapping[str, object]) -> int:
         if not self._metadata_path.exists():

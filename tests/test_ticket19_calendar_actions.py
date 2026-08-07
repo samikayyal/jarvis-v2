@@ -86,12 +86,13 @@ def test_update_freezes_complete_event_and_dispatches_the_stored_operation_once(
     None
 ):
     dispatcher, provider, state = connected_dispatcher()
+    snapshot = CalendarEventSnapshot(event=event(), etag='"etag-1"')
     proposal = CalendarWriteProposal.update(
         action_id="calendar-action-1",
         request_id="request-1",
         calendar_id="primary",
         event_id="event-1",
-        snapshot=CalendarEventSnapshot(event=event(), etag='"etag-1"'),
+        snapshot=snapshot,
         changes={},
         notification="all",
         connection_generation=state.get_connection().generation,
@@ -104,11 +105,11 @@ def test_update_freezes_complete_event_and_dispatches_the_stored_operation_once(
     assert request.operation == "update"
     assert request.calendar_id == "primary"
     assert request.event_id == "event-1"
-    assert request.complete_event == event()
+    assert request.complete_event == snapshot.event
     assert request.etag == '"etag-1"'
     assert request.notification == "all"
     assert credential.subject == IDENTITY
-    assert json.loads(proposal.payload)["complete_event"] == event()
+    assert json.loads(proposal.payload)["complete_event"] == snapshot.event
 
 
 def test_stale_generation_or_tampered_proposal_never_reaches_calendar() -> None:
@@ -220,6 +221,108 @@ def test_update_from_snapshot_derives_one_complete_result_and_preserves_material
     assert payload["complete_event"]["reminders"] == current["reminders"]
     assert payload["complete_event"]["visibility"] == current["visibility"]
     assert payload["etag"] == '"etag-snapshot"'
+
+
+def test_calendar_writes_reject_cancelled_status_for_insert_update_and_patch() -> None:
+    _, _, state = connected_dispatcher()
+    cancelled = {**event(), "status": "cancelled"}
+
+    with pytest.raises(ValueError, match="cancelled"):
+        CalendarWriteProposal.insert(
+            action_id="calendar-cancelled-insert",
+            request_id="request-cancelled-insert",
+            calendar_id="primary",
+            complete_event=cancelled,
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+
+    snapshot = CalendarEventSnapshot(event=event(), etag='"etag-cancelled"')
+    with pytest.raises(ValueError, match="cancelled"):
+        CalendarWriteProposal.update(
+            action_id="calendar-cancelled-update",
+            request_id="request-cancelled-update",
+            calendar_id="primary",
+            event_id="event-cancelled",
+            snapshot=snapshot,
+            changes={"status": "cancelled"},
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+
+    with pytest.raises(ValueError, match="cancelled"):
+        CalendarWriteProposal.patch(
+            action_id="calendar-cancelled-patch",
+            request_id="request-cancelled-patch",
+            calendar_id="primary",
+            event_id="event-cancelled",
+            snapshot=snapshot,
+            reviewed_patch={"status": "cancelled"},
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+
+
+def test_full_snapshot_preserves_writable_google_event_state_for_put() -> None:
+    _, _, state = connected_dispatcher()
+    current = {
+        **event(summary="Existing summary"),
+        "id": "event-full",
+        "etag": '"etag-full"',
+        "conferenceData": {
+            "createRequest": {"requestId": "conference-request"},
+            "entryPoints": [{"entryPointType": "video", "uri": "https://meet.test"}],
+        },
+        "extendedProperties": {
+            "private": {"workflow": "jarvis"},
+            "shared": {"team": "calendar"},
+        },
+        "guestsCanInviteOthers": False,
+        "guestsCanModify": True,
+        "guestsCanSeeOtherGuests": False,
+        "transparency": "transparent",
+        "sequence": 7,
+        "source": {"title": "Planner", "url": "https://planner.test"},
+        "attachments": [
+            {
+                "fileId": "file-1",
+                "fileUrl": "https://drive.test/file-1",
+                "title": "Agenda",
+                "mimeType": "text/plain",
+            }
+        ],
+        # These are returned by a complete GET but must not become PUT fields.
+        "organizer": {"email": "organizer@example.test"},
+        "updated": "2026-08-07T11:00:00Z",
+    }
+
+    proposal = CalendarWriteProposal.update_from_snapshot(
+        action_id="calendar-full-snapshot",
+        request_id="request-full-snapshot",
+        calendar_id="primary",
+        event_id="event-full",
+        snapshot=CalendarEventSnapshot(event=current, etag='"etag-full"'),
+        changes={"summary": "Changed summary"},
+        notification="all",
+        connection_generation=state.get_connection().generation,
+    )
+
+    complete_event = json.loads(proposal.payload)["complete_event"]
+    assert complete_event["summary"] == "Changed summary"
+    for field in (
+        "conferenceData",
+        "extendedProperties",
+        "guestsCanInviteOthers",
+        "guestsCanModify",
+        "guestsCanSeeOtherGuests",
+        "transparency",
+        "sequence",
+        "source",
+        "attachments",
+    ):
+        assert complete_event[field] == current[field]
+    assert "organizer" not in complete_event
+    assert "updated" not in complete_event
 
 
 def test_fetched_snapshot_makes_google_omissions_explicit() -> None:

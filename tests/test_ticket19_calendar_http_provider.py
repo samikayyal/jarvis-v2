@@ -77,17 +77,20 @@ def response(status_code: int, payload: object) -> GoogleCalendarHttpResponse:
     )
 
 
-def request(operation: str = "update") -> CalendarWriteRequest:
+def request(
+    operation: str = "update", *, event_value: dict[str, object] | None = None
+) -> CalendarWriteRequest:
     state = InMemoryGoogleOAuthStateStore()
     connection = state.set_connection(
         connected=True, granted_scopes=frozenset({CALENDAR_WRITE_SCOPE})
     )
+    calendar_event = event() if event_value is None else event_value
     proposal_factory = getattr(CalendarWriteProposal, operation)
     kwargs: dict[str, object] = {
         "action_id": "calendar-http-action",
         "request_id": "calendar-http-request",
         "calendar_id": "primary",
-        "complete_event": event(),
+        "complete_event": calendar_event,
         "notification": "all",
         "connection_generation": connection.generation,
     }
@@ -95,7 +98,9 @@ def request(operation: str = "update") -> CalendarWriteRequest:
         kwargs.update(
             {
                 "event_id": "event-1",
-                "snapshot": CalendarEventSnapshot(event=event(), etag='"etag-1"'),
+                "snapshot": CalendarEventSnapshot(
+                    event=calendar_event, etag='"etag-1"'
+                ),
             }
         )
         kwargs.pop("complete_event", None)
@@ -117,6 +122,7 @@ def credential() -> OAuthCredentialRecord:
 
 def test_live_provider_uses_only_exact_update_method_etag_and_notification() -> None:
     returned = {"id": "event-1", **event()}
+    expected_request_event = CalendarEventSnapshot(event=event(), etag='"etag-1"').event
     transport = ControlledCalendarTransport(
         [response(200, {"access_token": "access-token"}), response(200, returned)]
     )
@@ -133,7 +139,80 @@ def test_live_provider_uses_only_exact_update_method_etag_and_notification() -> 
     assert parsed.path.endswith("/calendars/primary/events/event-1")
     assert parse_qs(parsed.query) == {"sendUpdates": ["all"]}
     assert write["headers"]["If-Match"] == '"etag-1"'
-    assert json.loads(write["body"]) == event()
+    assert json.loads(write["body"]) == expected_request_event
+
+
+def test_live_provider_preserves_conference_data_and_attachments_on_full_update() -> (
+    None
+):
+    complete_event = {
+        **event(),
+        "conferenceData": {
+            "entryPoints": [{"entryPointType": "video", "uri": "https://meet.test"}]
+        },
+        "attachments": [
+            {
+                "fileId": "file-1",
+                "fileUrl": "https://drive.test/file-1",
+                "title": "Agenda",
+                "mimeType": "text/plain",
+            }
+        ],
+        "eventLabelId": "label-1",
+    }
+    returned = {"id": "event-1", **complete_event}
+    transport = ControlledCalendarTransport(
+        [response(200, {"access_token": "access-token"}), response(200, returned)]
+    )
+    provider = GoogleApiCalendarWriteProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    provider.write(request=request(event_value=complete_event), credential=credential())
+
+    write = transport.calls[1]
+    query = parse_qs(urlparse(write["url"]).query)
+    assert query == {
+        "sendUpdates": ["all"],
+        "conferenceDataVersion": ["1"],
+        "supportsAttachments": ["true"],
+        "eventLabelVersion": ["1"],
+    }
+    assert (
+        json.loads(write["body"])["conferenceData"] == complete_event["conferenceData"]
+    )
+    assert json.loads(write["body"])["attachments"] == complete_event["attachments"]
+
+
+def test_single_event_success_accepts_google_omitted_default_fields() -> None:
+    single_event = {
+        "summary": "Single event",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "default",
+    }
+    returned = {
+        "id": "event-1",
+        "summary": single_event["summary"],
+        "start": single_event["start"],
+        "end": single_event["end"],
+        "status": "confirmed",
+    }
+    transport = ControlledCalendarTransport(
+        [response(200, {"access_token": "access-token"}), response(200, returned)]
+    )
+    provider = GoogleApiCalendarWriteProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    result = provider.write(
+        request=request(event_value=single_event), credential=credential()
+    )
+
+    assert result.event == returned
 
 
 def test_precondition_failure_is_known_but_malformed_success_is_ambiguous() -> None:

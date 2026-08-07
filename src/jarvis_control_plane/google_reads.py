@@ -624,7 +624,15 @@ class GoogleReadConnector:
         items, item_truncated = _bounded_items(
             provider_result.items,
             max_items=min(request.max_results, self._max_result_items),
-            max_item_bytes=self._max_item_bytes,
+            # A single Calendar event is also the source for an ETag-bound
+            # mutation snapshot.  Give that fixed read the maximum bounded
+            # item size so the complete resource is never silently cut at
+            # the ordinary 16 KiB model-read limit.
+            max_item_bytes=(
+                MAX_ITEM_BYTES
+                if request.operation == "calendar_events_get"
+                else self._max_item_bytes
+            ),
         )
         result = GoogleReadResult(
             service=_SERVICE_BY_OPERATION[request.operation],
@@ -1070,12 +1078,10 @@ def _google_read_url(request: GoogleReadRequest) -> str:
     if operation == "calendar_events_get":
         calendar = quote(arguments["calendar_id"], safe="")
         event = quote(arguments["event_id"], safe="")
-        return _url(
-            f"{_CALENDAR_API_ROOT}/calendars/{calendar}/events/{event}",
-            {
-                "fields": "id,etag,status,summary,description,location,start,end,attendees,organizer,recurrence,visibility,reminders,updated",
-            },
-        )
+        # This is the only single-event read and is the mutation snapshot
+        # source.  Do not apply the display/list projection here: events.update
+        # is a full PUT, so omitted writable fields would be erased or reset.
+        return _url(f"{_CALENDAR_API_ROOT}/calendars/{calendar}/events/{event}", {})
     if operation == "drive_files_list":
         return _url(
             f"{_DRIVE_API_ROOT}/files",
@@ -1110,7 +1116,7 @@ def _url(endpoint: str, query: Mapping[str, object]) -> str:
             flattened.extend((key, str(item)) for item in value)
         else:
             flattened.append((key, str(value)))
-    return f"{endpoint}?{urlencode(flattened)}"
+    return endpoint if not flattened else f"{endpoint}?{urlencode(flattened)}"
 
 
 def _response_items(

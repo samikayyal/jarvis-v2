@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 
 import pytest
@@ -570,7 +571,7 @@ def test_file_credential_replacement_is_atomic_when_replace_fails(
     assert list((tmp_path / "google-credentials").glob("*.tmp")) == []
 
 
-def test_file_credential_store_reads_legacy_records_and_keeps_new_writes_rollback_readable(
+def test_file_credential_store_reads_legacy_records_and_commits_generation_with_token(
     tmp_path,
 ) -> None:
     directory = tmp_path / "google-credentials"
@@ -599,10 +600,67 @@ def test_file_credential_store_reads_legacy_records_and_keeps_new_writes_rollbac
     )
     store.replace(replacement)
 
-    rollback_payload = json.loads(path.read_text(encoding="utf-8"))
-    assert set(rollback_payload) == {
+    stored_payload = json.loads(path.read_text(encoding="utf-8"))
+    assert set(stored_payload) == {
+        "connection_generation",
         "granted_scopes",
         "refresh_token",
         "subject",
     }
     assert FileGoogleCredentialStore(directory).current == replacement
+
+
+def test_file_credential_generation_remains_bound_when_a_second_rename_would_fail(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "google-credentials"
+    store = FileGoogleCredentialStore(directory)
+    original = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="original-refresh-token",
+        connection_generation=1,
+    )
+    replacement = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="replacement-refresh-token",
+        connection_generation=2,
+    )
+    store.replace(original)
+
+    real_replace = os.replace
+    calls = 0
+
+    def fail_if_second_rename(source: object, target: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("controlled second rename failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        "jarvis_control_plane.google_oauth.os.replace", fail_if_second_rename
+    )
+
+    store.replace(replacement)
+
+    # Replacement is one authoritative rename; there is no second generation
+    # sidecar commit that can fail after the token becomes visible.
+    assert calls == 1
+    assert store.current == replacement
+
+    state_store = InMemoryGoogleOAuthStateStore()
+    state_store.set_connection(connected=True, granted_scopes=frozenset(READ_SCOPES))
+    current_connection = state_store.set_connection(
+        connected=True, granted_scopes=frozenset(READ_SCOPES)
+    )
+    lifecycle, trace_store = build_lifecycle(credentials=store, state_store=state_store)
+    try:
+        invalidated = lifecycle.handle_refresh_failure(
+            "invalid_grant", connection_generation=current_connection.generation
+        )
+        assert not invalidated.connected
+    finally:
+        trace_store._close_writer_service()
+    assert store.current is None

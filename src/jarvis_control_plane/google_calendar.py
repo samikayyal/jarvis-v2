@@ -44,6 +44,28 @@ _REQUIRED_COMPLETE_EVENT_FIELDS = frozenset(
     {"attendees", "recurrence", "reminders", "visibility"}
 )
 _VISIBILITY_VALUES = frozenset({"default", "public", "private", "confidential"})
+_STATUS_VALUES = frozenset({"confirmed", "tentative", "cancelled"})
+_EVENT_IDENTITY_FIELDS = frozenset({"id", "etag"})
+# A complete Event GET also returns server-managed fields.  They are removed
+# from mutation snapshots explicitly so a full PUT preserves writable state
+# without sending identity or read-only metadata back to Google.
+_READ_ONLY_EVENT_FIELDS = frozenset(
+    {
+        "kind",
+        "htmlLink",
+        "created",
+        "updated",
+        "creator",
+        "organizer",
+        "recurringEventId",
+        "originalStartTime",
+        "iCalUID",
+        "hangoutLink",
+        "locked",
+        "privateCopy",
+        "eventType",
+    }
+)
 GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES = 32 * 1024
 _CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
 _MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
@@ -71,6 +93,32 @@ def _event(value: object) -> dict[str, object]:
     event = _canonical_json(value, "complete_event")
     if not isinstance(event, dict):
         raise TypeError("complete_event must be an object")
+    identity_fields = _EVENT_IDENTITY_FIELDS & set(event)
+    if identity_fields:
+        raise ValueError(
+            "complete_event cannot replace event identity or ETag: "
+            + ", ".join(sorted(identity_fields))
+        )
+    read_only_fields = _READ_ONLY_EVENT_FIELDS & set(event)
+    if read_only_fields:
+        raise ValueError(
+            "complete_event contains read-only fields: "
+            + ", ".join(sorted(read_only_fields))
+        )
+    status = event.get("status")
+    if status is not None and (
+        not isinstance(status, str) or status not in _STATUS_VALUES
+    ):
+        raise ValueError("complete_event status has an invalid value")
+    if status == "cancelled":
+        raise ValueError("complete_event cannot represent a cancelled/deleted event")
+    if "attendeesOmitted" in event:
+        if not isinstance(event["attendeesOmitted"], bool):
+            raise TypeError("complete_event attendeesOmitted has an invalid shape")
+        if event["attendeesOmitted"]:
+            raise ValueError(
+                "complete_event cannot rely on an event with omitted attendees"
+            )
     missing = _REQUIRED_COMPLETE_EVENT_FIELDS - set(event)
     if missing:
         raise ValueError(
@@ -113,28 +161,55 @@ def _event(value: object) -> dict[str, object]:
 def _snapshot_event(value: object) -> dict[str, object]:
     """Normalize Google's omitted optional fields before complete-event validation."""
 
-    event = _canonical_json(value, "current_event")
-    if not isinstance(event, dict):
+    raw_event = _canonical_json(value, "current_event")
+    if not isinstance(raw_event, dict):
         raise TypeError("current_event must be an object")
+    identity = {
+        field: raw_event[field]
+        for field in _EVENT_IDENTITY_FIELDS
+        if field in raw_event
+    }
+    event = {
+        field: field_value
+        for field, field_value in raw_event.items()
+        if field not in _READ_ONLY_EVENT_FIELDS and field not in _EVENT_IDENTITY_FIELDS
+    }
+    if event.get("status") == "cancelled":
+        raise ValueError("current_event cannot represent a cancelled/deleted event")
     event.setdefault("attendees", [])
     event.setdefault("recurrence", [])
     event.setdefault("visibility", "default")
+    event.setdefault("status", "confirmed")
+    event.setdefault("transparency", "opaque")
+    event.setdefault("anyoneCanAddSelf", False)
+    event.setdefault("guestsCanInviteOthers", True)
+    event.setdefault("guestsCanModify", False)
+    event.setdefault("guestsCanSeeOtherGuests", True)
     if "reminders" not in event:
         event["reminders"] = {"useDefault": True, "overrides": []}
     elif isinstance(event["reminders"], dict) and "overrides" not in event["reminders"]:
         reminders = dict(event["reminders"])
-        if reminders.get("useDefault") is True:
-            reminders["overrides"] = []
+        reminders["overrides"] = []
         event["reminders"] = reminders
-    return _event(event)
+    normalized = _event(event)
+    normalized.update(identity)
+    return normalized
 
 
 def _patch(value: object, complete_event: Mapping[str, object]) -> dict[str, object]:
     patch = _canonical_json(value, "reviewed_patch")
     if not isinstance(patch, dict) or not patch:
         raise ValueError("reviewed_patch must be a non-empty object")
-    if {"id", "etag"} & set(patch):
+    if _EVENT_IDENTITY_FIELDS & set(patch):
         raise ValueError("reviewed_patch cannot replace event identity or ETag")
+    read_only_fields = _READ_ONLY_EVENT_FIELDS & set(patch)
+    if read_only_fields:
+        raise ValueError(
+            "reviewed_patch contains read-only fields: "
+            + ", ".join(sorted(read_only_fields))
+        )
+    if patch.get("status") == "cancelled":
+        raise ValueError("reviewed_patch cannot represent a cancelled/deleted event")
     for field in patch:
         if field not in complete_event or patch[field] != complete_event[field]:
             raise ValueError(
@@ -161,7 +236,7 @@ class CalendarEventSnapshot:
         normalized_changes = _canonical_json(changes, "event_changes")
         if not isinstance(normalized_changes, dict):
             raise TypeError("event_changes must be an object")
-        if {"id", "etag"} & set(normalized_changes):
+        if _EVENT_IDENTITY_FIELDS & set(normalized_changes):
             raise ValueError("event_changes cannot replace event identity or ETag")
         result = {
             key: value for key, value in self.event.items() if key not in {"id", "etag"}
@@ -211,11 +286,6 @@ class CalendarWriteRequest:
         else:
             _text(self.event_id, "event_id")
             _text(self.etag, "etag")
-            if (
-                "id" in self.complete_event
-                and self.complete_event["id"] != self.event_id
-            ):
-                raise ValueError("complete_event identity does not match event_id")
             if self.operation == "patch":
                 if self.reviewed_patch is None:
                     raise ValueError("Calendar patch requires a reviewed patch")
@@ -475,7 +545,10 @@ class GoogleCalendarWriteProviderResult:
     event: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "event", _event(self.event))
+        normalized = _canonical_json(self.event, "provider_event")
+        if not isinstance(normalized, dict):
+            raise TypeError("provider_event must be an object")
+        object.__setattr__(self, "event", normalized)
 
 
 GoogleCalendarHttpResponse = GoogleHttpResponse
@@ -545,10 +618,22 @@ class GoogleApiCalendarWriteProvider:
         event_path = (
             "" if request.event_id is None else "/" + quote(request.event_id, safe="")
         )
+        body_payload = (
+            request.reviewed_patch
+            if request.operation == "patch"
+            else request.complete_event
+        )
+        query: dict[str, str] = {"sendUpdates": request.notification}
+        if "conferenceData" in body_payload:
+            query["conferenceDataVersion"] = "1"
+        if "attachments" in body_payload:
+            query["supportsAttachments"] = "true"
+        if "eventLabelId" in body_payload:
+            query["eventLabelVersion"] = "1"
         url = (
             f"{_CALENDAR_API_ROOT}/calendars/"
             f"{quote(request.calendar_id, safe='')}/events{event_path}?"
-            f"{urlencode({'sendUpdates': request.notification})}"
+            f"{urlencode(query)}"
         )
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -556,11 +641,6 @@ class GoogleApiCalendarWriteProvider:
         }
         if request.etag is not None:
             headers["If-Match"] = request.etag
-        body_payload = (
-            request.reviewed_patch
-            if request.operation == "patch"
-            else request.complete_event
-        )
         return self._transport.request(
             method=method,
             url=url,
@@ -599,7 +679,16 @@ class GoogleApiCalendarWriteProvider:
                 "Calendar returned a different event identity",
                 may_have_dispatched=True,
             )
-        if not _contains_complete(request.complete_event, returned):
+        try:
+            expected = _snapshot_event(request.complete_event)
+            actual = _snapshot_event(returned)
+        except (TypeError, ValueError) as exc:
+            raise GoogleCalendarWriteProviderError(
+                "returned_event_mismatch",
+                "Calendar returned an invalid event representation",
+                may_have_dispatched=True,
+            ) from exc
+        if not _contains_complete(expected, actual):
             raise GoogleCalendarWriteProviderError(
                 "returned_event_mismatch",
                 "Calendar returned content different from the approved event",
