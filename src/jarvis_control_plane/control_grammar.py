@@ -267,10 +267,21 @@ def parse_control(message: str) -> ParsedControl:
     history_is_valid = (
         command is ControlCommand.HISTORY
         and len(parts) >= 2
-        and parts[1] in {"search", "inspect", "export", "conversation"}
         and (
-            (parts[1] == "search" and len(parts) >= 3)
-            or (parts[1] != "search" and len(parts) == 3)
+            (
+                parts[1] in {"search", "inspect", "export", "conversation"}
+                and (
+                    (parts[1] == "search" and len(parts) >= 3)
+                    or (parts[1] != "search" and len(parts) == 3)
+                )
+            )
+            or (
+                parts[1] == "delete"
+                and (
+                    (parts[2] in {"message", "conversation"} and len(parts) == 4)
+                    or (parts[2] in {"date", "range"} and len(parts) == 5)
+                )
+            )
         )
     )
     if len(parts) - 1 not in allowed_argument_counts[command] or (
@@ -386,7 +397,10 @@ def _usage(parsed: ParsedControl) -> str:
         ControlCommand.REVOKE: "Usage: /revoke <permission-id|session|persistent|all>",
         ControlCommand.HISTORY: (
             "Usage: /history search <text> | /history conversation <conversation-id> | "
-            "/history inspect <message-id> | /history export <message-id>"
+            "/history inspect <message-id> | /history export <message-id> | "
+            "/history delete message <history-id> | "
+            "/history delete conversation <conversation-id> | "
+            "/history delete date <YYYY-MM-DD> <YYYY-MM-DD>"
         ),
     }
     if parsed.command is not None:

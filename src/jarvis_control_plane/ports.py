@@ -16,7 +16,10 @@ if TYPE_CHECKING:
 from .models import (
     AuditEvidence,
     AuditFilter,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
     ConversationMessage,
+    ConversationTombstone,
     FrozenActionProposal,
     HistorySelection,
     IngressAdmissionResult,
@@ -195,6 +198,22 @@ class DurableStateStore(Protocol):
         excluding_working_session_id: str,
         limit: int = 5,
     ) -> HistorySelection: ...
+
+    def preview_conversation_deletion(
+        self, scope: ConversationDeletionScope
+    ) -> ConversationDeletionPreview: ...
+
+    def delete_conversation_history(
+        self,
+        preview: ConversationDeletionPreview,
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> tuple[ConversationTombstone, ...]: ...
+
+    def list_conversation_tombstones(
+        self, *, history_ids: tuple[str, ...] = ()
+    ) -> tuple[ConversationTombstone, ...]: ...
 
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
 
