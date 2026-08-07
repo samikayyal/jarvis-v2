@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol
+from enum import Enum
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .sessions import ModelAvailability
@@ -53,6 +55,24 @@ class ActionDispatcherError(ControlPlaneError):
     def __init__(self, message: str, *, may_have_dispatched: bool = False) -> None:
         super().__init__(message)
         self.may_have_dispatched = may_have_dispatched
+
+
+class ActionCancellationStatus(str, Enum):
+    """The bounded acknowledgement from an action cancellation request."""
+
+    STOPPED = "stopped"
+    NOT_STARTED = "not_started"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ActionCancellationResult:
+    """Typed result of asking a dispatcher to stop one prepared action."""
+
+    status: ActionCancellationStatus | str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", ActionCancellationStatus(self.status))
 
 
 class OutboundConnectorError(ControlPlaneError):
@@ -205,10 +225,20 @@ class OrchestrationAdapter(Protocol):
     def run(self, request: OrchestrationRequest) -> OrchestrationResult: ...
 
 
-class ActionDispatcher(Protocol):
-    """Closed side-effect boundary for a broker-approved frozen action."""
+@runtime_checkable
+class ActionDispatchHandle(Protocol):
+    """Prepared execution handle whose run waits for one bounded dispatch."""
 
-    def dispatch(self, action: FrozenActionProposal) -> object | None: ...
+    def run(self) -> object | None: ...
+
+
+@runtime_checkable
+class ActionDispatcher(Protocol):
+    """Closed, cancellable side-effect boundary for a frozen action."""
+
+    def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle: ...
+
+    def cancel(self, *, action_id: str) -> ActionCancellationResult: ...
 
 
 class ModelAvailabilityProvider(Protocol):

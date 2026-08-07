@@ -9,6 +9,8 @@ import pytest
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
+    ActionCancellationResult,
+    ActionCancellationStatus,
     ActionDispatcherError,
     ControlledOrchestrationAdapter,
     ControlledWorkerTransport,
@@ -192,6 +194,7 @@ def test_worker_gateway_retains_known_partial_compound_failure_without_retry() -
             status=WorkerExecutionStatus.FAILED,
             started_components=(0, 1),
             completed_components=(0,),
+            process_tree_stopped=True,
             stderr="second command exited 1",
         ),
     )
@@ -473,7 +476,10 @@ def test_post_dispatch_trace_failure_returns_the_same_unknown_outcome_it_persist
     None
 ):
     class TraceFailingDispatcher:
-        def dispatch(self, _action: FrozenActionProposal) -> None:
+        def prepare(self, _action: FrozenActionProposal) -> TraceFailingDispatcher:
+            return self
+
+        def run(self) -> None:
             try:
                 raise TraceWriteError(
                     "trace persistence failed", operation_started=True
@@ -482,6 +488,9 @@ def test_post_dispatch_trace_failure_returns_the_same_unknown_outcome_it_persist
                 raise ActionDispatcherError(
                     "worker result could not be recorded"
                 ) from trace_error
+
+        def cancel(self, *, action_id: str) -> ActionCancellationResult:
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
 
     components = build_receiver_components(
         operator_id=OPERATOR,
@@ -517,3 +526,149 @@ def test_post_dispatch_trace_failure_returns_the_same_unknown_outcome_it_persist
     current = components.broker.working_sessions.load()
     assert current is not None
     assert current.action_outbox[-1].status is DispatchStatus.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WorkerExecutionStatus.COMPLETED,
+        WorkerExecutionStatus.FAILED,
+        WorkerExecutionStatus.TIMED_OUT,
+        WorkerExecutionStatus.CANCELLED,
+    ],
+)
+def test_definite_worker_status_without_process_tree_proof_becomes_unknown(
+    status: WorkerExecutionStatus,
+) -> None:
+    result = WorkerExecutionResult(
+        status=status,
+        started_components=(0,),
+        completed_components=(0,) if status is WorkerExecutionStatus.COMPLETED else (),
+        process_tree_stopped=False,
+    )
+
+    assert result.status is WorkerExecutionStatus.UNKNOWN
+
+
+def test_worker_gateway_publishes_handle_before_worker_start_and_cancellation_wins() -> (
+    None
+):
+    worker = ControlledWorkerTransport(
+        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")}
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker},
+        registered_identities={
+            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
+        },
+    )
+    proposal = FrozenActionProposal.create(
+        action_id="action-worker-before-start-cancel",
+        request_id="request-worker-before-start-cancel",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/git",
+            "arguments": ["status"],
+            "cwd": "/workspace",
+        },
+    )
+
+    handle = gateway.prepare(proposal)
+    cancellation = gateway.cancel(action_id=proposal.action_id)
+
+    assert cancellation.status is ActionCancellationStatus.NOT_STARTED
+    assert proposal.action_id not in gateway._running  # type: ignore[attr-defined]
+    with pytest.raises(WorkerExecutionError) as exc:
+        handle.run()
+    assert exc.value.result.status is WorkerExecutionStatus.CANCELLED
+    assert worker.invocations == []
+
+
+def test_approval_dispatch_releases_lock_before_worker_completion() -> None:
+    class BlockingHandle:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+            self.cancelled = Event()
+
+        def run(self) -> None:
+            self.started.set()
+            assert self.release.wait(timeout=5)
+
+        def cancel(self, *, action_id: str) -> ActionCancellationResult:
+            self.cancelled.set()
+            self.release.set()
+            return ActionCancellationResult(ActionCancellationStatus.STOPPED)
+
+    class BlockingDispatcher:
+        def __init__(self) -> None:
+            self.handle = BlockingHandle()
+
+        def prepare(self, _action: FrozenActionProposal) -> BlockingHandle:
+            return self.handle
+
+        def cancel(self, *, action_id: str) -> ActionCancellationResult:
+            return self.handle.cancel(action_id=action_id)
+
+    dispatcher = BlockingDispatcher()
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket11-approval-cancel",
+        action_dispatcher=dispatcher,
+        orchestration=ControlledOrchestrationAdapter(
+            proposal_factory=lambda request: FrozenActionProposal.create(
+                action_id="action-worker-approval-cancel",
+                request_id=request.state.request_id,
+                kind="terminal",
+                preview="Run the exact terminal action.",
+                payload={
+                    "host": "ubuntu",
+                    "executable": "/usr/bin/touch",
+                    "arguments": ["/workspace/exact.txt"],
+                    "cwd": "/workspace",
+                },
+            )
+        ),
+    )
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    components.broker.working_sessions.compare_and_set(
+        session, replace(session, readiness=ReadinessState(ubuntu="ready"))
+    )
+
+    proposed = components.receiver.receive(
+        _event("run the command", "approval-proposal")
+    )
+    assert proposed.disposition == "pending_action"
+
+    approval_result: list[object] = []
+    approval = Thread(
+        target=lambda: approval_result.append(
+            components.receiver.receive(_event("1", "approval-confirm"))
+        )
+    )
+    approval.start()
+    try:
+        assert dispatcher.handle.started.wait(timeout=5)
+        started_at = monotonic()
+        cancelled = components.receiver.receive(_event("/cancel", "approval-cancel"))
+        elapsed = monotonic() - started_at
+
+        assert cancelled.disposition == "cancelled"
+        assert elapsed < 3
+        assert dispatcher.handle.cancelled.is_set()
+        approval.join(timeout=5)
+        assert not approval.is_alive()
+        assert approval_result[0].disposition == "late_result_ignored"
+    finally:
+        dispatcher.handle.release.set()
+        approval.join(timeout=5)
+
+    current = components.broker.working_sessions.load()
+    assert current is not None
+    assert current.action_outbox[-1].status is DispatchStatus.CANCELLED

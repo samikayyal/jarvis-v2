@@ -35,6 +35,8 @@ from .models import (
     ensure_utc,
 )
 from .ports import (
+    ActionCancellationResult,
+    ActionCancellationStatus,
     ActionDispatcherError,
     AuditBoundary,
     AuditWriteError,
@@ -2306,8 +2308,41 @@ class ControlledOrchestrationAdapter:
         )
 
 
+class _ControlledActionDispatch:
+    """Prepared controlled action with the same cancellation barrier as workers."""
+
+    def __init__(
+        self, owner: ControlledActionDispatcher, action: FrozenActionProposal
+    ) -> None:
+        self._owner = owner
+        self._action = action
+        self._lock = threading.RLock()
+        self._started = False
+        self._cancelled = False
+
+    def run(self) -> None:
+        with self._lock:
+            if self._cancelled:
+                self._owner._forget(self._action.action_id, self)
+                raise ActionDispatcherError("action was cancelled before dispatch")
+            self._started = True
+        try:
+            self._owner._dispatch(self._action)
+        finally:
+            self._owner._forget(self._action.action_id, self)
+
+    def cancel(self) -> ActionCancellationResult:
+        with self._lock:
+            if not self._started:
+                self._cancelled = True
+                result = ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+                self._owner._forget(self._action.action_id, self)
+                return result
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+
+
 class ControlledActionDispatcher:
-    """Controlled action edge that records exactly the frozen proposal passed in."""
+    """Controlled action edge with an explicit prepared/cancellable lifecycle."""
 
     def __init__(
         self, *, failure: str | None = None, failure_may_have_dispatched: bool = False
@@ -2315,13 +2350,43 @@ class ControlledActionDispatcher:
         self.failure = failure
         self.failure_may_have_dispatched = failure_may_have_dispatched
         self.dispatched: list[FrozenActionProposal] = []
+        self._lock = threading.RLock()
+        self._prepared: dict[str, _ControlledActionDispatch] = {}
+
+    def prepare(self, action: FrozenActionProposal) -> _ControlledActionDispatch:
+        handle = _ControlledActionDispatch(self, action)
+        with self._lock:
+            if action.action_id in self._prepared:
+                raise ActionDispatcherError(
+                    f"action {action.action_id} is already prepared",
+                    may_have_dispatched=True,
+                )
+            self._prepared[action.action_id] = handle
+        return handle
 
     def dispatch(self, action: FrozenActionProposal) -> None:
+        """Compatibility helper for direct controlled-adapter callers."""
+
+        self.prepare(action).run()
+
+    def cancel(self, *, action_id: str) -> ActionCancellationResult:
+        with self._lock:
+            handle = self._prepared.get(action_id)
+        if handle is None:
+            return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+        return handle.cancel()
+
+    def _dispatch(self, action: FrozenActionProposal) -> None:
         if self.failure is not None:
             raise ActionDispatcherError(
                 self.failure, may_have_dispatched=self.failure_may_have_dispatched
             )
         self.dispatched.append(action)
+
+    def _forget(self, action_id: str, handle: _ControlledActionDispatch) -> None:
+        with self._lock:
+            if self._prepared.get(action_id) is handle:
+                del self._prepared[action_id]
 
 
 class ControlledOutboundConnector:

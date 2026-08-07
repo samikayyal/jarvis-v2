@@ -82,7 +82,10 @@ from .models import (
 )
 from .orchestration import AgentsSdkOrchestrationAdapter
 from .ports import (
+    ActionCancellationResult,
+    ActionCancellationStatus,
     ActionDispatcherError,
+    ActionDispatchHandle,
     AuditWriteError,
     ControlPlaneError,
     DiagnosticTraceError,
@@ -120,6 +123,9 @@ __all__ = [
     "GOOGLE_OAUTH_STATE_TTL",
     "GOOGLE_READ_SCOPES",
     "MAX_TRACE_RESERVATION_BYTES",
+    "ActionCancellationResult",
+    "ActionCancellationStatus",
+    "ActionDispatchHandle",
     "ActionDispatcherError",
     "AgentsSdkOrchestrationAdapter",
     "AuditEvidence",

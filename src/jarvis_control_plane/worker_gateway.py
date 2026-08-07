@@ -11,10 +11,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from threading import Event, RLock, Thread
+from time import monotonic
 from typing import Protocol
 
 from .models import FrozenActionProposal
-from .ports import ActionDispatcherError
+from .ports import (
+    ActionCancellationResult,
+    ActionCancellationStatus,
+    ActionDispatcherError,
+    ActionDispatchHandle,
+)
 from .terminal_policy import TerminalAction, terminal_action_from_proposal
 
 
@@ -52,6 +58,7 @@ class WorkerExecutionLimits:
     stdout_limit_bytes: int = 1024 * 1024
     stderr_limit_bytes: int = 1024 * 1024
     cancellation_grace_seconds: int = 10
+    authentication_timeout_seconds: int = 10
 
     def __post_init__(self) -> None:
         if any(
@@ -61,12 +68,17 @@ class WorkerExecutionLimits:
                 self.stdout_limit_bytes,
                 self.stderr_limit_bytes,
                 self.cancellation_grace_seconds,
+                self.authentication_timeout_seconds,
             )
         ):
             raise TypeError("worker execution limits must be integers")
         if not 1 <= self.deadline_seconds <= 10 * 60:
             raise ValueError(
                 "worker deadline must be between one second and ten minutes"
+            )
+        if not 1 <= self.authentication_timeout_seconds <= 30:
+            raise ValueError(
+                "worker authentication timeout must be between one and 30 seconds"
             )
         if self.stdout_limit_bytes != 1024 * 1024:
             raise ValueError("worker stdout limit is fixed at one MiB")
@@ -103,7 +115,7 @@ class WorkerExecutionResult:
     stderr: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "status", WorkerExecutionStatus(self.status))
+        status = WorkerExecutionStatus(self.status)
         for name in ("started_components", "completed_components"):
             value = tuple(getattr(self, name))
             if any(
@@ -118,6 +130,12 @@ class WorkerExecutionResult:
             raise ValueError("only started components may be completed")
         if not isinstance(self.process_tree_stopped, bool):
             raise TypeError("worker process-tree stop confirmation must be boolean")
+        if (
+            status is not WorkerExecutionStatus.UNKNOWN
+            and not self.process_tree_stopped
+        ):
+            status = WorkerExecutionStatus.UNKNOWN
+        object.__setattr__(self, "status", status)
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
             raise TypeError("worker output must be text")
 
@@ -149,7 +167,210 @@ class WorkerTransport(Protocol):
 
     def execute(self, invocation: WorkerInvocation) -> WorkerExecutionResult: ...
 
-    def cancel(self, *, action_id: str) -> None: ...
+    def cancel(
+        self, *, action_id: str, timeout_seconds: int
+    ) -> ActionCancellationResult: ...
+
+
+def _call_with_timeout(
+    operation: Callable[[], object], *, timeout_seconds: int
+) -> tuple[object | None, BaseException | None, bool]:
+    """Run one transport call with an explicit daemon-thread bound."""
+
+    finished = Event()
+    result: object | None = None
+    failure: BaseException | None = None
+
+    def invoke() -> None:
+        nonlocal failure, result
+        try:
+            result = operation()
+        except BaseException as exc:  # noqa: BLE001 - transport boundary
+            failure = exc
+        finally:
+            finished.set()
+
+    Thread(target=invoke, daemon=True).start()
+    if not finished.wait(timeout=timeout_seconds):
+        return None, None, True
+    return result, failure, False
+
+
+class _WorkerDispatchHandle:
+    """One registered worker execution that can be cancelled before it starts."""
+
+    def __init__(
+        self,
+        *,
+        action: FrozenActionProposal,
+        terminal: TerminalAction,
+        worker: WorkerTransport,
+        limits: WorkerExecutionLimits,
+        unregister: Callable[[str, _WorkerDispatchHandle], None],
+    ) -> None:
+        self.action = action
+        self.terminal = terminal
+        self.worker = worker
+        self.limits = limits
+        self._unregister = unregister
+        self._lock = RLock()
+        self._cancel_lock = RLock()
+        self._cancel_requested = Event()
+        self._wake = Event()
+        self._finished = Event()
+        self._run_called = False
+        self._started = False
+        self._cancel_result: ActionCancellationResult | None = None
+        self._result: WorkerExecutionResult | None = None
+        self._failure: BaseException | None = None
+
+    def run(self) -> WorkerExecutionResult:
+        with self._lock:
+            if self._run_called:
+                raise ActionDispatcherError(
+                    "worker dispatch handle was already consumed",
+                    may_have_dispatched=True,
+                )
+            self._run_called = True
+            if self._cancel_requested.is_set():
+                self._unregister(self.action.action_id, self)
+                raise WorkerExecutionError(self._not_started_result())
+
+        invocation = WorkerInvocation(
+            action_id=self.action.action_id,
+            action=self.terminal,
+            interactive=False,
+            deadline_seconds=self.limits.deadline_seconds,
+            stdout_limit_bytes=self.limits.stdout_limit_bytes,
+            stderr_limit_bytes=self.limits.stderr_limit_bytes,
+            cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+        )
+
+        def execute() -> None:
+            try:
+                with self._lock:
+                    # This check and the started transition are the local
+                    # barrier immediately before the transport call. A
+                    # cancellation that wins it cannot start worker execution.
+                    if self._cancel_requested.is_set():
+                        self._result = self._not_started_result()
+                        return
+                    self._started = True
+                self._result = self.worker.execute(invocation)
+            except BaseException as exc:  # noqa: BLE001 - preserve transport boundary
+                self._failure = exc
+            finally:
+                self._finished.set()
+                self._wake.set()
+                self._unregister(self.action.action_id, self)
+
+        try:
+            Thread(target=execute, daemon=True).start()
+        except BaseException as exc:
+            self._unregister(self.action.action_id, self)
+            raise ActionDispatcherError(
+                "worker execution thread could not start"
+            ) from exc
+
+        wait_state = self._wait_for_completion(self.limits.deadline_seconds)
+        deadline_expired = wait_state == "deadline"
+        if wait_state in {"deadline", "cancelled"}:
+            if wait_state == "deadline":
+                self.cancel()
+            if not self._finished.wait(timeout=self.limits.cancellation_grace_seconds):
+                raise WorkerExecutionError(self._unknown_result())
+
+        if self._failure is not None:
+            raise WorkerExecutionError(
+                WorkerExecutionResult(
+                    status=WorkerExecutionStatus.UNKNOWN,
+                    started_components=(0,),
+                )
+            ) from self._failure
+        if self._result is None:
+            raise ActionDispatcherError(
+                "worker completed without a terminal result",
+                may_have_dispatched=True,
+            )
+        result = _bounded_result(
+            self._result,
+            limits=self.limits,
+            component_count=len(self.terminal.components),
+        )
+        if deadline_expired and result.status is not WorkerExecutionStatus.UNKNOWN:
+            result = replace(result, status=WorkerExecutionStatus.TIMED_OUT)
+        if result.status is WorkerExecutionStatus.COMPLETED:
+            return result
+        raise WorkerExecutionError(result)
+
+    def cancel(self) -> ActionCancellationResult:
+        """Request bounded worker cancellation and return its acknowledgement."""
+
+        with self._cancel_lock:
+            with self._lock:
+                if self._cancel_result is not None:
+                    return self._cancel_result
+                if not self._started:
+                    self._cancel_requested.set()
+                    self._wake.set()
+                    result = ActionCancellationResult(
+                        ActionCancellationStatus.NOT_STARTED
+                    )
+                    self._cancel_result = result
+                    self._unregister(self.action.action_id, self)
+                    return result
+                if self._finished.is_set():
+                    result = ActionCancellationResult(ActionCancellationStatus.STOPPED)
+                    self._cancel_result = result
+                    return result
+                self._cancel_requested.set()
+                self._wake.set()
+
+            value, failure, timed_out = _call_with_timeout(
+                lambda: self.worker.cancel(
+                    action_id=self.action.action_id,
+                    timeout_seconds=self.limits.cancellation_grace_seconds,
+                ),
+                timeout_seconds=self.limits.cancellation_grace_seconds,
+            )
+            if (
+                timed_out
+                or failure is not None
+                or not isinstance(value, ActionCancellationResult)
+            ):
+                result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+            elif value.status is ActionCancellationStatus.NOT_STARTED:
+                # The local barrier already marked this execution started.
+                result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+            else:
+                result = value
+            with self._lock:
+                self._cancel_result = result
+            return result
+
+    def _wait_for_completion(self, timeout_seconds: int) -> str:
+        deadline = monotonic() + timeout_seconds
+        while not self._finished.is_set():
+            if self._cancel_requested.is_set():
+                return "cancelled"
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return "deadline"
+            self._wake.wait(timeout=remaining)
+        return "finished"
+
+    def _unknown_result(self) -> WorkerExecutionResult:
+        return WorkerExecutionResult(
+            status=WorkerExecutionStatus.UNKNOWN,
+            started_components=(0,),
+        )
+
+    @staticmethod
+    def _not_started_result() -> WorkerExecutionResult:
+        return WorkerExecutionResult(
+            status=WorkerExecutionStatus.CANCELLED,
+            process_tree_stopped=True,
+        )
 
 
 class WorkerGateway:
@@ -174,10 +395,10 @@ class WorkerGateway:
         self._workers = dict(workers)
         self._registered_identities = dict(registered_identities)
         self._limits = limits or WorkerExecutionLimits()
-        self._running: dict[str, tuple[object, WorkerTransport]] = {}
+        self._running: dict[str, _WorkerDispatchHandle] = {}
         self._lock = RLock()
 
-    def dispatch(self, action: FrozenActionProposal) -> WorkerExecutionResult:
+    def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
         terminal = _terminal_action(action)
         worker = self._workers.get(terminal.host)
         expected = self._registered_identities.get(terminal.host)
@@ -185,93 +406,62 @@ class WorkerGateway:
             raise ActionDispatcherError(
                 f"selected execution host {terminal.host} has no registered worker"
             )
-        actual = worker.authenticate(selected_host=terminal.host)
+        actual, failure, timed_out = _call_with_timeout(
+            lambda: worker.authenticate(selected_host=terminal.host),
+            timeout_seconds=self._limits.authentication_timeout_seconds,
+        )
+        if timed_out:
+            raise ActionDispatcherError(
+                f"selected execution host {terminal.host} authentication timed out"
+            )
+        if failure is not None:
+            if isinstance(failure, ActionDispatcherError):
+                raise failure
+            raise ActionDispatcherError(
+                f"selected execution host {terminal.host} authentication failed"
+            ) from failure
+        if not isinstance(actual, WorkerIdentity):
+            raise ActionDispatcherError(
+                f"selected execution host {terminal.host} returned an invalid identity"
+            )
         if actual != expected:
             raise ActionDispatcherError(
                 f"selected execution host {terminal.host} did not authenticate as its registered worker"
             )
-        invocation = WorkerInvocation(
-            action_id=action.action_id,
-            action=terminal,
-            interactive=False,
-            deadline_seconds=self._limits.deadline_seconds,
-            stdout_limit_bytes=self._limits.stdout_limit_bytes,
-            stderr_limit_bytes=self._limits.stderr_limit_bytes,
-            cancellation_grace_seconds=self._limits.cancellation_grace_seconds,
-        )
-        finished = Event()
-        result: WorkerExecutionResult | None = None
-        failure: BaseException | None = None
-        execution = object()
-        with self._lock:
-            self._running[action.action_id] = (execution, worker)
-
-        def execute() -> None:
-            nonlocal failure, result
-            try:
-                result = worker.execute(invocation)
-            except BaseException as exc:  # noqa: BLE001 - preserve transport boundary
-                failure = exc
-            finally:
-                finished.set()
-                with self._lock:
-                    if self._running.get(action.action_id) == (execution, worker):
-                        del self._running[action.action_id]
-
-        thread = Thread(target=execute, daemon=True)
-        try:
-            thread.start()
-        except BaseException as exc:
-            with self._lock:
-                if self._running.get(action.action_id) == (execution, worker):
-                    del self._running[action.action_id]
-            raise ActionDispatcherError(
-                "worker execution thread could not start"
-            ) from exc
-        deadline_expired = not finished.wait(timeout=self._limits.deadline_seconds)
-        if deadline_expired:
-            worker.cancel(action_id=action.action_id)
-            if not finished.wait(timeout=self._limits.cancellation_grace_seconds):
-                unknown = WorkerExecutionResult(
-                    status=WorkerExecutionStatus.UNKNOWN,
-                    started_components=(0,),
-                )
-                raise WorkerExecutionError(unknown)
-        if failure is not None:
-            raise WorkerExecutionError(
-                WorkerExecutionResult(status=WorkerExecutionStatus.UNKNOWN)
-            ) from failure
-        if result is None:
-            raise ActionDispatcherError(
-                "worker completed without a terminal result",
-                may_have_dispatched=True,
-            )
-        result = _bounded_result(
-            result,
+        handle = _WorkerDispatchHandle(
+            action=action,
+            terminal=terminal,
+            worker=worker,
             limits=self._limits,
-            component_count=len(terminal.components),
+            unregister=self._unregister,
         )
-        if deadline_expired and result.status is not WorkerExecutionStatus.UNKNOWN:
-            result = replace(
-                result,
-                status=(
-                    WorkerExecutionStatus.TIMED_OUT
-                    if result.process_tree_stopped
-                    else WorkerExecutionStatus.UNKNOWN
-                ),
-            )
-        if result.status is WorkerExecutionStatus.COMPLETED:
-            return result
-        raise WorkerExecutionError(result)
+        with self._lock:
+            if action.action_id in self._running:
+                raise ActionDispatcherError(
+                    f"worker action {action.action_id} is already prepared",
+                    may_have_dispatched=True,
+                )
+            self._running[action.action_id] = handle
+        return handle
 
-    def cancel(self, *, action_id: str) -> None:
-        """Forward cancellation only to a worker currently executing that action."""
+    def dispatch(self, action: FrozenActionProposal) -> WorkerExecutionResult:
+        """Compatibility helper for direct gateway callers."""
+
+        return self.prepare(action).run()  # type: ignore[no-any-return]
+
+    def cancel(self, *, action_id: str) -> ActionCancellationResult:
+        """Cancel a prepared or running action through its typed lifecycle."""
 
         with self._lock:
             running = self._running.get(action_id)
-        if running is not None:
-            _, worker = running
-            worker.cancel(action_id=action_id)
+        if running is None:
+            return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+        return running.cancel()
+
+    def _unregister(self, action_id: str, handle: _WorkerDispatchHandle) -> None:
+        with self._lock:
+            if self._running.get(action_id) is handle:
+                del self._running[action_id]
 
 
 class ControlledWorkerTransport:
@@ -284,7 +474,7 @@ class ControlledWorkerTransport:
         result: WorkerExecutionResult | None = None,
         execution_hook: Callable[[WorkerInvocation], WorkerExecutionResult]
         | None = None,
-        on_cancel: Callable[[str], None] | None = None,
+        on_cancel: Callable[[str], ActionCancellationResult | None] | None = None,
     ) -> None:
         self.identities = dict(identities)
         self.result = result or WorkerExecutionResult.completed()
@@ -309,10 +499,19 @@ class ControlledWorkerTransport:
             return self.execution_hook(invocation)
         return self.result
 
-    def cancel(self, *, action_id: str) -> None:
+    def cancel(
+        self, *, action_id: str, timeout_seconds: int
+    ) -> ActionCancellationResult:
         self.cancelled.append(action_id)
         if self.on_cancel is not None:
-            self.on_cancel(action_id)
+            result = self.on_cancel(action_id)
+            if result is not None:
+                if not isinstance(result, ActionCancellationResult):
+                    raise TypeError(
+                        "controlled cancellation must return a typed result"
+                    )
+                return result
+        return ActionCancellationResult(ActionCancellationStatus.STOPPED)
 
 
 def _terminal_action(action: FrozenActionProposal) -> TerminalAction:
