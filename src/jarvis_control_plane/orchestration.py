@@ -20,6 +20,11 @@ from .gmail_actions import (
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
 )
+from .knowledge_vault_writes import (
+    KNOWLEDGE_VAULT_WRITE_KIND,
+    KnowledgeVaultWriteConnector,
+    VaultWriteError,
+)
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
@@ -54,7 +59,12 @@ class AgentsSdkProposal(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["terminal", "gmail_send", "gmail_reply"]
+    kind: Literal[
+        "terminal",
+        "gmail_send",
+        "gmail_reply",
+        "knowledge_vault_write",
+    ]
     preview: str = Field(min_length=1, max_length=2_000)
     payload: dict[str, object]
 
@@ -188,6 +198,7 @@ class AgentsSdkOrchestrationAdapter:
         read_tool: BoundedReadTool | None = None,
         google_read_connector: object | None = None,
         vault_read_tool: BoundedReadTool | None = None,
+        vault_write_connector: KnowledgeVaultWriteConnector | None = None,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -257,6 +268,13 @@ class AgentsSdkOrchestrationAdapter:
         if vault_read_tool is not None:
             read_tools.append(vault_read_tool)
         self._read_tools = tuple(read_tools)
+        if vault_write_connector is not None and not isinstance(
+            vault_write_connector, KnowledgeVaultWriteConnector
+        ):
+            raise TypeError(
+                "vault_write_connector must be a KnowledgeVaultWriteConnector"
+            )
+        self._vault_write_connector = vault_write_connector
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
         milestones = [
@@ -285,7 +303,8 @@ class AgentsSdkOrchestrationAdapter:
                 instructions=_instructions(
                     has_vault_read=any(
                         tool.name == "read_knowledge_vault" for tool in self._read_tools
-                    )
+                    ),
+                    has_vault_write=self._vault_write_connector is not None,
                 ),
                 model=request.model,
                 model_settings=self._model_settings_factory(
@@ -417,8 +436,8 @@ class AgentsSdkOrchestrationAdapter:
             )
         return tools
 
-    @staticmethod
     def _frozen_proposal(
+        self,
         request: OrchestrationRequest,
         plan: AgentsSdkPlan,
         host: Literal["ubuntu", "windows"] | None,
@@ -458,13 +477,30 @@ class AgentsSdkOrchestrationAdapter:
                     request_id=request.state.request_id,
                     **payload,
                 )
+            elif plan.proposal.kind == KNOWLEDGE_VAULT_WRITE_KIND:
+                if self._vault_write_connector is None:
+                    raise OrchestrationAdapterError(
+                        "knowledge-vault write capability is not configured"
+                    )
+                if (
+                    set(payload) - {"changes", "commit_subject"}
+                    or "changes" not in payload
+                ):
+                    raise OrchestrationAdapterError(
+                        "knowledge-vault write proposal has an unexpected shape"
+                    )
+                candidate = self._vault_write_connector.propose(
+                    request_id=request.state.request_id,
+                    changes=payload["changes"],  # type: ignore[arg-type]
+                    commit_subject=payload.get("commit_subject"),  # type: ignore[arg-type]
+                )
             else:
                 candidate = create_gmail_reply_proposal(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
                     **payload,
                 )
-        except (TypeError, ValueError, KeyError) as exc:
+        except (TypeError, ValueError, KeyError, VaultWriteError) as exc:
             raise OrchestrationAdapterError(
                 "model returned a malformed action proposal"
             ) from exc
@@ -488,7 +524,7 @@ def _model_input_with_history(request: OrchestrationRequest) -> str:
     )
 
 
-def _instructions(*, has_vault_read: bool) -> str:
+def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
     """Keep the model on a closed planning contract with no authority tools."""
 
     return (
@@ -508,6 +544,14 @@ def _instructions(*, has_vault_read: bool) -> str:
             "The read_knowledge_vault tool is a local, deterministic, read-only "
             "search of the configured vault and returns only bounded excerpts. "
             if has_vault_read
+            else ""
+        )
+        + (
+            "For an approved knowledge-vault note change, emit one complete "
+            "knowledge_vault_write proposal containing only a path-to-new-content "
+            "changes mapping; the connector will independently synchronize and "
+            "freeze the exact base and diff. "
+            if has_vault_write
             else ""
         )
         + "Read tools never mutate, dispatch, approve, create permissions, expose "

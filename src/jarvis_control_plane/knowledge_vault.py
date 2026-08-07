@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -20,17 +20,20 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .knowledge_vault_common import (
+    _EXCLUDED_TOP_LEVEL_DIRECTORIES,
+    _remaining_seconds,
+)
+
 _MAX_QUERY_CHARS = 200
 _MAX_RETURNED_EXCERPTS = 8
 _MAX_EXCERPT_CHARS = 600
 _MAX_NOTES_INSPECTED = 128
 _MAX_BYTES_PER_NOTE = 64 * 1024
 _MAX_TOTAL_BYTES_SCANNED = 512 * 1024
-_EXCLUDED_TOP_LEVEL_DIRECTORIES = frozenset(
-    {"attachments", "plugins", "templates", "themes", "trash"}
-)
 _WIKILINK = re.compile(r"\[\[([^\]]+)\]\]")
 _MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+_UNIFIED_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 
 
 class VaultReadError(Exception):
@@ -213,6 +216,148 @@ class SubprocessVaultSynchronizer:
         self._synchronization_state.save_knowledge_vault_synchronized_at(now)
         return now
 
+    def current_commit(self, root: Path, *, deadline: float | None = None) -> str:
+        """Return the dedicated clone's exact checked-out commit."""
+
+        return self._git(
+            root,
+            "rev-parse",
+            "HEAD",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout.strip()
+
+    def fetch_remote_commit(self, root: Path, *, deadline: float | None = None) -> str:
+        """Fetch without merging, then return the exact fetched remote base."""
+
+        self._git(
+            root,
+            "fetch",
+            "--prune",
+            "--no-tags",
+            "origin",
+            failure_type=VaultRemoteUnavailable,
+            deadline=deadline,
+        )
+        return self._git(
+            root,
+            "rev-parse",
+            "FETCH_HEAD",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout.strip()
+
+    def stage(
+        self, root: Path, paths: Sequence[str], *, deadline: float | None = None
+    ) -> None:
+        """Stage only the already validated Markdown paths."""
+
+        if not paths:
+            raise VaultRepositoryConflict("knowledge-vault write has no paths")
+        self._git(
+            root,
+            "add",
+            "--",
+            *paths,
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        )
+
+    def staged_diff(
+        self, root: Path, paths: Sequence[str], *, deadline: float | None = None
+    ) -> str:
+        """Return a path-only unified diff without Git metadata or rename headers."""
+
+        if not paths:
+            raise VaultRepositoryConflict("knowledge-vault write has no paths")
+        output = self._git(
+            root,
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-renames",
+            "--no-color",
+            "--unified=3",
+            "--",
+            *paths,
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout
+        return _normalise_staged_diff(output)
+
+    def commit(
+        self,
+        root: Path,
+        *,
+        author_name: str,
+        author_email: str,
+        subject: str,
+        body: str,
+        deadline: float | None = None,
+    ) -> str:
+        """Create one normal commit with the frozen configured identity."""
+
+        self._git(
+            root,
+            "-c",
+            f"user.name={author_name}",
+            "-c",
+            f"user.email={author_email}",
+            "commit",
+            "--no-verify",
+            "-m",
+            subject,
+            "-m",
+            body,
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        )
+        return self.current_commit(root, deadline=deadline)
+
+    def push(
+        self,
+        root: Path,
+        *,
+        expected_base: str,
+        commit_id: str,
+        deadline: float | None = None,
+    ) -> None:
+        """Push the checked-out branch normally; force and history rewrites are absent."""
+
+        branch = self._git(
+            root,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout.strip()
+        if not branch or branch == "HEAD":
+            raise VaultRepositoryConflict("knowledge-vault clone is detached")
+        local = self.current_commit(root, deadline=deadline)
+        if local != commit_id:
+            raise VaultRepositoryConflict("knowledge-vault commit changed before push")
+        try:
+            self._git(
+                root,
+                "push",
+                "--porcelain",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+            )
+        except VaultRepositoryConflict as exc:
+            message = str(exc).casefold()
+            if "non-fast-forward" in message or "rejected" in message:
+                raise VaultRepositoryConflict(
+                    "knowledge-vault remote rejected a non-fast-forward push"
+                ) from exc
+            raise VaultRemoteUnavailable(
+                "knowledge-vault push was unavailable"
+            ) from exc
+
     def _git(
         self,
         root: Path,
@@ -240,7 +385,15 @@ class SubprocessVaultSynchronizer:
         if deadline is not None:
             _remaining_seconds(deadline, failure_type)
         if completed.returncode != 0:
-            raise failure_type("knowledge-vault synchronization failed")
+            detail = " ".join(
+                part.strip()
+                for part in (completed.stderr, completed.stdout)
+                if part.strip()
+            )[:200]
+            message = "knowledge-vault synchronization failed"
+            if detail:
+                message = f"{message}: {detail}"
+            raise failure_type(message)
         return completed
 
 
@@ -600,13 +753,6 @@ def _note_title(content: str) -> str | None:
     return None
 
 
-def _remaining_seconds(deadline: float, error_type: type[Exception]) -> float:
-    remaining = deadline - monotonic()
-    if remaining <= 0:
-        raise error_type("knowledge-vault read exceeded its overall deadline")
-    return remaining
-
-
 def _stale_warning(age) -> str:
     minutes = max(0, int(age.total_seconds() // 60))
     hours, minutes = divmod(minutes, 60)
@@ -625,3 +771,49 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
             seen.add(path)
             unique.append(path)
     return unique
+
+
+def _normalise_staged_diff(output: str) -> str:
+    """Remove Git-only headers while retaining every unified-diff line."""
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    ignored_prefixes = (
+        "diff --git ",
+        "index ",
+        "new file mode ",
+        "old mode ",
+        "new mode ",
+        "deleted file mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+    )
+    lines = output.replace("\r\n", "\n").splitlines()
+    hunk_lines_remaining = 0
+    for line in lines:
+        is_file_header = line.startswith("--- ") and hunk_lines_remaining == 0
+        if is_file_header:
+            if current:
+                chunks.append(current)
+            current = [line]
+            continue
+        if not current:
+            continue
+        if line.startswith(ignored_prefixes) or line == r"\ No newline at end of file":
+            continue
+        current.append(line)
+        if line.startswith("@@ "):
+            hunk = _UNIFIED_HUNK.match(line)
+            if hunk is not None:
+                old_count = int(hunk.group(1) or "1")
+                new_count = int(hunk.group(2) or "1")
+                hunk_lines_remaining = old_count + new_count
+        elif hunk_lines_remaining and line and line[0] in " +-":
+            hunk_lines_remaining -= 1
+    if current:
+        chunks.append(current)
+    if not chunks:
+        return ""
+    return "\n".join("\n".join(chunk) for chunk in chunks).rstrip("\n") + "\n"

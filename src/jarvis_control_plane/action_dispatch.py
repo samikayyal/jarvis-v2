@@ -25,16 +25,24 @@ class RoutedActionDispatcher:
         terminal: ActionDispatcher,
         gmail: ActionDispatcher,
         gmail_lifecycle: BoundActionLifecycle,
+        vault: ActionDispatcher | None = None,
+        vault_lifecycle: BoundActionLifecycle | None = None,
     ) -> None:
         self._dispatchers = {
             "terminal": terminal,
             "gmail_send": gmail,
             "gmail_reply": gmail,
         }
+        if vault is not None:
+            self._dispatchers["knowledge_vault_write"] = vault
         self._bound_lifecycles = {
             "gmail_send": gmail_lifecycle,
             "gmail_reply": gmail_lifecycle,
         }
+        if vault_lifecycle is not None:
+            if vault is None:
+                raise ValueError("vault_lifecycle requires a vault dispatcher")
+            self._bound_lifecycles["knowledge_vault_write"] = vault_lifecycle
         self._prepared: dict[str, tuple[ActionDispatcher, ActionDispatchHandle]] = {}
         self._lock = RLock()
 
