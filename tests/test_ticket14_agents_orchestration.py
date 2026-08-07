@@ -99,8 +99,6 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="I will inspect the repository.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 
@@ -132,10 +130,10 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
         "tracing_disabled": True,
         "trace_include_sensitive_data": False,
     }
-    assert result.reply_text.startswith("[ubuntu: The request is host-neutral")
+    assert result.reply_text == "I will inspect the repository."
     assert result.proposal is None
-    assert result.execution_host == "ubuntu"
-    assert result.host_reason_code == "default_ubuntu"
+    assert result.execution_host is None
+    assert result.host_reason_code is None
 
 
 def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_and_final() -> (
@@ -158,8 +156,6 @@ def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_a
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The bounded read is complete.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 
@@ -175,7 +171,7 @@ def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_a
     assert tool_result["source"] == "authorized_request"
     assert len(tool_result["text"]) <= 8
     assert captured["tools"][0].needs_approval is False
-    assert result.reply_text.startswith("[ubuntu:")
+    assert result.reply_text == "The bounded read is complete."
     assert result.reply_text.endswith("The bounded read is complete.")
     assert [milestone.stage for milestone in result.milestones] == [
         "orchestration_started",
@@ -205,8 +201,6 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The late read was ignored.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 
@@ -230,8 +224,6 @@ def test_agents_adapter_enforces_a_per_request_read_invocation_limit() -> None:
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="unreachable",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 
@@ -569,6 +561,20 @@ def test_typed_host_selection_does_not_depend_on_substring_routing(
                 reply_text="The bounded plan is ready.",
                 execution_host=host,
                 host_reason_code=reason_code,
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Run the bounded terminal action.",
+                    payload={
+                        "host": host,
+                        "executable": (
+                            "/usr/bin/touch"
+                            if host == "ubuntu"
+                            else "C:/Program Files/Git/bin/git.exe"
+                        ),
+                        "arguments": ["status"],
+                        "cwd": "/workspace" if host == "ubuntu" else "C:/workspace",
+                    },
+                ),
             )
         )
 

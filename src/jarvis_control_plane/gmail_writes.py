@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from email.message import EmailMessage
 from email.policy import SMTP
+from threading import RLock
 from typing import Literal, Protocol
 
 from .gmail_actions import (
@@ -38,6 +39,8 @@ from .google_http import (
     ensure_bounded_response_body,
 )
 from .google_oauth import (
+    GoogleConnectionBinding,
+    GoogleConnectionSnapshot,
     GoogleConnectionState,
     GoogleCredentialStore,
     GoogleOAuthLifecycle,
@@ -271,7 +274,8 @@ class GmailWriteConnector:
         trace: DiagnosticTraceRecorder,
         clock: Clock,
         ids: IdGenerator,
-        connection_state: Callable[[], GoogleConnectionState],
+        connection_state: Callable[[], GoogleConnectionState] | None = None,
+        connection_binding: GoogleConnectionBinding | None = None,
         on_invalid_grant: Callable[[], object] | None = None,
     ) -> None:
         self._configured_identity = _canonical_string(
@@ -285,62 +289,72 @@ class GmailWriteConnector:
         self._trace = trace
         self._clock = clock
         self._ids = ids
-        if not callable(connection_state):
-            raise TypeError("connection_state must return GoogleConnectionState")
+        if connection_binding is None and not callable(connection_state):
+            raise TypeError("connection_state or connection_binding must be configured")
+        if connection_binding is not None and connection_state is not None:
+            raise ValueError(
+                "connection_state and connection_binding are mutually exclusive"
+            )
         self._connection_state = connection_state
+        self._connection_binding = connection_binding
+        self._connection_lock = (
+            connection_binding.synchronization_lock
+            if connection_binding is not None
+            else RLock()
+        )
         self._on_invalid_grant = on_invalid_grant or credential_store.delete
 
     def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
         """Freeze the current Google connection generation before presentation."""
 
-        request = gmail_write_request_from_proposal(action)
-        if request.google_subject is not None:
-            raise ValueError("only the Gmail connector may bind a Google action")
-        connection = self._current_connection()
-        self._require_usable_connection(connection)
-        bound_request = replace(
-            request,
-            google_subject=self._configured_identity,
-            connection_generation=connection.generation,
-        )
-        return FrozenActionProposal.create(
-            action_id=action.action_id,
-            request_id=action.request_id,
-            kind=action.kind,
-            preview=gmail_proposal_preview(bound_request),
-            payload=gmail_proposal_payload(bound_request),
-        )
+        with self._connection_lock:
+            request = gmail_write_request_from_proposal(action)
+            if request.google_subject is not None:
+                raise ValueError("only the Gmail connector may bind a Google action")
+            connection = self._connection_snapshot().connection
+            self._require_usable_connection(connection)
+            bound_request = replace(
+                request,
+                google_subject=self._configured_identity,
+                connection_generation=connection.generation,
+            )
+            return FrozenActionProposal.create(
+                action_id=action.action_id,
+                request_id=action.request_id,
+                kind=action.kind,
+                preview=gmail_proposal_preview(bound_request),
+                payload=gmail_proposal_payload(bound_request),
+            )
 
     def validate_pending_action(self, action: FrozenActionProposal) -> None:
         """Refuse a frozen Gmail action if its OAuth connection changed."""
 
-        request = gmail_write_request_from_proposal(action, require_binding=True)
-        connection = self._current_connection()
-        self._require_usable_connection(connection)
-        if (
-            request.google_subject != self._configured_identity
-            or request.connection_generation != connection.generation
-        ):
-            raise ActionDispatcherError("Google connection changed after proposal")
+        with self._connection_lock:
+            request = gmail_write_request_from_proposal(action, require_binding=True)
+            self._validate_connection_snapshot(request, self._connection_snapshot())
 
     def dispatch(self, action: FrozenActionProposal) -> None:
         """Run the one-shot Gmail lifecycle with explicit security phases."""
 
-        request, credential = self._prepare_dispatch(action)
-        try:
-            result = self._attempt_provider_once(
-                action=action,
-                request=request,
-                credential=credential,
-            )
-            self._classify_provider_result(request, result)
-        except GmailWriteProviderError as exc:
-            self._raise_provider_failure(action, exc)
-        except (DiagnosticTraceError, TraceCapacityError, TraceWriteError) as exc:
-            self._raise_unknown_provider_failure(action, exc)
-        except Exception as exc:  # noqa: BLE001 - unknown provider failures are ambiguous
-            self._raise_unknown_provider_failure(action, exc)
-        self._record_completed_delivery(action)
+        # Keep the same boundary held from the final snapshot through the
+        # provider attempt.  OAuth replacement/disconnect cannot change the
+        # credential or generation in that interval.
+        with self._connection_lock:
+            request, credential = self._prepare_dispatch(action)
+            try:
+                result = self._attempt_provider_once(
+                    action=action,
+                    request=request,
+                    credential=credential,
+                )
+                self._classify_provider_result(request, result)
+            except GmailWriteProviderError as exc:
+                self._raise_provider_failure(action, exc)
+            except (DiagnosticTraceError, TraceCapacityError, TraceWriteError) as exc:
+                self._raise_unknown_provider_failure(action, exc)
+            except Exception as exc:  # noqa: BLE001 - unknown provider failures are ambiguous
+                self._raise_unknown_provider_failure(action, exc)
+            self._record_completed_delivery(action)
 
     def _prepare_dispatch(
         self, action: FrozenActionProposal
@@ -349,12 +363,16 @@ class GmailWriteConnector:
 
         try:
             request = gmail_write_request_from_proposal(action, require_binding=True)
-            self.validate_pending_action(action)
-            credential = self._credential()
+            snapshot = self._connection_snapshot()
+            credential = self._validate_connection_snapshot(request, snapshot)
             self._append_audit(
                 action, outcome="attempted", execution_status="attempted"
             )
-            self.validate_pending_action(action)
+            # The audit write is part of the preflight boundary.  Re-read the
+            # pair before returning, while the shared lock is still held.
+            credential = self._validate_connection_snapshot(
+                request, self._connection_snapshot()
+            )
         except (ActionDispatcherError, ValueError, TypeError, AuditWriteError) as exc:
             raise ActionDispatcherError(
                 str(exc) or "Gmail dispatch was blocked"
@@ -404,7 +422,7 @@ class GmailWriteConnector:
         if error.code == "invalid_grant":
             try:
                 self._on_invalid_grant()
-            except (OSError, RuntimeError, ValueError) as cleanup_error:
+            except Exception as cleanup_error:
                 self._record_terminal(action, outcome="failed")
                 raise ActionDispatcherError(
                     "Gmail connection could not be invalidated safely"
@@ -444,11 +462,37 @@ class GmailWriteConnector:
                 "Gmail delivery outcome is unknown", may_have_dispatched=True
             ) from exc
 
-    def _credential(self) -> OAuthCredentialRecord:
+    def _connection_snapshot(self) -> GoogleConnectionSnapshot:
+        if self._connection_binding is not None:
+            try:
+                return self._connection_binding.snapshot()
+            except Exception as exc:
+                raise ActionDispatcherError(
+                    "Google connection snapshot is unavailable"
+                ) from exc
         try:
+            connection = self._connection_state()  # type: ignore[misc]
             credential = self._credential_store.current
         except Exception as exc:
-            raise ValueError("Gmail is unavailable") from exc
+            raise ActionDispatcherError(
+                "Google connection snapshot is unavailable"
+            ) from exc
+        if not isinstance(connection, GoogleConnectionState):
+            raise ActionDispatcherError("Google connection state is unavailable")
+        return GoogleConnectionSnapshot(connection=connection, credential=credential)
+
+    def _validate_connection_snapshot(
+        self,
+        request: GmailWriteRequest,
+        snapshot: GoogleConnectionSnapshot,
+    ) -> OAuthCredentialRecord:
+        self._require_usable_connection(snapshot.connection)
+        if (
+            request.google_subject != self._configured_identity
+            or request.connection_generation != snapshot.connection.generation
+        ):
+            raise ActionDispatcherError("Google connection changed after proposal")
+        credential = snapshot.credential
         if credential is None:
             raise ValueError("Gmail is disconnected")
         if credential.subject != self._configured_identity:
@@ -456,17 +500,6 @@ class GmailWriteConnector:
         if GMAIL_SEND_SCOPE not in credential.granted_scopes:
             raise ValueError("Gmail send scope is unavailable")
         return credential
-
-    def _current_connection(self) -> GoogleConnectionState:
-        try:
-            connection = self._connection_state()
-        except Exception as exc:
-            raise ActionDispatcherError(
-                "Google connection state is unavailable"
-            ) from exc
-        if not isinstance(connection, GoogleConnectionState):
-            raise ActionDispatcherError("Google connection state is unavailable")
-        return connection
 
     @staticmethod
     def _require_usable_connection(connection: GoogleConnectionState) -> None:
@@ -536,7 +569,7 @@ def build_live_gmail_write_connector(
         trace=trace,
         clock=clock,
         ids=ids,
-        connection_state=lambda: oauth_lifecycle.connection,
+        connection_binding=oauth_lifecycle.connection_binding,
         on_invalid_grant=lambda: oauth_lifecycle.handle_refresh_failure(
             "invalid_grant"
         ),

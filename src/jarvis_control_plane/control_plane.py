@@ -32,6 +32,7 @@ from .ports import (
     ActionDispatcherError,
     AuditBoundary,
     AuditWriteError,
+    BoundActionLifecycle,
     Clock,
     DiagnosticTraceError,
     DurableStateStore,
@@ -111,18 +112,18 @@ class _CancelledBeforeDispatch(OutboundConnectorError):
 class _UnavailableActionDispatcher:
     """Fail closed until a later ticket supplies a concrete capability edge."""
 
-    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
-        """Leave freezing intact so the missing edge fails at dispatch time."""
+    def dispatch(self, action: FrozenActionProposal) -> None:
+        raise ActionDispatcherError("no action dispatcher is configured")
 
+
+class _NoopActionLifecycle:
+    """Identity lifecycle for actions whose dispatcher has no external binding."""
+
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
         return action
 
     def validate_pending_action(self, action: FrozenActionProposal) -> None:
-        """There is no changing connector state to validate."""
-
         return
-
-    def dispatch(self, action: FrozenActionProposal) -> None:
-        raise ActionDispatcherError("no action dispatcher is configured")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +172,7 @@ class DeterministicCapabilityBroker:
         model_availability_provider: ModelAvailabilityProvider,
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
+        action_lifecycle: BoundActionLifecycle | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError(
@@ -186,6 +188,7 @@ class DeterministicCapabilityBroker:
         self.model_availability_provider = model_availability_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
         self.action_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
+        self.action_lifecycle = action_lifecycle or _NoopActionLifecycle()
         existing_session = self.working_sessions.load()
         if existing_session is None:
             self.working_sessions.create(
@@ -433,7 +436,7 @@ class DeterministicCapabilityBroker:
     ) -> FrozenActionProposal:
         """Let the typed action surface add its current immutable binding."""
 
-        bound = self.action_dispatcher.bind_proposal(proposal)
+        bound = self.action_lifecycle.bind_proposal(proposal)
         if not isinstance(bound, FrozenActionProposal):
             raise InvariantViolation("action dispatcher returned an invalid proposal")
         return bound
@@ -1015,7 +1018,7 @@ class DeterministicCapabilityBroker:
             digest=action.digest,
         )
         try:
-            self.action_dispatcher.validate_pending_action(frozen)
+            self.action_lifecycle.validate_pending_action(frozen)
         except ActionDispatcherError:
             transition = reject_pending_action(session, now=self.clock)
             try:

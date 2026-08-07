@@ -206,7 +206,15 @@ class OrchestrationAdapter(Protocol):
 
 
 class ActionDispatcher(Protocol):
-    """Complete lifecycle boundary for one broker-approved frozen action."""
+    """Dispatch-only boundary for one broker-approved frozen action."""
+
+    def dispatch(self, action: FrozenActionProposal) -> None:
+        """Attempt the one permitted side effect for the approved proposal."""
+        ...
+
+
+class BoundActionLifecycle(Protocol):
+    """Optional connector lifecycle needed to bind and revalidate an action."""
 
     def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
         """Add immutable connector state before the proposal is presented."""
@@ -214,10 +222,6 @@ class ActionDispatcher(Protocol):
 
     def validate_pending_action(self, action: FrozenActionProposal) -> None:
         """Reject a frozen action whose connector state changed after binding."""
-        ...
-
-    def dispatch(self, action: FrozenActionProposal) -> None:
-        """Attempt the one permitted side effect for the approved proposal."""
         ...
 
 

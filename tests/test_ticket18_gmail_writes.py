@@ -3,16 +3,20 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
+    GMAIL_SEND_SCOPE,
     ActionDispatcher,
     ActionDispatcherError,
+    AuditWriteError,
     ControlledActionDispatcher,
     ControlledGmailWriteProvider,
+    ControlledGoogleOAuthProvider,
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
     FixedClock,
@@ -24,6 +28,7 @@ from jarvis_control_plane import (
     GmailWriteConnector,
     GoogleConnectionState,
     GoogleHttpResponse,
+    GoogleOAuthLifecycle,
     GoogleRefreshTokenExchanger,
     InboundMessage,
     InMemoryAuditBoundary,
@@ -31,6 +36,7 @@ from jarvis_control_plane import (
     InMemoryGoogleCredentialStore,
     InMemoryGoogleOAuthStateStore,
     OAuthCredentialRecord,
+    OAuthGrant,
     OrchestrationRequest,
     RequestState,
     RoutedActionDispatcher,
@@ -150,7 +156,12 @@ def _terminal_proposal() -> FrozenActionProposal:
     )
 
 
-def _components(proposal: FrozenActionProposal, dispatcher: ActionDispatcher) -> object:
+def _components(
+    proposal: FrozenActionProposal,
+    dispatcher: ActionDispatcher,
+    *,
+    audit: InMemoryAuditBoundary | None = None,
+) -> object:
     from jarvis_control_plane import ControlledOrchestrationAdapter
 
     return build_receiver_components(
@@ -159,6 +170,7 @@ def _components(proposal: FrozenActionProposal, dispatcher: ActionDispatcher) ->
         signing_secret=SECRET,
         now=NOW,
         id_prefix="ticket18",
+        audit=audit,
         orchestration=ControlledOrchestrationAdapter(
             proposal_factory=lambda request: FrozenActionProposal.create(
                 action_id=f"{request.state.request_id}:gmail",
@@ -169,6 +181,7 @@ def _components(proposal: FrozenActionProposal, dispatcher: ActionDispatcher) ->
             )
         ),
         action_dispatcher=dispatcher,  # type: ignore[arg-type]
+        action_lifecycle=dispatcher,  # type: ignore[arg-type]
     )
 
 
@@ -347,6 +360,120 @@ def test_reconnected_google_generation_invalidates_a_frozen_gmail_action() -> No
     assert provider.calls == []
 
 
+def test_reconnect_cannot_replace_the_credential_between_binding_and_gmail_send() -> (
+    None
+):
+    replaced = Event()
+    release_replacement = Event()
+
+    class PausingCredentialStore(InMemoryGoogleCredentialStore):
+        def replace(self, credential: OAuthCredentialRecord) -> None:
+            super().replace(credential)
+            replaced.set()
+            if not release_replacement.wait(timeout=5):
+                raise AssertionError("credential replacement was not released")
+
+    credentials = PausingCredentialStore(
+        OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=frozenset({GMAIL_SEND_SCOPE}),
+            refresh_token="credential-a",
+        )
+    )
+    connection = InMemoryGoogleOAuthStateStore()
+    connection.set_connection(
+        connected=True, granted_scopes=frozenset({GMAIL_SEND_SCOPE})
+    )
+    audit = InMemoryAuditBoundary()
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(
+        writer=trace_store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-race-trace"),
+    )
+    oauth = GoogleOAuthLifecycle(
+        configured_identity=IDENTITY,
+        state_store=connection,
+        credential_store=credentials,
+        provider=ControlledGoogleOAuthProvider(
+            grant=OAuthGrant(
+                subject=IDENTITY,
+                granted_scopes=frozenset({GMAIL_SEND_SCOPE}),
+                access_token="access-b",
+                refresh_token="credential-b",
+            )
+        ),
+        audit=audit,
+        trace=trace,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-race-oauth"),
+        state_factory=lambda: "ticket18-race-state",
+    )
+    provider = ControlledGmailWriteProvider()
+    gmail = GmailWriteConnector(
+        configured_identity=IDENTITY,
+        credential_store=credentials,
+        provider=provider,
+        audit=audit,
+        trace=trace,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-race-gmail"),
+        connection_binding=oauth.connection_binding,
+    )
+    router = RoutedActionDispatcher(
+        terminal=ControlledActionDispatcher(),
+        gmail=gmail,
+        gmail_lifecycle=gmail,
+    )
+    components = _components(_proposal(), router)
+    pending = components.receiver.receive(_event("send", suffix="race-pending"))
+    authorization = oauth.start_authorization(
+        operation_id="ticket18-race-reconnect",
+        requested_scopes=(GMAIL_SEND_SCOPE,),
+    )
+
+    callback_result: dict[str, object] = {}
+    approval_result: dict[str, object] = {}
+
+    def reconnect() -> None:
+        callback_result["response"] = oauth.handle_callback(
+            method="GET",
+            query={"state": authorization.state, "code": "code-b"},
+        )
+
+    def approve() -> None:
+        approval_result["result"] = components.receiver.receive(
+            _event("yes", suffix="race-approval")
+        )
+
+    callback_thread = Thread(target=reconnect)
+    approval_thread: Thread | None = None
+    try:
+        assert pending.disposition == "pending_action"
+        callback_thread.start()
+        assert replaced.wait(timeout=5)
+        approval_thread = Thread(target=approve)
+        approval_thread.start()
+        approval_thread.join(timeout=0.2)
+        assert approval_thread.is_alive()
+        assert provider.calls == []
+    finally:
+        release_replacement.set()
+        callback_thread.join(timeout=5)
+        if approval_thread is not None:
+            approval_thread.join(timeout=5)
+        trace_store._close_writer_service()
+
+    assert not callback_thread.is_alive()
+    assert approval_thread is not None and not approval_thread.is_alive()
+    assert callback_result["response"].status_code == 204  # type: ignore[union-attr]
+    assert approval_result["result"].disposition == "action_invalidated"  # type: ignore[union-attr]
+    assert connection.get_connection().generation == 2
+    assert credentials.current is not None
+    assert credentials.current.refresh_token == "credential-b"
+    assert provider.calls == []
+
+
 def test_manual_trace_retains_complete_credential_bearing_gmail_provider_exchange() -> (
     None
 ):
@@ -483,6 +610,102 @@ def test_manual_trace_retains_gmail_provider_error_evidence() -> None:
     assert "controlled-provider-failure" in trace_payload
 
 
+def test_invalid_grant_cleanup_audit_failure_is_bounded_and_closes_the_outbox() -> None:
+    class RefreshInvalidationAuditFailure(InMemoryAuditBoundary):
+        def append(self, evidence: object) -> None:
+            if getattr(evidence, "kind", None) == "google_oauth_refresh_invalidated":
+                raise AuditWriteError("refresh invalidation audit unavailable")
+            super().append(evidence)  # type: ignore[arg-type]
+
+    class InvalidGrantTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, **_kwargs: object) -> GoogleHttpResponse:
+            self.calls += 1
+            return GoogleHttpResponse(
+                status_code=400,
+                headers={"Content-Type": "application/json"},
+                body=b'{"error":"invalid_grant"}',
+            )
+
+    credentials = InMemoryGoogleCredentialStore(
+        OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=frozenset({GMAIL_SEND_SCOPE}),
+            refresh_token="refresh-token",
+        )
+    )
+    connection = InMemoryGoogleOAuthStateStore()
+    connection.set_connection(
+        connected=True, granted_scopes=frozenset({GMAIL_SEND_SCOPE})
+    )
+    audit = RefreshInvalidationAuditFailure()
+    trace_store = InMemoryDiagnosticTraceStore()
+    trace = DiagnosticTraceRecorder(
+        writer=trace_store.writer(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-invalid-grant-trace"),
+    )
+    oauth = GoogleOAuthLifecycle(
+        configured_identity=IDENTITY,
+        state_store=connection,
+        credential_store=credentials,
+        provider=ControlledGoogleOAuthProvider(
+            grant=OAuthGrant(
+                subject=IDENTITY,
+                granted_scopes=frozenset({GMAIL_SEND_SCOPE}),
+                access_token="access-token",
+                refresh_token="refresh-token",
+            )
+        ),
+        audit=audit,
+        trace=trace,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-invalid-grant-oauth"),
+    )
+    transport = InvalidGrantTransport()
+    gmail = GmailWriteConnector(
+        configured_identity=IDENTITY,
+        credential_store=credentials,
+        provider=GmailApiWriteProvider(
+            client_id="client-id",
+            client_secret="client-secret",
+            transport=transport,
+        ),
+        audit=audit,
+        trace=trace,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-invalid-grant-gmail"),
+        connection_binding=oauth.connection_binding,
+        on_invalid_grant=lambda: oauth.handle_refresh_failure("invalid_grant"),
+    )
+    router = RoutedActionDispatcher(
+        terminal=ControlledActionDispatcher(),
+        gmail=gmail,
+        gmail_lifecycle=gmail,
+    )
+    components = _components(_proposal(), router, audit=audit)
+
+    assert components.receiver.receive(
+        _event("send", suffix="invalid-grant-01")
+    ).disposition == ("pending_action")
+    result = components.receiver.receive(_event("yes", suffix="invalid-grant-02"))
+
+    assert result.status_code == 202
+    assert result.disposition == "action_dispatch_failed"
+    assert transport.calls == 1
+    assert credentials.current is None
+    assert not connection.get_connection().connected
+    assert components.broker.current_pending_action is None
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    assert len(session.action_outbox) == 1
+    assert session.action_outbox[0].status.value == "failed"
+    assert session.action_outbox[0].payload is None
+    trace_store._close_writer_service()
+
+
 def test_terminal_audit_failure_after_a_send_is_reported_unknown_without_retry() -> (
     None
 ):
@@ -556,8 +779,6 @@ def test_orchestration_rebuilds_a_canonical_gmail_preview() -> None:
 
     plan = AgentsSdkPlan(
         reply_text="The exact Gmail action is ready.",
-        execution_host="ubuntu",
-        host_reason_code="default_ubuntu",
         proposal=AgentsSdkProposal(
             kind="gmail_send",
             preview="untrusted model prose is never the frozen preview",
@@ -602,6 +823,9 @@ def test_orchestration_rebuilds_a_canonical_gmail_preview() -> None:
         "Gmail new send\nTo: recipient@example.com"
     )
     assert "untrusted model prose" not in result.proposal.preview
+    assert result.reply_text == "The exact Gmail action is ready."
+    assert result.execution_host is None
+    assert result.host_reason_code is None
 
 
 def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
@@ -609,12 +833,14 @@ def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
     gmail_provider = ControlledGmailWriteProvider(
         result=GmailDeliveryResult(message_id="sent-routed", thread_id="thread-new")
     )
+    terminal_gmail = _dispatcher(gmail_provider)
 
     terminal_components = _components(
         _terminal_proposal(),
         RoutedActionDispatcher(
             terminal=terminal_dispatcher,
-            gmail=_dispatcher(gmail_provider),
+            gmail=terminal_gmail,
+            gmail_lifecycle=terminal_gmail,
         ),
     )
     terminal_pending = terminal_components.receiver.receive(
@@ -637,7 +863,8 @@ def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
         _proposal(),
         RoutedActionDispatcher(
             terminal=ControlledActionDispatcher(),
-            gmail=_dispatcher(gmail_provider),
+            gmail=terminal_gmail,
+            gmail_lifecycle=terminal_gmail,
         ),
     )
     gmail_pending = gmail_components.receiver.receive(

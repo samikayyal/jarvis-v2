@@ -421,8 +421,6 @@ def test_vault_tool_enforces_one_deadline_when_process_runner_is_slow(
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The vault search is complete.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 
@@ -495,8 +493,6 @@ def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The vault search is complete.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
                 proposal=None,
             )
         )
@@ -544,8 +540,6 @@ def test_orchestration_deterministically_discloses_a_stale_vault_read(
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The vault search is complete.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 

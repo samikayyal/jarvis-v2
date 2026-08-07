@@ -579,8 +579,6 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="I found one bounded Gmail result.",
-                execution_host="ubuntu",
-                host_reason_code="default_ubuntu",
             )
         )
 
