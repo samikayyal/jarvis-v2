@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import UTC, datetime
 
 import pytest
 
 from jarvis_control_plane import (
+    AuditWriteError,
     ControlledGoogleOAuthProvider,
     DeterministicIdGenerator,
     FileGoogleCredentialStore,
@@ -43,6 +46,7 @@ def build_lifecycle(
     | None = None,
     audit: InMemoryAuditBoundary | None = None,
     trace: DiagnosticTraceRecorder | None = None,
+    state_factory=None,
 ):
     clock = clock or FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket16")
@@ -69,7 +73,7 @@ def build_lifecycle(
         ),
         clock=clock,
         ids=ids,
-        state_factory=lambda: "state-ticket16",
+        state_factory=state_factory or (lambda: "state-ticket16"),
     )
     return lifecycle, trace_store
 
@@ -124,6 +128,7 @@ def test_callback_consumes_state_once_and_replaces_connector_credential() -> Non
             subject=IDENTITY,
             granted_scopes=frozenset(READ_SCOPES),
             refresh_token="controlled-refresh-token",
+            connection_generation=1,
         )
         assert lifecycle.connection.connected
         assert lifecycle.connection.generation == 1
@@ -397,7 +402,7 @@ def test_invalid_grant_and_explicit_disconnect_delete_local_credential() -> None
     )
     lifecycle, trace_store = build_lifecycle(provider=provider, credentials=credentials)
     try:
-        lifecycle.handle_refresh_failure("invalid_grant")
+        lifecycle.handle_refresh_failure("invalid_grant", connection_generation=0)
         assert credentials.current is None
         assert not lifecycle.connection.connected
 
@@ -414,6 +419,127 @@ def test_invalid_grant_and_explicit_disconnect_delete_local_credential() -> None
         assert provider.revoke_calls == ["controlled-refresh-token"]
         assert lifecycle.connection.generation == 2
     finally:
+        trace_store._close_writer_service()
+
+
+def test_old_invalid_grant_cannot_invalidate_a_newer_google_connection() -> None:
+    old = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="old-refresh-token",
+        connection_generation=1,
+    )
+    credentials = InMemoryGoogleCredentialStore(old)
+    state_store = InMemoryGoogleOAuthStateStore()
+    state_store.set_connection(connected=True, granted_scopes=frozenset(READ_SCOPES))
+    lifecycle, trace_store = build_lifecycle(
+        credentials=credentials, state_store=state_store
+    )
+    try:
+        newer_state = state_store.set_connection(
+            connected=True, granted_scopes=frozenset(READ_SCOPES)
+        )
+        newer = OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=frozenset(READ_SCOPES),
+            refresh_token="new-refresh-token",
+            connection_generation=newer_state.generation,
+        )
+        credentials.replace(newer)
+
+        lifecycle.handle_refresh_failure(
+            "invalid_grant", connection_generation=old.connection_generation
+        )
+
+        assert credentials.current == newer
+        assert lifecycle.connection == newer_state
+    finally:
+        trace_store._close_writer_service()
+
+
+def test_callback_audit_failure_cannot_invalidate_a_newer_callback_connection() -> None:
+    import threading
+
+    class FailFirstCompletionAudit(InMemoryAuditBoundary):
+        def __init__(self) -> None:
+            super().__init__()
+            self.completion_started = threading.Event()
+            self.release_completion = threading.Event()
+
+        def append(self, evidence):  # type: ignore[no-untyped-def]
+            if (
+                evidence.kind == "google_oauth_code_exchange_completed"
+                and evidence.request_id == "callback-old"
+            ):
+                self.completion_started.set()
+                assert self.release_completion.wait(timeout=2)
+                raise AuditWriteError("controlled completion audit failure")
+            return super().append(evidence)
+
+    class GrantsByCode(ControlledGoogleOAuthProvider):
+        def exchange_code(self, *, code: str, requested_scopes: frozenset[str]):
+            self.grant = OAuthGrant(
+                subject=IDENTITY,
+                granted_scopes=frozenset(READ_SCOPES),
+                access_token=f"access-{code}",
+                refresh_token=f"refresh-{code}",
+            )
+            return super().exchange_code(code=code, requested_scopes=requested_scopes)
+
+    audit = FailFirstCompletionAudit()
+    provider = GrantsByCode(
+        grant=OAuthGrant(
+            subject=IDENTITY,
+            granted_scopes=frozenset(READ_SCOPES),
+            access_token="unused-access",
+            refresh_token="unused-refresh",
+        )
+    )
+    credentials = InMemoryGoogleCredentialStore()
+    state_store = InMemoryGoogleOAuthStateStore()
+    lifecycle, trace_store = build_lifecycle(
+        provider=provider,
+        credentials=credentials,
+        state_store=state_store,
+        audit=audit,
+        state_factory=iter(("state-old", "state-new")).__next__,
+    )
+    try:
+        old_authorization = lifecycle.start_authorization(
+            operation_id="callback-old", requested_scopes=READ_SCOPES
+        )
+        new_authorization = lifecycle.start_authorization(
+            operation_id="callback-new", requested_scopes=READ_SCOPES
+        )
+        old_result: list[object] = []
+
+        def run_old_callback() -> None:
+            old_result.append(
+                lifecycle.handle_callback(
+                    method="GET",
+                    query={"state": old_authorization.state, "code": "old"},
+                )
+            )
+
+        old_thread = threading.Thread(target=run_old_callback)
+        old_thread.start()
+        assert audit.completion_started.wait(timeout=2)
+
+        new_response = lifecycle.handle_callback(
+            method="GET",
+            query={"state": new_authorization.state, "code": "new"},
+        )
+        audit.release_completion.set()
+        old_thread.join(timeout=2)
+
+        assert new_response.status_code == 204
+        assert old_result[0].status_code == 503
+        assert credentials.current is not None
+        assert credentials.current.refresh_token == "refresh-new"
+        assert lifecycle.connection.connected
+        assert lifecycle.connection.generation == 2
+    finally:
+        audit.release_completion.set()
         trace_store._close_writer_service()
 
 
@@ -443,3 +569,142 @@ def test_file_credential_replacement_is_atomic_when_replace_fails(
 
     assert store.current == original
     assert list((tmp_path / "google-credentials").glob("*.tmp")) == []
+
+
+def test_file_credential_store_reads_legacy_records_and_commits_generation_with_token(
+    tmp_path,
+) -> None:
+    directory = tmp_path / "google-credentials"
+    directory.mkdir()
+    path = directory / "google-oauth.json"
+    legacy = {
+        "granted_scopes": sorted(READ_SCOPES),
+        "refresh_token": "legacy-refresh-token",
+        "subject": IDENTITY,
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    store = FileGoogleCredentialStore(directory)
+
+    assert store.current == OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="legacy-refresh-token",
+        connection_generation=0,
+    )
+
+    replacement = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="new-refresh-token",
+        connection_generation=7,
+    )
+    store.replace(replacement)
+
+    stored_payload = json.loads(path.read_text(encoding="utf-8"))
+    assert set(stored_payload) == {
+        "granted_scopes",
+        "refresh_token",
+        "subject",
+    }
+    # This is the exact reader contract from the prior pinned release.  The
+    # generation sidecar is intentionally invisible to that reader.
+    prior_release_record = json.loads(path.read_text(encoding="utf-8"))
+    assert prior_release_record == {
+        "granted_scopes": sorted(READ_SCOPES),
+        "refresh_token": "new-refresh-token",
+        "subject": IDENTITY,
+    }
+    metadata = json.loads((directory / "google-oauth.json.meta").read_text())
+    assert metadata["schema"] == "google_oauth_credential_metadata_v2"
+    assert any(record["connection_generation"] == 7 for record in metadata["records"])
+    assert FileGoogleCredentialStore(directory).current == replacement
+
+
+def test_file_credential_generation_remains_bound_when_a_second_rename_would_fail(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "google-credentials"
+    store = FileGoogleCredentialStore(directory)
+    original = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="original-refresh-token",
+        connection_generation=1,
+    )
+    replacement = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="replacement-refresh-token",
+        connection_generation=2,
+    )
+    store.replace(original)
+
+    real_replace = os.replace
+    calls = 0
+
+    def fail_if_second_rename(source: object, target: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("controlled second rename failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        "jarvis_control_plane.google_oauth.os.replace", fail_if_second_rename
+    )
+
+    with pytest.raises(OSError, match="controlled second rename failure"):
+        store.replace(replacement)
+
+    # The sidecar was published with both generations, but the old primary
+    # record remained visible when its rename failed.  The current reader must
+    # therefore continue to resolve the original token and generation.
+    assert calls == 2
+    assert store.current == original
+
+    state_store = InMemoryGoogleOAuthStateStore()
+    current_connection = state_store.set_connection(
+        connected=True, granted_scopes=frozenset(READ_SCOPES)
+    )
+    lifecycle, trace_store = build_lifecycle(credentials=store, state_store=state_store)
+    try:
+        invalidated = lifecycle.handle_refresh_failure(
+            "invalid_grant", connection_generation=current_connection.generation
+        )
+        assert not invalidated.connected
+    finally:
+        trace_store._close_writer_service()
+    assert store.current is None
+
+
+def test_file_credential_store_migrates_embedded_generation_before_rollback(
+    tmp_path,
+) -> None:
+    directory = tmp_path / "google-credentials"
+    directory.mkdir()
+    path = directory / "google-oauth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "connection_generation": 4,
+                "granted_scopes": sorted(READ_SCOPES),
+                "refresh_token": "embedded-generation-token",
+                "subject": IDENTITY,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = FileGoogleCredentialStore(directory)
+
+    assert store.current == OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="embedded-generation-token",
+        connection_generation=4,
+    )
+    assert set(json.loads(path.read_text(encoding="utf-8"))) == {
+        "granted_scopes",
+        "refresh_token",
+        "subject",
+    }

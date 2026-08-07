@@ -394,7 +394,7 @@ class GoogleReadConnector:
         trace: DiagnosticTraceRecorder,
         clock: Clock,
         ids: IdGenerator,
-        on_invalid_grant: Callable[[], object] | None = None,
+        on_invalid_grant: Callable[[int], object] | None = None,
         max_result_items: int = DEFAULT_MAX_RESULT_ITEMS,
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
@@ -410,7 +410,7 @@ class GoogleReadConnector:
         self._trace = trace
         self._clock = clock
         self._ids = ids
-        self._on_invalid_grant = on_invalid_grant or credential_store.delete
+        self._on_invalid_grant = on_invalid_grant or self._discard_invalid_credential
         self._max_result_items = _limit(
             max_result_items,
             MAX_RESULT_ITEMS,
@@ -585,7 +585,7 @@ class GoogleReadConnector:
         except GoogleReadProviderError as exc:
             if exc.code == "invalid_grant":
                 try:
-                    self._on_invalid_grant()
+                    self._on_invalid_grant(credential.connection_generation)
                 except Exception as cleanup_error:
                     self._record_failure(request_id, operation)
                     raise GoogleReadError("google_read_unavailable") from cleanup_error
@@ -622,7 +622,11 @@ class GoogleReadConnector:
         items, item_truncated = _bounded_items(
             provider_result.items,
             max_items=min(request.max_results, self._max_result_items),
-            max_item_bytes=self._max_item_bytes,
+            max_item_bytes=(
+                MAX_ITEM_BYTES
+                if request.operation == "calendar_events_get"
+                else self._max_item_bytes
+            ),
         )
         result = GoogleReadResult(
             service=_SERVICE_BY_OPERATION[request.operation],
@@ -697,6 +701,14 @@ class GoogleReadConnector:
             raise GoogleReadError("missing_scope")
         return credential
 
+    def _discard_invalid_credential(self, connection_generation: int) -> None:
+        credential = self._credential_store.current
+        if (
+            credential is not None
+            and credential.connection_generation == connection_generation
+        ):
+            self._credential_store.delete()
+
 
 def build_live_google_read_connector(
     *,
@@ -732,8 +744,10 @@ def build_live_google_read_connector(
         trace=trace,
         clock=clock,
         ids=ids,
-        on_invalid_grant=lambda: oauth_lifecycle.handle_refresh_failure(
-            "invalid_grant"
+        on_invalid_grant=lambda connection_generation: (
+            oauth_lifecycle.handle_refresh_failure(
+                "invalid_grant", connection_generation=connection_generation
+            )
         ),
     )
 
@@ -1050,18 +1064,13 @@ def _google_read_url(request: GoogleReadRequest) -> str:
                 "maxResults": request.max_results,
                 "singleEvents": "true",
                 "orderBy": "startTime",
-                "fields": "items(id,status,summary,description,location,start,end,attendees,organizer,recurrence,updated),nextPageToken",
+                "fields": "items(id,etag,status,summary,description,location,start,end,attendees,organizer,recurrence,visibility,reminders,updated),nextPageToken",
             },
         )
     if operation == "calendar_events_get":
         calendar = quote(arguments["calendar_id"], safe="")
         event = quote(arguments["event_id"], safe="")
-        return _url(
-            f"{_CALENDAR_API_ROOT}/calendars/{calendar}/events/{event}",
-            {
-                "fields": "id,status,summary,description,location,start,end,attendees,organizer,recurrence,updated",
-            },
-        )
+        return _url(f"{_CALENDAR_API_ROOT}/calendars/{calendar}/events/{event}", {})
     if operation == "drive_files_list":
         return _url(
             f"{_DRIVE_API_ROOT}/files",

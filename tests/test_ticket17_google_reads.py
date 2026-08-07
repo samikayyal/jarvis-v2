@@ -222,7 +222,8 @@ def test_invalid_grant_discards_the_credential_before_reporting_disconnection() 
     )
     invalidations: list[str] = []
 
-    def invalidate() -> None:
+    def invalidate(connection_generation: int) -> None:
+        assert connection_generation == 0
         store.delete()
         invalidations.append("invalidated")
 
@@ -334,7 +335,12 @@ def test_live_provider_uses_only_the_fixed_google_read_operations(
     assert call["method"] == "GET"
     assert parsed.path == expected_path
     assert "pageToken" not in query
-    assert "fields" in query
+    if read_request.operation == "calendar_events_get":
+        # A single event is the source for an ETag-bound Calendar mutation
+        # snapshot, so it must return the complete Event resource.
+        assert "fields" not in query
+    else:
+        assert "fields" in query
     if page_size_key is not None:
         assert query[page_size_key] == [str(read_request.max_results)]
     assert result.items

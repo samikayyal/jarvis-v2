@@ -7,12 +7,14 @@ Google connector's credential record for the configured Google subject.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import sqlite3
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -128,6 +130,7 @@ class OAuthCredentialRecord:
     subject: str
     granted_scopes: frozenset[str]
     refresh_token: str = field(repr=False)
+    connection_generation: int = 0
 
     def __post_init__(self) -> None:
         _canonical_string(self.subject, "subject")
@@ -135,6 +138,12 @@ class OAuthCredentialRecord:
             self, "granted_scopes", _canonical_scopes(self.granted_scopes)
         )
         _canonical_string(self.refresh_token, "refresh_token")
+        if (
+            not isinstance(self.connection_generation, int)
+            or isinstance(self.connection_generation, bool)
+            or self.connection_generation < 0
+        ):
+            raise ValueError("connection_generation must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,12 +200,17 @@ class GoogleOAuthStateStore(Protocol):
 
     def get_connection(self) -> GoogleConnectionState: ...
 
+    def dispatch_lease(self) -> AbstractContextManager[None]: ...
+
+    @property
+    def synchronization_lock(self) -> AbstractContextManager[None]: ...
+
 
 class InMemoryGoogleOAuthStateStore:
     """Thread-safe controlled implementation of the OAuth state boundary."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._authorizations: dict[str, OAuthAuthorization] = {}
         self._connection = GoogleConnectionState()
 
@@ -234,6 +248,15 @@ class InMemoryGoogleOAuthStateStore:
         with self._lock:
             return self._connection
 
+    @contextmanager
+    def dispatch_lease(self) -> Iterator[None]:
+        with self._lock:
+            yield
+
+    @property
+    def synchronization_lock(self) -> AbstractContextManager[None]:
+        return self._lock
+
 
 class SQLiteGoogleOAuthStateStore:
     """SQLite implementation that consumes callback state in one transaction."""
@@ -246,7 +269,7 @@ class SQLiteGoogleOAuthStateStore:
             else sqlite3.connect(str(database), check_same_thread=False)
         )
         self.connection.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         try:
             self.connection.execute("PRAGMA journal_mode = WAL")
             self.connection.execute(
@@ -399,6 +422,15 @@ class SQLiteGoogleOAuthStateStore:
         if self._owns_connection:
             self.connection.close()
 
+    @contextmanager
+    def dispatch_lease(self) -> Iterator[None]:
+        with self._lock:
+            yield
+
+    @property
+    def synchronization_lock(self) -> AbstractContextManager[None]:
+        return self._lock
+
 
 class GoogleCredentialStore(Protocol):
     """Private connector-owned persistence for the sole refresh-token record."""
@@ -430,7 +462,7 @@ class GoogleConnectionBinding:
     ) -> None:
         self._state_store = state_store
         self._credential_store = credential_store
-        self.synchronization_lock = threading.RLock()
+        self.synchronization_lock = state_store.synchronization_lock
 
     def snapshot(self) -> GoogleConnectionSnapshot:
         """Read generation and credential while no lifecycle mutation can interleave."""
@@ -476,6 +508,10 @@ class FileGoogleCredentialStore:
     def _path(self) -> Path:
         return self._directory / self._filename
 
+    @property
+    def _metadata_path(self) -> Path:
+        return self._directory / f"{self._filename}.meta"
+
     def _restrict_directory(self) -> None:
         if os.name != "nt":
             os.chmod(self._directory, 0o700)
@@ -486,23 +522,133 @@ class FileGoogleCredentialStore:
             return None
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
-            if set(payload) != {"granted_scopes", "refresh_token", "subject"}:
+            fields = set(payload)
+            if fields == {"granted_scopes", "refresh_token", "subject"}:
+                connection_generation = self._legacy_generation(payload)
+            elif fields == {
+                "connection_generation",
+                "granted_scopes",
+                "refresh_token",
+                "subject",
+            }:
+                credential = OAuthCredentialRecord(
+                    subject=payload["subject"],
+                    granted_scopes=frozenset(payload["granted_scopes"]),
+                    refresh_token=payload["refresh_token"],
+                    connection_generation=payload["connection_generation"],
+                )
+                self._write_legacy_compatible_record(credential)
+                return credential
+            else:
                 raise ValueError("credential record has an unexpected shape")
             return OAuthCredentialRecord(
                 subject=payload["subject"],
                 granted_scopes=frozenset(payload["granted_scopes"]),
                 refresh_token=payload["refresh_token"],
+                connection_generation=connection_generation,
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise GoogleOAuthError("credential_store_unavailable") from exc
 
     def replace(self, credential: OAuthCredentialRecord) -> None:
-        temporary = self._directory / f".{self._filename}.{secrets.token_hex(16)}.tmp"
+        self._write_legacy_compatible_record(credential)
+
+    def _write_legacy_compatible_record(
+        self, credential: OAuthCredentialRecord
+    ) -> None:
+        previous = self._read_existing_record()
+        records = []
+        if previous is not None and previous.refresh_token != credential.refresh_token:
+            records.append(self._metadata_record(previous))
+        records.append(self._metadata_record(credential))
+        metadata = {
+            "records": records,
+            "schema": "google_oauth_credential_metadata_v2",
+        }
         payload = {
             "granted_scopes": sorted(credential.granted_scopes),
             "refresh_token": credential.refresh_token,
             "subject": credential.subject,
         }
+        self._atomic_write(self._metadata_path, metadata)
+        self._atomic_write(self._path, payload)
+
+    def _read_existing_record(self) -> OAuthCredentialRecord | None:
+        if not self._path.exists():
+            return None
+        payload = json.loads(self._path.read_text(encoding="utf-8"))
+        fields = set(payload)
+        if fields == {"granted_scopes", "refresh_token", "subject"}:
+            connection_generation = self._legacy_generation(payload)
+        elif fields == {
+            "connection_generation",
+            "granted_scopes",
+            "refresh_token",
+            "subject",
+        }:
+            connection_generation = payload["connection_generation"]
+        else:
+            raise ValueError("credential record has an unexpected shape")
+        return OAuthCredentialRecord(
+            subject=payload["subject"],
+            granted_scopes=frozenset(payload["granted_scopes"]),
+            refresh_token=payload["refresh_token"],
+            connection_generation=connection_generation,
+        )
+
+    @staticmethod
+    def _metadata_record(credential: OAuthCredentialRecord) -> dict[str, object]:
+        return {
+            "connection_generation": credential.connection_generation,
+            "refresh_token_sha256": hashlib.sha256(
+                credential.refresh_token.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def _legacy_generation(self, payload: Mapping[str, object]) -> int:
+        if not self._metadata_path.exists():
+            return 0
+        metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
+        refresh_token = payload.get("refresh_token")
+        if not isinstance(refresh_token, str):
+            raise TypeError("credential record has an invalid refresh token")
+        fingerprint = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+        if (
+            isinstance(metadata, Mapping)
+            and set(metadata)
+            == {"connection_generation", "refresh_token_sha256", "schema"}
+            and metadata["schema"] == "google_oauth_credential_metadata_v1"
+        ):
+            if metadata["refresh_token_sha256"] != fingerprint:
+                return 0
+            return int(metadata["connection_generation"])
+        if (
+            not isinstance(metadata, Mapping)
+            or set(metadata) != {"records", "schema"}
+            or metadata["schema"] != "google_oauth_credential_metadata_v2"
+            or not isinstance(metadata["records"], list)
+            or not metadata["records"]
+        ):
+            raise ValueError("credential metadata has an unexpected shape")
+        matches = [
+            record
+            for record in metadata["records"]
+            if isinstance(record, Mapping)
+            and set(record) == {"connection_generation", "refresh_token_sha256"}
+            and record["refresh_token_sha256"] == fingerprint
+        ]
+        if not matches:
+            return 0
+        generations = {record["connection_generation"] for record in matches}
+        if len(generations) != 1:
+            raise ValueError("credential metadata has conflicting generations")
+        generation = next(iter(generations))
+        if not isinstance(generation, int):
+            raise TypeError("credential metadata has an invalid generation")
+        return generation
+
+    def _atomic_write(self, path: Path, payload: Mapping[str, object]) -> None:
+        temporary = self._directory / f".{path.name}.{secrets.token_hex(16)}.tmp"
         try:
             with temporary.open("x", encoding="utf-8") as stream:
                 if os.name != "nt":
@@ -510,9 +656,9 @@ class FileGoogleCredentialStore:
                 json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._path)
+            os.replace(temporary, path)
             if os.name != "nt":
-                os.chmod(self._path, 0o600)
+                os.chmod(path, 0o600)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -520,6 +666,7 @@ class FileGoogleCredentialStore:
     def delete(self) -> None:
         try:
             self._path.unlink(missing_ok=True)
+            self._metadata_path.unlink(missing_ok=True)
         except OSError as exc:
             raise GoogleOAuthError("credential_store_unavailable") from exc
 
@@ -583,6 +730,12 @@ class _RevocationReceipt:
     provider_result: None = None
 
 
+@dataclass(slots=True)
+class _CallbackExchangeContext:
+    previous_generation: int | None = None
+    next_generation: int | None = None
+
+
 class GoogleOAuthConnector:
     """Exchange code and atomically own refresh-token replacement in one boundary."""
 
@@ -600,7 +753,11 @@ class GoogleOAuthConnector:
         self._credential_store = credential_store
 
     def exchange_and_replace(
-        self, *, code: str, requested_scopes: frozenset[str]
+        self,
+        *,
+        code: str,
+        requested_scopes: frozenset[str],
+        connection_generation: int = 0,
     ) -> _ExchangeReceipt:
         grant = self._provider.exchange_code(
             code=code, requested_scopes=requested_scopes
@@ -616,6 +773,7 @@ class GoogleOAuthConnector:
                 subject=grant.subject,
                 granted_scopes=grant.granted_scopes,
                 refresh_token=grant.refresh_token,
+                connection_generation=connection_generation,
             )
         )
         return _ExchangeReceipt(grant=grant)
@@ -742,39 +900,29 @@ class GoogleOAuthLifecycle:
         except AuditWriteError:
             return OAuthCallbackResponse(status_code=503)
 
+        context = _CallbackExchangeContext()
         try:
-            # Credential replacement and generation advancement are one
-            # synchronization boundary.  Gmail dispatch holds this same lock
-            # through its final check and provider attempt.
-            with self._connection_binding.synchronization_lock:
-                receipt = self._trace.execute(
-                    request_id=authorization.operation_id,
-                    operation_type="google_oauth_code_exchange",
-                    operation=lambda: self._connector.exchange_and_replace(
-                        code=query["code"],
-                        requested_scopes=authorization.requested_scopes,
-                    ),
-                    arguments={
-                        "flow": "authorization_code",
-                        "authorization_code": query["code"],
-                        "requested_scopes": authorization.requested_scopes,
-                    },
-                    result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-                    error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-                )
-                self._state_store.set_connection(
-                    connected=True, granted_scopes=receipt.grant.granted_scopes
-                )
+            self._exchange_and_publish(
+                authorization=authorization,
+                code=query["code"],
+                context=context,
+            )
         except OAuthExchangeError as exc:
             if self._has_trace_write_failure(exc):
-                self._invalidate_connection()
+                self._invalidate_connection(
+                    connection_generation=context.next_generation,
+                    previous_generation=context.previous_generation,
+                )
                 return OAuthCallbackResponse(status_code=503)
             self._append_callback_rejection(authorization.operation_id)
             return OAuthCallbackResponse(status_code=400)
         except (DiagnosticTraceError, GoogleOAuthError, OSError):
             # A failed trace reservation or write makes the exchange outcome
             # unusable.  Delete the private credential and force reconnect.
-            self._invalidate_connection()
+            self._invalidate_connection(
+                connection_generation=context.next_generation,
+                previous_generation=context.previous_generation,
+            )
             return OAuthCallbackResponse(status_code=503)
 
         try:
@@ -785,21 +933,70 @@ class GoogleOAuthLifecycle:
                 execution_status="completed",
             )
         except AuditWriteError:
-            self._invalidate_connection()
+            self._invalidate_connection(connection_generation=context.next_generation)
             return OAuthCallbackResponse(status_code=503)
         return OAuthCallbackResponse(status_code=204)
 
-    def handle_refresh_failure(self, error_code: str) -> GoogleConnectionState:
+    def _exchange_and_publish(
+        self,
+        *,
+        authorization: OAuthAuthorization,
+        code: str,
+        context: _CallbackExchangeContext,
+    ) -> None:
+        with self._connection_binding.synchronization_lock:
+            context.previous_generation = self.connection.generation
+            context.next_generation = context.previous_generation + 1
+            receipt = self._trace.execute(
+                request_id=authorization.operation_id,
+                operation_type="google_oauth_code_exchange",
+                operation=lambda: self._connector.exchange_and_replace(
+                    code=code,
+                    requested_scopes=authorization.requested_scopes,
+                    connection_generation=context.next_generation,
+                ),
+                arguments={
+                    "flow": "authorization_code",
+                    "authorization_code": code,
+                    "requested_scopes": authorization.requested_scopes,
+                },
+                result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+            )
+            self._state_store.set_connection(
+                connected=True, granted_scopes=receipt.grant.granted_scopes
+            )
+
+    def handle_refresh_failure(
+        self, error_code: str, *, connection_generation: int | None = None
+    ) -> GoogleConnectionState:
         if error_code != "invalid_grant":
             raise ValueError("only invalid_grant can invalidate the OAuth credential")
+        if connection_generation is not None and (
+            not isinstance(connection_generation, int)
+            or isinstance(connection_generation, bool)
+            or connection_generation < 0
+        ):
+            raise ValueError("connection_generation must be a non-negative integer")
         with self._connection_binding.synchronization_lock:
-            self._connector.discard_local_credential()
-            state = self._state_store.set_connection(connected=False)
+            current = self._state_store.get_connection()
+            credential = self._connector.current_credential
+            if connection_generation is None or (
+                current.generation == connection_generation
+                and credential is not None
+                and credential.connection_generation == connection_generation
+            ):
+                self._connector.discard_local_credential()
+                state = self._state_store.set_connection(connected=False)
+                outcome = "invalidated"
+            else:
+                state = current
+                outcome = "stale_ignored"
         self._append_audit(
             kind="google_oauth_refresh_invalidated",
             request_id="google-oauth-refresh",
-            outcome="invalidated",
-            execution_status="failed",
+            outcome=outcome,
+            execution_status="failed" if outcome == "invalidated" else "ignored",
         )
         return state
 
@@ -849,18 +1046,44 @@ class GoogleOAuthLifecycle:
             # content-free response remains available while audit is down.
             pass
 
-    def _invalidate_connection(self) -> None:
+    def _invalidate_connection(
+        self,
+        *,
+        connection_generation: int | None,
+        previous_generation: int | None = None,
+    ) -> None:
         """Remove a possibly replaced credential without leaking state-store failures."""
 
+        if connection_generation is None:
+            return
         with self._connection_binding.synchronization_lock:
+            try:
+                current = self._state_store.get_connection()
+                credential = self._connector.current_credential
+            except GoogleOAuthError:
+                return
+            if credential is None or (
+                credential.connection_generation != connection_generation
+            ):
+                return
+            if current.generation == connection_generation:
+                should_disconnect = True
+            elif (
+                previous_generation is not None
+                and current.generation == previous_generation
+            ):
+                should_disconnect = False
+            else:
+                return
             try:
                 self._connector.discard_local_credential()
             except GoogleOAuthError:
                 pass
-            try:
-                self._state_store.set_connection(connected=False)
-            except GoogleOAuthError:
-                pass
+            if should_disconnect:
+                try:
+                    self._state_store.set_connection(connected=False)
+                except GoogleOAuthError:
+                    pass
 
     @staticmethod
     def _has_trace_write_failure(error: BaseException) -> bool:

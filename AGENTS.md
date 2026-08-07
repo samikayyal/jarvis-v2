@@ -6,7 +6,7 @@ Issues and specs live as Markdown files under `.scratch/<feature-slug>/`. See `d
 
 ### Triage labels
 
-The repo uses the default canonical labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+The repo uses the default canonical triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. Completed implementation tickets use the separate terminal lifecycle status `complete`. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
