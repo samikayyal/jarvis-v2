@@ -52,6 +52,7 @@ CONTROL_COMMANDS = (
     "/permissions",
     "/revoke",
     "/history",
+    "/memory",
 )
 
 _THIS_TIME_APPROVALS = frozenset(
@@ -85,6 +86,7 @@ class ControlCommand(str, Enum):
     PERMISSIONS = "permissions"
     REVOKE = "revoke"
     HISTORY = "history"
+    MEMORY = "memory"
 
 
 class MessageKind(str, Enum):
@@ -117,6 +119,7 @@ class ControlTransitionKind(str, Enum):
     PERMISSION_REVOKED = "permission_revoked"
     PERMISSION_NOT_ACTIVE = "permission_not_active"
     HISTORY_REQUEST = "history_request"
+    MEMORY_REQUEST = "memory_request"
 
 
 class ApprovalChoice(str, Enum):
@@ -233,6 +236,7 @@ def _known_command(value: str) -> ControlCommand | None:
         "/permissions": ControlCommand.PERMISSIONS,
         "/revoke": ControlCommand.REVOKE,
         "/history": ControlCommand.HISTORY,
+        "/memory": ControlCommand.MEMORY,
     }.get(value)
 
 
@@ -263,6 +267,7 @@ def parse_control(message: str) -> ParsedControl:
         ControlCommand.PERMISSIONS: {0},
         ControlCommand.REVOKE: {1},
         ControlCommand.HISTORY: set(range(2, 1_000)),
+        ControlCommand.MEMORY: set(range(1_000)),
     }
     history_is_valid = (
         command is ControlCommand.HISTORY
@@ -388,12 +393,16 @@ def _usage(parsed: ParsedControl) -> str:
             "Usage: /history search <text> | /history conversation <conversation-id> | "
             "/history inspect <message-id> | /history export <message-id>"
         ),
+        ControlCommand.MEMORY: (
+            "Usage: /memory list | /memory search <text> | /memory inspect <id> | "
+            "/memory remember <text> | /memory replace <id> <text> | /memory forget <id>"
+        ),
     }
     if parsed.command is not None:
         return usage.get(parsed.command, f"Usage: /{parsed.command.value}")
     return (
         "Unknown or malformed control command. Valid: /new, /status, /cancel, "
-        "/model, /reasoning, /config, /permissions, /revoke, /history."
+        "/model, /reasoning, /config, /permissions, /revoke, /history, /memory."
     )
 
 
@@ -682,6 +691,15 @@ def _apply_control(
             state=session,
             parsed=parsed,
             kind=ControlTransitionKind.HISTORY_REQUEST,
+        )
+
+    if parsed.command is ControlCommand.MEMORY:
+        # The broker owns exact memory parsing, authorization, and durable
+        # reads/writes; this pure grammar only reserves the command shape.
+        return ControlTransition(
+            state=session,
+            parsed=parsed,
+            kind=ControlTransitionKind.MEMORY_REQUEST,
         )
 
     raise AssertionError("_apply_control called without a complete control command")
