@@ -16,6 +16,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .gmail_actions import (
+    create_gmail_new_send_proposal,
+    create_gmail_reply_proposal,
+)
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
@@ -418,18 +422,18 @@ class AgentsSdkOrchestrationAdapter:
                     payload=payload,
                 )
                 terminal_action_from_proposal(candidate)
-            else:
-                from .gmail_writes import create_gmail_send_proposal
-
-                candidate = create_gmail_send_proposal(
+            elif plan.proposal.kind == "gmail_send":
+                candidate = create_gmail_new_send_proposal(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
                     **payload,
                 )
-                if candidate.kind != plan.proposal.kind:
-                    raise OrchestrationAdapterError(
-                        "model selected a Gmail action type that does not match its fields"
-                    )
+            else:
+                candidate = create_gmail_reply_proposal(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    **payload,
+                )
         except (TypeError, ValueError, KeyError) as exc:
             raise OrchestrationAdapterError(
                 "model returned a malformed action proposal"

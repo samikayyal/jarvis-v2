@@ -14,12 +14,23 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Literal, Protocol
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .google_auth import (
+    GoogleRefreshTokenExchanger,
+    GoogleTokenExchangeError,
+)
+from .google_http import (
+    GOOGLE_HTTP_TIMEOUT_SECONDS,
+    MAX_GOOGLE_HTTP_RESPONSE_BYTES,
+    GoogleHttpError,
+    GoogleHttpResponse,
+    GoogleHttpTransport,
+    UrllibGoogleHttpTransport,
+    ensure_bounded_response_body,
+)
 from .google_oauth import (
     GoogleCredentialStore,
     GoogleOAuthLifecycle,
@@ -60,14 +71,12 @@ DEFAULT_MAX_ITEM_BYTES = 16 * 1024
 MAX_ITEM_BYTES = 64 * 1024
 DEFAULT_MAX_RESULT_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 1024 * 1024
-MAX_PROVIDER_RESPONSE_BYTES = 512 * 1024
+MAX_PROVIDER_RESPONSE_BYTES = MAX_GOOGLE_HTTP_RESPONSE_BYTES
 # A single blocking HTTPS exchange may take up to five seconds.  The
 # orchestration tool owns the 20-second deadline for the complete, possibly
 # multi-request read (token refresh plus one or more fixed Google calls).
-GOOGLE_HTTP_TIMEOUT_SECONDS = 5.0
 GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES = 2 * 1024 * 1024
 
-_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me"
 _CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
 _DRIVE_API_ROOT = "https://www.googleapis.com/drive/v3"
@@ -87,6 +96,12 @@ _TEXT_MEDIA_MIME_TYPES = frozenset(
 )
 _GMAIL_TEXT_MIME_TYPES = frozenset({"text/plain", "text/html"})
 _GMAIL_METADATA_HEADERS = frozenset({"from", "to", "cc", "subject", "date"})
+
+# Kept as read-side aliases for existing callers; ownership now lives in the
+# neutral Google HTTP module rather than in this connector.
+GoogleReadHttpResponse = GoogleHttpResponse
+GoogleReadHttpTransport = GoogleHttpTransport
+UrllibGoogleReadHttpTransport = UrllibGoogleHttpTransport
 
 GoogleReadOperation = Literal[
     "gmail_messages_list",
@@ -169,68 +184,6 @@ class GoogleReadTracePayload:
     result: GoogleReadResult
 
 
-@dataclass(frozen=True, slots=True)
-class GoogleReadHttpResponse:
-    """One bounded response from the isolated live HTTP edge."""
-
-    status_code: int
-    headers: Mapping[str, str]
-    body: bytes
-
-
-class GoogleReadHttpTransport(Protocol):
-    """The deliberately small HTTP capability used by the live Google provider."""
-
-    def request(
-        self,
-        *,
-        method: Literal["GET", "POST"],
-        url: str,
-        headers: Mapping[str, str],
-        body: bytes | None,
-        timeout_seconds: float,
-    ) -> GoogleReadHttpResponse: ...
-
-
-class UrllibGoogleReadHttpTransport:
-    """Production HTTPS transport with a hard response-size cap."""
-
-    def request(
-        self,
-        *,
-        method: Literal["GET", "POST"],
-        url: str,
-        headers: Mapping[str, str],
-        body: bytes | None,
-        timeout_seconds: float,
-    ) -> GoogleReadHttpResponse:
-        request = Request(url, data=body, headers=dict(headers), method=method)
-        try:
-            response = urlopen(request, timeout=timeout_seconds)
-        except HTTPError as error:
-            return GoogleReadHttpResponse(
-                status_code=error.code,
-                headers=dict(error.headers.items()),
-                body=_read_bounded_body(error),
-            )
-        except TimeoutError as error:
-            raise GoogleReadProviderError("timeout", str(error)) from error
-        except URLError as error:
-            if isinstance(error.reason, TimeoutError):
-                raise GoogleReadProviderError("timeout", str(error)) from error
-            raise GoogleReadProviderError("unavailable", str(error)) from error
-        except OSError as error:
-            raise GoogleReadProviderError("unavailable", str(error)) from error
-        try:
-            return GoogleReadHttpResponse(
-                status_code=response.getcode(),
-                headers=dict(response.headers.items()),
-                body=_read_bounded_body(response),
-            )
-        finally:
-            response.close()
-
-
 class GoogleApiReadProvider:
     """Live, fixed-surface Google reader; it has no generic API operation."""
 
@@ -242,16 +195,14 @@ class GoogleApiReadProvider:
         transport: GoogleReadHttpTransport | None = None,
         timeout_seconds: float = GOOGLE_HTTP_TIMEOUT_SECONDS,
     ) -> None:
-        self._client_id = _non_blank(client_id, "client_id")
-        self._client_secret = _non_blank(client_secret, "client_secret")
-        self._transport = transport or UrllibGoogleReadHttpTransport()
-        if (
-            not isinstance(timeout_seconds, (int, float))
-            or isinstance(timeout_seconds, bool)
-            or not 0 < timeout_seconds <= GOOGLE_HTTP_TIMEOUT_SECONDS
-        ):
-            raise ValueError("timeout_seconds must be positive and no greater than 5")
-        self._timeout_seconds = float(timeout_seconds)
+        self._token_exchange = GoogleRefreshTokenExchanger(
+            client_id=client_id,
+            client_secret=client_secret,
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+        )
+        self._transport = self._token_exchange.transport
+        self._timeout_seconds = self._token_exchange.timeout_seconds
 
     def read(
         self, *, request: GoogleReadRequest, credential: OAuthCredentialRecord
@@ -298,61 +249,58 @@ class GoogleApiReadProvider:
         )
 
     def _refresh_access_token(self, refresh_token: str) -> str:
-        body = urlencode(
-            {
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }
-        ).encode("ascii")
-        response = self._transport.request(
-            method="POST",
-            url=_GOOGLE_TOKEN_URL,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            body=body,
-            timeout_seconds=self._timeout_seconds,
-        )
-        payload = self._json_response(response, token_exchange=True)
-        token = payload.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise GoogleReadProviderError(
-                "unavailable", "token response lacked access_token"
+        try:
+            return self._token_exchange.exchange(refresh_token).access_token
+        except GoogleTokenExchangeError as exc:
+            raise GoogleReadProviderError(exc.code, str(exc)) from exc
+
+    def _request(
+        self,
+        *,
+        method: Literal["GET", "POST"],
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+    ) -> GoogleReadHttpResponse:
+        try:
+            return self._transport.request(
+                method=method,
+                url=url,
+                headers=dict(headers),
+                body=body,
+                timeout_seconds=self._timeout_seconds,
             )
-        return token
+        except GoogleHttpError as exc:
+            raise GoogleReadProviderError(exc.code, str(exc)) from exc
 
     def _authorized_get(
         self, request: GoogleReadRequest, access_token: str
     ) -> GoogleReadHttpResponse:
         url = _google_read_url(request)
-        return self._transport.request(
+        return self._request(
             method="GET",
             url=url,
             headers={"Authorization": f"Bearer {access_token}"},
             body=None,
-            timeout_seconds=self._timeout_seconds,
         )
 
     def _authorized_drive_media_get(
         self, file_id: str, access_token: str
     ) -> GoogleReadHttpResponse:
-        return self._transport.request(
+        return self._request(
             method="GET",
             url=_drive_media_url(file_id),
             headers={"Authorization": f"Bearer {access_token}"},
             body=None,
-            timeout_seconds=self._timeout_seconds,
         )
 
     def _json_response(
         self,
         response: GoogleReadHttpResponse,
-        *,
-        token_exchange: bool = False,
     ) -> Mapping[str, object]:
         _ensure_response_size(response.body)
         if response.status_code != 200:
-            _raise_http_failure(response, token_exchange=token_exchange)
+            _raise_http_failure(response)
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1031,35 +979,18 @@ def _serialized_result(result: GoogleReadResult) -> bytes:
     ).encode("utf-8")
 
 
-def _read_bounded_body(response: object) -> bytes:
-    body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)  # type: ignore[attr-defined]
-    if not isinstance(body, bytes):
-        raise GoogleReadProviderError("unavailable", "Google returned a non-bytes body")
-    _ensure_response_size(body)
-    return body
-
-
 def _ensure_response_size(body: bytes) -> None:
-    if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
-        raise GoogleReadProviderError(
-            "oversized", "Google response exceeded the fixed limit"
-        )
+    try:
+        ensure_bounded_response_body(body)
+    except GoogleHttpError as exc:
+        raise GoogleReadProviderError(exc.code, str(exc)) from exc
 
 
-def _raise_http_failure(
-    response: GoogleReadHttpResponse, *, token_exchange: bool = False
-) -> None:
+def _raise_http_failure(response: GoogleReadHttpResponse) -> None:
     detail = response.body.decode("utf-8", errors="replace")
     code = "unavailable"
     if response.status_code == 429:
         code = "rate_limited"
-    elif response.status_code == 400 and token_exchange:
-        try:
-            payload = json.loads(detail)
-        except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict) and payload.get("error") == "invalid_grant":
-            code = "invalid_grant"
     raise GoogleReadProviderError(code, detail)
 
 

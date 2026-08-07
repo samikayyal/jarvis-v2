@@ -18,10 +18,13 @@ from jarvis_control_plane import (
     FixedClock,
     FrozenActionProposal,
     GmailApiWriteProvider,
-    GmailSendProviderResult,
+    GmailDeliveryResult,
+    GmailNewSendRequest,
+    GmailReplyRequest,
     GmailWriteConnector,
     GoogleConnectionState,
-    GoogleReadHttpResponse,
+    GoogleHttpResponse,
+    GoogleRefreshTokenExchanger,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
@@ -32,7 +35,9 @@ from jarvis_control_plane import (
     RequestState,
     RoutedActionDispatcher,
     SignedInboundEvent,
-    create_gmail_send_proposal,
+    create_gmail_new_send_proposal,
+    create_gmail_reply_proposal,
+    gmail_write_request_from_proposal,
 )
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.orchestration import (
@@ -126,11 +131,8 @@ def _proposal(*, reply: bool = False) -> FrozenActionProposal:
                 "references": ("<root@example.com>", "<source-001@example.com>"),
             }
         )
-    return create_gmail_send_proposal(
-        action_id="gmail-action-001",
-        request_id="request-001",
-        **fields,
-    )
+    factory = create_gmail_reply_proposal if reply else create_gmail_new_send_proposal
+    return factory(action_id="gmail-action-001", request_id="request-001", **fields)
 
 
 def _terminal_proposal() -> FrozenActionProposal:
@@ -170,11 +172,62 @@ def _components(proposal: FrozenActionProposal, dispatcher: ActionDispatcher) ->
     )
 
 
+def test_gmail_new_send_and_reply_use_distinct_typed_action_contracts() -> None:
+    new_send = gmail_write_request_from_proposal(_proposal())
+    reply = gmail_write_request_from_proposal(_proposal(reply=True))
+
+    assert isinstance(new_send, GmailNewSendRequest)
+    assert isinstance(reply, GmailReplyRequest)
+    assert new_send.operation == "gmail_send"
+    assert reply.operation == "gmail_reply"
+    assert new_send.threading == "new_message"
+    assert reply.threading == "gmail_threaded_reply"
+
+    with pytest.raises(TypeError):
+        create_gmail_new_send_proposal(
+            action_id="gmail-action-invalid",
+            request_id="request-invalid",
+            to=("recipient@example.com",),
+            subject="Subject",
+            body="Body",
+            mime_type="text/plain",
+            source_message_id="source-001",  # type: ignore[call-arg]
+        )
+
+
+def test_shared_google_refresh_exchange_owns_wire_request_and_timeout_bound() -> None:
+    class Transport:
+        def request(self, **kwargs: object) -> GoogleHttpResponse:
+            assert kwargs["method"] == "POST"
+            assert kwargs["url"] == "https://oauth2.googleapis.com/token"
+            assert kwargs["timeout_seconds"] == 5.0
+            return GoogleHttpResponse(
+                status_code=200,
+                headers={"Content-Type": "application/json"},
+                body=b'{"access_token":"shared-access-token"}',
+            )
+
+    result = GoogleRefreshTokenExchanger(
+        client_id="client-id",
+        client_secret="client-secret",
+        transport=Transport(),
+    ).exchange("refresh-token")
+
+    assert result.access_token == "shared-access-token"
+    assert result.request.form == {
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "grant_type": "refresh_token",
+        "refresh_token": "refresh-token",
+    }
+    assert b"grant_type=refresh_token" in result.request.body
+
+
 def test_new_send_freezes_every_delivery_field_and_dispatches_that_exact_message() -> (
     None
 ):
     provider = ControlledGmailWriteProvider(
-        result=GmailSendProviderResult(message_id="sent-001", thread_id="thread-new")
+        result=GmailDeliveryResult(message_id="sent-001", thread_id="thread-new")
     )
     proposal = _proposal()
     components = _components(proposal, _dispatcher(provider))
@@ -204,7 +257,7 @@ def test_typed_reply_freezes_source_thread_headers_and_requires_returned_thread_
     None
 ):
     provider = ControlledGmailWriteProvider(
-        result=GmailSendProviderResult(message_id="sent-002", thread_id="thread-001")
+        result=GmailDeliveryResult(message_id="sent-002", thread_id="thread-001")
     )
     proposal = _proposal(reply=True)
     components = _components(proposal, _dispatcher(provider))
@@ -243,7 +296,7 @@ def test_altered_or_expired_approval_never_dispatches_a_gmail_replacement(
 
 def test_mismatched_thread_is_unknown_and_a_replay_never_sends_a_replacement() -> None:
     provider = ControlledGmailWriteProvider(
-        result=GmailSendProviderResult(message_id="sent-003", thread_id="wrong-thread")
+        result=GmailDeliveryResult(message_id="sent-003", thread_id="wrong-thread")
     )
     components = _components(_proposal(reply=True), _dispatcher(provider))
     components.receiver.receive(_event("reply", suffix="01"))
@@ -300,19 +353,19 @@ def test_manual_trace_retains_complete_credential_bearing_gmail_provider_exchang
     class Transport:
         def __init__(self) -> None:
             self.responses = [
-                GoogleReadHttpResponse(
+                GoogleHttpResponse(
                     status_code=200,
                     headers={"Content-Type": "application/json"},
                     body=b'{"access_token":"controlled-access-token"}',
                 ),
-                GoogleReadHttpResponse(
+                GoogleHttpResponse(
                     status_code=200,
                     headers={"Content-Type": "application/json"},
                     body=b'{"id":"sent-traced","threadId":"thread-new"}',
                 ),
             ]
 
-        def request(self, **_kwargs: object) -> GoogleReadHttpResponse:
+        def request(self, **_kwargs: object) -> GoogleHttpResponse:
             return self.responses.pop(0)
 
     trace_store = InMemoryDiagnosticTraceStore()
@@ -366,19 +419,19 @@ def test_manual_trace_retains_gmail_provider_error_evidence() -> None:
     class Transport:
         def __init__(self) -> None:
             self.responses = [
-                GoogleReadHttpResponse(
+                GoogleHttpResponse(
                     status_code=200,
                     headers={"Content-Type": "application/json"},
                     body=b'{"access_token":"controlled-access-token"}',
                 ),
-                GoogleReadHttpResponse(
+                GoogleHttpResponse(
                     status_code=503,
                     headers={"Content-Type": "application/json"},
                     body=b'{"error":"controlled-provider-failure"}',
                 ),
             ]
 
-        def request(self, **_kwargs: object) -> GoogleReadHttpResponse:
+        def request(self, **_kwargs: object) -> GoogleHttpResponse:
             return self.responses.pop(0)
 
     trace_store = InMemoryDiagnosticTraceStore()
@@ -454,15 +507,15 @@ def test_live_provider_posts_only_raw_frozen_rfc822_message_and_thread_id() -> N
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def request(self, **kwargs: object) -> GoogleReadHttpResponse:
+        def request(self, **kwargs: object) -> GoogleHttpResponse:
             self.calls.append(kwargs)
             if len(self.calls) == 1:
-                return GoogleReadHttpResponse(
+                return GoogleHttpResponse(
                     status_code=200,
                     headers={"Content-Type": "application/json"},
                     body=b'{"access_token":"live-token"}',
                 )
-            return GoogleReadHttpResponse(
+            return GoogleHttpResponse(
                 status_code=200,
                 headers={"Content-Type": "application/json"},
                 body=json.dumps({"id": "sent-004", "threadId": "thread-001"}).encode(),
@@ -554,7 +607,7 @@ def test_orchestration_rebuilds_a_canonical_gmail_preview() -> None:
 def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
     terminal_dispatcher = ControlledActionDispatcher()
     gmail_provider = ControlledGmailWriteProvider(
-        result=GmailSendProviderResult(message_id="sent-routed", thread_id="thread-new")
+        result=GmailDeliveryResult(message_id="sent-routed", thread_id="thread-new")
     )
 
     terminal_components = _components(
