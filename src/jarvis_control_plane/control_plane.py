@@ -36,6 +36,7 @@ from .ports import (
     ActionFinalizer,
     AuditBoundary,
     AuditWriteError,
+    BoundActionLifecycle,
     Clock,
     DiagnosticTraceError,
     DurableStateStore,
@@ -176,6 +177,16 @@ class _CancellationOutcome:
     durable_status: DispatchStatus
 
 
+class _NoopActionLifecycle:
+    """Identity lifecycle for actions whose dispatcher has no external binding."""
+
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        return action
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        return
+
+
 @dataclass(frozen=True, slots=True)
 class _RequestAdmission:
     """The durable request and session token produced by successful admission."""
@@ -222,6 +233,7 @@ class DeterministicCapabilityBroker:
         model_availability_provider: ModelAvailabilityProvider,
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
+        action_lifecycle: BoundActionLifecycle | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError(
@@ -242,6 +254,7 @@ class DeterministicCapabilityBroker:
                 "action_dispatcher must implement the prepared cancellable dispatch port"
             )
         self.action_dispatcher = selected_dispatcher
+        self.action_lifecycle = action_lifecycle or _NoopActionLifecycle()
         existing_session = self.working_sessions.load()
         if existing_session is None:
             self.working_sessions.create(
@@ -347,7 +360,7 @@ class DeterministicCapabilityBroker:
 
         if result.proposal is not None:
             try:
-                action = self.freeze_action(result.proposal)
+                action = self.freeze_action(self._bind_action_proposal(result.proposal))
                 self._present_action(action, message)
                 if action.policy_disposition in {
                     TerminalDisposition.SAFE_READ.value,
@@ -356,6 +369,7 @@ class DeterministicCapabilityBroker:
                     return self._auto_authorize_terminal_action(action, message)
             except (
                 AuditWriteError,
+                ActionDispatcherError,
                 DiagnosticTraceError,
                 InvariantViolation,
                 OutboundConnectorError,
@@ -478,6 +492,16 @@ class DeterministicCapabilityBroker:
                 continue
             return action
         raise SessionStoreError("pending action could not be frozen atomically")
+
+    def _bind_action_proposal(
+        self, proposal: FrozenActionProposal
+    ) -> FrozenActionProposal:
+        """Let the typed action surface add its current immutable binding."""
+
+        bound = self.action_lifecycle.bind_proposal(proposal)
+        if not isinstance(bound, FrozenActionProposal):
+            raise InvariantViolation("action dispatcher returned an invalid proposal")
+        return bound
 
     def _present_action(
         self, action: PendingActionState, message: InboundMessage
@@ -766,6 +790,12 @@ class DeterministicCapabilityBroker:
                     reason=f"pending action rejection was not recorded: {exc}",
                 )
             return ReceiveResult(status_code=202, disposition="action_rejected")
+
+        invalidated = self._invalidate_changed_connector_action(
+            message, session, action
+        )
+        if invalidated is not None:
+            return invalidated
 
         transition = approve_pending_action(session, now=self.clock)
         approved_state = transition.state
@@ -1065,19 +1095,23 @@ class DeterministicCapabilityBroker:
         """Trace and await a prepared action after its cancellation barrier."""
 
         try:
-            self._trace.execute(
-                request_id=prepared.action.request_id,
-                operation_id=f"{prepared.action.action_id}:dispatch",
-                operation_type=(
-                    "worker" if prepared.action.kind == "terminal" else "connector"
-                ),
-                input_payload=prepared.action,
-                arguments={"operation": "dispatch", "kind": prepared.action.kind},
-                telemetry={"phase": "dispatch"},
-                operation=prepared.handle.run,
-                result_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
-                error_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
-            )
+            if prepared.action.kind in {"gmail_send", "gmail_reply"}:
+                # Gmail owns the complete credential-bearing trace boundary.
+                # Re-wrapping it here would reserve a second trace and would
+                # change its definite pre-provider failure classification.
+                prepared.handle.run()
+            else:
+                self._trace.execute(
+                    request_id=prepared.action.request_id,
+                    operation_id=f"{prepared.action.action_id}:dispatch",
+                    operation_type="worker",
+                    input_payload=prepared.action,
+                    arguments={"operation": "dispatch", "kind": prepared.action.kind},
+                    telemetry={"phase": "dispatch"},
+                    operation=prepared.handle.run,
+                    result_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
+                    error_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
+                )
         except (DiagnosticTraceError, ActionDispatcherError) as exc:
             self._release_prepared_dispatch(prepared.action.action_id)
             terminal_status = _dispatch_failure_status(exc)
@@ -1216,6 +1250,54 @@ class DeterministicCapabilityBroker:
             disposition="permission_revoked",
             reason="the exact command permission was revoked before dispatch",
         )
+
+    def _invalidate_changed_connector_action(
+        self,
+        message: InboundMessage,
+        session: WorkingSession,
+        action: PendingActionState,
+    ) -> ReceiveResult | None:
+        """Invalidate a pending connector action that no longer matches its binding."""
+
+        frozen = FrozenActionProposal(
+            action_id=action.action_id,
+            request_id=action.request_id,
+            kind=action.kind,
+            preview=action.preview or "",
+            payload=action.payload,
+            digest=action.digest,
+        )
+        try:
+            self.action_lifecycle.validate_pending_action(frozen)
+        except ActionDispatcherError:
+            transition = reject_pending_action(session, now=self.clock)
+            try:
+                self._commit_session_with_audit(
+                    session,
+                    transition.state,
+                    kind="pending_action",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome="rejected",
+                    actor="control_plane",
+                    operation_type="approval_gated_action",
+                    target_category="pending_action",
+                    approval_decision="invalidated",
+                    details={"action": action.action_id, "state": "rejected"},
+                )
+            except (AuditWriteError, SessionStoreError) as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"changed connector action was not invalidated: {exc}",
+                )
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_invalidated",
+                reason="connector connection changed after the proposal was frozen",
+            )
+        return None
 
     def _proposal_choices(self, action: PendingActionState) -> str:
         if action.policy_disposition in {

@@ -7,6 +7,8 @@ from datetime import datetime
 from typing import Any
 
 from jarvis_control_plane import (
+    ActionDispatcher,
+    BoundActionLifecycle,
     ControlledActionDispatcher,
     ControlledOrchestrationAdapter,
     ControlledOutboundConnector,
@@ -40,7 +42,8 @@ class ReceiverComponents:
     receiver: SignedMessageReceiver
     trace_store: InMemoryDiagnosticTraceStore | None
     trace: DiagnosticTraceRecorder
-    action_dispatcher: ControlledActionDispatcher
+    action_dispatcher: ActionDispatcher
+    action_lifecycle: BoundActionLifecycle | None
 
 
 def build_receiver_components(
@@ -58,7 +61,8 @@ def build_receiver_components(
     clock: FixedClock | None = None,
     ids: DeterministicIdGenerator | None = None,
     trace: DiagnosticTraceRecorder | None = None,
-    action_dispatcher: ControlledActionDispatcher | None = None,
+    action_dispatcher: ActionDispatcher | None = None,
+    action_lifecycle: BoundActionLifecycle | None = None,
     working_sessions: Any | None = None,
 ) -> ReceiverComponents:
     """Build the repeated receiver/broker graph while preserving test overrides."""
@@ -100,6 +104,7 @@ def build_receiver_components(
         trace=trace,
         model_availability_provider=provider,
         action_dispatcher=action_dispatcher,
+        action_lifecycle=action_lifecycle,
         working_sessions=working_sessions,
     )
     receiver = SignedMessageReceiver(
@@ -124,4 +129,5 @@ def build_receiver_components(
         trace_store=trace_store,
         trace=trace,
         action_dispatcher=action_dispatcher,
+        action_lifecycle=action_lifecycle,
     )

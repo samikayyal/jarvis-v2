@@ -50,7 +50,7 @@ class OrchestrationAdapterError(ControlPlaneError):
 
 
 class ActionDispatcherError(ControlPlaneError):
-    """A frozen approval-gated action could not be dispatched."""
+    """A frozen approval-gated action lifecycle could not proceed."""
 
     def __init__(self, message: str, *, may_have_dispatched: bool = False) -> None:
         super().__init__(message)
@@ -254,6 +254,19 @@ class ActionFinalizer(Protocol):
     """Optional retirement handshake for dispatchers with transport state."""
 
     def finalize(self, *, action_id: str) -> None: ...
+
+
+@runtime_checkable
+class BoundActionLifecycle(Protocol):
+    """Optional connector lifecycle needed to bind and revalidate an action."""
+
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Add immutable connector state before the proposal is presented."""
+        ...
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """Reject a frozen action whose connector state changed after binding."""
+        ...
 
 
 class ModelAvailabilityProvider(Protocol):

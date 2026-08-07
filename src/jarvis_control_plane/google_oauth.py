@@ -411,6 +411,37 @@ class GoogleCredentialStore(Protocol):
     def delete(self) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class GoogleConnectionSnapshot:
+    """One lock-consistent view of connection state and its credential."""
+
+    connection: GoogleConnectionState
+    credential: OAuthCredentialRecord | None
+
+
+class GoogleConnectionBinding:
+    """Shared synchronization boundary for OAuth state and credential changes."""
+
+    def __init__(
+        self,
+        *,
+        state_store: GoogleOAuthStateStore,
+        credential_store: GoogleCredentialStore,
+    ) -> None:
+        self._state_store = state_store
+        self._credential_store = credential_store
+        self.synchronization_lock = threading.RLock()
+
+    def snapshot(self) -> GoogleConnectionSnapshot:
+        """Read generation and credential while no lifecycle mutation can interleave."""
+
+        with self.synchronization_lock:
+            return GoogleConnectionSnapshot(
+                connection=self._state_store.get_connection(),
+                credential=self._credential_store.current,
+            )
+
+
 class InMemoryGoogleCredentialStore:
     """Controlled credential-store double; it is never an ordinary state store."""
 
@@ -634,6 +665,10 @@ class GoogleOAuthLifecycle:
                 "OAuth state TTL must be positive and no longer than ten minutes"
             )
         self._state_store = state_store
+        self._connection_binding = GoogleConnectionBinding(
+            state_store=state_store,
+            credential_store=credential_store,
+        )
         self._connector = GoogleOAuthConnector(
             configured_identity=self._configured_identity,
             provider=provider,
@@ -648,7 +683,13 @@ class GoogleOAuthLifecycle:
 
     @property
     def connection(self) -> GoogleConnectionState:
-        return self._state_store.get_connection()
+        return self._connection_binding.snapshot().connection
+
+    @property
+    def connection_binding(self) -> GoogleConnectionBinding:
+        """Expose the shared lifecycle boundary to connector composition only."""
+
+        return self._connection_binding
 
     def start_authorization(
         self, *, operation_id: str, requested_scopes: Sequence[str]
@@ -702,20 +743,28 @@ class GoogleOAuthLifecycle:
             return OAuthCallbackResponse(status_code=503)
 
         try:
-            receipt = self._trace.execute(
-                request_id=authorization.operation_id,
-                operation_type="google_oauth_code_exchange",
-                operation=lambda: self._connector.exchange_and_replace(
-                    code=query["code"], requested_scopes=authorization.requested_scopes
-                ),
-                arguments={
-                    "flow": "authorization_code",
-                    "authorization_code": query["code"],
-                    "requested_scopes": authorization.requested_scopes,
-                },
-                result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-                error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-            )
+            # Credential replacement and generation advancement are one
+            # synchronization boundary.  Gmail dispatch holds this same lock
+            # through its final check and provider attempt.
+            with self._connection_binding.synchronization_lock:
+                receipt = self._trace.execute(
+                    request_id=authorization.operation_id,
+                    operation_type="google_oauth_code_exchange",
+                    operation=lambda: self._connector.exchange_and_replace(
+                        code=query["code"],
+                        requested_scopes=authorization.requested_scopes,
+                    ),
+                    arguments={
+                        "flow": "authorization_code",
+                        "authorization_code": query["code"],
+                        "requested_scopes": authorization.requested_scopes,
+                    },
+                    result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                    error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                )
+                self._state_store.set_connection(
+                    connected=True, granted_scopes=receipt.grant.granted_scopes
+                )
         except OAuthExchangeError as exc:
             if self._has_trace_write_failure(exc):
                 self._invalidate_connection()
@@ -728,13 +777,6 @@ class GoogleOAuthLifecycle:
             self._invalidate_connection()
             return OAuthCallbackResponse(status_code=503)
 
-        try:
-            self._state_store.set_connection(
-                connected=True, granted_scopes=receipt.grant.granted_scopes
-            )
-        except GoogleOAuthError:
-            self._invalidate_connection()
-            return OAuthCallbackResponse(status_code=503)
         try:
             self._append_audit(
                 kind="google_oauth_code_exchange_completed",
@@ -750,8 +792,9 @@ class GoogleOAuthLifecycle:
     def handle_refresh_failure(self, error_code: str) -> GoogleConnectionState:
         if error_code != "invalid_grant":
             raise ValueError("only invalid_grant can invalidate the OAuth credential")
-        self._connector.discard_local_credential()
-        state = self._state_store.set_connection(connected=False)
+        with self._connection_binding.synchronization_lock:
+            self._connector.discard_local_credential()
+            state = self._state_store.set_connection(connected=False)
         self._append_audit(
             kind="google_oauth_refresh_invalidated",
             request_id="google-oauth-refresh",
@@ -767,23 +810,24 @@ class GoogleOAuthLifecycle:
             outcome="attempted",
             execution_status="attempted",
         )
-        credential = self._connector.current_credential
-        try:
-            self._trace.execute(
-                request_id="google-oauth-disconnect",
-                operation_type="google_oauth_revocation",
-                operation=self._connector.disconnect,
-                arguments={
-                    "flow": "revocation",
-                    "refresh_token": (
-                        credential.refresh_token if credential is not None else None
-                    ),
-                },
-                result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-                error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
-            )
-        finally:
-            state = self._state_store.set_connection(connected=False)
+        with self._connection_binding.synchronization_lock:
+            credential = self._connector.current_credential
+            try:
+                self._trace.execute(
+                    request_id="google-oauth-disconnect",
+                    operation_type="google_oauth_revocation",
+                    operation=self._connector.disconnect,
+                    arguments={
+                        "flow": "revocation",
+                        "refresh_token": (
+                            credential.refresh_token if credential is not None else None
+                        ),
+                    },
+                    result_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                    error_limit_bytes=GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES,
+                )
+            finally:
+                state = self._state_store.set_connection(connected=False)
         self._append_audit(
             kind="google_oauth_revocation_completed",
             request_id="google-oauth-disconnect",
@@ -808,14 +852,15 @@ class GoogleOAuthLifecycle:
     def _invalidate_connection(self) -> None:
         """Remove a possibly replaced credential without leaking state-store failures."""
 
-        try:
-            self._connector.discard_local_credential()
-        except GoogleOAuthError:
-            pass
-        try:
-            self._state_store.set_connection(connected=False)
-        except GoogleOAuthError:
-            pass
+        with self._connection_binding.synchronization_lock:
+            try:
+                self._connector.discard_local_credential()
+            except GoogleOAuthError:
+                pass
+            try:
+                self._state_store.set_connection(connected=False)
+            except GoogleOAuthError:
+                pass
 
     @staticmethod
     def _has_trace_write_failure(error: BaseException) -> bool:
