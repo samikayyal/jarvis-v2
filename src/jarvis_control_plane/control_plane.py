@@ -76,6 +76,7 @@ from .sessions import (
     interrupt_for_restart,
     mark_action_dispatch_attempted,
     mark_proposal_presented,
+    reconcile_action_cancellation,
     record_proposal_fragment,
     reject_pending_action,
 )
@@ -153,6 +154,16 @@ class _PreparedActionDispatch:
 
     action: FrozenActionProposal
     handle: ActionDispatchHandle
+
+
+@dataclass(frozen=True, slots=True)
+class _CancellationOutcome:
+    """One bounded dispatcher acknowledgement and its durable interpretation."""
+
+    action_id: str
+    kind: str
+    result: ActionCancellationResult
+    durable_status: DispatchStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -1049,11 +1060,11 @@ class DeterministicCapabilityBroker:
 
         try:
             self.action_dispatcher.cancel(action_id=action_id)
-        except (ActionDispatcherError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - an unavailable edge is unknown
             # The durable action outcome below remains authoritative. A concrete
             # dispatcher must make cancellation bounded, but cleanup cannot
             # replace the outcome when that edge is already unavailable.
-            pass
+            return
 
     def _late_action_result(
         self,
@@ -1087,6 +1098,16 @@ class DeterministicCapabilityBroker:
                 status_code=202,
                 disposition="late_result_ignored",
                 reason="worker result arrived after cancellation: " + reason,
+            )
+        if record is not None and record.status in {
+            DispatchStatus.CANCELLING,
+            DispatchStatus.UNKNOWN,
+        }:
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_dispatch_unknown",
+                reason="worker result arrived after an uncertain cancellation: "
+                + reason,
             )
         return ReceiveResult(
             status_code=202,
@@ -2250,10 +2271,10 @@ class DeterministicCapabilityBroker:
         expected: WorkingSession,
         transition: ControlTransition,
     ) -> ReceiveResult:
-        terminal_dispatches_to_cancel = tuple(
-            record.action_id
+        dispatches_to_cancel = tuple(
+            (record.action_id, record.kind)
             for record in expected.action_outbox
-            if record.is_live and record.kind == "terminal"
+            if record.is_open
         )
         audit_kind = {
             ControlTransitionKind.STATUS: "working_session_status_viewed",
@@ -2298,33 +2319,162 @@ class DeterministicCapabilityBroker:
                     disposition="failed",
                     reason=f"working-session control lost a concurrent race: {exc}",
                 )
-            if transition.kind in {
-                ControlTransitionKind.CANCELLED,
-                ControlTransitionKind.NEW_SESSION,
-            }:
-                self._cancel_terminal_dispatches(terminal_dispatches_to_cancel)
+        cancellation_outcomes: tuple[_CancellationOutcome, ...] = ()
+        if transition.kind in {
+            ControlTransitionKind.CANCELLED,
+            ControlTransitionKind.NEW_SESSION,
+        }:
+            cancellation_outcomes = self._cancel_dispatches(dispatches_to_cancel)
+            if transition.kind is ControlTransitionKind.CANCELLED:
+                try:
+                    for cancellation in cancellation_outcomes:
+                        current = self._current_working_session()
+                        reconciliation = reconcile_action_cancellation(
+                            current,
+                            action_id=cancellation.action_id,
+                            status=cancellation.durable_status,
+                            now=self.clock,
+                        )
+                        self.working_sessions.compare_and_set(
+                            current, reconciliation.state
+                        )
+                except (InvariantViolation, SessionStoreError) as exc:
+                    self._best_effort_audit(
+                        kind="action_cancellation_reconciliation_failed",
+                        event_id=message.event_id,
+                        request_id=(
+                            expected.active_request.request_id
+                            if expected.active_request is not None
+                            else None
+                        ),
+                        message_id=message.message_id,
+                        outcome="unknown",
+                        actor="control_plane",
+                        operation_type="action_cancellation",
+                        target_category="side_effect",
+                        details={"reason": type(exc).__name__},
+                    )
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="cancellation_unknown",
+                        reason=(
+                            "cancellation was requested but its durable outcome "
+                            "could not be reconciled"
+                        ),
+                    )
+            try:
+                self._append_cancellation_audit(
+                    message, expected, cancellation_outcomes
+                )
+            except AuditWriteError as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"cancellation outcome was not recorded: {exc}",
+                )
 
         if transition.reply is None:
             return ReceiveResult(status_code=202, disposition=transition.kind.value)
+        if cancellation_outcomes:
+            transition = replace(
+                transition,
+                reply=self._cancellation_reply(transition, cancellation_outcomes),
+            )
         return self._dispatch_control_reply(message, transition)
 
-    def _cancel_terminal_dispatches(
-        self, action_ids: tuple[str, ...]
-    ) -> tuple[ActionCancellationResult, ...]:
-        """Ask the typed action edge to stop each live terminal scope."""
+    def _cancel_dispatches(
+        self, action_refs: tuple[tuple[str, str], ...]
+    ) -> tuple[_CancellationOutcome, ...]:
+        """Close every side-effect edge and preserve cancellation uncertainty."""
 
-        results: list[ActionCancellationResult] = []
-        for action_id in action_ids:
+        results: list[_CancellationOutcome] = []
+        for action_id, kind in action_refs:
             try:
                 result = self.action_dispatcher.cancel(action_id=action_id)
                 if not isinstance(result, ActionCancellationResult):
                     raise TypeError("action cancellation returned an invalid result")
-            except (ActionDispatcherError, TypeError):
-                # The state transition already closed the action. A later worker
-                # result cannot restore it or cause a new dispatch.
+            except Exception:  # noqa: BLE001 - an unavailable edge is unknown
                 result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
-            results.append(result)
+            durable_status = (
+                DispatchStatus.CANCELLED
+                if result.status
+                in {
+                    ActionCancellationStatus.NOT_STARTED,
+                    ActionCancellationStatus.STOPPED,
+                }
+                else DispatchStatus.UNKNOWN
+            )
+            results.append(
+                _CancellationOutcome(
+                    action_id=action_id,
+                    kind=kind,
+                    result=result,
+                    durable_status=durable_status,
+                )
+            )
         return tuple(results)
+
+    def _append_cancellation_audit(
+        self,
+        message: InboundMessage,
+        expected: WorkingSession,
+        outcomes: tuple[_CancellationOutcome, ...],
+    ) -> None:
+        """Record only bounded identifiers and cancellation outcomes."""
+
+        request_id = (
+            expected.active_request.request_id
+            if expected.active_request is not None
+            else None
+        )
+        for outcome in outcomes:
+            self._append_audit(
+                kind="action_cancellation",
+                event_id=message.event_id,
+                request_id=request_id,
+                message_id=message.message_id,
+                outcome=outcome.durable_status.value,
+                actor="control_plane",
+                operation_type="action_cancellation",
+                target_category=(
+                    "execution_host" if outcome.kind == "terminal" else "side_effect"
+                ),
+                execution_status=outcome.result.status.value,
+                details={
+                    "action": outcome.action_id,
+                    "dispatch_state": outcome.durable_status.value,
+                    "execution_status": outcome.result.status.value,
+                },
+            )
+
+    @staticmethod
+    def _cancellation_reply(
+        transition: ControlTransition,
+        outcomes: tuple[_CancellationOutcome, ...],
+    ) -> str:
+        """Tell the operator when any external action remains uncertain."""
+
+        if any(
+            outcome.durable_status is DispatchStatus.UNKNOWN for outcome in outcomes
+        ):
+            if transition.kind is ControlTransitionKind.NEW_SESSION:
+                return (
+                    "Started a clean session, but one or more previous external "
+                    "actions remain of unknown outcome. No retry will be attempted."
+                )
+            return (
+                "Cancellation was accepted, but one or more external actions have "
+                "an unknown outcome. No retry will be attempted."
+            )
+        if transition.kind is ControlTransitionKind.NEW_SESSION:
+            return (
+                "Started a clean session. Previous work was stopped or confirmed "
+                "not started; no action will resume."
+            )
+        return (
+            "Cancelled the active request and invalidated its pending action. "
+            "External actions were stopped or confirmed not started."
+        )
 
     def _dispatch_control_reply(
         self,

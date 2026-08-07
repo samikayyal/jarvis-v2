@@ -115,6 +115,10 @@ from .worker_gateway import (
     WorkerGateway,
     WorkerIdentity,
     WorkerInvocation,
+    WorkerOutputStream,
+    WorkerProgressEvent,
+    WorkerProgressKind,
+    WorkerProgressSink,
 )
 
 __all__ = [
@@ -214,6 +218,10 @@ __all__ = [
     "WorkerGateway",
     "WorkerIdentity",
     "WorkerInvocation",
+    "WorkerOutputStream",
+    "WorkerProgressEvent",
+    "WorkerProgressKind",
+    "WorkerProgressSink",
     "build_live_google_read_connector",
     "sign_body",
 ]

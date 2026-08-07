@@ -757,6 +757,18 @@ def _apply_message(
             effects=("request_refused_busy",),
             reason="one active request is already present; no queue transition",
         )
+    if any(record.is_open for record in session.action_outbox):
+        return ControlTransition(
+            state=session,
+            parsed=parsed,
+            kind=ControlTransitionKind.BUSY_REFUSED,
+            reply=(
+                "A prior action cancellation is still being reconciled. "
+                "Use /status or /cancel; V1 does not queue another request."
+            ),
+            effects=("request_refused_busy",),
+            reason="an action cancellation is still being reconciled; no queue transition",
+        )
 
     if not model_availability.model_is_available(session.model):
         return ControlTransition(

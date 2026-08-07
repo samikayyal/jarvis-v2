@@ -234,7 +234,15 @@ class ActionDispatchHandle(Protocol):
 
 @runtime_checkable
 class ActionDispatcher(Protocol):
-    """Closed, cancellable side-effect boundary for a frozen action."""
+    """Closed, cancellable side-effect boundary for a frozen action.
+
+    ``cancel`` must return ``NOT_STARTED`` only when the dispatcher can prove
+    that the operation never began, ``STOPPED`` only when it can prove that
+    the complete side-effect scope stopped, and ``UNKNOWN`` for every lost,
+    timed-out, or otherwise unconfirmed edge. A missing prepared handle is
+    not proof of ``NOT_STARTED`` because the operation may have completed
+    before its durable result was recorded.
+    """
 
     def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle: ...
 

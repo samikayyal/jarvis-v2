@@ -2373,7 +2373,10 @@ class ControlledActionDispatcher:
         with self._lock:
             handle = self._prepared.get(action_id)
         if handle is None:
-            return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+            # The prepared handle may have forgotten itself after the external
+            # operation returned but before the control plane persisted its
+            # terminal state. Absence is therefore not proof of non-start.
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         return handle.cancel()
 
     def _dispatch(self, action: FrozenActionProposal) -> None:

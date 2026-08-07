@@ -26,18 +26,27 @@ from .terminal_policy import TerminalAction, terminal_action_from_proposal
 
 @dataclass(frozen=True, slots=True)
 class WorkerIdentity:
-    """One authenticated registered execution-worker identity."""
+    """One authenticated registered execution-worker connection identity.
+
+    ``connection_id`` is the worker boot or authenticated-session binding. It
+    is required because host and worker identifiers alone do not detect a
+    disconnect followed by a different live connection.
+    """
 
     host: str
     worker_id: str
+    connection_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.host, str) or not self.host.strip():
             raise ValueError("worker identity host must be non-blank")
         if not isinstance(self.worker_id, str) or not self.worker_id.strip():
             raise ValueError("worker identity identifier must be non-blank")
+        if not isinstance(self.connection_id, str) or not self.connection_id.strip():
+            raise ValueError("worker connection identifier must be non-blank")
         object.__setattr__(self, "host", self.host.strip())
         object.__setattr__(self, "worker_id", self.worker_id.strip())
+        object.__setattr__(self, "connection_id", self.connection_id.strip())
 
 
 class WorkerExecutionStatus(str, Enum):
@@ -59,6 +68,8 @@ class WorkerExecutionLimits:
     stderr_limit_bytes: int = 1024 * 1024
     cancellation_grace_seconds: int = 10
     authentication_timeout_seconds: int = 10
+    progress_event_limit: int = 128
+    milestone_limit_bytes: int = 4 * 1024
 
     def __post_init__(self) -> None:
         if any(
@@ -69,6 +80,8 @@ class WorkerExecutionLimits:
                 self.stderr_limit_bytes,
                 self.cancellation_grace_seconds,
                 self.authentication_timeout_seconds,
+                self.progress_event_limit,
+                self.milestone_limit_bytes,
             )
         ):
             raise TypeError("worker execution limits must be integers")
@@ -88,6 +101,12 @@ class WorkerExecutionLimits:
             raise ValueError(
                 "worker cancellation grace must be between one and 30 seconds"
             )
+        if not 1 <= self.progress_event_limit <= 512:
+            raise ValueError("worker progress event limit must be between one and 512")
+        if not 1 <= self.milestone_limit_bytes <= 16 * 1024:
+            raise ValueError(
+                "worker milestone limit must be between one byte and 16 KiB"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +120,60 @@ class WorkerInvocation:
     stdout_limit_bytes: int
     stderr_limit_bytes: int
     cancellation_grace_seconds: int
+    progress_event_limit: int
+    milestone_limit_bytes: int
+    worker_identity: WorkerIdentity
+
+
+class WorkerProgressKind(str, Enum):
+    """Typed worker events emitted before the terminal execution result."""
+
+    READY = "ready"
+    MILESTONE = "milestone"
+    OUTPUT = "output"
+
+
+class WorkerOutputStream(str, Enum):
+    """The only output streams a worker may tag in a progress event."""
+
+    STDOUT = "stdout"
+    STDERR = "stderr"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerProgressEvent:
+    """One ordered, bounded worker readiness, milestone, or output event."""
+
+    sequence: int
+    kind: WorkerProgressKind | str
+    text: str = ""
+    stream: WorkerOutputStream | str | None = None
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int):
+            raise TypeError("worker progress sequence must be an integer")
+        if self.sequence < 1:
+            raise ValueError("worker progress sequence must be positive")
+        kind = WorkerProgressKind(self.kind)
+        object.__setattr__(self, "kind", kind)
+        if not isinstance(self.text, str):
+            raise TypeError("worker progress text must be text")
+        if self.stream is not None:
+            object.__setattr__(self, "stream", WorkerOutputStream(self.stream))
+        if kind is WorkerProgressKind.OUTPUT and self.stream is None:
+            raise ValueError("worker output progress must name stdout or stderr")
+        if kind is not WorkerProgressKind.OUTPUT and self.stream is not None:
+            raise ValueError("only output progress may name a stream")
+        if not isinstance(self.truncated, bool):
+            raise TypeError("worker progress truncation marker must be boolean")
+
+    @classmethod
+    def ready(cls, sequence: int = 1) -> WorkerProgressEvent:
+        return cls(sequence=sequence, kind=WorkerProgressKind.READY, text="ready")
+
+
+WorkerProgressSink = Callable[[WorkerProgressEvent], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +186,7 @@ class WorkerExecutionResult:
     process_tree_stopped: bool = False
     stdout: str = ""
     stderr: str = ""
+    progress_events: tuple[WorkerProgressEvent, ...] = ()
 
     def __post_init__(self) -> None:
         status = WorkerExecutionStatus(self.status)
@@ -138,6 +212,10 @@ class WorkerExecutionResult:
         object.__setattr__(self, "status", status)
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
             raise TypeError("worker output must be text")
+        progress_events = tuple(self.progress_events)
+        if any(not isinstance(event, WorkerProgressEvent) for event in progress_events):
+            raise TypeError("worker progress must contain WorkerProgressEvent values")
+        object.__setattr__(self, "progress_events", progress_events)
 
     @classmethod
     def completed(cls, *, stdout: str = "", stderr: str = "") -> WorkerExecutionResult:
@@ -161,39 +239,26 @@ class WorkerExecutionError(ActionDispatcherError):
 
 
 class WorkerTransport(Protocol):
-    """Authenticated transport owned by exactly one registered worker."""
+    """Authenticated, readiness-checking transport for one registered worker.
 
-    def authenticate(self, *, selected_host: str) -> WorkerIdentity: ...
+    ``authenticate`` must perform the transport's readiness probe and enforce
+    its supplied deadline internally. ``cancel`` has the same deadline
+    obligation; the gateway never abandons an unbounded transport call in a
+    helper thread. Both methods must return an identity or cancellation result
+    only when the transport has enough evidence to do so.
+    """
 
-    def execute(self, invocation: WorkerInvocation) -> WorkerExecutionResult: ...
+    def authenticate(
+        self, *, selected_host: str, timeout_seconds: int
+    ) -> WorkerIdentity: ...
+
+    def execute(
+        self, invocation: WorkerInvocation, progress: WorkerProgressSink
+    ) -> WorkerExecutionResult: ...
 
     def cancel(
         self, *, action_id: str, timeout_seconds: int
     ) -> ActionCancellationResult: ...
-
-
-def _call_with_timeout(
-    operation: Callable[[], object], *, timeout_seconds: int
-) -> tuple[object | None, BaseException | None, bool]:
-    """Run one transport call with an explicit daemon-thread bound."""
-
-    finished = Event()
-    result: object | None = None
-    failure: BaseException | None = None
-
-    def invoke() -> None:
-        nonlocal failure, result
-        try:
-            result = operation()
-        except BaseException as exc:  # noqa: BLE001 - transport boundary
-            failure = exc
-        finally:
-            finished.set()
-
-    Thread(target=invoke, daemon=True).start()
-    if not finished.wait(timeout=timeout_seconds):
-        return None, None, True
-    return result, failure, False
 
 
 class _WorkerDispatchHandle:
@@ -205,12 +270,14 @@ class _WorkerDispatchHandle:
         action: FrozenActionProposal,
         terminal: TerminalAction,
         worker: WorkerTransport,
+        expected_identity: WorkerIdentity,
         limits: WorkerExecutionLimits,
         unregister: Callable[[str, _WorkerDispatchHandle], None],
     ) -> None:
         self.action = action
         self.terminal = terminal
         self.worker = worker
+        self.expected_identity = expected_identity
         self.limits = limits
         self._unregister = unregister
         self._lock = RLock()
@@ -223,6 +290,11 @@ class _WorkerDispatchHandle:
         self._cancel_result: ActionCancellationResult | None = None
         self._result: WorkerExecutionResult | None = None
         self._failure: BaseException | None = None
+        self._progress_lock = RLock()
+        self._progress_events: list[WorkerProgressEvent] = []
+        self._progress_stdout_bytes = 0
+        self._progress_stderr_bytes = 0
+        self._progress_milestone_bytes = 0
 
     def run(self) -> WorkerExecutionResult:
         with self._lock:
@@ -236,27 +308,31 @@ class _WorkerDispatchHandle:
                 self._unregister(self.action.action_id, self)
                 raise WorkerExecutionError(self._not_started_result())
 
-        invocation = WorkerInvocation(
-            action_id=self.action.action_id,
-            action=self.terminal,
-            interactive=False,
-            deadline_seconds=self.limits.deadline_seconds,
-            stdout_limit_bytes=self.limits.stdout_limit_bytes,
-            stderr_limit_bytes=self.limits.stderr_limit_bytes,
-            cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
-        )
-
         def execute() -> None:
             try:
+                actual = self._authenticate_before_start()
                 with self._lock:
                     # This check and the started transition are the local
-                    # barrier immediately before the transport call. A
+                    # barrier immediately before the worker execute call. A
                     # cancellation that wins it cannot start worker execution.
                     if self._cancel_requested.is_set():
                         self._result = self._not_started_result()
                         return
                     self._started = True
-                self._result = self.worker.execute(invocation)
+                invocation = WorkerInvocation(
+                    action_id=self.action.action_id,
+                    action=self.terminal,
+                    interactive=False,
+                    deadline_seconds=self.limits.deadline_seconds,
+                    stdout_limit_bytes=self.limits.stdout_limit_bytes,
+                    stderr_limit_bytes=self.limits.stderr_limit_bytes,
+                    cancellation_grace_seconds=self.limits.cancellation_grace_seconds,
+                    progress_event_limit=self.limits.progress_event_limit,
+                    milestone_limit_bytes=self.limits.milestone_limit_bytes,
+                    worker_identity=actual,
+                )
+                self._record_progress(WorkerProgressEvent.ready())
+                self._result = self.worker.execute(invocation, self._record_progress)
             except BaseException as exc:  # noqa: BLE001 - preserve transport boundary
                 self._failure = exc
             finally:
@@ -281,22 +357,29 @@ class _WorkerDispatchHandle:
                 raise WorkerExecutionError(self._unknown_result())
 
         if self._failure is not None:
-            raise WorkerExecutionError(
-                WorkerExecutionResult(
-                    status=WorkerExecutionStatus.UNKNOWN,
-                    started_components=(0,),
-                )
-            ) from self._failure
+            with self._lock:
+                started = self._started
+            if not started and isinstance(self._failure, ActionDispatcherError):
+                raise self._failure
+            if not started:
+                raise ActionDispatcherError(
+                    "worker authentication failed before execution"
+                ) from self._failure
+            raise WorkerExecutionError(self._unknown_result()) from self._failure
         if self._result is None:
             raise ActionDispatcherError(
                 "worker completed without a terminal result",
                 may_have_dispatched=True,
             )
-        result = _bounded_result(
-            self._result,
-            limits=self.limits,
-            component_count=len(self.terminal.components),
-        )
+        try:
+            result = _bounded_result(
+                self._result,
+                limits=self.limits,
+                component_count=len(self.terminal.components),
+            )
+        except ActionDispatcherError as exc:
+            raise WorkerExecutionError(self._unknown_result()) from exc
+        result = replace(result, progress_events=self._progress_events_snapshot())
         if deadline_expired and result.status is not WorkerExecutionStatus.UNKNOWN:
             result = replace(result, status=WorkerExecutionStatus.TIMED_OUT)
         if result.status is WorkerExecutionStatus.COMPLETED:
@@ -320,24 +403,22 @@ class _WorkerDispatchHandle:
                     self._unregister(self.action.action_id, self)
                     return result
                 if self._finished.is_set():
-                    result = ActionCancellationResult(ActionCancellationStatus.STOPPED)
+                    # The result may already be a successful external side
+                    # effect even though the control plane has not persisted it.
+                    result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
                     self._cancel_result = result
                     return result
                 self._cancel_requested.set()
                 self._wake.set()
 
-            value, failure, timed_out = _call_with_timeout(
-                lambda: self.worker.cancel(
+            try:
+                value = self.worker.cancel(
                     action_id=self.action.action_id,
                     timeout_seconds=self.limits.cancellation_grace_seconds,
-                ),
-                timeout_seconds=self.limits.cancellation_grace_seconds,
-            )
-            if (
-                timed_out
-                or failure is not None
-                or not isinstance(value, ActionCancellationResult)
-            ):
+                )
+            except (ActionDispatcherError, TimeoutError, TypeError, ValueError):
+                value = None
+            if not isinstance(value, ActionCancellationResult):
                 result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
             elif value.status is ActionCancellationStatus.NOT_STARTED:
                 # The local barrier already marked this execution started.
@@ -363,7 +444,83 @@ class _WorkerDispatchHandle:
         return WorkerExecutionResult(
             status=WorkerExecutionStatus.UNKNOWN,
             started_components=(0,),
+            progress_events=self._progress_events_snapshot(),
         )
+
+    def _authenticate_before_start(self) -> WorkerIdentity:
+        """Verify the exact registered connection at the execution barrier."""
+
+        try:
+            actual = self.worker.authenticate(
+                selected_host=self.terminal.host,
+                timeout_seconds=self.limits.authentication_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise ActionDispatcherError(
+                f"selected execution host {self.terminal.host} authentication timed out"
+            ) from exc
+        except ActionDispatcherError:
+            raise
+        except BaseException as exc:
+            raise ActionDispatcherError(
+                f"selected execution host {self.terminal.host} authentication failed"
+            ) from exc
+        if not isinstance(actual, WorkerIdentity):
+            raise ActionDispatcherError(
+                f"selected execution host {self.terminal.host} returned an invalid identity"
+            )
+        if actual != self.expected_identity:
+            raise ActionDispatcherError(
+                f"selected execution host {self.terminal.host} did not authenticate as its registered worker connection"
+            )
+        return actual
+
+    def _record_progress(self, event: WorkerProgressEvent) -> None:
+        """Validate ordering and enforce bounded, tagged progress material."""
+
+        if not isinstance(event, WorkerProgressEvent):
+            raise ActionDispatcherError("worker returned an invalid progress event")
+        with self._progress_lock:
+            expected_sequence = len(self._progress_events) + 1
+            if event.sequence != expected_sequence:
+                raise ActionDispatcherError(
+                    "worker progress sequence was not contiguous"
+                )
+            if len(self._progress_events) >= self.limits.progress_event_limit:
+                raise ActionDispatcherError("worker progress event limit exceeded")
+            if event.kind is WorkerProgressKind.MILESTONE:
+                encoded = len(event.text.encode())
+                if (
+                    self._progress_milestone_bytes + encoded
+                    > self.limits.milestone_limit_bytes
+                ):
+                    raise ActionDispatcherError(
+                        "worker milestone output limit exceeded"
+                    )
+                self._progress_milestone_bytes += encoded
+            elif event.kind is WorkerProgressKind.OUTPUT:
+                if event.stream is WorkerOutputStream.STDOUT:
+                    limit = self.limits.stdout_limit_bytes
+                    available = limit - self._progress_stdout_bytes
+                else:
+                    limit = self.limits.stderr_limit_bytes
+                    available = limit - self._progress_stderr_bytes
+                text = event.text
+                truncated = event.truncated
+                if len(text.encode()) > max(available, 0):
+                    text = _truncate_output(text, max(available, 0))
+                    truncated = True
+                encoded = len(text.encode())
+                if event.stream is WorkerOutputStream.STDOUT:
+                    self._progress_stdout_bytes += encoded
+                else:
+                    self._progress_stderr_bytes += encoded
+                event = replace(event, text=text, truncated=truncated)
+            self._progress_events.append(event)
+
+    def _progress_events_snapshot(self) -> tuple[WorkerProgressEvent, ...]:
+        with self._progress_lock:
+            return tuple(self._progress_events)
 
     @staticmethod
     def _not_started_result() -> WorkerExecutionResult:
@@ -406,32 +563,11 @@ class WorkerGateway:
             raise ActionDispatcherError(
                 f"selected execution host {terminal.host} has no registered worker"
             )
-        actual, failure, timed_out = _call_with_timeout(
-            lambda: worker.authenticate(selected_host=terminal.host),
-            timeout_seconds=self._limits.authentication_timeout_seconds,
-        )
-        if timed_out:
-            raise ActionDispatcherError(
-                f"selected execution host {terminal.host} authentication timed out"
-            )
-        if failure is not None:
-            if isinstance(failure, ActionDispatcherError):
-                raise failure
-            raise ActionDispatcherError(
-                f"selected execution host {terminal.host} authentication failed"
-            ) from failure
-        if not isinstance(actual, WorkerIdentity):
-            raise ActionDispatcherError(
-                f"selected execution host {terminal.host} returned an invalid identity"
-            )
-        if actual != expected:
-            raise ActionDispatcherError(
-                f"selected execution host {terminal.host} did not authenticate as its registered worker"
-            )
         handle = _WorkerDispatchHandle(
             action=action,
             terminal=terminal,
             worker=worker,
+            expected_identity=expected,
             limits=self._limits,
             unregister=self._unregister,
         )
@@ -455,7 +591,7 @@ class WorkerGateway:
         with self._lock:
             running = self._running.get(action_id)
         if running is None:
-            return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         return running.cancel()
 
     def _unregister(self, action_id: str, handle: _WorkerDispatchHandle) -> None:
@@ -474,17 +610,21 @@ class ControlledWorkerTransport:
         result: WorkerExecutionResult | None = None,
         execution_hook: Callable[[WorkerInvocation], WorkerExecutionResult]
         | None = None,
+        progress_hook: Callable[[WorkerProgressSink], None] | None = None,
         on_cancel: Callable[[str], ActionCancellationResult | None] | None = None,
     ) -> None:
         self.identities = dict(identities)
         self.result = result or WorkerExecutionResult.completed()
         self.execution_hook = execution_hook
+        self.progress_hook = progress_hook
         self.on_cancel = on_cancel
         self.invocations: list[WorkerInvocation] = []
         self.executions: list[TerminalAction] = []
         self.cancelled: list[str] = []
 
-    def authenticate(self, *, selected_host: str) -> WorkerIdentity:
+    def authenticate(
+        self, *, selected_host: str, timeout_seconds: int
+    ) -> WorkerIdentity:
         identity = self.identities.get(selected_host)
         if identity is None:
             raise ActionDispatcherError(
@@ -492,9 +632,13 @@ class ControlledWorkerTransport:
             )
         return identity
 
-    def execute(self, invocation: WorkerInvocation) -> WorkerExecutionResult:
+    def execute(
+        self, invocation: WorkerInvocation, progress: WorkerProgressSink
+    ) -> WorkerExecutionResult:
         self.invocations.append(invocation)
         self.executions.append(invocation.action)
+        if self.progress_hook is not None:
+            self.progress_hook(progress)
         if self.execution_hook is not None:
             return self.execution_hook(invocation)
         return self.result
@@ -551,6 +695,10 @@ def _truncate_output(value: str, limit: int) -> str:
     if len(encoded) <= limit:
         return value
     suffix = "\n[truncated]"
+    if limit <= 0:
+        return ""
+    if limit <= len(suffix.encode()):
+        return encoded[:limit].decode(errors="ignore")
     prefix = encoded[: limit - len(suffix.encode())].decode(errors="ignore")
     return f"{prefix}{suffix}"
 

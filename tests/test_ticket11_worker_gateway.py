@@ -24,6 +24,10 @@ from jarvis_control_plane import (
     WorkerExecutionStatus,
     WorkerGateway,
     WorkerIdentity,
+    WorkerOutputStream,
+    WorkerProgressEvent,
+    WorkerProgressKind,
+    WorkerProgressSink,
 )
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.sessions import DispatchStatus, ReadinessState
@@ -32,6 +36,15 @@ NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 OPERATOR = "operator.test"
 TRANSPORT_SESSION = "session.test"
 SECRET = b"ticket11-test-secret"
+
+
+def _worker_identity(
+    *,
+    host: str = "ubuntu",
+    worker_id: str = "ubuntu-01",
+    connection_id: str = "boot-01",
+) -> WorkerIdentity:
+    return WorkerIdentity(host=host, worker_id=worker_id, connection_id=connection_id)
 
 
 def _event(text: str, suffix: str) -> SignedInboundEvent:
@@ -56,13 +69,11 @@ def test_worker_gateway_rejects_mismatched_authenticated_identity_without_failov
     None
 ):
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="windows", worker_id="windows-01")}
+        identities={"ubuntu": _worker_identity(host="windows", worker_id="windows-01")}
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     components = build_receiver_components(
         operator_id=OPERATOR,
@@ -102,16 +113,104 @@ def test_worker_gateway_rejects_mismatched_authenticated_identity_without_failov
     assert current.action_outbox[-1].status is DispatchStatus.FAILED
 
 
+def test_worker_gateway_rechecks_the_authenticated_connection_at_execution_barrier() -> (
+    None
+):
+    registered = WorkerIdentity(
+        host="ubuntu", worker_id="ubuntu-01", connection_id="boot-a"
+    )
+    worker = ControlledWorkerTransport(identities={"ubuntu": registered})
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker},
+        registered_identities={"ubuntu": registered},
+    )
+    proposal = FrozenActionProposal.create(
+        action_id="action-worker-rebind",
+        request_id="request-worker-rebind",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/git",
+            "arguments": ["status"],
+            "cwd": "/workspace",
+        },
+    )
+
+    handle = gateway.prepare(proposal)
+    worker.identities["ubuntu"] = WorkerIdentity(
+        host="ubuntu", worker_id="ubuntu-01", connection_id="boot-b"
+    )
+
+    with pytest.raises(ActionDispatcherError, match="registered worker connection"):
+        handle.run()
+
+    assert worker.invocations == []
+    assert worker.executions == []
+
+
+def test_worker_gateway_exposes_ordered_bounded_progress_events() -> None:
+    identity = WorkerIdentity(
+        host="ubuntu", worker_id="ubuntu-01", connection_id="boot-progress"
+    )
+
+    def publish(progress: WorkerProgressSink) -> None:
+        progress(
+            WorkerProgressEvent(
+                sequence=2,
+                kind=WorkerProgressKind.MILESTONE,
+                text="prepared",
+            )
+        )
+        progress(
+            WorkerProgressEvent(
+                sequence=3,
+                kind=WorkerProgressKind.OUTPUT,
+                text="git status\n",
+                stream=WorkerOutputStream.STDOUT,
+            )
+        )
+
+    worker = ControlledWorkerTransport(
+        identities={"ubuntu": identity},
+        progress_hook=publish,
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker}, registered_identities={"ubuntu": identity}
+    )
+    proposal = FrozenActionProposal.create(
+        action_id="action-worker-progress",
+        request_id="request-worker-progress",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/git",
+            "arguments": ["status"],
+            "cwd": "/workspace",
+        },
+    )
+
+    result = gateway.dispatch(proposal)
+
+    assert worker.invocations[0].worker_identity == identity
+    assert [event.sequence for event in result.progress_events] == [1, 2, 3]
+    assert [event.kind for event in result.progress_events] == [
+        WorkerProgressKind.READY,
+        WorkerProgressKind.MILESTONE,
+        WorkerProgressKind.OUTPUT,
+    ]
+    assert result.progress_events[-1].stream is WorkerOutputStream.STDOUT
+
+
 def test_worker_gateway_forwards_only_bounded_non_interactive_execution() -> None:
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         result=WorkerExecutionResult.completed(stdout="x" * (1024 * 1024 + 10)),
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     proposal = FrozenActionProposal.create(
         action_id="action-worker-bounded",
@@ -137,14 +236,12 @@ def test_worker_gateway_forwards_only_bounded_non_interactive_execution() -> Non
 
 def test_worker_dispatch_result_is_retained_in_the_manual_trace_boundary() -> None:
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         result=WorkerExecutionResult.completed(stdout="bounded worker output"),
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     components = build_receiver_components(
         operator_id=OPERATOR,
@@ -189,7 +286,7 @@ def test_worker_dispatch_result_is_retained_in_the_manual_trace_boundary() -> No
 
 def test_worker_gateway_retains_known_partial_compound_failure_without_retry() -> None:
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         result=WorkerExecutionResult(
             status=WorkerExecutionStatus.FAILED,
             started_components=(0, 1),
@@ -200,9 +297,7 @@ def test_worker_gateway_retains_known_partial_compound_failure_without_retry() -
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     proposal = FrozenActionProposal.create(
         action_id="action-worker-partial",
@@ -248,15 +343,13 @@ def test_worker_gateway_enforces_deadline_then_cancels_the_process_scope() -> No
         )
 
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         execution_hook=wait_for_cancellation,
         on_cancel=lambda _action_id: release_execution.set(),
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
         limits=WorkerExecutionLimits(deadline_seconds=1),
     )
     proposal = FrozenActionProposal.create(
@@ -279,7 +372,18 @@ def test_worker_gateway_enforces_deadline_then_cancels_the_process_scope() -> No
     assert exc.value.result.status is WorkerExecutionStatus.TIMED_OUT
 
 
-def test_cancel_targets_the_running_selected_worker_and_ends_dispatch() -> None:
+@pytest.mark.parametrize(
+    ("worker_cancellation", "expected_status"),
+    [
+        (None, DispatchStatus.CANCELLED),
+        (ActionCancellationStatus.UNKNOWN, DispatchStatus.UNKNOWN),
+    ],
+    ids=("stopped", "unknown"),
+)
+def test_cancel_reconciles_the_running_selected_worker(
+    worker_cancellation: ActionCancellationStatus | None,
+    expected_status: DispatchStatus,
+) -> None:
     execution_started = Event()
     release_execution = Event()
 
@@ -294,15 +398,20 @@ def test_cancel_targets_the_running_selected_worker_and_ends_dispatch() -> None:
         )
 
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         execution_hook=block_until_cancel,
-        on_cancel=lambda _action_id: release_execution.set(),
+        on_cancel=lambda _action_id: (
+            release_execution.set()
+            or (
+                ActionCancellationResult(worker_cancellation)
+                if worker_cancellation is not None
+                else None
+            )
+        ),
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     components = build_receiver_components(
         operator_id=OPERATOR,
@@ -347,6 +456,14 @@ def test_cancel_targets_the_running_selected_worker_and_ends_dispatch() -> None:
         assert worker.cancelled == ["action-worker-cancel"]
         dispatch.join(timeout=5)
         assert not dispatch.is_alive()
+        current = components.broker.working_sessions.load()
+        assert current is not None
+        assert current.action_outbox[-1].status is expected_status
+        assert holder[0].disposition == (
+            "action_dispatch_unknown"
+            if expected_status is DispatchStatus.UNKNOWN
+            else "late_result_ignored"
+        )
     finally:
         release_execution.set()
         dispatch.join(timeout=5)
@@ -357,14 +474,12 @@ def test_post_start_transport_disconnect_is_an_unknown_worker_outcome() -> None:
         raise ActionDispatcherError("worker transport disconnected")
 
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         execution_hook=disconnect,
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     proposal = FrozenActionProposal.create(
         action_id="action-worker-disconnect",
@@ -397,15 +512,13 @@ def test_deadline_cancellation_preserves_an_explicit_unknown_worker_result() -> 
         )
 
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         execution_hook=unknown_after_cancel,
         on_cancel=lambda _action_id: release_execution.set(),
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
         limits=WorkerExecutionLimits(deadline_seconds=1),
     )
     proposal = FrozenActionProposal.create(
@@ -436,14 +549,12 @@ def test_late_worker_completion_cleans_its_unconfirmed_running_entry() -> None:
         return WorkerExecutionResult.completed()
 
     worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")},
+        identities={"ubuntu": _worker_identity()},
         execution_hook=complete_late,
     )
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
         limits=WorkerExecutionLimits(deadline_seconds=1, cancellation_grace_seconds=1),
     )
     proposal = FrozenActionProposal.create(
@@ -553,14 +664,10 @@ def test_definite_worker_status_without_process_tree_proof_becomes_unknown(
 def test_worker_gateway_publishes_handle_before_worker_start_and_cancellation_wins() -> (
     None
 ):
-    worker = ControlledWorkerTransport(
-        identities={"ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")}
-    )
+    worker = ControlledWorkerTransport(identities={"ubuntu": _worker_identity()})
     gateway = WorkerGateway(
         workers={"ubuntu": worker},
-        registered_identities={
-            "ubuntu": WorkerIdentity(host="ubuntu", worker_id="ubuntu-01")
-        },
+        registered_identities={"ubuntu": _worker_identity()},
     )
     proposal = FrozenActionProposal.create(
         action_id="action-worker-before-start-cancel",
@@ -672,3 +779,83 @@ def test_approval_dispatch_releases_lock_before_worker_completion() -> None:
     current = components.broker.working_sessions.load()
     assert current is not None
     assert current.action_outbox[-1].status is DispatchStatus.CANCELLED
+
+
+def test_cancel_marks_an_inflight_connector_action_unknown_without_a_stop_proof() -> (
+    None
+):
+    class BlockingConnectorHandle:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+            self.cancelled = Event()
+
+        def run(self) -> None:
+            self.started.set()
+            assert self.release.wait(timeout=5)
+
+        def cancel(self, *, action_id: str) -> ActionCancellationResult:
+            self.cancelled.set()
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+
+    class BlockingConnectorDispatcher:
+        def __init__(self) -> None:
+            self.handle = BlockingConnectorHandle()
+
+        def prepare(self, _action: FrozenActionProposal) -> BlockingConnectorHandle:
+            return self.handle
+
+        def cancel(self, *, action_id: str) -> ActionCancellationResult:
+            return self.handle.cancel(action_id=action_id)
+
+    dispatcher = BlockingConnectorDispatcher()
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket11-connector-cancel",
+        action_dispatcher=dispatcher,
+        orchestration=ControlledOrchestrationAdapter(
+            proposal_factory=lambda request: FrozenActionProposal.create(
+                action_id="action-calendar-cancel",
+                request_id=request.state.request_id,
+                kind="calendar_update",
+                preview="Update the calendar event.",
+                payload={
+                    "event_id": "event-calendar-cancel",
+                    "start": "2026-08-07T13:00:00Z",
+                },
+            )
+        ),
+    )
+
+    proposed = components.receiver.receive(
+        _event("update the calendar", "connector-proposal")
+    )
+    assert proposed.disposition == "pending_action"
+
+    approval_result: list[object] = []
+    approval = Thread(
+        target=lambda: approval_result.append(
+            components.receiver.receive(_event("1", "connector-approval"))
+        )
+    )
+    approval.start()
+    try:
+        assert dispatcher.handle.started.wait(timeout=5)
+        cancelled = components.receiver.receive(_event("/cancel", "connector-cancel"))
+
+        assert cancelled.disposition == "cancelled"
+        assert dispatcher.handle.cancelled.is_set()
+        current = components.broker.working_sessions.load()
+        assert current is not None
+        assert current.action_outbox[-1].status is DispatchStatus.UNKNOWN
+
+        dispatcher.handle.release.set()
+        approval.join(timeout=5)
+        assert not approval.is_alive()
+        assert approval_result[0].disposition == "action_dispatch_unknown"
+    finally:
+        dispatcher.handle.release.set()
+        approval.join(timeout=5)
