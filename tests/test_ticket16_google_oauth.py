@@ -124,6 +124,7 @@ def test_callback_consumes_state_once_and_replaces_connector_credential() -> Non
             subject=IDENTITY,
             granted_scopes=frozenset(READ_SCOPES),
             refresh_token="controlled-refresh-token",
+            connection_generation=1,
         )
         assert lifecycle.connection.connected
         assert lifecycle.connection.generation == 1

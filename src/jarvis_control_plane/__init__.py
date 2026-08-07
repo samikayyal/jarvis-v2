@@ -26,8 +26,11 @@ from .google_calendar import (
     CalendarWriteProposal,
     CalendarWriteRequest,
     ControlledGoogleCalendarWriteProvider,
+    GoogleApiCalendarWriteProvider,
+    GoogleCalendarHttpResponse,
     GoogleCalendarWriteProvider,
     GoogleCalendarWriteProviderError,
+    build_live_calendar_action_dispatcher,
 )
 from .google_oauth import (
     GOOGLE_OAUTH_SCOPES,
@@ -149,7 +152,9 @@ __all__ = [
     "FixedClock",
     "FixedModelAvailabilityProvider",
     "FrozenActionProposal",
+    "GoogleApiCalendarWriteProvider",
     "GoogleApiReadProvider",
+    "GoogleCalendarHttpResponse",
     "GoogleCalendarWriteProvider",
     "GoogleCalendarWriteProviderError",
     "GoogleConnectionState",
@@ -206,6 +211,7 @@ __all__ = [
     "VaultRepositoryConflict",
     "VaultSynchronizationError",
     "VaultSynchronizationMetadataStore",
+    "build_live_calendar_action_dispatcher",
     "build_live_google_read_connector",
     "sign_body",
 ]

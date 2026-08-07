@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 from test_support import build_receiver_components
@@ -11,7 +12,11 @@ from jarvis_control_plane import (
     CalendarWriteProposal,
     ControlledGoogleCalendarWriteProvider,
     ControlledOrchestrationAdapter,
+    DeterministicIdGenerator,
+    DiagnosticTraceRecorder,
+    FixedClock,
     InboundMessage,
+    InMemoryDiagnosticTraceStore,
     InMemoryGoogleCredentialStore,
     InMemoryGoogleOAuthStateStore,
     OAuthCredentialRecord,
@@ -20,6 +25,7 @@ from jarvis_control_plane import (
 from jarvis_control_plane.ports import ActionDispatcherError
 
 IDENTITY = "operator@example.test"
+NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 
 
 def event(*, summary: str = "Design review") -> dict[str, object]:
@@ -46,11 +52,13 @@ def connected_dispatcher() -> tuple[
     state.set_connection(
         connected=True, granted_scopes=frozenset({CALENDAR_WRITE_SCOPE})
     )
+    connection = state.get_connection()
     credentials = InMemoryGoogleCredentialStore(
         OAuthCredentialRecord(
             subject=IDENTITY,
             granted_scopes=frozenset({CALENDAR_WRITE_SCOPE}),
             refresh_token="controlled-refresh-token",
+            connection_generation=connection.generation,
         )
     )
     provider = ControlledGoogleCalendarWriteProvider()
@@ -60,6 +68,11 @@ def connected_dispatcher() -> tuple[
             connection_state=state,
             credential_store=credentials,
             provider=provider,
+            trace=DiagnosticTraceRecorder(
+                writer=InMemoryDiagnosticTraceStore().writer(),
+                clock=FixedClock(NOW),
+                ids=DeterministicIdGenerator("ticket19-calendar"),
+            ),
         ),
         provider,
         state,
@@ -162,8 +175,6 @@ def test_reviewed_patch_requires_complete_array_values_and_never_retries_ambiguo
 
 
 def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
-    from datetime import UTC, datetime
-
     dispatcher, provider, state = connected_dispatcher()
     orchestration = ControlledOrchestrationAdapter(
         proposal_factory=lambda request: CalendarWriteProposal.insert(
@@ -179,7 +190,7 @@ def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
         operator_id="operator.test",
         transport_session_id="session.test",
         signing_secret=b"ticket19-secret",
-        now=datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+        now=NOW,
         id_prefix="ticket19",
         orchestration=orchestration,
         action_dispatcher=dispatcher,
