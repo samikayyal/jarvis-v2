@@ -789,6 +789,11 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
             {"accepted", "completed", "failed", "not_started", "rejected", "unknown"}
         ),
     },
+    "action_cancellation": {
+        "action": None,
+        "dispatch_state": frozenset({"cancelled", "unknown"}),
+        "execution_status": frozenset({"not_started", "stopped", "unknown"}),
+    },
     "inbound_admitted": {
         "channel": frozenset({"direct_text"}),
         "phase": frozenset({"admission"}),

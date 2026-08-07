@@ -82,7 +82,11 @@ from .models import (
 )
 from .orchestration import AgentsSdkOrchestrationAdapter
 from .ports import (
+    ActionCancellationResult,
+    ActionCancellationStatus,
     ActionDispatcherError,
+    ActionDispatchHandle,
+    ActionFinalizer,
     AuditWriteError,
     ControlPlaneError,
     DiagnosticTraceError,
@@ -103,6 +107,21 @@ from .traces import (
     SQLiteDiagnosticTraceStore,
     TraceReservation,
 )
+from .worker_gateway import (
+    ControlledWorkerTransport,
+    WorkerExecutionError,
+    WorkerExecutionLimits,
+    WorkerExecutionResult,
+    WorkerExecutionStatus,
+    WorkerGateway,
+    WorkerIdentity,
+    WorkerInvocation,
+    WorkerOutputStream,
+    WorkerProgressEvent,
+    WorkerProgressKind,
+    WorkerProgressSink,
+    WorkerTransport,
+)
 
 __all__ = [
     "DEFAULT_TRACE_RESERVATION_BYTES",
@@ -110,7 +129,11 @@ __all__ = [
     "GOOGLE_OAUTH_STATE_TTL",
     "GOOGLE_READ_SCOPES",
     "MAX_TRACE_RESERVATION_BYTES",
+    "ActionCancellationResult",
+    "ActionCancellationStatus",
+    "ActionDispatchHandle",
     "ActionDispatcherError",
+    "ActionFinalizer",
     "AgentsSdkOrchestrationAdapter",
     "AuditEvidence",
     "AuditFilter",
@@ -124,6 +147,7 @@ __all__ = [
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
     "ControlledVaultSynchronizer",
+    "ControlledWorkerTransport",
     "ConversationMessage",
     "DeterministicCapabilityBroker",
     "DeterministicIdGenerator",
@@ -190,6 +214,18 @@ __all__ = [
     "VaultRepositoryConflict",
     "VaultSynchronizationError",
     "VaultSynchronizationMetadataStore",
+    "WorkerExecutionError",
+    "WorkerExecutionLimits",
+    "WorkerExecutionResult",
+    "WorkerExecutionStatus",
+    "WorkerGateway",
+    "WorkerIdentity",
+    "WorkerInvocation",
+    "WorkerOutputStream",
+    "WorkerProgressEvent",
+    "WorkerProgressKind",
+    "WorkerProgressSink",
+    "WorkerTransport",
     "build_live_google_read_connector",
     "sign_body",
 ]

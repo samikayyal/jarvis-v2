@@ -89,6 +89,7 @@ class TransitionKind(str, Enum):
     PENDING_APPROVED = "pending_approved"
     PENDING_REJECTED = "pending_rejected"
     DISPATCH_ATTEMPTED = "dispatch_attempted"
+    DISPATCH_CANCELLATION_RECONCILED = "dispatch_cancellation_reconciled"
     DISPATCH_COMPLETED = "dispatch_completed"
     RESTART_INTERRUPTED = "restart_interrupted"
     RESULT_APPLIED = "result_applied"
@@ -530,6 +531,7 @@ class DispatchStatus(str, Enum):
     UNKNOWN = "unknown"
     NOT_STARTED = "not_started"
     CANCELLED = "cancelled"
+    CANCELLING = "cancelling"
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,6 +591,16 @@ class ActionDispatchRecord:
     @property
     def is_live(self) -> bool:
         return self.status in {DispatchStatus.UNATTEMPTED, DispatchStatus.ATTEMPTED}
+
+    @property
+    def is_cancelling(self) -> bool:
+        return self.status is DispatchStatus.CANCELLING
+
+    @property
+    def is_open(self) -> bool:
+        """Whether the record still needs an external dispatch decision."""
+
+        return self.is_live or self.is_cancelling
 
 
 def _pending_action_digest(
@@ -940,8 +952,9 @@ class WorkingSession:
         if len(action_ids) != len(set(action_ids)):
             raise InvariantViolation("action outbox identifiers must be unique")
         live_outbox = tuple(record for record in outbox if record.is_live)
-        if len(live_outbox) > 1:
-            raise InvariantViolation("only one action dispatch may be live")
+        open_outbox = tuple(record for record in outbox if record.is_open)
+        if len(open_outbox) > 1:
+            raise InvariantViolation("only one action dispatch may be open")
         object.__setattr__(self, "action_outbox", outbox)
         if self.active_request is not None:
             if self.lifecycle is not SessionLifecycle.ACTIVE:
@@ -979,6 +992,13 @@ class WorkingSession:
                 raise InvariantViolation(
                     "live action dispatch requires dispatching phase"
                 )
+        cancelling_outbox = tuple(record for record in outbox if record.is_cancelling)
+        if cancelling_outbox and (
+            self.active_request is not None or self.pending_action is not None
+        ):
+            raise InvariantViolation(
+                "cancelling action dispatch cannot retain live request state"
+            )
         if self.lifecycle is not SessionLifecycle.ACTIVE and (
             self.active_request is not None or self.pending_action is not None
         ):
@@ -1140,6 +1160,14 @@ def _busy_or_pending(session: WorkingSession) -> SessionTransition | None:
             TransitionKind.PENDING_BLOCKED,
             effects=("request_refused_pending",),
             reason="a pending action blocks unrelated work",
+        )
+    if any(record.is_open for record in session.action_outbox):
+        return _transition(
+            session,
+            session,
+            TransitionKind.BUSY_REFUSED,
+            effects=("request_refused_busy",),
+            reason="an action cancellation is still being reconciled; no queue transition",
         )
     if session.active_request is not None:
         return _transition(
@@ -1339,7 +1367,7 @@ def cancel_active_request(
     if (
         session.active_request is None
         and session.pending_action is None
-        and not any(record.is_live for record in session.action_outbox)
+        and not any(record.is_open for record in session.action_outbox)
     ):
         return _transition(
             session,
@@ -1358,7 +1386,7 @@ def cancel_active_request(
     outbox = tuple(
         replace(
             record,
-            status=DispatchStatus.CANCELLED,
+            status=DispatchStatus.CANCELLING,
             payload=None,
             preview=None,
             terminal_at=at,
@@ -1367,7 +1395,7 @@ def cancel_active_request(
         else record
         for record in session.action_outbox
     )
-    if any(record.is_live for record in session.action_outbox):
+    if any(record.is_open for record in session.action_outbox):
         effects.append("close_action_dispatch")
     effects.append("advance_cancellation_generation")
     after = replace(
@@ -1416,7 +1444,7 @@ def new_working_session(
     new_conversation = conversation_ref or f"conversation:{new_id}"
     old_request = session.active_request
     old_pending = session.pending_action
-    live_outbox = tuple(record for record in session.action_outbox if record.is_live)
+    open_outbox = tuple(record for record in session.action_outbox if record.is_open)
     persistent_permissions = tuple(
         permission
         for permission in session.permissions
@@ -1427,7 +1455,7 @@ def new_working_session(
         effects.append("cancel_active_request")
     if old_pending is not None:
         effects.append("invalidate_pending_action")
-    if live_outbox:
+    if open_outbox:
         effects.append("close_action_dispatch")
     effects.extend(
         (
@@ -1454,16 +1482,12 @@ def new_working_session(
         action_outbox=tuple(
             replace(
                 record,
-                status=(
-                    DispatchStatus.NOT_STARTED
-                    if record.status is DispatchStatus.UNATTEMPTED
-                    else DispatchStatus.UNKNOWN
-                ),
+                status=DispatchStatus.CANCELLING,
                 payload=None,
                 preview=None,
                 terminal_at=at,
             )
-            if record.is_live
+            if record.is_open
             else record
             for record in session.action_outbox
         ),
@@ -1719,6 +1743,52 @@ def complete_action_dispatch(
     )
 
 
+def reconcile_action_cancellation(
+    session: WorkingSession,
+    *,
+    action_id: str,
+    status: DispatchStatus,
+    now: datetime | Clock,
+) -> SessionTransition:
+    """Persist the result of stopping an action after admission was closed."""
+
+    if status not in {DispatchStatus.CANCELLED, DispatchStatus.UNKNOWN}:
+        raise ValueError(
+            "action cancellation reconciliation requires cancelled or unknown"
+        )
+    at = _now(now)
+    record = next(
+        (item for item in session.action_outbox if item.action_id == action_id), None
+    )
+    if record is None or not record.is_cancelling:
+        raise InvariantViolation("action cancellation record is not reconciling")
+    outcome = (
+        "action_cancelled"
+        if status is DispatchStatus.CANCELLED
+        else "action_dispatch_unknown"
+    )
+    terminal = replace(record, status=status, terminal_at=at)
+    after = replace(
+        session,
+        action_outbox=tuple(
+            terminal if item.action_id == action_id else item
+            for item in session.action_outbox
+        ),
+        last_activity_at=at,
+        inactivity_anchor_at=at,
+        last_request_id=record.request_id,
+        last_request_outcome=outcome,
+        last_terminal_at=at,
+    )
+    return _transition(
+        session,
+        after,
+        TransitionKind.DISPATCH_CANCELLATION_RECONCILED,
+        effects=("reconcile_action_cancellation",),
+        reason=outcome,
+    )
+
+
 def reject_pending_action(
     session: WorkingSession,
     *,
@@ -1761,8 +1831,8 @@ def interrupt_for_restart(
 ) -> SessionTransition:
     """Invalidate non-resumable work and session permissions at restart."""
 
-    live_dispatches = tuple(
-        record for record in session.action_outbox if record.is_live
+    open_dispatches = tuple(
+        record for record in session.action_outbox if record.is_open
     )
     active_session_permissions = any(
         permission.lifetime is PermissionLifetime.SESSION and permission.is_active
@@ -1771,7 +1841,7 @@ def interrupt_for_restart(
     if (
         session.active_request is None
         and session.pending_action is None
-        and not live_dispatches
+        and not open_dispatches
         and not active_session_permissions
     ):
         return _transition(
@@ -1791,7 +1861,7 @@ def interrupt_for_restart(
             preview=None,
             terminal_at=at,
         )
-        if record.is_live
+        if record.is_open
         else record
         for record in session.action_outbox
     )
@@ -1815,7 +1885,8 @@ def interrupt_for_restart(
         last_request_outcome=(
             "action_dispatch_unknown"
             if any(
-                record.status is DispatchStatus.ATTEMPTED for record in live_dispatches
+                record.status in {DispatchStatus.ATTEMPTED, DispatchStatus.CANCELLING}
+                for record in open_dispatches
             )
             else "interrupted"
             if request is not None

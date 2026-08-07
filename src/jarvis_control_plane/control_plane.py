@@ -28,8 +28,12 @@ from .models import (
     SignedInboundEvent,
 )
 from .ports import (
+    ActionCancellationResult,
+    ActionCancellationStatus,
     ActionDispatcher,
     ActionDispatcherError,
+    ActionDispatchHandle,
+    ActionFinalizer,
     AuditBoundary,
     AuditWriteError,
     Clock,
@@ -73,10 +77,12 @@ from .sessions import (
     interrupt_for_restart,
     mark_action_dispatch_attempted,
     mark_proposal_presented,
+    reconcile_action_cancellation,
     record_proposal_fragment,
     reject_pending_action,
 )
 from .terminal_policy import (
+    TerminalAction,
     TerminalDisposition,
     authorize_terminal_proposal,
     terminal_action_from_proposal,
@@ -104,6 +110,31 @@ def _bounded_informational_reply(reply_text: str, *, request_id: str) -> str:
     return f"{reply_text[:content_limit]}{_INFORMATIONAL_TRUNCATION_MARKER}{suffix}"
 
 
+def _dispatch_failure_status(error: BaseException) -> DispatchStatus:
+    """Translate one dispatch failure into the durable outcome exactly once."""
+
+    trace_error = error if isinstance(error, TraceWriteError) else error.__cause__
+    if isinstance(trace_error, TraceWriteError) and trace_error.operation_started:
+        return DispatchStatus.UNKNOWN
+    if isinstance(error, DiagnosticTraceError):
+        return DispatchStatus.NOT_STARTED
+    if isinstance(error, ActionDispatcherError):
+        return (
+            DispatchStatus.UNKNOWN
+            if error.may_have_dispatched
+            else DispatchStatus.FAILED
+        )
+    return DispatchStatus.UNKNOWN
+
+
+def _dispatch_disposition(status: DispatchStatus) -> str:
+    return {
+        DispatchStatus.UNKNOWN: "action_dispatch_unknown",
+        DispatchStatus.NOT_STARTED: "action_dispatch_not_started",
+        DispatchStatus.FAILED: "action_dispatch_failed",
+    }.get(status, "action_dispatch_unknown")
+
+
 class _CancelledBeforeDispatch(OutboundConnectorError):
     """The request lost ownership before its outbound operation started."""
 
@@ -111,8 +142,38 @@ class _CancelledBeforeDispatch(OutboundConnectorError):
 class _UnavailableActionDispatcher:
     """Fail closed until a later ticket supplies a concrete capability edge."""
 
-    def dispatch(self, action: FrozenActionProposal) -> None:
+    def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
         raise ActionDispatcherError("no action dispatcher is configured")
+
+    def cancel(self, *, action_id: str) -> ActionCancellationResult:
+        return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedActionDispatch:
+    """The registered handle and exact frozen payload waiting outside the lock."""
+
+    action: FrozenActionProposal
+    handle: ActionDispatchHandle
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovedActionDispatch:
+    """Approved action metadata whose external preparation may run unlocked."""
+
+    action: PendingActionState
+    terminal: TerminalAction | None
+    permission_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CancellationOutcome:
+    """One bounded dispatcher acknowledgement and its durable interpretation."""
+
+    action_id: str
+    kind: str
+    result: ActionCancellationResult
+    durable_status: DispatchStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +236,12 @@ class DeterministicCapabilityBroker:
         self.ids = ids
         self.model_availability_provider = model_availability_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
-        self.action_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
+        selected_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
+        if not isinstance(selected_dispatcher, ActionDispatcher):
+            raise TypeError(
+                "action_dispatcher must implement the prepared cancellable dispatch port"
+            )
+        self.action_dispatcher = selected_dispatcher
         existing_session = self.working_sessions.load()
         if existing_session is None:
             self.working_sessions.create(
@@ -215,19 +281,15 @@ class DeterministicCapabilityBroker:
                         disposition="pending_presenting",
                         reason="proposal presentation is incomplete",
                     )
-                # `/cancel` takes this same lock. Once approval has consumed a
-                # proposal, cancellation cannot slip between that durable
-                # consumption and the one permitted dispatch attempt.
-                with self._dispatch_lock:
-                    current = self._current_working_session()
-                    if current.pending_action is None:
-                        return ReceiveResult(
-                            status_code=202,
-                            disposition="pending_unavailable",
-                        )
-                    if current.pending_action.is_expired(self.clock):
-                        return self._expire_pending_action(message, current)
-                    return self._consume_pending_approval(message, current, choice)
+                current = self._current_working_session()
+                if current.pending_action is None:
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="pending_unavailable",
+                    )
+                if current.pending_action.is_expired(self.clock):
+                    return self._expire_pending_action(message, current)
+                return self._consume_pending_approval(message, choice)
         parsed = parse_control(message.text)
         if parsed.is_command and parsed.command is ControlCommand.HISTORY:
             return self._handle_history_control(message, parsed.args)
@@ -629,10 +691,51 @@ class DeterministicCapabilityBroker:
     def _consume_pending_approval(
         self,
         message: InboundMessage,
-        session: WorkingSession,
         choice: object,
     ) -> ReceiveResult:
-        """Persist approval consumption before the one permitted dispatch attempt."""
+        """Consume approval and wait for dispatch outside the broker lock."""
+
+        # Both human approval and deterministic auto-authorization use this one
+        # lifecycle. The lock covers the durable approval boundary, while the
+        # external dispatcher preparation runs unlocked so a stalled transport
+        # cannot block /cancel or /new.
+        with self._dispatch_lock:
+            current = self._current_working_session()
+            if current.pending_action is None:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="pending_unavailable",
+                )
+            if current.pending_action.is_expired(self.clock):
+                return self._expire_pending_action(message, current)
+            approved_or_result = self._approve_pending_action(message, current, choice)
+        if isinstance(approved_or_result, ReceiveResult):
+            return approved_or_result
+        prepared_or_result = self._prepare_approved_dispatch(
+            message=message,
+            action=approved_or_result.action,
+            terminal=approved_or_result.terminal,
+            permission_id=approved_or_result.permission_id,
+        )
+        if isinstance(prepared_or_result, ReceiveResult):
+            return prepared_or_result
+        if not self._dispatch_is_still_attempted(prepared_or_result.action.action_id):
+            self._release_prepared_dispatch(prepared_or_result.action.action_id)
+            self._finalize_dispatch(prepared_or_result.action.action_id)
+            return self._late_action_result(
+                message,
+                prepared_or_result,
+                reason="worker registration completed after cancellation",
+            )
+        return self._run_prepared_action(message, prepared_or_result)
+
+    def _approve_pending_action(
+        self,
+        message: InboundMessage,
+        session: WorkingSession,
+        choice: object,
+    ) -> _ApprovedActionDispatch | ReceiveResult:
+        """Own approval semantics before any external dispatcher is called."""
 
         action = session.pending_action
         request = session.active_request
@@ -798,6 +901,62 @@ class DeterministicCapabilityBroker:
                 reason=f"pending action approval was not recorded: {exc}",
             )
 
+        return _ApprovedActionDispatch(
+            action=action,
+            terminal=terminal,
+            permission_id=permission_id,
+        )
+
+    def _prepare_approved_dispatch(
+        self,
+        *,
+        message: InboundMessage,
+        action: PendingActionState,
+        terminal: TerminalAction | None,
+        permission_id: str | None,
+    ) -> _PreparedActionDispatch | ReceiveResult:
+        """Prepare a dispatcher outside the broker's cancellation barrier."""
+
+        with self._dispatch_lock:
+            frozen_or_result = self._prepare_approved_dispatch_boundary(
+                message=message,
+                action=action,
+                terminal=terminal,
+                permission_id=permission_id,
+            )
+        if isinstance(frozen_or_result, ReceiveResult):
+            return frozen_or_result
+        try:
+            handle = self.action_dispatcher.prepare(frozen_or_result)
+            if not isinstance(handle, ActionDispatchHandle):
+                raise ActionDispatcherError(
+                    "action dispatcher returned an invalid dispatch handle"
+                )
+        except ActionDispatcherError as exc:
+            terminal_status = _dispatch_failure_status(exc)
+            if not self._finish_frozen_action(action.action_id, terminal_status):
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_unknown",
+                    reason="dispatcher failed and terminal state could not be persisted",
+                )
+            return ReceiveResult(
+                status_code=202,
+                disposition=_dispatch_disposition(terminal_status),
+                reason=str(exc),
+            )
+        return _PreparedActionDispatch(action=frozen_or_result, handle=handle)
+
+    def _prepare_approved_dispatch_boundary(
+        self,
+        *,
+        message: InboundMessage,
+        action: PendingActionState,
+        terminal: TerminalAction | None,
+        permission_id: str | None,
+    ) -> FrozenActionProposal | ReceiveResult:
+        """Run readiness and record the durable dispatch-attempt boundary."""
+
         dispatching = self._current_working_session()
         if permission_id is not None:
             active_permission = next(
@@ -890,45 +1049,132 @@ class DeterministicCapabilityBroker:
             for item in attempted.state.action_outbox
             if item.action_id == action.action_id
         )
+        frozen_dispatch = FrozenActionProposal(
+            action_id=record.action_id,
+            request_id=record.request_id,
+            kind=record.kind,
+            preview=record.preview or "",
+            payload=record.payload or "",
+            digest=record.digest,
+        )
+        return frozen_dispatch
+
+    def _run_prepared_action(
+        self, message: InboundMessage, prepared: _PreparedActionDispatch
+    ) -> ReceiveResult:
+        """Trace and await a prepared action after its cancellation barrier."""
+
         try:
-            self.action_dispatcher.dispatch(
-                FrozenActionProposal(
-                    action_id=record.action_id,
-                    request_id=record.request_id,
-                    kind=record.kind,
-                    preview=record.preview or "",
-                    payload=record.payload or "",
-                    digest=record.digest,
-                )
+            self._trace.execute(
+                request_id=prepared.action.request_id,
+                operation_id=f"{prepared.action.action_id}:dispatch",
+                operation_type=(
+                    "worker" if prepared.action.kind == "terminal" else "connector"
+                ),
+                input_payload=prepared.action,
+                arguments={"operation": "dispatch", "kind": prepared.action.kind},
+                telemetry={"phase": "dispatch"},
+                operation=prepared.handle.run,
+                result_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
+                error_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
             )
-        except ActionDispatcherError as exc:
-            terminal_status = (
-                DispatchStatus.UNKNOWN
-                if exc.may_have_dispatched
-                else DispatchStatus.FAILED
-            )
-            if not self._finish_frozen_action(action.action_id, terminal_status):
-                return ReceiveResult(
-                    status_code=202,
-                    disposition="action_dispatch_unknown",
-                    reason="dispatcher failed and terminal state could not be persisted",
-                )
+        except (DiagnosticTraceError, ActionDispatcherError) as exc:
+            self._release_prepared_dispatch(prepared.action.action_id)
+            terminal_status = _dispatch_failure_status(exc)
+            if not self._finish_frozen_action(
+                prepared.action.action_id, terminal_status
+            ):
+                return self._late_action_result(message, prepared, reason=str(exc))
             return ReceiveResult(
                 status_code=202,
-                disposition=(
-                    "action_dispatch_unknown"
-                    if exc.may_have_dispatched
-                    else "action_dispatch_failed"
-                ),
+                disposition=_dispatch_disposition(terminal_status),
                 reason=str(exc),
             )
-        if not self._finish_frozen_action(action.action_id, DispatchStatus.COMPLETED):
+        if not self._finish_frozen_action(
+            prepared.action.action_id, DispatchStatus.COMPLETED
+        ):
+            return self._late_action_result(
+                message,
+                prepared,
+                reason="action completed but terminal state was already closed",
+            )
+        return ReceiveResult(status_code=202, disposition="action_dispatched")
+
+    def _dispatch_is_still_attempted(self, action_id: str) -> bool:
+        """Check that cancellation did not close the edge while it prepared."""
+
+        with self._dispatch_lock:
+            current = self._current_working_session()
+            record = next(
+                (item for item in current.action_outbox if item.action_id == action_id),
+                None,
+            )
+            return record is not None and record.status is DispatchStatus.ATTEMPTED
+
+    def _release_prepared_dispatch(self, action_id: str) -> None:
+        """Close a prepared edge when trace admission fails before dispatch."""
+
+        try:
+            self.action_dispatcher.cancel(action_id=action_id)
+        except Exception:  # noqa: BLE001 - an unavailable edge is unknown
+            # The durable action outcome below remains authoritative. A concrete
+            # dispatcher must make cancellation bounded, but cleanup cannot
+            # replace the outcome when that edge is already unavailable.
+            return
+
+    def _late_action_result(
+        self,
+        message: InboundMessage,
+        prepared: _PreparedActionDispatch,
+        *,
+        reason: str,
+    ) -> ReceiveResult:
+        current = self._current_working_session()
+        record = next(
+            (
+                item
+                for item in current.action_outbox
+                if item.action_id == prepared.action.action_id
+            ),
+            None,
+        )
+        if record is not None and record.status is DispatchStatus.CANCELLED:
+            self._finalize_dispatch(prepared.action.action_id)
+            self._best_effort_audit(
+                kind="late_result_ignored",
+                event_id=message.event_id,
+                request_id=prepared.action.request_id,
+                message_id=message.message_id,
+                outcome="ignored",
+                actor="control_plane",
+                operation_type="terminal_dispatch",
+                target_category="execution_host",
+                details={},
+            )
+            return ReceiveResult(
+                status_code=202,
+                disposition="late_result_ignored",
+                reason="worker result arrived after cancellation: " + reason,
+            )
+        if record is not None and record.status in {
+            DispatchStatus.CANCELLING,
+            DispatchStatus.UNKNOWN,
+        }:
+            if record.status is DispatchStatus.UNKNOWN:
+                self._finalize_dispatch(prepared.action.action_id)
             return ReceiveResult(
                 status_code=202,
                 disposition="action_dispatch_unknown",
-                reason="action completed but terminal state could not be persisted",
+                reason="worker result arrived after an uncertain cancellation: "
+                + reason,
             )
-        return ReceiveResult(status_code=202, disposition="action_dispatched")
+        if record is not None and not record.is_open:
+            self._finalize_dispatch(prepared.action.action_id)
+        return ReceiveResult(
+            status_code=202,
+            disposition="action_dispatch_unknown",
+            reason=reason,
+        )
 
     def _reject_revoked_pending_action(
         self,
@@ -989,20 +1235,30 @@ class DeterministicCapabilityBroker:
     ) -> ReceiveResult:
         """Consume safe-read or exact-permission authorization after presentation."""
 
-        return self._consume_pending_approval(
-            message, self._current_working_session(), ApprovalChoice.APPROVE
-        )
+        return self._consume_pending_approval(message, ApprovalChoice.APPROVE)
 
     def _finish_frozen_action(self, action_id: str, status: DispatchStatus) -> bool:
-        current = self._current_working_session()
-        try:
-            transition = complete_action_dispatch(
-                current, action_id=action_id, status=status, now=self.clock
-            )
-            self.working_sessions.compare_and_set(current, transition.state)
-        except (InvariantViolation, SessionStoreError):
-            return False
+        with self._dispatch_lock:
+            current = self._current_working_session()
+            try:
+                transition = complete_action_dispatch(
+                    current, action_id=action_id, status=status, now=self.clock
+                )
+                self.working_sessions.compare_and_set(current, transition.state)
+            except (InvariantViolation, SessionStoreError):
+                return False
+        self._finalize_dispatch(action_id)
         return True
+
+    def _finalize_dispatch(self, action_id: str) -> None:
+        """Run an optional transport retirement handshake after durable closure."""
+
+        if not isinstance(self.action_dispatcher, ActionFinalizer):
+            return
+        try:
+            self.action_dispatcher.finalize(action_id=action_id)
+        except Exception:  # noqa: BLE001 - bounded retention is the fallback
+            return
 
     @staticmethod
     def _unavailable_terminal_host(
@@ -2087,6 +2343,11 @@ class DeterministicCapabilityBroker:
         expected: WorkingSession,
         transition: ControlTransition,
     ) -> ReceiveResult:
+        dispatches_to_cancel = tuple(
+            (record.action_id, record.kind)
+            for record in expected.action_outbox
+            if record.is_open
+        )
         audit_kind = {
             ControlTransitionKind.STATUS: "working_session_status_viewed",
             ControlTransitionKind.CANCELLED: "working_session_cancelled",
@@ -2130,10 +2391,165 @@ class DeterministicCapabilityBroker:
                     disposition="failed",
                     reason=f"working-session control lost a concurrent race: {exc}",
                 )
+        cancellation_outcomes: tuple[_CancellationOutcome, ...] = ()
+        if transition.kind in {
+            ControlTransitionKind.CANCELLED,
+            ControlTransitionKind.NEW_SESSION,
+        }:
+            cancellation_outcomes = self._cancel_dispatches(dispatches_to_cancel)
+            if transition.kind in {
+                ControlTransitionKind.CANCELLED,
+                ControlTransitionKind.NEW_SESSION,
+            }:
+                try:
+                    for cancellation in cancellation_outcomes:
+                        current = self._current_working_session()
+                        reconciliation = reconcile_action_cancellation(
+                            current,
+                            action_id=cancellation.action_id,
+                            status=cancellation.durable_status,
+                            now=self.clock,
+                        )
+                        self.working_sessions.compare_and_set(
+                            current, reconciliation.state
+                        )
+                except (InvariantViolation, SessionStoreError) as exc:
+                    self._best_effort_audit(
+                        kind="action_cancellation_reconciliation_failed",
+                        event_id=message.event_id,
+                        request_id=(
+                            expected.active_request.request_id
+                            if expected.active_request is not None
+                            else None
+                        ),
+                        message_id=message.message_id,
+                        outcome="unknown",
+                        actor="control_plane",
+                        operation_type="action_cancellation",
+                        target_category="side_effect",
+                        details={"reason": type(exc).__name__},
+                    )
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="cancellation_unknown",
+                        reason=(
+                            "cancellation was requested but its durable outcome "
+                            "could not be reconciled"
+                        ),
+                    )
+            try:
+                self._append_cancellation_audit(
+                    message, expected, cancellation_outcomes
+                )
+            except AuditWriteError as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"cancellation outcome was not recorded: {exc}",
+                )
 
         if transition.reply is None:
             return ReceiveResult(status_code=202, disposition=transition.kind.value)
+        if cancellation_outcomes:
+            transition = replace(
+                transition,
+                reply=self._cancellation_reply(transition, cancellation_outcomes),
+            )
         return self._dispatch_control_reply(message, transition)
+
+    def _cancel_dispatches(
+        self, action_refs: tuple[tuple[str, str], ...]
+    ) -> tuple[_CancellationOutcome, ...]:
+        """Close every side-effect edge and preserve cancellation uncertainty."""
+
+        results: list[_CancellationOutcome] = []
+        for action_id, kind in action_refs:
+            try:
+                result = self.action_dispatcher.cancel(action_id=action_id)
+                if not isinstance(result, ActionCancellationResult):
+                    raise TypeError("action cancellation returned an invalid result")
+            except Exception:  # noqa: BLE001 - an unavailable edge is unknown
+                result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+            durable_status = (
+                DispatchStatus.CANCELLED
+                if result.status
+                in {
+                    ActionCancellationStatus.NOT_STARTED,
+                    ActionCancellationStatus.STOPPED,
+                }
+                else DispatchStatus.UNKNOWN
+            )
+            results.append(
+                _CancellationOutcome(
+                    action_id=action_id,
+                    kind=kind,
+                    result=result,
+                    durable_status=durable_status,
+                )
+            )
+        return tuple(results)
+
+    def _append_cancellation_audit(
+        self,
+        message: InboundMessage,
+        expected: WorkingSession,
+        outcomes: tuple[_CancellationOutcome, ...],
+    ) -> None:
+        """Record only bounded identifiers and cancellation outcomes."""
+
+        request_id = (
+            expected.active_request.request_id
+            if expected.active_request is not None
+            else None
+        )
+        for outcome in outcomes:
+            self._append_audit(
+                kind="action_cancellation",
+                event_id=message.event_id,
+                request_id=request_id,
+                message_id=message.message_id,
+                outcome=outcome.durable_status.value,
+                actor="control_plane",
+                operation_type="action_cancellation",
+                target_category=(
+                    "execution_host" if outcome.kind == "terminal" else "side_effect"
+                ),
+                execution_status=outcome.result.status.value,
+                details={
+                    "action": outcome.action_id,
+                    "dispatch_state": outcome.durable_status.value,
+                    "execution_status": outcome.result.status.value,
+                },
+            )
+
+    @staticmethod
+    def _cancellation_reply(
+        transition: ControlTransition,
+        outcomes: tuple[_CancellationOutcome, ...],
+    ) -> str:
+        """Tell the operator when any external action remains uncertain."""
+
+        if any(
+            outcome.durable_status is DispatchStatus.UNKNOWN for outcome in outcomes
+        ):
+            if transition.kind is ControlTransitionKind.NEW_SESSION:
+                return (
+                    "Started a clean session, but one or more previous external "
+                    "actions remain of unknown outcome. No retry will be attempted."
+                )
+            return (
+                "Cancellation was accepted, but one or more external actions have "
+                "an unknown outcome. No retry will be attempted."
+            )
+        if transition.kind is ControlTransitionKind.NEW_SESSION:
+            return (
+                "Started a clean session. Previous work was stopped or confirmed "
+                "not started; no action will resume."
+            )
+        return (
+            "Cancelled the active request and invalidated its pending action. "
+            "External actions were stopped or confirmed not started."
+        )
 
     def _dispatch_control_reply(
         self,
