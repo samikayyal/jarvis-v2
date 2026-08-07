@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from email import message_from_bytes
+from email.policy import SMTP
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -41,10 +44,13 @@ from jarvis_control_plane import (
     RequestState,
     RoutedActionDispatcher,
     SignedInboundEvent,
+    TraceReservation,
+    TraceWriteError,
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
     gmail_write_request_from_proposal,
 )
+from jarvis_control_plane.gmail_writes import _encode_rfc822
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
@@ -91,6 +97,7 @@ def _dispatcher(
     *,
     audit: InMemoryAuditBoundary | None = None,
     connection_state: object | None = None,
+    trace: DiagnosticTraceRecorder | None = None,
 ) -> GmailWriteConnector:
     connection_state = connection_state or (
         lambda: GoogleConnectionState(
@@ -112,7 +119,7 @@ def _dispatcher(
         ),
         provider=provider,
         audit=audit or InMemoryAuditBoundary(),
-        trace=_trace(),
+        trace=trace or _trace(),
         clock=FixedClock(NOW),
         ids=DeterministicIdGenerator("ticket18-gmail"),
         connection_state=connection_state,  # type: ignore[arg-type]
@@ -161,6 +168,7 @@ def _components(
     dispatcher: ActionDispatcher,
     *,
     audit: InMemoryAuditBoundary | None = None,
+    trace: DiagnosticTraceRecorder | None = None,
 ) -> object:
     from jarvis_control_plane import ControlledOrchestrationAdapter
 
@@ -182,6 +190,7 @@ def _components(
         ),
         action_dispatcher=dispatcher,  # type: ignore[arg-type]
         action_lifecycle=dispatcher,  # type: ignore[arg-type]
+        trace=trace,
     )
 
 
@@ -258,12 +267,114 @@ def test_new_send_freezes_every_delivery_field_and_dispatches_that_exact_message
     assert len(provider.calls) == 1
     sent = provider.calls[0]
     assert sent.operation == "gmail_send"
-    assert sent.to == ("recipient@example.com",)
-    assert sent.cc == ("copy@example.com",)
-    assert sent.bcc == ("blind@example.com",)
-    assert sent.subject == "Quarterly check-in"
-    assert sent.body == "Hello\n\nPlease review the attached plan."
-    assert sent.mime_type == "text/plain"
+    assert sent.message.to == ("recipient@example.com",)
+    assert sent.message.cc == ("copy@example.com",)
+    assert sent.message.bcc == ("blind@example.com",)
+    assert sent.message.subject == "Quarterly check-in"
+    assert sent.message.body == "Hello\n\nPlease review the attached plan."
+    assert sent.message.mime_type == "text/plain"
+
+
+def test_approved_message_round_trips_from_proposal_through_rfc822() -> None:
+    request = gmail_write_request_from_proposal(_proposal(reply=True))
+
+    encoded = _encode_rfc822(request)
+    raw = base64.urlsafe_b64decode(encoded + "===")
+    message = message_from_bytes(raw, policy=SMTP)
+    body = message.get_content().replace("\r\n", "\n")
+
+    assert message["To"] == ", ".join(request.message.to)
+    assert message["Cc"] == ", ".join(request.message.cc)
+    assert message["Bcc"] == ", ".join(request.message.bcc)
+    assert message["Subject"] == request.message.subject
+    assert message.get_content_type() == request.message.mime_type
+    assert body.removesuffix("\n") == request.message.body
+    assert message["In-Reply-To"] == request.in_reply_to
+    assert message["References"] == " ".join(request.references)
+    assert request.thread_id == request.source_thread_id
+
+
+def test_trace_capacity_failure_is_definite_not_started_for_gmail_dispatch() -> None:
+    trace_store = InMemoryDiagnosticTraceStore()
+    writer = trace_store.writer()
+    trace = DiagnosticTraceRecorder(
+        writer=writer,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-capacity-trace"),
+    )
+    provider = ControlledGmailWriteProvider()
+    components = _components(
+        _proposal(),
+        _dispatcher(provider, trace=trace),
+        trace=trace,
+    )
+    blockers = []
+    try:
+        pending = components.receiver.receive(_event("send", suffix="capacity-pending"))
+        assert pending.disposition == "pending_action"
+        while (available := trace_store.available_bytes) > 0:
+            blockers.append(
+                writer.reserve(
+                    request_id=f"ticket18-capacity-blocker-{len(blockers)}",
+                    reservation_bytes=min(
+                        available, trace_store.limits.reservation_bytes
+                    ),
+                )
+            )
+
+        result = components.receiver.receive(_event("yes", suffix="capacity-approve"))
+
+        assert result.disposition == "action_dispatch_failed"
+        assert "not attempted" in (result.reason or "")
+        assert provider.calls == []
+        session = components.broker.working_sessions.load()
+        assert session is not None
+        assert session.pending_action is None
+        assert len(session.action_outbox) == 1
+        assert session.action_outbox[0].status.value == "failed"
+    finally:
+        for blocker in blockers:
+            writer.release(blocker)
+        trace_store._close_writer_service()
+
+
+def test_trace_persistence_failure_after_provider_start_remains_unknown() -> None:
+    class AppendFailureWriter:
+        def __init__(self) -> None:
+            self.owner = object()
+
+        def reserve(
+            self, *, request_id: str, reservation_bytes: int | None = None
+        ) -> TraceReservation:
+            return TraceReservation(
+                reservation_id="ticket18-persistence-failure",
+                request_id=request_id,
+                reserved_bytes=16 * 1024 * 1024,
+                _owner=self.owner,
+            )
+
+        def append(self, _trace: object, _reservation: TraceReservation) -> None:
+            raise TraceWriteError(
+                "controlled trace persistence failure",
+                operation_started=True,
+            )
+
+        def release(self, _reservation: TraceReservation) -> None:
+            return
+
+    trace = DiagnosticTraceRecorder(
+        writer=AppendFailureWriter(),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket18-persistence-trace"),
+    )
+    provider = ControlledGmailWriteProvider()
+    connector = _dispatcher(provider, trace=trace)
+
+    with pytest.raises(ActionDispatcherError) as caught:
+        connector.dispatch(connector.bind_proposal(_proposal()))
+
+    assert caught.value.may_have_dispatched is True
+    assert provider.calls != []
 
 
 def test_typed_reply_freezes_source_thread_headers_and_requires_returned_thread_match() -> (

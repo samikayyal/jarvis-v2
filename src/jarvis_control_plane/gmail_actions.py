@@ -10,7 +10,8 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from dataclasses import fields as dataclass_fields
+from typing import ClassVar, Literal
 
 from .models import FrozenActionProposal
 
@@ -45,6 +46,57 @@ class GmailMessage:
         object.__setattr__(self, "body", _body(self.body))
         object.__setattr__(self, "mime_type", _mime_type(self.mime_type))
 
+    @classmethod
+    def material_field_names(cls) -> tuple[str, ...]:
+        """Return the dataclass fields that define the material message."""
+
+        return tuple(field.name for field in dataclass_fields(cls))
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> GmailMessage:
+        """Rebuild the canonical material message from a frozen payload."""
+
+        try:
+            values = {field: payload[field] for field in cls.material_field_names()}
+        except KeyError as exc:
+            raise ValueError(
+                "Gmail message payload is missing a material field"
+            ) from exc
+        return cls(**values)  # type: ignore[arg-type]
+
+    def to_payload(self) -> dict[str, object]:
+        """Serialize every delivery-affecting message field exactly once."""
+
+        return {field: getattr(self, field) for field in self.material_field_names()}
+
+    def preview_lines(self) -> tuple[str, ...]:
+        """Render the canonical material fields used by human approval."""
+
+        return (
+            f"To: {', '.join(self.to)}",
+            f"Cc: {', '.join(self.cc) or '(none)'}",
+            f"Bcc: {', '.join(self.bcc) or '(none)'}",
+            f"Subject: {self.subject}",
+            f"MIME: {self.mime_type}",
+        )
+
+    def mime_headers(self) -> tuple[tuple[str, str], ...]:
+        """Return the canonical RFC822 headers for the material message."""
+
+        headers: list[tuple[str, str]] = [("To", ", ".join(self.to))]
+        if self.cc:
+            headers.append(("Cc", ", ".join(self.cc)))
+        if self.bcc:
+            headers.append(("Bcc", ", ".join(self.bcc)))
+        headers.append(("Subject", self.subject))
+        return tuple(headers)
+
+    @property
+    def mime_subtype(self) -> Literal["plain", "html"]:
+        """Return the validated RFC822 content subtype."""
+
+        return "html" if self.mime_type == "text/html" else "plain"
+
 
 @dataclass(frozen=True, slots=True)
 class GmailNewSendRequest:
@@ -67,34 +119,18 @@ class GmailNewSendRequest:
     def threading(self) -> Literal["new_message"]:
         return "new_message"
 
-    @property
-    def to(self) -> tuple[str, ...]:
-        return self.message.to
-
-    @property
-    def cc(self) -> tuple[str, ...]:
-        return self.message.cc
-
-    @property
-    def bcc(self) -> tuple[str, ...]:
-        return self.message.bcc
-
-    @property
-    def subject(self) -> str:
-        return self.message.subject
-
-    @property
-    def body(self) -> str:
-        return self.message.body
-
-    @property
-    def mime_type(self) -> Literal["text/plain", "text/html"]:
-        return self.message.mime_type
-
 
 @dataclass(frozen=True, slots=True)
 class GmailReplyRequest:
     """A typed Gmail reply bound to one frozen source message and thread."""
+
+    THREADING_FIELDS: ClassVar[tuple[str, ...]] = (
+        "thread_id",
+        "source_message_id",
+        "source_thread_id",
+        "in_reply_to",
+        "references",
+    )
 
     message: GmailMessage
     thread_id: str
@@ -135,29 +171,46 @@ class GmailReplyRequest:
     def threading(self) -> Literal["gmail_threaded_reply"]:
         return "gmail_threaded_reply"
 
-    @property
-    def to(self) -> tuple[str, ...]:
-        return self.message.to
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        message: GmailMessage,
+        binding: Mapping[str, object],
+    ) -> GmailReplyRequest:
+        """Rebuild the reply-only extension around the canonical message."""
 
-    @property
-    def cc(self) -> tuple[str, ...]:
-        return self.message.cc
+        try:
+            values = {field: payload[field] for field in cls.THREADING_FIELDS}
+        except KeyError as exc:
+            raise ValueError(
+                "Gmail reply payload is missing a threading field"
+            ) from exc
+        return cls(message=message, **values, **binding)  # type: ignore[arg-type]
 
-    @property
-    def bcc(self) -> tuple[str, ...]:
-        return self.message.bcc
+    def threading_payload(self) -> dict[str, object]:
+        """Serialize only the reply-specific threading extension."""
 
-    @property
-    def subject(self) -> str:
-        return self.message.subject
+        return {field: getattr(self, field) for field in self.THREADING_FIELDS}
 
-    @property
-    def body(self) -> str:
-        return self.message.body
+    def threading_preview_lines(self) -> tuple[str, ...]:
+        """Render only the reply-specific fields shown during approval."""
 
-    @property
-    def mime_type(self) -> Literal["text/plain", "text/html"]:
-        return self.message.mime_type
+        return (
+            f"Source message: {self.source_message_id}",
+            f"Source thread: {self.source_thread_id}",
+            f"In-Reply-To: {self.in_reply_to}",
+            f"References: {' '.join(self.references)}",
+        )
+
+    def threading_mime_headers(self) -> tuple[tuple[str, str], ...]:
+        """Return only the reply-specific RFC822 threading extension."""
+
+        return (
+            ("In-Reply-To", self.in_reply_to),
+            ("References", " ".join(self.references)),
+        )
 
 
 type GmailWriteRequest = GmailNewSendRequest | GmailReplyRequest
@@ -267,25 +320,10 @@ def gmail_write_request_from_proposal(
 def gmail_proposal_payload(request: GmailWriteRequest) -> dict[str, object]:
     """Serialize the complete typed request into its frozen proposal payload."""
 
-    payload: dict[str, object] = {
-        "to": request.to,
-        "cc": request.cc,
-        "bcc": request.bcc,
-        "subject": request.subject,
-        "body": request.body,
-        "mime_type": request.mime_type,
-        "threading": request.threading,
-    }
+    payload = request.message.to_payload()
+    payload["threading"] = request.threading
     if isinstance(request, GmailReplyRequest):
-        payload.update(
-            {
-                "thread_id": request.thread_id,
-                "source_message_id": request.source_message_id,
-                "source_thread_id": request.source_thread_id,
-                "in_reply_to": request.in_reply_to,
-                "references": request.references,
-            }
-        )
+        payload.update(request.threading_payload())
     if request.google_subject is not None:
         payload.update(
             {
@@ -303,11 +341,7 @@ def gmail_proposal_preview(request: GmailWriteRequest) -> str:
         "Gmail typed reply"
         if isinstance(request, GmailReplyRequest)
         else "Gmail new send",
-        f"To: {', '.join(request.to)}",
-        f"Cc: {', '.join(request.cc) or '(none)'}",
-        f"Bcc: {', '.join(request.bcc) or '(none)'}",
-        f"Subject: {request.subject}",
-        f"MIME: {request.mime_type}",
+        *request.message.preview_lines(),
         f"Threading: {request.threading}",
     ]
     if request.google_subject is not None:
@@ -318,15 +352,8 @@ def gmail_proposal_preview(request: GmailWriteRequest) -> str:
             )
         )
     if isinstance(request, GmailReplyRequest):
-        lines.extend(
-            (
-                f"Source message: {request.source_message_id}",
-                f"Source thread: {request.source_thread_id}",
-                f"In-Reply-To: {request.in_reply_to}",
-                f"References: {' '.join(request.references)}",
-            )
-        )
-    return "\n".join((*lines, "", "Body:", request.body))
+        lines.extend(request.threading_preview_lines())
+    return "\n".join((*lines, "", "Body:", request.message.body))
 
 
 def _proposal(
@@ -359,37 +386,19 @@ def _reply_request_from_payload(
     payload: Mapping[str, object],
 ) -> GmailReplyRequest:
     expected = _common_fields(payload) | {
-        "thread_id",
-        "source_message_id",
-        "source_thread_id",
-        "in_reply_to",
-        "references",
+        *GmailReplyRequest.THREADING_FIELDS,
     }
     if set(payload) != expected:
         raise ValueError("Gmail reply payload has missing or unknown delivery fields")
-    return GmailReplyRequest(
+    return GmailReplyRequest.from_payload(
+        payload,
         message=_message_from_payload(payload),
-        thread_id=_identifier(payload["thread_id"], "thread_id"),
-        source_message_id=_identifier(
-            payload["source_message_id"], "source_message_id"
-        ),
-        source_thread_id=_identifier(payload["source_thread_id"], "source_thread_id"),
-        in_reply_to=_message_id(payload["in_reply_to"]),
-        references=_message_ids(payload["references"]),
-        **_binding_from_payload(payload),
+        binding=_binding_from_payload(payload),
     )
 
 
 def _common_fields(payload: Mapping[str, object]) -> set[str]:
-    fields = {
-        "to",
-        "cc",
-        "bcc",
-        "subject",
-        "body",
-        "mime_type",
-        "threading",
-    }
+    fields = set(GmailMessage.material_field_names()) | {"threading"}
     supplied_binding = set(payload) & {"google_subject", "connection_generation"}
     if supplied_binding and supplied_binding != {
         "google_subject",
@@ -401,14 +410,7 @@ def _common_fields(payload: Mapping[str, object]) -> set[str]:
 
 def _message_from_payload(payload: Mapping[str, object]) -> GmailMessage:
     _threading(payload["threading"], reply="thread_id" in payload)
-    return GmailMessage(
-        to=_recipients(payload["to"], "to"),
-        cc=_recipients(payload["cc"], "cc", allow_empty=True),
-        bcc=_recipients(payload["bcc"], "bcc", allow_empty=True),
-        subject=_subject(payload["subject"]),
-        body=_body(payload["body"]),
-        mime_type=_mime_type(payload["mime_type"]),
-    )
+    return GmailMessage.from_payload(payload)
 
 
 def _binding_from_payload(

@@ -350,7 +350,13 @@ class GmailWriteConnector:
                 self._classify_provider_result(request, result)
             except GmailWriteProviderError as exc:
                 self._raise_provider_failure(action, exc)
-            except (DiagnosticTraceError, TraceCapacityError, TraceWriteError) as exc:
+            except TraceCapacityError as exc:
+                self._raise_trace_failure(action, exc, may_have_dispatched=False)
+            except TraceWriteError as exc:
+                self._raise_trace_failure(
+                    action, exc, may_have_dispatched=exc.operation_started
+                )
+            except DiagnosticTraceError as exc:
                 self._raise_unknown_provider_failure(action, exc)
             except Exception as exc:  # noqa: BLE001 - unknown provider failures are ambiguous
                 self._raise_unknown_provider_failure(action, exc)
@@ -445,6 +451,24 @@ class GmailWriteConnector:
         self._record_terminal(action, outcome="unknown")
         raise ActionDispatcherError(
             "Gmail delivery outcome is unknown", may_have_dispatched=True
+        ) from error
+
+    def _raise_trace_failure(
+        self,
+        action: FrozenActionProposal,
+        error: DiagnosticTraceError,
+        *,
+        may_have_dispatched: bool,
+    ) -> None:
+        """Preserve whether tracing reached the external operation boundary."""
+
+        outcome = "unknown" if may_have_dispatched else "failed"
+        self._record_terminal(action, outcome=outcome)
+        raise ActionDispatcherError(
+            "Gmail delivery outcome is unknown"
+            if may_have_dispatched
+            else "Gmail delivery was not attempted",
+            may_have_dispatched=may_have_dispatched,
         ) from error
 
     def _record_completed_delivery(self, action: FrozenActionProposal) -> None:
@@ -578,17 +602,16 @@ def build_live_gmail_write_connector(
 
 def _encode_rfc822(request: GmailWriteRequest) -> str:
     message = EmailMessage(policy=SMTP)
-    message["To"] = ", ".join(request.to)
-    if request.cc:
-        message["Cc"] = ", ".join(request.cc)
-    if request.bcc:
-        message["Bcc"] = ", ".join(request.bcc)
-    message["Subject"] = request.subject
+    for name, value in request.message.mime_headers():
+        message[name] = value
     if isinstance(request, GmailReplyRequest):
-        message["In-Reply-To"] = request.in_reply_to
-        message["References"] = " ".join(request.references)
-    subtype = request.mime_type.split("/", 1)[1]
-    message.set_content(request.body, subtype=subtype, charset="utf-8")
+        for name, value in request.threading_mime_headers():
+            message[name] = value
+    message.set_content(
+        request.message.body,
+        subtype=request.message.mime_subtype,
+        charset="utf-8",
+    )
     return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
 
 
