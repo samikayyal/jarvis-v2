@@ -456,9 +456,10 @@ class InMemoryGoogleCredentialStore:
 class FileGoogleCredentialStore:
     """One 0600 generation-bound credential record in a private directory.
 
-    Legacy three-field records may still use the metadata sidecar while they
-    are being read, but new replacements commit the refresh token and its
-    connection generation together in one file rename.
+    The primary file deliberately keeps the three-field shape used by the
+    previous pinned release.  Generation metadata is stored in a sidecar that
+    the previous reader ignores; a two-entry sidecar lets the current reader
+    recover the old or new generation if the primary rename is interrupted.
     """
 
     def __init__(
@@ -477,7 +478,7 @@ class FileGoogleCredentialStore:
 
     @property
     def _metadata_path(self) -> Path:
-        """Compatibility metadata used only when reading legacy records."""
+        """Generation metadata kept outside the rollback-compatible record."""
 
         return self._directory / f"{self._filename}.meta"
 
@@ -504,9 +505,17 @@ class FileGoogleCredentialStore:
                 "refresh_token",
                 "subject",
             }:
-                # Read the format emitted by the first Ticket 19 revision so
-                # an in-place upgrade can migrate it without losing access.
-                connection_generation = payload["connection_generation"]
+                # Migrate the first Ticket 19 format before a rollback can
+                # encounter its extra field.  The returned credential remains
+                # bound to the embedded generation after the conversion.
+                credential = OAuthCredentialRecord(
+                    subject=payload["subject"],
+                    granted_scopes=frozenset(payload["granted_scopes"]),
+                    refresh_token=payload["refresh_token"],
+                    connection_generation=payload["connection_generation"],
+                )
+                self._write_legacy_compatible_record(credential)
+                return credential
             else:
                 raise ValueError("credential record has an unexpected shape")
             return OAuthCredentialRecord(
@@ -519,41 +528,110 @@ class FileGoogleCredentialStore:
             raise GoogleOAuthError("credential_store_unavailable") from exc
 
     def replace(self, credential: OAuthCredentialRecord) -> None:
+        self._write_legacy_compatible_record(credential)
+
+    def _write_legacy_compatible_record(
+        self, credential: OAuthCredentialRecord
+    ) -> None:
+        previous = self._read_existing_record()
+        records = []
+        if previous is not None and previous.refresh_token != credential.refresh_token:
+            records.append(self._metadata_record(previous))
+        records.append(self._metadata_record(credential))
+        metadata = {
+            "records": records,
+            "schema": "google_oauth_credential_metadata_v2",
+        }
         payload = {
-            "connection_generation": credential.connection_generation,
             "granted_scopes": sorted(credential.granted_scopes),
             "refresh_token": credential.refresh_token,
             "subject": credential.subject,
         }
-        # The generation is authoritative in the same record as the refresh
-        # token.  A single rename therefore cannot leave a new token bound to
-        # an old or missing generation sidecar.
+        # Publish metadata first.  It contains both generations while the old
+        # primary record is still visible, so either side of the primary-file
+        # rename remains interpretable.  The old release ignores this sidecar
+        # and continues to consume the three-field primary record.
+        self._atomic_write(self._metadata_path, metadata)
         self._atomic_write(self._path, payload)
+
+    def _read_existing_record(self) -> OAuthCredentialRecord | None:
+        if not self._path.exists():
+            return None
+        payload = json.loads(self._path.read_text(encoding="utf-8"))
+        fields = set(payload)
+        if fields == {
+            "granted_scopes",
+            "refresh_token",
+            "subject",
+        }:
+            connection_generation = self._legacy_generation(payload)
+        elif fields == {
+            "connection_generation",
+            "granted_scopes",
+            "refresh_token",
+            "subject",
+        }:
+            connection_generation = payload["connection_generation"]
+        else:
+            raise ValueError("credential record has an unexpected shape")
+        return OAuthCredentialRecord(
+            subject=payload["subject"],
+            granted_scopes=frozenset(payload["granted_scopes"]),
+            refresh_token=payload["refresh_token"],
+            connection_generation=connection_generation,
+        )
+
+    @staticmethod
+    def _metadata_record(credential: OAuthCredentialRecord) -> dict[str, object]:
+        return {
+            "connection_generation": credential.connection_generation,
+            "refresh_token_sha256": hashlib.sha256(
+                credential.refresh_token.encode("utf-8")
+            ).hexdigest(),
+        }
 
     def _legacy_generation(self, payload: Mapping[str, object]) -> int:
         if not self._metadata_path.exists():
             return 0
         metadata = json.loads(self._metadata_path.read_text(encoding="utf-8"))
-        if (
-            set(metadata)
-            != {
-                "connection_generation",
-                "refresh_token_sha256",
-                "schema",
-            }
-            or metadata["schema"] != "google_oauth_credential_metadata_v1"
-        ):
-            raise ValueError("credential metadata has an unexpected shape")
         refresh_token = payload.get("refresh_token")
         if not isinstance(refresh_token, str):
             raise TypeError("credential record has an invalid refresh token")
         fingerprint = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
-        if metadata["refresh_token_sha256"] != fingerprint:
-            # An older release may have replaced the legacy record without
-            # knowing about the metadata sidecar.  Treat its generation as
-            # unbound instead of reusing metadata for a different token.
+        if (
+            isinstance(metadata, Mapping)
+            and set(metadata)
+            == {
+                "connection_generation",
+                "refresh_token_sha256",
+                "schema",
+            }
+            and metadata["schema"] == "google_oauth_credential_metadata_v1"
+        ):
+            if metadata["refresh_token_sha256"] != fingerprint:
+                return 0
+            return metadata["connection_generation"]
+        if (
+            not isinstance(metadata, Mapping)
+            or set(metadata) != {"records", "schema"}
+            or metadata["schema"] != "google_oauth_credential_metadata_v2"
+            or not isinstance(metadata["records"], list)
+            or not metadata["records"]
+        ):
+            raise ValueError("credential metadata has an unexpected shape")
+        matches = [
+            record
+            for record in metadata["records"]
+            if isinstance(record, Mapping)
+            and set(record) == {"connection_generation", "refresh_token_sha256"}
+            and record["refresh_token_sha256"] == fingerprint
+        ]
+        if not matches:
             return 0
-        return metadata["connection_generation"]
+        generations = {record["connection_generation"] for record in matches}
+        if len(generations) != 1:
+            raise ValueError("credential metadata has conflicting generations")
+        return next(iter(generations))
 
     def _atomic_write(self, path: Path, payload: Mapping[str, object]) -> None:
         temporary = self._directory / f".{path.name}.{secrets.token_hex(16)}.tmp"

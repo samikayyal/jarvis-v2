@@ -8,24 +8,30 @@ from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     CALENDAR_WRITE_SCOPE,
+    AuditWriteError,
     CalendarActionDispatcher,
     CalendarEventSnapshot,
     CalendarWriteProposal,
     CalendarWriteRequest,
     ControlledGoogleCalendarWriteProvider,
+    ControlledGoogleOAuthProvider,
     ControlledOrchestrationAdapter,
     DeterministicIdGenerator,
     DiagnosticTraceRecorder,
     FixedClock,
+    GoogleOAuthLifecycle,
     InboundMessage,
+    InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryGoogleCredentialStore,
     InMemoryGoogleOAuthStateStore,
     OAuthCredentialRecord,
+    OAuthGrant,
     SignedInboundEvent,
 )
 from jarvis_control_plane.google_calendar import GoogleCalendarWriteProviderError
 from jarvis_control_plane.ports import ActionDispatcherError
+from jarvis_control_plane.sessions import DispatchStatus
 
 IDENTITY = "operator@example.test"
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
@@ -261,7 +267,11 @@ def test_update_from_snapshot_derives_one_complete_result_and_preserves_material
 
     payload = json.loads(proposal.payload)
     assert payload["complete_event"]["summary"] == "Changed summary"
-    assert payload["complete_event"]["attendees"] == current["attendees"]
+    assert (
+        payload["complete_event"]["attendees"][0]["email"]
+        == current["attendees"][0]["email"]
+    )
+    assert payload["complete_event"]["attendees"][0]["optional"] is False
     assert payload["complete_event"]["recurrence"] == current["recurrence"]
     assert payload["complete_event"]["reminders"] == current["reminders"]
     assert payload["complete_event"]["visibility"] == current["visibility"]
@@ -471,6 +481,56 @@ def test_calendar_invalid_grant_cleanup_receives_the_failed_generation() -> None
     assert received == [failed_generation]
 
 
+def test_calendar_invalid_grant_audit_failure_preserves_known_no_dispatch_outcome() -> (
+    None
+):
+    _, _, state = connected_dispatcher()
+    failed_generation = state.get_connection().generation
+
+    class InvalidGrantProvider(ControlledGoogleCalendarWriteProvider):
+        def write(self, **kwargs: object):
+            self.calls.append((kwargs["request"], kwargs["credential"]))  # type: ignore[arg-type]
+            raise GoogleCalendarWriteProviderError("invalid_grant")
+
+    provider = InvalidGrantProvider()
+
+    def on_invalid_grant(connection_generation: int) -> None:
+        assert connection_generation == failed_generation
+        raise AuditWriteError("controlled invalidation audit failure")
+
+    dispatcher = CalendarActionDispatcher(
+        configured_identity=IDENTITY,
+        connection_state=state,
+        credential_store=InMemoryGoogleCredentialStore(
+            OAuthCredentialRecord(
+                subject=IDENTITY,
+                granted_scopes=frozenset({CALENDAR_WRITE_SCOPE}),
+                refresh_token="controlled-refresh-token",
+                connection_generation=failed_generation,
+            )
+        ),
+        provider=provider,
+        trace=DiagnosticTraceRecorder(
+            writer=InMemoryDiagnosticTraceStore().writer(),
+            clock=FixedClock(NOW),
+            ids=DeterministicIdGenerator("ticket19-invalid-grant-audit"),
+        ),
+        on_invalid_grant=on_invalid_grant,
+    )
+    proposal = CalendarWriteProposal.insert(
+        action_id="calendar-invalid-grant-audit",
+        request_id="request-invalid-grant-audit",
+        calendar_id="primary",
+        complete_event=event(),
+        notification="none",
+        connection_generation=failed_generation,
+    )
+    with pytest.raises(ActionDispatcherError, match="invalidation failed") as error:
+        dispatcher.dispatch(proposal)
+
+    assert error.value.may_have_dispatched is False
+
+
 def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
     dispatcher, provider, state = connected_dispatcher()
     orchestration = ControlledOrchestrationAdapter(
@@ -516,3 +576,127 @@ def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
     assert receive("yes", "2").disposition == "action_dispatched"
     assert receive("yes", "3").disposition != "action_dispatched"
     assert len(provider.calls) == 1
+
+
+def test_broker_closes_invalid_grant_action_when_invalidation_audit_fails() -> None:
+    state = InMemoryGoogleOAuthStateStore()
+    state.set_connection(
+        connected=True, granted_scopes=frozenset({CALENDAR_WRITE_SCOPE})
+    )
+    connection = state.get_connection()
+    credentials = InMemoryGoogleCredentialStore(
+        OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=frozenset({CALENDAR_WRITE_SCOPE}),
+            refresh_token="controlled-refresh-token",
+            connection_generation=connection.generation,
+        )
+    )
+    oauth_trace_store = InMemoryDiagnosticTraceStore()
+    oauth_lifecycle = GoogleOAuthLifecycle(
+        configured_identity=IDENTITY,
+        state_store=state,
+        credential_store=credentials,
+        provider=ControlledGoogleOAuthProvider(
+            grant=OAuthGrant(
+                subject=IDENTITY,
+                granted_scopes=frozenset({CALENDAR_WRITE_SCOPE}),
+                access_token="controlled-access-token",
+                refresh_token="controlled-refresh-token",
+            )
+        ),
+        audit=InMemoryAuditBoundary(fail=True),
+        trace=DiagnosticTraceRecorder(
+            writer=oauth_trace_store.writer(),
+            clock=FixedClock(NOW),
+            ids=DeterministicIdGenerator("ticket19-oauth"),
+        ),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ticket19-oauth"),
+    )
+
+    class InvalidGrantProvider(ControlledGoogleCalendarWriteProvider):
+        def write(self, **kwargs: object):
+            self.calls.append((kwargs["request"], kwargs["credential"]))  # type: ignore[arg-type]
+            raise GoogleCalendarWriteProviderError("invalid_grant")
+
+    provider = InvalidGrantProvider()
+    calendar_trace_store = InMemoryDiagnosticTraceStore()
+    dispatcher = CalendarActionDispatcher(
+        configured_identity=IDENTITY,
+        connection_state=state,
+        credential_store=credentials,
+        provider=provider,
+        trace=DiagnosticTraceRecorder(
+            writer=calendar_trace_store.writer(),
+            clock=FixedClock(NOW),
+            ids=DeterministicIdGenerator("ticket19-calendar-broker"),
+        ),
+        on_invalid_grant=lambda connection_generation: (
+            oauth_lifecycle.handle_refresh_failure(
+                "invalid_grant", connection_generation=connection_generation
+            )
+        ),
+    )
+    orchestration = ControlledOrchestrationAdapter(
+        proposal_factory=lambda request: CalendarWriteProposal.insert(
+            action_id="calendar-action-broker-audit-failure",
+            request_id=request.state.request_id,
+            calendar_id="primary",
+            complete_event=event(),
+            notification="none",
+            connection_generation=connection.generation,
+        )
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket19-secret-audit-failure",
+        now=NOW,
+        id_prefix="ticket19-audit-failure",
+        orchestration=orchestration,
+        action_dispatcher=dispatcher,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket19-secret-audit-failure",
+            )
+        )
+
+    try:
+        assert receive("create it", "1").disposition == "pending_action"
+        result = receive("yes", "2")
+
+        assert result.disposition == "action_dispatch_failed"
+        assert credentials.current is None
+        assert not state.get_connection().connected
+        session = components.broker.working_sessions.load()
+        assert session is not None
+        assert session.pending_action is None
+        assert session.active_request is None
+        record = next(
+            record
+            for record in session.action_outbox
+            if record.action_id == "calendar-action-broker-audit-failure"
+        )
+        assert record.status is DispatchStatus.FAILED
+        assert record.payload is None
+        assert record.preview is None
+        assert len(provider.calls) == 1
+    finally:
+        oauth_trace_store._close_writer_service()
+        calendar_trace_store._close_writer_service()

@@ -602,11 +602,21 @@ def test_file_credential_store_reads_legacy_records_and_commits_generation_with_
 
     stored_payload = json.loads(path.read_text(encoding="utf-8"))
     assert set(stored_payload) == {
-        "connection_generation",
         "granted_scopes",
         "refresh_token",
         "subject",
     }
+    # This is the exact reader contract from the prior pinned release.  The
+    # generation sidecar is intentionally invisible to that reader.
+    prior_release_record = json.loads(path.read_text(encoding="utf-8"))
+    assert prior_release_record == {
+        "granted_scopes": sorted(READ_SCOPES),
+        "refresh_token": "new-refresh-token",
+        "subject": IDENTITY,
+    }
+    metadata = json.loads((directory / "google-oauth.json.meta").read_text())
+    assert metadata["schema"] == "google_oauth_credential_metadata_v2"
+    assert any(record["connection_generation"] == 7 for record in metadata["records"])
     assert FileGoogleCredentialStore(directory).current == replacement
 
 
@@ -643,15 +653,16 @@ def test_file_credential_generation_remains_bound_when_a_second_rename_would_fai
         "jarvis_control_plane.google_oauth.os.replace", fail_if_second_rename
     )
 
-    store.replace(replacement)
+    with pytest.raises(OSError, match="controlled second rename failure"):
+        store.replace(replacement)
 
-    # Replacement is one authoritative rename; there is no second generation
-    # sidecar commit that can fail after the token becomes visible.
-    assert calls == 1
-    assert store.current == replacement
+    # The sidecar was published with both generations, but the old primary
+    # record remained visible when its rename failed.  The current reader must
+    # therefore continue to resolve the original token and generation.
+    assert calls == 2
+    assert store.current == original
 
     state_store = InMemoryGoogleOAuthStateStore()
-    state_store.set_connection(connected=True, granted_scopes=frozenset(READ_SCOPES))
     current_connection = state_store.set_connection(
         connected=True, granted_scopes=frozenset(READ_SCOPES)
     )
@@ -664,3 +675,36 @@ def test_file_credential_generation_remains_bound_when_a_second_rename_would_fai
     finally:
         trace_store._close_writer_service()
     assert store.current is None
+
+
+def test_file_credential_store_migrates_embedded_generation_before_rollback(
+    tmp_path,
+) -> None:
+    directory = tmp_path / "google-credentials"
+    directory.mkdir()
+    path = directory / "google-oauth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "connection_generation": 4,
+                "granted_scopes": sorted(READ_SCOPES),
+                "refresh_token": "embedded-generation-token",
+                "subject": IDENTITY,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = FileGoogleCredentialStore(directory)
+
+    assert store.current == OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=frozenset(READ_SCOPES),
+        refresh_token="embedded-generation-token",
+        connection_generation=4,
+    )
+    assert set(json.loads(path.read_text(encoding="utf-8"))) == {
+        "granted_scopes",
+        "refresh_token",
+        "subject",
+    }

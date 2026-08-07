@@ -30,6 +30,7 @@ from .google_oauth import (
 from .models import FrozenActionProposal
 from .ports import (
     ActionDispatcherError,
+    AuditWriteError,
     DiagnosticTraceError,
     TraceCapacityError,
     TraceWriteError,
@@ -89,6 +90,22 @@ _UNORDERED_COLLECTION_PATHS = frozenset(
         ("reminders", "overrides"),
     }
 )
+_CALENDAR_EVENT_DEFAULTS: dict[str, object] = {
+    "anyoneCanAddSelf": False,
+    "attendeesOmitted": False,
+    "endTimeUnspecified": False,
+    "guestsCanInviteOthers": True,
+    "guestsCanModify": False,
+    "guestsCanSeeOtherGuests": True,
+    "status": "confirmed",
+    "transparency": "opaque",
+    "visibility": "default",
+}
+_CALENDAR_ATTENDEE_DEFAULTS: dict[str, object] = {
+    "additionalGuests": 0,
+    "optional": False,
+    "resource": False,
+}
 
 
 def _text(value: object, name: str) -> str:
@@ -213,10 +230,38 @@ def _event(
     return event
 
 
+def _apply_calendar_semantic_defaults(event: Mapping[str, object]) -> dict[str, object]:
+    """Apply documented Calendar defaults before freezing or comparing events."""
+
+    normalized = dict(event)
+    normalized.setdefault("attendees", [])
+    normalized.setdefault("recurrence", [])
+    normalized.setdefault("reminders", {"useDefault": True, "overrides": []})
+    for field, default in _CALENDAR_EVENT_DEFAULTS.items():
+        normalized.setdefault(field, default)
+
+    attendees = normalized.get("attendees")
+    if isinstance(attendees, list):
+        normalized["attendees"] = [
+            {
+                **_CALENDAR_ATTENDEE_DEFAULTS,
+                **dict(attendee),
+            }
+            if isinstance(attendee, Mapping)
+            else attendee
+            for attendee in attendees
+        ]
+
+    reminders = normalized.get("reminders")
+    if isinstance(reminders, Mapping) and "overrides" not in reminders:
+        normalized["reminders"] = {**reminders, "overrides": []}
+    return normalized
+
+
 def _snapshot_event(
     value: object, *, operation: CalendarWriteOperation = "update"
 ) -> dict[str, object]:
-    """Normalize Google's omitted optional fields before complete-event validation."""
+    """Create a complete writable snapshot from Google's event representation."""
 
     raw_event = _canonical_json(value, "current_event")
     if not isinstance(raw_event, dict):
@@ -233,22 +278,10 @@ def _snapshot_event(
     }
     if event.get("status") == "cancelled":
         raise ValueError("current_event cannot represent a cancelled/deleted event")
-    event.setdefault("attendees", [])
-    event.setdefault("recurrence", [])
-    event.setdefault("visibility", "default")
-    event.setdefault("status", "confirmed")
-    event.setdefault("transparency", "opaque")
-    event.setdefault("anyoneCanAddSelf", False)
-    event.setdefault("guestsCanInviteOthers", True)
-    event.setdefault("guestsCanModify", False)
-    event.setdefault("guestsCanSeeOtherGuests", True)
-    if "reminders" not in event:
-        event["reminders"] = {"useDefault": True, "overrides": []}
-    elif isinstance(event["reminders"], dict) and "overrides" not in event["reminders"]:
-        reminders = dict(event["reminders"])
-        reminders["overrides"] = []
-        event["reminders"] = reminders
-    normalized = _event(event, operation=operation)
+    normalized = _event(
+        _apply_calendar_semantic_defaults(event),
+        operation=operation,
+    )
     normalized.update(identity)
     return normalized
 
@@ -928,9 +961,10 @@ class CalendarActionDispatcher:
         if error.code == "invalid_grant" and self._on_invalid_grant is not None:
             try:
                 self._on_invalid_grant(request.connection_generation)
-            except (GoogleOAuthError, OSError) as cleanup_error:
+            except (AuditWriteError, GoogleOAuthError, OSError) as cleanup_error:
                 raise ActionDispatcherError(
-                    "Calendar credential invalidation failed"
+                    "Calendar credential invalidation failed",
+                    may_have_dispatched=False,
                 ) from cleanup_error
         raise ActionDispatcherError(
             str(error), may_have_dispatched=error.may_have_dispatched

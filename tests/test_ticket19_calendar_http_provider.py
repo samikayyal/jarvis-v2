@@ -280,6 +280,39 @@ def test_single_event_success_accepts_google_omitted_default_fields() -> None:
     assert result.event == returned
 
 
+def test_returned_event_omitted_writable_defaults_is_semantically_equal() -> None:
+    complete_event = {
+        **event(),
+        "attendeesOmitted": False,
+        "endTimeUnspecified": False,
+        "attendees": [
+            {
+                "email": "guest@example.test",
+                "additionalGuests": 0,
+                "optional": False,
+                "resource": False,
+            }
+        ],
+    }
+    returned = {"id": "event-1", **complete_event}
+    returned.pop("attendeesOmitted")
+    returned.pop("endTimeUnspecified")
+    returned["attendees"] = [{"email": "guest@example.test"}]
+    transport = ControlledCalendarTransport(
+        [response(200, {"access_token": "access-token"}), response(200, returned)]
+    )
+    provider = GoogleApiCalendarWriteProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    result = provider.write(
+        request=request(operation="insert", event_value=complete_event),
+        credential=credential(),
+    )
+
+    assert result.event == returned
+
+
 def test_precondition_failure_is_known_but_malformed_success_is_ambiguous() -> None:
     provider = GoogleApiCalendarWriteProvider(
         client_id="client-id",
