@@ -2325,7 +2325,10 @@ class DeterministicCapabilityBroker:
             ControlTransitionKind.NEW_SESSION,
         }:
             cancellation_outcomes = self._cancel_dispatches(dispatches_to_cancel)
-            if transition.kind is ControlTransitionKind.CANCELLED:
+            if transition.kind in {
+                ControlTransitionKind.CANCELLED,
+                ControlTransitionKind.NEW_SESSION,
+            }:
                 try:
                     for cancellation in cancellation_outcomes:
                         current = self._current_working_session()

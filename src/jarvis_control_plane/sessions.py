@@ -1482,11 +1482,7 @@ def new_working_session(
         action_outbox=tuple(
             replace(
                 record,
-                status=(
-                    DispatchStatus.NOT_STARTED
-                    if record.status is DispatchStatus.UNATTEMPTED
-                    else DispatchStatus.UNKNOWN
-                ),
+                status=DispatchStatus.CANCELLING,
                 payload=None,
                 preview=None,
                 terminal_at=at,

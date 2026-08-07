@@ -126,7 +126,7 @@ class WorkerInvocation:
 
 
 class WorkerProgressKind(str, Enum):
-    """Typed worker events emitted before the terminal execution result."""
+    """Typed progress kinds emitted before the terminal execution result."""
 
     READY = "ready"
     MILESTONE = "milestone"
@@ -142,7 +142,7 @@ class WorkerOutputStream(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class WorkerProgressEvent:
-    """One ordered, bounded worker readiness, milestone, or output event."""
+    """One ordered, bounded progress event; readiness is gateway-owned."""
 
     sequence: int
     kind: WorkerProgressKind | str
@@ -159,18 +159,25 @@ class WorkerProgressEvent:
         object.__setattr__(self, "kind", kind)
         if not isinstance(self.text, str):
             raise TypeError("worker progress text must be text")
+        if not isinstance(self.truncated, bool):
+            raise TypeError("worker progress truncation marker must be boolean")
+        if kind is WorkerProgressKind.READY:
+            if self.sequence != 1:
+                raise ValueError("worker readiness must be the first progress event")
+            if self.text:
+                raise ValueError("worker readiness cannot contain a payload")
+            if self.truncated:
+                raise ValueError("worker readiness cannot be truncated")
         if self.stream is not None:
             object.__setattr__(self, "stream", WorkerOutputStream(self.stream))
         if kind is WorkerProgressKind.OUTPUT and self.stream is None:
             raise ValueError("worker output progress must name stdout or stderr")
         if kind is not WorkerProgressKind.OUTPUT and self.stream is not None:
             raise ValueError("only output progress may name a stream")
-        if not isinstance(self.truncated, bool):
-            raise TypeError("worker progress truncation marker must be boolean")
 
     @classmethod
     def ready(cls, sequence: int = 1) -> WorkerProgressEvent:
-        return cls(sequence=sequence, kind=WorkerProgressKind.READY, text="ready")
+        return cls(sequence=sequence, kind=WorkerProgressKind.READY)
 
 
 WorkerProgressSink = Callable[[WorkerProgressEvent], None]
@@ -241,12 +248,19 @@ class WorkerExecutionError(ActionDispatcherError):
 class WorkerTransport(Protocol):
     """Authenticated, readiness-checking transport for one registered worker.
 
-    ``authenticate`` must perform the transport's readiness probe and enforce
-    its supplied deadline internally. ``cancel`` has the same deadline
-    obligation; the gateway never abandons an unbounded transport call in a
-    helper thread. Both methods must return an identity or cancellation result
-    only when the transport has enough evidence to do so.
+    ``register_execution`` creates a transport-owned pending record for the
+    action identifier. ``execute`` and ``cancel`` must atomically compete for
+    that record: cancellation that wins creates a tombstone, returns
+    ``NOT_STARTED``, and prevents any later execute for the same identifier
+    from starting. ``authenticate`` must perform the transport's readiness
+    probe and enforce its supplied deadline internally. ``cancel`` has the
+    same deadline obligation; the gateway never abandons an unbounded
+    transport call in a helper thread. All methods must return an identity,
+    execution result, or cancellation result only when the transport has
+    enough evidence to do so.
     """
+
+    def register_execution(self, *, action_id: str) -> None: ...
 
     def authenticate(
         self, *, selected_host: str, timeout_seconds: int
@@ -286,7 +300,7 @@ class _WorkerDispatchHandle:
         self._wake = Event()
         self._finished = Event()
         self._run_called = False
-        self._started = False
+        self._execute_submitted = False
         self._cancel_result: ActionCancellationResult | None = None
         self._result: WorkerExecutionResult | None = None
         self._failure: BaseException | None = None
@@ -312,13 +326,9 @@ class _WorkerDispatchHandle:
             try:
                 actual = self._authenticate_before_start()
                 with self._lock:
-                    # This check and the started transition are the local
-                    # barrier immediately before the worker execute call. A
-                    # cancellation that wins it cannot start worker execution.
                     if self._cancel_requested.is_set():
                         self._result = self._not_started_result()
                         return
-                    self._started = True
                 invocation = WorkerInvocation(
                     action_id=self.action.action_id,
                     action=self.terminal,
@@ -331,7 +341,15 @@ class _WorkerDispatchHandle:
                     milestone_limit_bytes=self.limits.milestone_limit_bytes,
                     worker_identity=actual,
                 )
-                self._record_progress(WorkerProgressEvent.ready())
+                with self._lock:
+                    if self._cancel_requested.is_set():
+                        self._result = self._not_started_result()
+                        return
+                    # This records only that the transport call was submitted;
+                    # the worker transport owns the pending/running/tombstone
+                    # boundary and is the sole authority for component progress.
+                    self._execute_submitted = True
+                self._record_gateway_ready()
                 self._result = self.worker.execute(invocation, self._record_progress)
             except BaseException as exc:  # noqa: BLE001 - preserve transport boundary
                 self._failure = exc
@@ -358,10 +376,12 @@ class _WorkerDispatchHandle:
 
         if self._failure is not None:
             with self._lock:
-                started = self._started
-            if not started and isinstance(self._failure, ActionDispatcherError):
+                execute_submitted = self._execute_submitted
+            if not execute_submitted and isinstance(
+                self._failure, ActionDispatcherError
+            ):
                 raise self._failure
-            if not started:
+            if not execute_submitted:
                 raise ActionDispatcherError(
                     "worker authentication failed before execution"
                 ) from self._failure
@@ -393,21 +413,13 @@ class _WorkerDispatchHandle:
             with self._lock:
                 if self._cancel_result is not None:
                     return self._cancel_result
-                if not self._started:
-                    self._cancel_requested.set()
-                    self._wake.set()
-                    result = ActionCancellationResult(
-                        ActionCancellationStatus.NOT_STARTED
-                    )
-                    self._cancel_result = result
-                    self._unregister(self.action.action_id, self)
-                    return result
                 if self._finished.is_set():
                     # The result may already be a successful external side
                     # effect even though the control plane has not persisted it.
                     result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
                     self._cancel_result = result
                     return result
+                run_called = self._run_called
                 self._cancel_requested.set()
                 self._wake.set()
 
@@ -420,13 +432,12 @@ class _WorkerDispatchHandle:
                 value = None
             if not isinstance(value, ActionCancellationResult):
                 result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
-            elif value.status is ActionCancellationStatus.NOT_STARTED:
-                # The local barrier already marked this execution started.
-                result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
             else:
                 result = value
             with self._lock:
                 self._cancel_result = result
+            if not run_called:
+                self._unregister(self.action.action_id, self)
             return result
 
     def _wait_for_completion(self, timeout_seconds: int) -> str:
@@ -443,7 +454,6 @@ class _WorkerDispatchHandle:
     def _unknown_result(self) -> WorkerExecutionResult:
         return WorkerExecutionResult(
             status=WorkerExecutionStatus.UNKNOWN,
-            started_components=(0,),
             progress_events=self._progress_events_snapshot(),
         )
 
@@ -475,8 +485,20 @@ class _WorkerDispatchHandle:
             )
         return actual
 
+    def _record_gateway_ready(self) -> None:
+        """Record the one payload-free readiness event owned by the gateway."""
+
+        self._append_progress(WorkerProgressEvent.ready(), gateway_owned=True)
+
     def _record_progress(self, event: WorkerProgressEvent) -> None:
-        """Validate ordering and enforce bounded, tagged progress material."""
+        """Validate worker ordering and enforce bounded, tagged progress material."""
+
+        self._append_progress(event, gateway_owned=False)
+
+    def _append_progress(
+        self, event: WorkerProgressEvent, *, gateway_owned: bool
+    ) -> None:
+        """Append one event after applying its source-specific invariants."""
 
         if not isinstance(event, WorkerProgressEvent):
             raise ActionDispatcherError("worker returned an invalid progress event")
@@ -488,6 +510,10 @@ class _WorkerDispatchHandle:
                 )
             if len(self._progress_events) >= self.limits.progress_event_limit:
                 raise ActionDispatcherError("worker progress event limit exceeded")
+            if event.kind is WorkerProgressKind.READY and not gateway_owned:
+                raise ActionDispatcherError(
+                    "worker cannot publish readiness; the gateway owns the first event"
+                )
             if event.kind is WorkerProgressKind.MILESTONE:
                 encoded = len(event.text.encode())
                 if (
@@ -577,6 +603,7 @@ class WorkerGateway:
                     f"worker action {action.action_id} is already prepared",
                     may_have_dispatched=True,
                 )
+            worker.register_execution(action_id=action.action_id)
             self._running[action.action_id] = handle
         return handle
 
@@ -600,6 +627,15 @@ class WorkerGateway:
                 del self._running[action_id]
 
 
+class _WorkerTransportActionState(str, Enum):
+    """Transport-owned state for one registered action identifier."""
+
+    RESERVED = "reserved"
+    RUNNING = "running"
+    CANCELLATION_TOMBSTONE = "cancellation_tombstone"
+    TERMINAL = "terminal"
+
+
 class ControlledWorkerTransport:
     """Deterministic test transport for the closed worker-gateway contract."""
 
@@ -621,6 +657,20 @@ class ControlledWorkerTransport:
         self.invocations: list[WorkerInvocation] = []
         self.executions: list[TerminalAction] = []
         self.cancelled: list[str] = []
+        self._action_state_lock = RLock()
+        self._action_states: dict[str, _WorkerTransportActionState] = {}
+        self._cancel_results: dict[str, ActionCancellationResult] = {}
+
+    def register_execution(self, *, action_id: str) -> None:
+        """Reserve an action ID before the gateway exposes its handle."""
+
+        with self._action_state_lock:
+            if action_id in self._action_states:
+                raise ActionDispatcherError(
+                    f"worker action {action_id} is already registered",
+                    may_have_dispatched=True,
+                )
+            self._action_states[action_id] = _WorkerTransportActionState.RESERVED
 
     def authenticate(
         self, *, selected_host: str, timeout_seconds: int
@@ -635,18 +685,65 @@ class ControlledWorkerTransport:
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
     ) -> WorkerExecutionResult:
-        self.invocations.append(invocation)
-        self.executions.append(invocation.action)
-        if self.progress_hook is not None:
-            self.progress_hook(progress)
-        if self.execution_hook is not None:
-            return self.execution_hook(invocation)
-        return self.result
+        with self._action_state_lock:
+            state = self._action_states.get(invocation.action_id)
+            if state is _WorkerTransportActionState.CANCELLATION_TOMBSTONE:
+                return WorkerExecutionResult(
+                    status=WorkerExecutionStatus.CANCELLED,
+                    process_tree_stopped=True,
+                )
+            if state is not _WorkerTransportActionState.RESERVED:
+                raise ActionDispatcherError(
+                    f"worker action {invocation.action_id} was not executable",
+                    may_have_dispatched=state
+                    in {
+                        _WorkerTransportActionState.RUNNING,
+                        _WorkerTransportActionState.TERMINAL,
+                    },
+                )
+            self._action_states[invocation.action_id] = (
+                _WorkerTransportActionState.RUNNING
+            )
+            self.invocations.append(invocation)
+            self.executions.append(invocation.action)
+        try:
+            if self.progress_hook is not None:
+                self.progress_hook(progress)
+            if self.execution_hook is not None:
+                return self.execution_hook(invocation)
+            return self.result
+        finally:
+            with self._action_state_lock:
+                self._action_states[invocation.action_id] = (
+                    _WorkerTransportActionState.TERMINAL
+                )
 
     def cancel(
         self, *, action_id: str, timeout_seconds: int
     ) -> ActionCancellationResult:
-        self.cancelled.append(action_id)
+        with self._action_state_lock:
+            cached = self._cancel_results.get(action_id)
+            if cached is not None:
+                return cached
+            state = self._action_states.get(action_id)
+            if state in {
+                None,
+                _WorkerTransportActionState.RESERVED,
+                _WorkerTransportActionState.CANCELLATION_TOMBSTONE,
+            }:
+                self._action_states[action_id] = (
+                    _WorkerTransportActionState.CANCELLATION_TOMBSTONE
+                )
+                result = ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+                self._cancel_results[action_id] = result
+                self.cancelled.append(action_id)
+                return result
+            if state is _WorkerTransportActionState.TERMINAL:
+                result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+                self._cancel_results[action_id] = result
+                self.cancelled.append(action_id)
+                return result
+            self.cancelled.append(action_id)
         if self.on_cancel is not None:
             result = self.on_cancel(action_id)
             if result is not None:
@@ -654,8 +751,13 @@ class ControlledWorkerTransport:
                     raise TypeError(
                         "controlled cancellation must return a typed result"
                     )
-                return result
-        return ActionCancellationResult(ActionCancellationStatus.STOPPED)
+            else:
+                result = ActionCancellationResult(ActionCancellationStatus.STOPPED)
+        else:
+            result = ActionCancellationResult(ActionCancellationStatus.STOPPED)
+        with self._action_state_lock:
+            self._cancel_results[action_id] = result
+        return result
 
 
 def _terminal_action(action: FrozenActionProposal) -> TerminalAction:

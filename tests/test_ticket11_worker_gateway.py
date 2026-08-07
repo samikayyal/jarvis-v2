@@ -203,6 +203,18 @@ def test_worker_gateway_exposes_ordered_bounded_progress_events() -> None:
     assert result.progress_events[-1].stream is WorkerOutputStream.STDOUT
 
 
+def test_worker_progress_readiness_is_payload_free_and_gateway_owned() -> None:
+    assert WorkerProgressEvent.ready().text == ""
+    with pytest.raises(ValueError, match="cannot contain a payload"):
+        WorkerProgressEvent(
+            sequence=1,
+            kind=WorkerProgressKind.READY,
+            text="x" * 10_000,
+        )
+    with pytest.raises(ValueError, match="must be the first"):
+        WorkerProgressEvent(sequence=2, kind=WorkerProgressKind.READY)
+
+
 def test_worker_gateway_forwards_only_bounded_non_interactive_execution() -> None:
     worker = ControlledWorkerTransport(
         identities={"ubuntu": _worker_identity()},
@@ -469,6 +481,82 @@ def test_cancel_reconciles_the_running_selected_worker(
         dispatch.join(timeout=5)
 
 
+def test_new_reconciles_the_worker_cancellation_acknowledgement() -> None:
+    execution_started = Event()
+    release_execution = Event()
+
+    def block_until_cancel(_invocation: object) -> WorkerExecutionResult:
+        execution_started.set()
+        assert release_execution.wait(timeout=5)
+        return WorkerExecutionResult(
+            status=WorkerExecutionStatus.CANCELLED,
+            started_components=(0,),
+            process_tree_stopped=True,
+        )
+
+    worker = ControlledWorkerTransport(
+        identities={"ubuntu": _worker_identity()},
+        execution_hook=block_until_cancel,
+        on_cancel=lambda _action_id: release_execution.set() or None,
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker},
+        registered_identities={"ubuntu": _worker_identity()},
+    )
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket11-new-cancel",
+        action_dispatcher=gateway,
+        orchestration=ControlledOrchestrationAdapter(
+            proposal_factory=lambda request: FrozenActionProposal.create(
+                action_id="action-worker-new-cancel",
+                request_id=request.state.request_id,
+                kind="terminal",
+                preview="Run the exact terminal action.",
+                payload={
+                    "host": "ubuntu",
+                    "executable": "/usr/bin/git",
+                    "arguments": ["status"],
+                    "cwd": "/workspace",
+                },
+            )
+        ),
+    )
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    components.broker.working_sessions.compare_and_set(
+        session, replace(session, readiness=ReadinessState(ubuntu="ready"))
+    )
+    holder: list[object] = []
+    dispatch = Thread(
+        target=lambda: holder.append(
+            components.receiver.receive(_event("show repo status", "new-work"))
+        )
+    )
+    dispatch.start()
+    try:
+        assert execution_started.wait(timeout=5)
+        replaced = components.receiver.receive(_event("/new", "new-command"))
+
+        assert replaced.disposition == "new_session"
+        assert replaced.reply is not None
+        assert "Previous work was stopped" in replaced.reply.body
+        current = components.broker.working_sessions.load()
+        assert current is not None
+        assert current.session_id == "S-002"
+        assert current.action_outbox[-1].status is DispatchStatus.CANCELLED
+
+        dispatch.join(timeout=5)
+        assert not dispatch.is_alive()
+        assert holder[0].disposition == "late_result_ignored"
+    finally:
+        release_execution.set()
+        dispatch.join(timeout=5)
+
+
 def test_post_start_transport_disconnect_is_an_unknown_worker_outcome() -> None:
     def disconnect(_invocation: object) -> WorkerExecutionResult:
         raise ActionDispatcherError("worker transport disconnected")
@@ -499,6 +587,7 @@ def test_post_start_transport_disconnect_is_an_unknown_worker_outcome() -> None:
 
     assert exc.value.may_have_dispatched is True
     assert exc.value.result.status is WorkerExecutionStatus.UNKNOWN
+    assert exc.value.result.started_components == ()
 
 
 def test_deadline_cancellation_preserves_an_explicit_unknown_worker_result() -> None:
@@ -691,6 +780,63 @@ def test_worker_gateway_publishes_handle_before_worker_start_and_cancellation_wi
         handle.run()
     assert exc.value.result.status is WorkerExecutionStatus.CANCELLED
     assert worker.invocations == []
+
+
+def test_transport_tombstone_wins_after_gateway_execute_submission() -> None:
+    worker = ControlledWorkerTransport(identities={"ubuntu": _worker_identity()})
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker},
+        registered_identities={"ubuntu": _worker_identity()},
+    )
+    proposal = FrozenActionProposal.create(
+        action_id="action-worker-transport-tombstone",
+        request_id="request-worker-transport-tombstone",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/git",
+            "arguments": ["status"],
+            "cwd": "/workspace",
+        },
+    )
+    handle = gateway.prepare(proposal)
+    ready_to_submit = Event()
+    release_submission = Event()
+
+    def pause_before_transport_call() -> None:
+        ready_to_submit.set()
+        assert release_submission.wait(timeout=5)
+
+    # This seam pauses after the gateway's local submission marker and before
+    # the transport call, making the cancellation/execute race deterministic.
+    handle._record_gateway_ready = pause_before_transport_call  # type: ignore[attr-defined]
+    errors: list[BaseException] = []
+
+    def run_handle() -> None:
+        try:
+            handle.run()
+        except BaseException as exc:  # noqa: BLE001 - capture thread outcome
+            errors.append(exc)
+
+    execution = Thread(
+        target=run_handle,
+    )
+    execution.start()
+    try:
+        assert ready_to_submit.wait(timeout=5)
+        cancellation = gateway.cancel(action_id=proposal.action_id)
+        assert cancellation.status is ActionCancellationStatus.NOT_STARTED
+        release_submission.set()
+        execution.join(timeout=5)
+        assert not execution.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], WorkerExecutionError)
+        assert errors[0].result.started_components == ()  # type: ignore[union-attr]
+        assert worker.invocations == []
+    finally:
+        release_submission.set()
+        execution.join(timeout=5)
 
 
 def test_approval_dispatch_releases_lock_before_worker_completion() -> None:
