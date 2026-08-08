@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -14,10 +15,14 @@ from jarvis_control_plane import (
     ConversationMessage,
     InboundMessage,
     InMemoryAuditBoundary,
+    InMemoryDeletedConversationArchive,
     InMemoryDurableStateStore,
     SignedInboundEvent,
     SQLiteDurableStateStore,
+    StateStoreError,
 )
+from jarvis_control_plane.control_grammar import MessageKind, parse_control
+from jarvis_control_plane.manual_admin import open_sqlite_deleted_conversation_archive
 
 NOW = datetime(2026, 8, 8, 9, 0, tzinfo=UTC)
 OPERATOR = "operator.test"
@@ -50,6 +55,20 @@ def _message(
         occurred_at=occurred_at,
         direction=direction,
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "/history delete",
+        "/history delete message",
+        "/history delete date 2026-08-08",
+    ),
+)
+def test_incomplete_history_delete_is_deterministically_malformed(command: str) -> None:
+    parsed = parse_control(command)
+
+    assert parsed.kind is MessageKind.MALFORMED_COMMAND
 
 
 @pytest.mark.parametrize(
@@ -121,8 +140,21 @@ def test_deletion_preview_rejects_records_outside_declared_scope() -> None:
 )
 def test_confirmed_deletion_moves_exact_content_and_leaves_only_tombstones(
     store_type: object,
+    tmp_path,
 ) -> None:
-    state = store_type()  # type: ignore[operator]
+    archive = InMemoryDeletedConversationArchive()
+    admin_archive = None
+    if store_type is SQLiteDurableStateStore:
+        database = tmp_path / "jarvis.sqlite3"
+        archive_path = tmp_path / "admin-only" / "deleted.sqlite3"
+        archive_path.parent.mkdir()
+        state = store_type(  # type: ignore[operator]
+            database=database,
+            deleted_database=archive_path,
+        )
+        admin_archive = open_sqlite_deleted_conversation_archive(archive_path)
+    else:
+        state = store_type(deleted_archive=archive)  # type: ignore[operator]
     selected = _message(message_id="delete-me", text="verbatim retained content")
     outside = _message(message_id="keep-me", text="still accessible")
     try:
@@ -165,24 +197,51 @@ def test_confirmed_deletion_moves_exact_content_and_leaves_only_tombstones(
         assert state.list_conversation_tombstones() == tombstones  # type: ignore[union-attr]
 
         if isinstance(state, SQLiteDurableStateStore):
-            archived = state.connection.execute(
-                "SELECT text FROM deleted_conversation_archive.deleted_messages"
-            ).fetchall()
-            assert [row["text"] for row in archived] == [selected.text]
+            assert [
+                name for _, name, *_ in state.connection.execute("PRAGMA database_list")
+            ] == ["main"]
+            with pytest.raises(sqlite3.OperationalError, match="no such table"):
+                state.connection.execute(
+                    "SELECT text FROM deleted_conversation_archive.deleted_messages"
+                ).fetchall()
+            assert admin_archive is not None
+            assert [record.message.text for record in admin_archive.list_records()] == [
+                selected.text
+            ]
         else:
-            assert (
-                state._deleted_conversation_messages[
-                    (
-                        selected.transport_session_id,
-                        selected.message_id,
-                    )
-                ].text
-                == selected.text
-            )
+            assert [record.message.text for record in archive.read_records()] == [
+                selected.text
+            ]
     finally:
+        if admin_archive is not None:
+            admin_archive.close()
         close = getattr(state, "close", None)
         if callable(close):
             close()
+
+
+def test_sqlite_deletion_requires_an_explicit_archive_boundary(tmp_path) -> None:
+    database = tmp_path / "jarvis.sqlite3"
+    state = SQLiteDurableStateStore(database)
+    selected = _message(message_id="archive-required", text="must not be orphaned")
+    state.append_conversation_message(selected)
+    preview = state.preview_conversation_deletion(
+        ConversationDeletionScope.message(selected.history_id)
+    )
+
+    try:
+        with pytest.raises(StateStoreError, match="archive writer is not configured"):
+            state.delete_conversation_history(
+                preview,
+                deletion_id="archive-required-deletion",
+                deleted_at=NOW + timedelta(minutes=1),
+            )
+        assert state.search_conversation_messages(
+            history_ids=(selected.history_id,)
+        ) == (selected,)
+        assert not (tmp_path / "jarvis.deleted.sqlite3").exists()
+    finally:
+        state.close()
 
 
 def test_history_delete_command_freezes_exact_preview_and_dispatches_once() -> None:
@@ -369,7 +428,8 @@ def test_audit_failure_before_deletion_keeps_accessible_content() -> None:
 
 def test_sqlite_deleted_area_and_tombstones_survive_restart(tmp_path) -> None:
     database = tmp_path / "jarvis.sqlite3"
-    deleted_database = tmp_path / "deleted.sqlite3"
+    deleted_database = tmp_path / "admin-only" / "deleted.sqlite3"
+    deleted_database.parent.mkdir()
     selected = _message(message_id="persistent-delete", text="retained outside Jarvis")
     state = SQLiteDurableStateStore(
         database=database,
@@ -397,9 +457,19 @@ def test_sqlite_deleted_area_and_tombstones_survive_restart(tmp_path) -> None:
         assert reopened.list_conversation_tombstones() == expected_tombstones
         assert reopened.search_conversation_messages(text="retained outside") == ()
         assert json.loads(reopened.export_conversation_messages()) == []
-        archived = reopened.connection.execute(
-            "SELECT text FROM deleted_conversation_archive.deleted_messages"
-        ).fetchall()
-        assert [row["text"] for row in archived] == [selected.text]
+        assert [
+            name for _, name, *_ in reopened.connection.execute("PRAGMA database_list")
+        ] == ["main"]
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            reopened.connection.execute(
+                "SELECT text FROM deleted_conversation_archive.deleted_messages"
+            ).fetchall()
+        admin_archive = open_sqlite_deleted_conversation_archive(deleted_database)
+        try:
+            assert [record.message.text for record in admin_archive.list_records()] == [
+                selected.text
+            ]
+        finally:
+            admin_archive.close()
     finally:
         reopened.close()

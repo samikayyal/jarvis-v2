@@ -44,6 +44,10 @@ class StateStoreError(ControlPlaneError):
     """Durable state could not be read or written."""
 
 
+class DeletedConversationArchiveError(ControlPlaneError):
+    """The manual-administration archival boundary could not accept content."""
+
+
 class AuditWriteError(ControlPlaneError):
     """Required redacted audit evidence could not be appended."""
 
@@ -125,6 +129,20 @@ class AuditBoundary(Protocol):
     ) -> tuple[AuditEvidence, ...]: ...
 
     def export_json(self, query: AuditFilter | None = None) -> str: ...
+
+
+class DeletedConversationArchiveWriter(Protocol):
+    """Write-only capability for content removed from Jarvis-readable state."""
+
+    def archive(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> None: ...
+
+    def close(self) -> None: ...
 
 
 class DurableStateStore(Protocol):

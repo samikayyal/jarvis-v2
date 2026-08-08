@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote
 
+from .conversation_archive import (
+    DeletedConversationArchiveRecord,
+    _archive_record_from_row,
+)
 from .traces import DiagnosticTrace, _canonical_json, _DiagnosticTraceStoreBase
 
 
@@ -69,6 +73,22 @@ class ManualDiagnosticTraceBoundary:
         self._source.close()
 
 
+class ManualDeletedConversationArchiveBoundary:
+    """Read/export boundary reserved for a manual administrator."""
+
+    def __init__(self, source: _DeletedArchiveReadSource) -> None:
+        self._source = source
+
+    def list_records(self) -> tuple[DeletedConversationArchiveRecord, ...]:
+        return self._source.read_records()
+
+    def inspect(self) -> tuple[DeletedConversationArchiveRecord, ...]:
+        return self.list_records()
+
+    def close(self) -> None:
+        self._source.close()
+
+
 def _open_manual_trace_boundary(
     store: _DiagnosticTraceStoreBase,
 ) -> ManualDiagnosticTraceBoundary:
@@ -83,6 +103,16 @@ def open_sqlite_manual_trace_boundary(
     """Open the durable read side independently for manual administration."""
 
     return ManualDiagnosticTraceBoundary(_SQLiteReadSource(database))
+
+
+def open_sqlite_deleted_conversation_archive(
+    database: str | Path,
+) -> ManualDeletedConversationArchiveBoundary:
+    """Open the deleted-conversation read side independently for administration."""
+
+    return ManualDeletedConversationArchiveBoundary(
+        _SQLiteDeletedArchiveReadSource(database)
+    )
 
 
 class _StoreReadSource:
@@ -176,4 +206,46 @@ class _SQLiteReadSource:
         self._connection.close()
 
 
-__all__ = ["ManualDiagnosticTraceBoundary", "open_sqlite_manual_trace_boundary"]
+class _DeletedArchiveReadSource(Protocol):
+    def read_records(self) -> tuple[DeletedConversationArchiveRecord, ...]: ...
+
+    def close(self) -> None: ...
+
+
+class _SQLiteDeletedArchiveReadSource:
+    """Read-only SQLite connection opened only by the admin composition root."""
+
+    def __init__(self, database: str | Path) -> None:
+        path = Path(database).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro"
+        self._connection = sqlite3.connect(uri, uri=True)
+        self._connection.row_factory = sqlite3.Row
+
+    def read_records(self) -> tuple[DeletedConversationArchiveRecord, ...]:
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT transport_session_id, working_session_id, message_id,
+                       event_id, chat_id, sender_id, text, occurred_at,
+                       direction, request_id, credential_like, deletion_id,
+                       deleted_at
+                FROM deleted_messages
+                ORDER BY deleted_at, transport_session_id, message_id
+                """
+            ).fetchall()
+            return tuple(_archive_record_from_row(row) for row in rows)
+        except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("manual deleted-conversation read failed") from exc
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+__all__ = [
+    "ManualDeletedConversationArchiveBoundary",
+    "ManualDiagnosticTraceBoundary",
+    "open_sqlite_deleted_conversation_archive",
+    "open_sqlite_manual_trace_boundary",
+]

@@ -21,6 +21,11 @@ from .control_plane import (
     DeterministicCapabilityBroker,
     SignedMessageReceiver,
 )
+from .conversation_archive import (
+    DeletedConversationArchiveRecord,
+    InMemoryDeletedConversationArchive,
+    SQLiteDeletedConversationArchiveWriter,
+)
 from .gmail_actions import (
     GMAIL_SEND_SCOPE,
     GmailMessage,
@@ -144,6 +149,7 @@ from .ports import (
     AuditWriteError,
     BoundActionLifecycle,
     ControlPlaneError,
+    DeletedConversationArchiveError,
     DiagnosticTraceError,
     OrchestrationAdapterError,
     OutboundConnectorError,
@@ -220,6 +226,8 @@ __all__ = [
     "ConversationDeletionScope",
     "ConversationMessage",
     "ConversationTombstone",
+    "DeletedConversationArchiveError",
+    "DeletedConversationArchiveRecord",
     "DeterministicCapabilityBroker",
     "DeterministicIdGenerator",
     "DiagnosticTrace",
@@ -261,6 +269,7 @@ __all__ = [
     "GoogleTokenExchangeResult",
     "HistorySelection",
     "InMemoryAuditBoundary",
+    "InMemoryDeletedConversationArchive",
     "InMemoryDiagnosticTraceStore",
     "InMemoryDurableStateStore",
     "InMemoryGoogleCredentialStore",
@@ -286,6 +295,7 @@ __all__ = [
     "RequestState",
     "RoutedActionDispatcher",
     "SQLiteAuditBoundary",
+    "SQLiteDeletedConversationArchiveWriter",
     "SQLiteDiagnosticTraceStore",
     "SQLiteDurableStateStore",
     "SQLiteGoogleOAuthStateStore",

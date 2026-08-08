@@ -19,6 +19,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
+from .conversation_archive import (
+    InMemoryDeletedConversationArchive,
+    SQLiteDeletedConversationArchiveWriter,
+)
 from .models import (
     AuditEvidence,
     AuditFilter,
@@ -45,6 +49,8 @@ from .ports import (
     AuditBoundary,
     AuditWriteError,
     Clock,
+    DeletedConversationArchiveError,
+    DeletedConversationArchiveWriter,
     IdGenerator,
     OrchestrationAdapterError,
     OutboundConnectorError,
@@ -114,13 +120,15 @@ class DeterministicIdGenerator:
 class InMemoryDurableStateStore:
     """A failure-controllable state port for narrow unit tests."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        deleted_archive: DeletedConversationArchiveWriter | None = None,
+    ) -> None:
         self.claims: dict[tuple[str, str], IngressClaim] = {}
         self.conversation_messages: dict[tuple[str, str], ConversationMessage] = {}
         self.outbound_outbox: dict[tuple[str, str], ConversationMessage] = {}
-        self._deleted_conversation_messages: dict[
-            tuple[str, str], ConversationMessage
-        ] = {}
+        self._deleted_archive = deleted_archive or InMemoryDeletedConversationArchive()
         self._conversation_tombstones: dict[str, ConversationTombstone] = {}
         self.requests: dict[str, RequestState] = {}
         self._knowledge_vault_synchronized_at: datetime | None = None
@@ -389,6 +397,16 @@ class InMemoryDurableStateStore:
                 raise StateStoreError(
                     "conversation deletion preview no longer matches accessible history"
                 )
+            try:
+                self._deleted_archive.archive(
+                    preview.messages,
+                    deletion_id=deletion_id,
+                    deleted_at=deleted_at,
+                )
+            except DeletedConversationArchiveError as exc:
+                raise StateStoreError(
+                    "could not transfer conversation history to the deleted archive"
+                ) from exc
             archived: list[tuple[tuple[str, str], ConversationMessage]] = []
             tombstones: list[ConversationTombstone] = []
             for message in preview.messages:
@@ -408,7 +426,6 @@ class InMemoryDurableStateStore:
                     )
                 )
             for key, message in archived:
-                self._deleted_conversation_messages[key] = message
                 self.conversation_messages.pop(key, None)
                 self.outbound_outbox.pop(key, None)
             for tombstone in tombstones:
@@ -500,7 +517,20 @@ class SQLiteDurableStateStore:
         database: str | Path | sqlite3.Connection = ":memory:",
         *,
         deleted_database: str | Path | None = None,
+        deleted_archive: DeletedConversationArchiveWriter | None = None,
     ) -> None:
+        if deleted_database is not None and deleted_archive is not None:
+            raise ValueError(
+                "configure either deleted_database or deleted_archive, not both"
+            )
+        if (
+            deleted_database is not None
+            and isinstance(database, (str, Path))
+            and str(database) != ":memory:"
+            and Path(database).expanduser().resolve()
+            == Path(deleted_database).expanduser().resolve()
+        ):
+            raise ValueError("deleted archive must use a separate database path")
         self._owns_connection = not isinstance(database, sqlite3.Connection)
         self.connection = (
             database
@@ -509,23 +539,18 @@ class SQLiteDurableStateStore:
         )
         self.connection.row_factory = sqlite3.Row
         self._conversation_has_legacy_session = False
+        self._deleted_archive = deleted_archive
+        self._owns_deleted_archive = deleted_database is not None
         if deleted_database is not None:
-            self._deleted_database_target = str(deleted_database)
-        elif isinstance(database, (str, Path)) and str(database) != ":memory:":
-            database_path = Path(database)
-            suffix = database_path.suffix or ".sqlite3"
-            self._deleted_database_target = str(
-                database_path.with_name(f"{database_path.stem}.deleted{suffix}")
-            )
-        else:
-            self._deleted_database_target = ":memory:"
-        self._deleted_database_attached = False
+            try:
+                self._deleted_archive = SQLiteDeletedConversationArchiveWriter(
+                    deleted_database
+                )
+            except Exception:
+                if self._owns_connection:
+                    self.connection.close()
+                raise
         try:
-            self.connection.execute(
-                "ATTACH DATABASE ? AS deleted_conversation_archive",
-                (self._deleted_database_target,),
-            )
-            self._deleted_database_attached = True
             self.connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS ingress_claims (
@@ -608,22 +633,6 @@ class SQLiteDurableStateStore:
                 CREATE TABLE IF NOT EXISTS knowledge_vault_synchronization (
                     slot INTEGER PRIMARY KEY CHECK (slot = 1),
                     synchronized_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS deleted_conversation_archive.deleted_messages (
-                    transport_session_id TEXT NOT NULL,
-                    working_session_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    chat_id TEXT NOT NULL,
-                    sender_id TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
-                    request_id TEXT,
-                    credential_like INTEGER NOT NULL CHECK (credential_like IN (0, 1)),
-                    deletion_id TEXT NOT NULL,
-                    deleted_at TEXT NOT NULL,
-                    PRIMARY KEY (transport_session_id, message_id)
                 );
                 """
             )
@@ -717,6 +726,7 @@ class SQLiteDurableStateStore:
                 self._conversation_has_legacy_session = False
             self._classify_and_index_conversation_history()
         except sqlite3.Error as exc:
+            self.close()
             raise StateStoreError("could not initialize SQLite state") from exc
 
     def admit_ingress(
@@ -1448,6 +1458,22 @@ class SQLiteDurableStateStore:
                 raise StateStoreError(
                     "conversation deletion preview no longer matches accessible history"
                 )
+            if self._deleted_archive is None:
+                self.connection.rollback()
+                raise StateStoreError(
+                    "deleted conversation archive writer is not configured"
+                )
+            try:
+                self._deleted_archive.archive(
+                    preview.messages,
+                    deletion_id=deletion_id,
+                    deleted_at=deleted_at,
+                )
+            except DeletedConversationArchiveError as exc:
+                self.connection.rollback()
+                raise StateStoreError(
+                    "could not transfer conversation history to the deleted archive"
+                ) from exc
             tombstones: list[ConversationTombstone] = []
             for ordinal, message in enumerate(preview.messages):
                 tombstone = _conversation_tombstone(
@@ -1456,30 +1482,6 @@ class SQLiteDurableStateStore:
                     deleted_at=deleted_at,
                     scope_type=preview.scope.scope_type,
                     ordinal=ordinal,
-                )
-                self.connection.execute(
-                    """
-                    INSERT INTO deleted_conversation_archive.deleted_messages(
-                        transport_session_id, working_session_id, message_id,
-                        event_id, chat_id, sender_id, text, occurred_at, direction,
-                        request_id, credential_like, deletion_id, deleted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        message.transport_session_id,
-                        message.working_session_id,
-                        message.message_id,
-                        message.event_id,
-                        message.chat_id,
-                        message.sender_id,
-                        message.text,
-                        message.occurred_at.isoformat(),
-                        message.direction,
-                        message.request_id,
-                        int(message.credential_like),
-                        deletion_id,
-                        deleted_at.isoformat(),
-                    ),
                 )
                 self.connection.execute(
                     """
@@ -1530,7 +1532,7 @@ class SQLiteDurableStateStore:
         except sqlite3.IntegrityError as exc:
             self.connection.rollback()
             raise StateStoreError(
-                "conversation deletion archive already contains a record"
+                "conversation deletion tombstone already exists"
             ) from exc
         except sqlite3.Error as exc:
             try:
@@ -1672,14 +1674,16 @@ class SQLiteDurableStateStore:
         self.connection.commit()
 
     def close(self) -> None:
-        if self._deleted_database_attached:
-            try:
-                self.connection.execute("DETACH DATABASE deleted_conversation_archive")
-            except sqlite3.Error:
-                pass
-            self._deleted_database_attached = False
-        if self._owns_connection:
-            self.connection.close()
+        archive = self._deleted_archive if self._owns_deleted_archive else None
+        self._deleted_archive = None
+        try:
+            if archive is not None:
+                close_archive = getattr(archive, "close", None)
+                if callable(close_archive):
+                    close_archive()
+        finally:
+            if self._owns_connection:
+                self.connection.close()
 
 
 def _request_values(request: RequestState) -> tuple[object, ...]:

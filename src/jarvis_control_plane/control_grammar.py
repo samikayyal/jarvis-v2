@@ -277,6 +277,7 @@ def parse_control(message: str) -> ParsedControl:
             )
             or (
                 parts[1] == "delete"
+                and len(parts) >= 3
                 and (
                     (parts[2] in {"message", "conversation"} and len(parts) == 4)
                     or (parts[2] in {"date", "range"} and len(parts) == 5)
