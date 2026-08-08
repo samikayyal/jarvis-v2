@@ -299,7 +299,12 @@ class _ConversationDeletionDispatch:
             )
         except ActionDispatcherError:
             raise
-        except (StateStoreError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except StateStoreError as exc:
+            raise ActionDispatcherError(
+                f"conversation deletion could not be committed: {exc}",
+                may_have_dispatched=exc.may_have_dispatched,
+            ) from exc
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ActionDispatcherError(
                 f"conversation deletion could not be committed: {exc}"
             ) from exc
@@ -1230,6 +1235,49 @@ class DeterministicCapabilityBroker:
             )
             self.working_sessions.compare_and_set(dispatching, attempted.state)
         except (InvariantViolation, SessionStoreError) as exc:
+            if action.kind == "conversation_history_delete":
+                frozen_action = FrozenActionProposal(
+                    action_id=action.action_id,
+                    request_id=action.request_id,
+                    kind=action.kind,
+                    preview=action.preview or "",
+                    payload=action.payload,
+                    digest=action.digest,
+                )
+                terminal_status = DispatchStatus.NOT_STARTED
+                audit_error: AuditWriteError | None = None
+                try:
+                    self._append_conversation_deletion_result(
+                        message,
+                        frozen_action,
+                        terminal_status,
+                    )
+                except AuditWriteError as audit_exc:
+                    audit_error = audit_exc
+                    terminal_status = DispatchStatus.UNKNOWN
+                if not self._finish_frozen_action(action.action_id, terminal_status):
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="action_dispatch_unknown",
+                        reason=(
+                            "conversation deletion dispatch boundary failed and its "
+                            f"terminal state could not be persisted: {exc}"
+                        ),
+                    )
+                if audit_error is not None:
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="action_dispatch_unknown",
+                        reason=(
+                            "conversation deletion did not start but its terminal "
+                            f"audit outcome was unavailable: {audit_error}"
+                        ),
+                    )
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_not_started",
+                    reason=f"dispatch attempt was not durably recorded: {exc}",
+                )
             return ReceiveResult(
                 status_code=202,
                 disposition="action_dispatch_not_started",
@@ -1279,24 +1327,97 @@ class DeterministicCapabilityBroker:
                 handle=prepared.handle,
             )
             terminal_status = _dispatch_failure_status(exc)
+            audit_error: AuditWriteError | None = None
+            if prepared.action.kind == "conversation_history_delete":
+                try:
+                    self._append_conversation_deletion_result(
+                        message,
+                        prepared.action,
+                        terminal_status,
+                    )
+                except AuditWriteError as audit_exc:
+                    audit_error = audit_exc
+                    terminal_status = DispatchStatus.UNKNOWN
             if not self._finish_frozen_action(
                 prepared.action.action_id, terminal_status
             ):
                 return self._late_action_result(message, prepared, reason=str(exc))
+            if audit_error is not None:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_unknown",
+                    reason=(
+                        "conversation deletion finished with an uncertain audit "
+                        f"outcome: {audit_error}"
+                    ),
+                )
             return ReceiveResult(
                 status_code=202,
                 disposition=_dispatch_disposition(terminal_status),
                 reason=str(exc),
             )
-        if not self._finish_frozen_action(
-            prepared.action.action_id, DispatchStatus.COMPLETED
-        ):
+        terminal_status = DispatchStatus.COMPLETED
+        audit_error = None
+        if prepared.action.kind == "conversation_history_delete":
+            try:
+                self._append_conversation_deletion_result(
+                    message,
+                    prepared.action,
+                    terminal_status,
+                )
+            except AuditWriteError as audit_exc:
+                audit_error = audit_exc
+                terminal_status = DispatchStatus.UNKNOWN
+        if not self._finish_frozen_action(prepared.action.action_id, terminal_status):
             return self._late_action_result(
                 message,
                 prepared,
                 reason="action completed but terminal state was already closed",
             )
+        if audit_error is not None:
+            return ReceiveResult(
+                status_code=202,
+                disposition="action_dispatch_unknown",
+                reason=(
+                    "conversation deletion may have completed but its terminal "
+                    f"audit outcome was unavailable: {audit_error}"
+                ),
+            )
         return ReceiveResult(status_code=202, disposition="action_dispatched")
+
+    def _append_conversation_deletion_result(
+        self,
+        message: InboundMessage,
+        action: FrozenActionProposal,
+        status: DispatchStatus,
+    ) -> None:
+        """Record the redacted terminal result before closing the action."""
+
+        if status is DispatchStatus.COMPLETED:
+            outcome = "completed"
+            execution_status = "completed"
+        elif status is DispatchStatus.UNKNOWN:
+            outcome = "unknown"
+            execution_status = "unknown"
+        elif status is DispatchStatus.NOT_STARTED:
+            outcome = "failed"
+            execution_status = "not_started"
+        else:
+            outcome = "failed"
+            execution_status = "failed"
+        self._append_audit(
+            kind="conversation_history_deletion_result",
+            event_id=message.event_id,
+            request_id=action.request_id,
+            message_id=message.message_id,
+            outcome=outcome,
+            actor="control_plane",
+            operation_type="conversation_history_delete",
+            target_category="operator_conversation",
+            approval_decision="approved",
+            execution_status=execution_status,
+            details={"action": action.action_id, "result": outcome},
+        )
 
     def _dispatch_is_still_attempted(self, action_id: str) -> bool:
         """Check that cancellation did not close the edge while it prepared."""

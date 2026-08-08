@@ -1090,6 +1090,10 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     "conversation_history_deletion_attempt": {
         "action": None,
     },
+    "conversation_history_deletion_result": {
+        "action": None,
+        "result": frozenset({"completed", "failed", "unknown"}),
+    },
 }
 _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str]]] = {
     "inbound_admitted": (
@@ -1215,6 +1219,13 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
         "control_plane",
         frozenset({"attempted"}),
         frozenset({"attempted"}),
+    ),
+    "conversation_history_deletion_result": (
+        "conversation_history_delete",
+        "operator_conversation",
+        "control_plane",
+        frozenset({"completed", "failed", "unknown"}),
+        frozenset({"completed", "failed", "unknown", "not_started"}),
     ),
 }
 
@@ -1372,6 +1383,19 @@ def _validate_audit_event_semantics(
             "trace_unavailable",
         }:
             raise ValueError("request lifecycle outcome does not match its status")
+    if kind == "conversation_history_deletion_result":
+        result = details.get("result")
+        if result is not None and result != outcome:
+            raise ValueError("conversation deletion result fields are contradictory")
+        if execution_status not in {
+            "completed",
+            "failed",
+            "unknown",
+            "not_started",
+        }:
+            raise ValueError("conversation deletion execution status is invalid")
+        if execution_status != "not_started" and execution_status != outcome:
+            raise ValueError("conversation deletion result status is contradictory")
 
 
 @dataclass(frozen=True, slots=True)

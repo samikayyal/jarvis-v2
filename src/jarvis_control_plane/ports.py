@@ -43,6 +43,10 @@ class InvalidEnvelopeError(ControlPlaneError):
 class StateStoreError(ControlPlaneError):
     """Durable state could not be read or written."""
 
+    def __init__(self, message: str, *, may_have_dispatched: bool = False) -> None:
+        super().__init__(message)
+        self.may_have_dispatched = may_have_dispatched
+
 
 class DeletedConversationArchiveError(ControlPlaneError):
     """The manual-administration archival boundary could not accept content."""
@@ -140,6 +144,8 @@ class DeletedConversationArchiveWriter(Protocol):
         *,
         deletion_id: str,
         deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
     ) -> None: ...
 
     def close(self) -> None: ...

@@ -15,9 +15,9 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
@@ -25,7 +25,7 @@ from threading import RLock
 from time import monotonic
 from typing import Any, NoReturn
 
-from .models import ConversationMessage, ensure_utc
+from .models import ConversationMessage, _conversation_message_digest, ensure_utc
 from .ports import DeletedConversationArchiveError, DeletedConversationArchiveWriter
 
 _ARCHIVE_RESPONSE_TIMEOUT_SECONDS = 30.0
@@ -50,6 +50,14 @@ _ARCHIVE_CLOSE_REQUEST_FIELDS = frozenset({"operation"})
 _ARCHIVE_REQUEST_FIELDS = frozenset(
     {"operation", "messages", "deletion_id", "deleted_at"}
 )
+_ARCHIVE_BEGIN_REQUEST_FIELDS = frozenset(
+    {"operation", "deletion_id", "deleted_at", "expected_count", "expected_digest"}
+)
+_ARCHIVE_CHUNK_REQUEST_FIELDS = frozenset(
+    {"operation", "deletion_id", "chunk_index", "messages"}
+)
+_ARCHIVE_COMMIT_REQUEST_FIELDS = frozenset({"operation", "deletion_id"})
+_ARCHIVE_ABORT_REQUEST_FIELDS = frozenset({"operation", "deletion_id"})
 _ARCHIVE_SUCCESS_RESPONSE_FIELDS = frozenset({"ok"})
 _ARCHIVE_FAILURE_RESPONSE_FIELDS = frozenset({"ok", "message"})
 _ARCHIVE_SCHEMA = """
@@ -68,6 +76,32 @@ CREATE TABLE IF NOT EXISTS deleted_messages (
     deletion_id TEXT NOT NULL,
     deleted_at TEXT NOT NULL,
     PRIMARY KEY (transport_session_id, message_id)
+)
+;
+CREATE TABLE IF NOT EXISTS deleted_message_batches (
+    deletion_id TEXT PRIMARY KEY,
+    expected_count INTEGER NOT NULL CHECK (expected_count >= 0),
+    expected_digest TEXT NOT NULL,
+    deleted_at TEXT NOT NULL
+)
+;
+CREATE TABLE IF NOT EXISTS deleted_message_batch_items (
+    deletion_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+    item_index INTEGER NOT NULL CHECK (item_index >= 0),
+    transport_session_id TEXT NOT NULL,
+    working_session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+    request_id TEXT,
+    credential_like INTEGER NOT NULL CHECK (credential_like IN (0, 1)),
+    PRIMARY KEY (deletion_id, transport_session_id, message_id),
+    UNIQUE (deletion_id, chunk_index, item_index)
 )
 """
 
@@ -93,6 +127,8 @@ def _validate_archive_request(
     *,
     deletion_id: str,
     deleted_at: datetime,
+    expected_count: int | None = None,
+    expected_digest: str | None = None,
 ) -> tuple[tuple[ConversationMessage, ...], datetime]:
     if not isinstance(messages, Sequence):
         raise TypeError("deleted archive messages must be a sequence")
@@ -105,7 +141,49 @@ def _validate_archive_request(
         raise ValueError("deleted archive request contains duplicate messages")
     if not isinstance(deletion_id, str) or not deletion_id.strip():
         raise ValueError("deletion_id must be non-blank")
+    if expected_count is not None:
+        _validate_expected_count(expected_count)
+        if expected_count != len(records):
+            raise ValueError("deleted archive message count does not match metadata")
+    if expected_digest is not None:
+        _validate_expected_digest(expected_digest)
+        if expected_digest != _conversation_message_digest(records):
+            raise ValueError("deleted archive message digest does not match metadata")
     return records, ensure_utc(deleted_at)
+
+
+def _validate_expected_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            "deleted archive expected count must be a non-negative integer"
+        )
+    return value
+
+
+def _validate_expected_digest(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("deleted archive expected digest must be a SHA-256 hex digest")
+    return value
+
+
+def _validate_batch_metadata(
+    *,
+    deletion_id: object,
+    deleted_at: object,
+    expected_count: object,
+    expected_digest: object,
+) -> tuple[str, datetime, int, str]:
+    if not isinstance(deletion_id, str) or not deletion_id.strip():
+        raise ValueError("deleted archive deletion_id must be non-blank")
+    if not isinstance(deleted_at, datetime):
+        raise TypeError("deleted archive deleted_at must be a datetime")
+    count = _validate_expected_count(expected_count)
+    digest = _validate_expected_digest(expected_digest)
+    return deletion_id, ensure_utc(deleted_at), count, digest
 
 
 def _archive_values(
@@ -149,21 +227,25 @@ def _archive_content_values(
     )
 
 
+def _archive_message_from_row(row: sqlite3.Row) -> ConversationMessage:
+    return ConversationMessage(
+        working_session_id=row["working_session_id"],
+        transport_session_id=row["transport_session_id"],
+        message_id=row["message_id"],
+        event_id=row["event_id"],
+        chat_id=row["chat_id"],
+        sender_id=row["sender_id"],
+        text=row["text"],
+        occurred_at=datetime.fromisoformat(row["occurred_at"]),
+        direction=row["direction"],
+        request_id=row["request_id"],
+        credential_like=bool(row["credential_like"]),
+    )
+
+
 def _archive_record_from_row(row: sqlite3.Row) -> DeletedConversationArchiveRecord:
     return DeletedConversationArchiveRecord(
-        message=ConversationMessage(
-            working_session_id=row["working_session_id"],
-            transport_session_id=row["transport_session_id"],
-            message_id=row["message_id"],
-            event_id=row["event_id"],
-            chat_id=row["chat_id"],
-            sender_id=row["sender_id"],
-            text=row["text"],
-            occurred_at=datetime.fromisoformat(row["occurred_at"]),
-            direction=row["direction"],
-            request_id=row["request_id"],
-            credential_like=bool(row["credential_like"]),
-        ),
+        message=_archive_message_from_row(row),
         deletion_id=row["deletion_id"],
         deleted_at=datetime.fromisoformat(row["deleted_at"]),
     )
@@ -182,11 +264,15 @@ class InMemoryDeletedConversationArchive:
         *,
         deletion_id: str,
         deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
     ) -> None:
         records, normalized_deleted_at = _validate_archive_request(
             messages,
             deletion_id=deletion_id,
             deleted_at=deleted_at,
+            expected_count=expected_count,
+            expected_digest=expected_digest,
         )
         with self._lock:
             for message in records:
@@ -353,6 +439,64 @@ def _encode_archive_request(request: dict[str, Any]) -> bytes:
             request, _ARCHIVE_CLOSE_REQUEST_FIELDS, "archive close request"
         )
         return _encode_archive_frame({"operation": "close"})
+    if operation == "begin":
+        _require_exact_mapping(
+            request, _ARCHIVE_BEGIN_REQUEST_FIELDS, "archive begin request"
+        )
+        _, normalized_deleted_at, expected_count, expected_digest = (
+            _validate_batch_metadata(
+                deletion_id=request["deletion_id"],
+                deleted_at=request["deleted_at"],
+                expected_count=request["expected_count"],
+                expected_digest=request["expected_digest"],
+            )
+        )
+        return _encode_archive_frame(
+            {
+                "operation": "begin",
+                "deletion_id": request["deletion_id"],
+                "deleted_at": normalized_deleted_at.isoformat(),
+                "expected_count": expected_count,
+                "expected_digest": expected_digest,
+            }
+        )
+    if operation == "chunk":
+        _require_exact_mapping(
+            request, _ARCHIVE_CHUNK_REQUEST_FIELDS, "archive chunk request"
+        )
+        chunk_index = request["chunk_index"]
+        if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+            raise ValueError("archive chunk index must be a non-negative integer")
+        if chunk_index < 0:
+            raise ValueError("archive chunk index must be a non-negative integer")
+        records, _ = _validate_archive_request(
+            request["messages"],
+            deletion_id=request["deletion_id"],
+            deleted_at=datetime.now(UTC),
+        )
+        return _encode_archive_frame(
+            {
+                "operation": "chunk",
+                "deletion_id": request["deletion_id"],
+                "chunk_index": chunk_index,
+                "messages": [_archive_message_to_wire(message) for message in records],
+            }
+        )
+    if operation in {"commit", "abort"}:
+        fields = (
+            _ARCHIVE_COMMIT_REQUEST_FIELDS
+            if operation == "commit"
+            else _ARCHIVE_ABORT_REQUEST_FIELDS
+        )
+        _require_exact_mapping(request, fields, f"archive {operation} request")
+        if (
+            not isinstance(request["deletion_id"], str)
+            or not request["deletion_id"].strip()
+        ):
+            raise ValueError("archive deletion_id must be non-blank")
+        return _encode_archive_frame(
+            {"operation": operation, "deletion_id": request["deletion_id"]}
+        )
     if operation != "archive":
         raise ValueError("deleted archive request has an unsupported operation")
     _require_exact_mapping(request, _ARCHIVE_REQUEST_FIELDS, "archive request")
@@ -381,6 +525,65 @@ def _decode_archive_request(frame: bytes) -> dict[str, object]:
             payload, _ARCHIVE_CLOSE_REQUEST_FIELDS, "archive close request"
         )
         return {"operation": "close"}
+    if operation == "begin":
+        raw = _require_exact_mapping(
+            payload, _ARCHIVE_BEGIN_REQUEST_FIELDS, "archive begin request"
+        )
+        deletion_id, deleted_at, expected_count, expected_digest = (
+            _validate_batch_metadata(
+                deletion_id=raw["deletion_id"],
+                deleted_at=datetime.fromisoformat(str(raw["deleted_at"])),
+                expected_count=raw["expected_count"],
+                expected_digest=raw["expected_digest"],
+            )
+        )
+        return {
+            "operation": "begin",
+            "deletion_id": deletion_id,
+            "deleted_at": deleted_at,
+            "expected_count": expected_count,
+            "expected_digest": expected_digest,
+        }
+    if operation == "chunk":
+        raw = _require_exact_mapping(
+            payload, _ARCHIVE_CHUNK_REQUEST_FIELDS, "archive chunk request"
+        )
+        raw_messages = raw["messages"]
+        if not isinstance(raw_messages, list):
+            raise TypeError("archive chunk messages must be a JSON list")
+        chunk_index = raw["chunk_index"]
+        if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+            raise ValueError("archive chunk index must be a non-negative integer")
+        if chunk_index < 0:
+            raise ValueError("archive chunk index must be a non-negative integer")
+        deletion_id = raw["deletion_id"]
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("archive chunk deletion_id must be non-blank")
+        messages = tuple(_archive_message_from_wire(value) for value in raw_messages)
+        _validate_archive_request(
+            messages,
+            deletion_id=deletion_id,
+            deleted_at=datetime.now(UTC),
+        )
+        if not messages:
+            raise ValueError("archive chunks must contain at least one message")
+        return {
+            "operation": "chunk",
+            "deletion_id": deletion_id,
+            "chunk_index": chunk_index,
+            "messages": messages,
+        }
+    if operation in {"commit", "abort"}:
+        fields = (
+            _ARCHIVE_COMMIT_REQUEST_FIELDS
+            if operation == "commit"
+            else _ARCHIVE_ABORT_REQUEST_FIELDS
+        )
+        raw = _require_exact_mapping(payload, fields, f"archive {operation} request")
+        deletion_id = raw["deletion_id"]
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("archive deletion_id must be non-blank")
+        return {"operation": operation, "deletion_id": deletion_id}
     if operation != "archive":
         raise ValueError("deleted archive request has an unsupported operation")
     raw = _require_exact_mapping(payload, _ARCHIVE_REQUEST_FIELDS, "archive request")
@@ -405,6 +608,51 @@ def _decode_archive_request(frame: bytes) -> dict[str, object]:
         "deletion_id": deletion_id,
         "deleted_at": normalized_deleted_at,
     }
+
+
+def _archive_message_chunks(
+    records: Sequence[ConversationMessage],
+    *,
+    deletion_id: str,
+) -> Iterator[tuple[ConversationMessage, ...]]:
+    """Yield complete-message chunks whose encoded IPC frames stay bounded."""
+
+    current: list[ConversationMessage] = []
+    for message in records:
+        candidate = (*current, message)
+        try:
+            _encode_archive_request(
+                {
+                    "operation": "chunk",
+                    "deletion_id": deletion_id,
+                    "chunk_index": 0,
+                    "messages": candidate,
+                }
+            )
+        except ValueError as exc:
+            if not current:
+                raise DeletedConversationArchiveError(
+                    "one deleted conversation message exceeds the archive frame limit"
+                ) from exc
+            yield tuple(current)
+            current = [message]
+            try:
+                _encode_archive_request(
+                    {
+                        "operation": "chunk",
+                        "deletion_id": deletion_id,
+                        "chunk_index": 0,
+                        "messages": current,
+                    }
+                )
+            except ValueError as single_message_error:
+                raise DeletedConversationArchiveError(
+                    "one deleted conversation message exceeds the archive frame limit"
+                ) from single_message_error
+        else:
+            current.append(message)
+    if current:
+        yield tuple(current)
 
 
 def _encode_archive_response(*, ok: bool, message: str | None = None) -> bytes:
@@ -533,22 +781,55 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
         *,
         deletion_id: str,
         deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
     ) -> None:
         records, normalized_deleted_at = _validate_archive_request(
             messages,
             deletion_id=deletion_id,
             deleted_at=deleted_at,
+            expected_count=expected_count,
+            expected_digest=expected_digest,
         )
+        expected_count = len(records)
+        expected_digest = expected_digest or _conversation_message_digest(records)
         with self._lock:
-            self._request(
-                {
-                    "operation": "archive",
-                    "messages": records,
-                    "deletion_id": deletion_id,
-                    "deleted_at": normalized_deleted_at,
-                },
-                timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
-            )
+            try:
+                self._request(
+                    {
+                        "operation": "begin",
+                        "deletion_id": deletion_id,
+                        "deleted_at": normalized_deleted_at,
+                        "expected_count": expected_count,
+                        "expected_digest": expected_digest,
+                    },
+                    timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
+                )
+                for chunk_index, chunk in enumerate(
+                    _archive_message_chunks(records, deletion_id=deletion_id)
+                ):
+                    self._request(
+                        {
+                            "operation": "chunk",
+                            "deletion_id": deletion_id,
+                            "chunk_index": chunk_index,
+                            "messages": chunk,
+                        },
+                        timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
+                    )
+                self._request(
+                    {"operation": "commit", "deletion_id": deletion_id},
+                    timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
+                )
+            except DeletedConversationArchiveError:
+                try:
+                    self._request(
+                        {"operation": "abort", "deletion_id": deletion_id},
+                        timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except DeletedConversationArchiveError:
+                    pass
+                raise
 
     def _receive_response(self, *, timeout_seconds: float) -> dict[str, object]:
         deadline = monotonic() + timeout_seconds
@@ -619,6 +900,64 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             return
 
 
+def _insert_archive_records(
+    archive_connection: sqlite3.Connection,
+    records: Sequence[ConversationMessage],
+    *,
+    deletion_id: str,
+    deleted_at: datetime,
+) -> None:
+    for message in records:
+        values = _archive_values(
+            message,
+            deletion_id=deletion_id,
+            deleted_at=deleted_at,
+        )
+        archive_connection.execute(
+            """
+            INSERT INTO deleted_messages(
+                transport_session_id, working_session_id, message_id,
+                event_id, chat_id, sender_id, text, occurred_at,
+                direction, request_id, credential_like, deletion_id,
+                deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(transport_session_id, message_id) DO NOTHING
+            """,
+            values,
+        )
+        existing = archive_connection.execute(
+            """
+            SELECT transport_session_id, working_session_id, message_id,
+                   event_id, chat_id, sender_id, text, occurred_at,
+                   direction, request_id, credential_like
+            FROM deleted_messages
+            WHERE transport_session_id = ? AND message_id = ?
+            """,
+            (message.transport_session_id, message.message_id),
+        ).fetchone()
+        if existing is None or tuple(existing) != _archive_content_values(message):
+            raise DeletedConversationArchiveError(
+                "deleted archive record does not match a prior transfer"
+            )
+        # The message body is immutable, but the deletion metadata belongs
+        # to the successful live-state deletion attempt.  Updating it here
+        # lets a fresh action adopt a prior archive after a live commit
+        # failure without duplicating or rejecting the retained content.
+        archive_connection.execute(
+            """
+            UPDATE deleted_messages
+            SET deletion_id = ?, deleted_at = ?
+            WHERE transport_session_id = ? AND message_id = ?
+            """,
+            (
+                deletion_id,
+                deleted_at.isoformat(),
+                message.transport_session_id,
+                message.message_id,
+            ),
+        )
+
+
 def _archive_batch(
     archive_connection: sqlite3.Connection,
     records: Sequence[ConversationMessage],
@@ -628,55 +967,186 @@ def _archive_batch(
 ) -> None:
     archive_connection.execute("BEGIN IMMEDIATE")
     try:
-        for message in records:
-            values = _archive_values(
-                message,
-                deletion_id=deletion_id,
-                deleted_at=deleted_at,
+        _insert_archive_records(
+            archive_connection,
+            records,
+            deletion_id=deletion_id,
+            deleted_at=deleted_at,
+        )
+        archive_connection.commit()
+    except Exception:
+        archive_connection.rollback()
+        raise
+
+
+def _begin_archive_batch(
+    archive_connection: sqlite3.Connection,
+    *,
+    deletion_id: str,
+    deleted_at: datetime,
+    expected_count: int,
+    expected_digest: str,
+) -> None:
+    archive_connection.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_batch_metadata(
+            deletion_id=deletion_id,
+            deleted_at=deleted_at,
+            expected_count=expected_count,
+            expected_digest=expected_digest,
+        )
+        archive_connection.execute(
+            "DELETE FROM deleted_message_batch_items WHERE deletion_id = ?",
+            (deletion_id,),
+        )
+        archive_connection.execute(
+            "DELETE FROM deleted_message_batches WHERE deletion_id = ?",
+            (deletion_id,),
+        )
+        archive_connection.execute(
+            """
+            INSERT INTO deleted_message_batches(
+                deletion_id, expected_count, expected_digest, deleted_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (deletion_id, expected_count, expected_digest, deleted_at.isoformat()),
+        )
+        archive_connection.commit()
+    except Exception:
+        archive_connection.rollback()
+        raise
+
+
+def _append_archive_batch_chunk(
+    archive_connection: sqlite3.Connection,
+    records: Sequence[ConversationMessage],
+    *,
+    deletion_id: str,
+    chunk_index: int,
+) -> None:
+    if not records:
+        raise DeletedConversationArchiveError(
+            "deleted archive chunks must contain at least one message"
+        )
+    archive_connection.execute("BEGIN IMMEDIATE")
+    try:
+        batch = archive_connection.execute(
+            "SELECT deletion_id FROM deleted_message_batches WHERE deletion_id = ?",
+            (deletion_id,),
+        ).fetchone()
+        if batch is None:
+            raise DeletedConversationArchiveError(
+                "deleted archive batch was not opened"
             )
+        last_chunk = archive_connection.execute(
+            """
+            SELECT COALESCE(MAX(chunk_index), -1) AS chunk_index
+            FROM deleted_message_batch_items
+            WHERE deletion_id = ?
+            """,
+            (deletion_id,),
+        ).fetchone()["chunk_index"]
+        if chunk_index != last_chunk + 1:
+            raise DeletedConversationArchiveError(
+                "deleted archive chunks must arrive in order"
+            )
+        for item_index, message in enumerate(records):
             archive_connection.execute(
                 """
-                INSERT INTO deleted_messages(
+                INSERT INTO deleted_message_batch_items(
+                    deletion_id, chunk_index, item_index,
                     transport_session_id, working_session_id, message_id,
                     event_id, chat_id, sender_id, text, occurred_at,
-                    direction, request_id, credential_like, deletion_id,
-                    deleted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(transport_session_id, message_id) DO NOTHING
-                """,
-                values,
-            )
-            existing = archive_connection.execute(
-                """
-                SELECT transport_session_id, working_session_id, message_id,
-                       event_id, chat_id, sender_id, text, occurred_at,
-                       direction, request_id, credential_like
-                FROM deleted_messages
-                WHERE transport_session_id = ? AND message_id = ?
-                """,
-                (message.transport_session_id, message.message_id),
-            ).fetchone()
-            if existing is None or tuple(existing) != _archive_content_values(message):
-                raise DeletedConversationArchiveError(
-                    "deleted archive record does not match a prior transfer"
-                )
-            # The message body is immutable, but the deletion metadata belongs
-            # to the successful live-state deletion attempt.  Updating it here
-            # lets a fresh action adopt a prior archive after a live commit
-            # failure without duplicating or rejecting the retained content.
-            archive_connection.execute(
-                """
-                UPDATE deleted_messages
-                SET deletion_id = ?, deleted_at = ?
-                WHERE transport_session_id = ? AND message_id = ?
+                    direction, request_id, credential_like
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     deletion_id,
-                    deleted_at.isoformat(),
-                    message.transport_session_id,
-                    message.message_id,
+                    chunk_index,
+                    item_index,
+                    *(_archive_content_values(message)),
                 ),
             )
+        archive_connection.commit()
+    except Exception:
+        archive_connection.rollback()
+        raise
+
+
+def _commit_archive_batch(
+    archive_connection: sqlite3.Connection,
+    *,
+    deletion_id: str,
+) -> None:
+    archive_connection.execute("BEGIN IMMEDIATE")
+    try:
+        batch = archive_connection.execute(
+            """
+            SELECT expected_count, expected_digest, deleted_at
+            FROM deleted_message_batches
+            WHERE deletion_id = ?
+            """,
+            (deletion_id,),
+        ).fetchone()
+        if batch is None:
+            raise DeletedConversationArchiveError(
+                "deleted archive batch was not opened"
+            )
+        rows = archive_connection.execute(
+            """
+            SELECT transport_session_id, working_session_id, message_id,
+                   event_id, chat_id, sender_id, text, occurred_at,
+                   direction, request_id, credential_like
+            FROM deleted_message_batch_items
+            WHERE deletion_id = ?
+            ORDER BY occurred_at, transport_session_id, message_id
+            """,
+            (deletion_id,),
+        ).fetchall()
+        records = tuple(_archive_message_from_row(row) for row in rows)
+        if len(records) != batch["expected_count"]:
+            raise DeletedConversationArchiveError(
+                "deleted archive batch count does not match its metadata"
+            )
+        if _conversation_message_digest(records) != batch["expected_digest"]:
+            raise DeletedConversationArchiveError(
+                "deleted archive batch digest does not match its metadata"
+            )
+        _insert_archive_records(
+            archive_connection,
+            records,
+            deletion_id=deletion_id,
+            deleted_at=datetime.fromisoformat(batch["deleted_at"]),
+        )
+        archive_connection.execute(
+            "DELETE FROM deleted_message_batch_items WHERE deletion_id = ?",
+            (deletion_id,),
+        )
+        archive_connection.execute(
+            "DELETE FROM deleted_message_batches WHERE deletion_id = ?",
+            (deletion_id,),
+        )
+        archive_connection.commit()
+    except Exception:
+        archive_connection.rollback()
+        raise
+
+
+def _abort_archive_batch(
+    archive_connection: sqlite3.Connection,
+    *,
+    deletion_id: str,
+) -> None:
+    archive_connection.execute("BEGIN IMMEDIATE")
+    try:
+        archive_connection.execute(
+            "DELETE FROM deleted_message_batch_items WHERE deletion_id = ?",
+            (deletion_id,),
+        )
+        archive_connection.execute(
+            "DELETE FROM deleted_message_batches WHERE deletion_id = ?",
+            (deletion_id,),
+        )
         archive_connection.commit()
     except Exception:
         archive_connection.rollback()
@@ -711,27 +1181,53 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> None:
                 _send_archive_response(connection, ok=True)
                 break
             try:
-                if operation != "archive":
+                if operation == "archive":
+                    records = request["messages"]
+                    deletion_id = request["deletion_id"]
+                    normalized_deleted_at = request["deleted_at"]
+                    if (
+                        not isinstance(records, tuple)
+                        or not isinstance(deletion_id, str)
+                        or not isinstance(normalized_deleted_at, datetime)
+                    ):
+                        raise DeletedConversationArchiveError(
+                            "deleted archive service received an invalid archive request"
+                        )
+                    _archive_batch(
+                        archive_connection,
+                        records,
+                        deletion_id=deletion_id,
+                        deleted_at=normalized_deleted_at,
+                    )
+                elif operation == "begin":
+                    _begin_archive_batch(
+                        archive_connection,
+                        deletion_id=request["deletion_id"],
+                        deleted_at=request["deleted_at"],
+                        expected_count=request["expected_count"],
+                        expected_digest=request["expected_digest"],
+                    )
+                elif operation == "chunk":
+                    _append_archive_batch_chunk(
+                        archive_connection,
+                        request["messages"],
+                        deletion_id=request["deletion_id"],
+                        chunk_index=request["chunk_index"],
+                    )
+                elif operation == "commit":
+                    _commit_archive_batch(
+                        archive_connection,
+                        deletion_id=request["deletion_id"],
+                    )
+                elif operation == "abort":
+                    _abort_archive_batch(
+                        archive_connection,
+                        deletion_id=request["deletion_id"],
+                    )
+                else:
                     raise DeletedConversationArchiveError(
                         "deleted archive service received an unsupported operation"
                     )
-                records = request["messages"]
-                deletion_id = request["deletion_id"]
-                normalized_deleted_at = request["deleted_at"]
-                if (
-                    not isinstance(records, tuple)
-                    or not isinstance(deletion_id, str)
-                    or not isinstance(normalized_deleted_at, datetime)
-                ):
-                    raise DeletedConversationArchiveError(
-                        "deleted archive service received an invalid archive request"
-                    )
-                _archive_batch(
-                    archive_connection,
-                    records,
-                    deletion_id=deletion_id,
-                    deleted_at=normalized_deleted_at,
-                )
                 _send_archive_response(connection, ok=True)
             except Exception as exc:  # noqa: BLE001 - IPC reports typed failures
                 try:

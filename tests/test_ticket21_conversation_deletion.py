@@ -58,6 +58,52 @@ class _FailOnceCommitConnection(sqlite3.Connection):
         super().commit()
 
 
+class _FailDeletionStateStore(InMemoryDurableStateStore):
+    def delete_conversation_history(self, preview, *, deletion_id, deleted_at):
+        raise StateStoreError("controlled deletion state failure")
+
+
+class _FailDeletionArchive:
+    def archive(
+        self,
+        messages,
+        *,
+        deletion_id,
+        deleted_at,
+        expected_count=None,
+        expected_digest=None,
+    ):
+        raise DeletedConversationArchiveError("controlled archive failure")
+
+    def close(self):
+        return None
+
+
+class _FailDeletionArchiveStateStore(InMemoryDurableStateStore):
+    def __init__(self):
+        super().__init__(deleted_archive=_FailDeletionArchive())
+
+
+class _AmbiguousDeletionStateStore(InMemoryDurableStateStore):
+    def delete_conversation_history(self, preview, *, deletion_id, deleted_at):
+        super().delete_conversation_history(
+            preview,
+            deletion_id=deletion_id,
+            deleted_at=deleted_at,
+        )
+        raise StateStoreError(
+            "controlled post-deletion uncertainty",
+            may_have_dispatched=True,
+        )
+
+
+class _FailDeletionResultAudit(InMemoryAuditBoundary):
+    def append(self, evidence: AuditEvidence) -> None:
+        if evidence.kind == "conversation_history_deletion_result":
+            raise AuditWriteError("controlled deletion-result audit failure")
+        super().append(evidence)
+
+
 class _PickleExecutionProbe:
     """Would create a marker if an archive server unpickled this payload."""
 
@@ -300,6 +346,36 @@ def test_deletion_preview_rejects_records_outside_declared_scope() -> None:
             messages=preview.messages,
             content_digest=preview.content_digest,
         )
+
+
+def test_sqlite_exact_deletion_preview_reads_only_the_requested_rows(
+    monkeypatch,
+) -> None:
+    state = SQLiteDurableStateStore()
+    messages = tuple(
+        _message(
+            message_id=f"large-history-{index}",
+            text=f"retained history record {index}",
+            occurred_at=NOW + timedelta(seconds=index),
+        )
+        for index in range(1_200)
+    )
+    try:
+        for message in messages:
+            state.append_conversation_message(message)
+
+        monkeypatch.setattr(
+            state,
+            "list_conversation_messages",
+            lambda: pytest.fail("exact deletion selection loaded all history"),
+        )
+        preview = state.preview_conversation_deletion(
+            ConversationDeletionScope.message(messages[777].history_id)
+        )
+
+        assert preview.messages == (messages[777],)
+    finally:
+        state.close()
 
 
 @pytest.mark.parametrize(
@@ -556,6 +632,213 @@ def test_history_delete_command_freezes_exact_preview_and_dispatches_once() -> N
         close = getattr(state, "close", None)
         if callable(close):
             close()
+
+
+@pytest.mark.parametrize(
+    ("store_type", "expected_disposition", "expected_outcome", "deleted"),
+    (
+        (InMemoryDurableStateStore, "action_dispatched", "completed", True),
+        (_FailDeletionStateStore, "action_dispatch_failed", "failed", False),
+        (
+            _FailDeletionArchiveStateStore,
+            "action_dispatch_failed",
+            "failed",
+            False,
+        ),
+        (_AmbiguousDeletionStateStore, "action_dispatch_unknown", "unknown", True),
+    ),
+)
+def test_deletion_records_a_terminal_redacted_audit_result(
+    store_type: object,
+    expected_disposition: str,
+    expected_outcome: str,
+    deleted: bool,
+) -> None:
+    state = store_type()  # type: ignore[operator]
+    selected = _message(
+        message_id=f"audit-terminal-{expected_outcome}", text="delete me"
+    )
+    state.append_conversation_message(selected)  # type: ignore[union-attr]
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket21-terminal-audit-secret",
+        now=NOW,
+        id_prefix=f"ticket21-terminal-{expected_outcome}",
+        state=state,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id=TRANSPORT_SESSION,
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id=OPERATOR,
+                    chat_id=OPERATOR,
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                components.config.signing_secret,
+            )
+        )
+
+    try:
+        pending = receive(
+            f"/history delete message {selected.history_id}", "terminal-preview"
+        )
+        result = receive("1", "terminal-approve")
+
+        assert pending.disposition == "pending_action", pending.reason
+        assert result.disposition == expected_disposition, result.reason
+        terminal = [
+            record
+            for record in components.audit.records
+            if record.kind == "conversation_history_deletion_result"
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].outcome == expected_outcome
+        assert terminal[0].execution_status == expected_outcome
+        assert terminal[0].details["result"] == expected_outcome
+        assert (
+            state.search_conversation_messages(  # type: ignore[union-attr]
+                history_ids=(selected.history_id,)
+            )
+            == ()
+        ) is deleted
+    finally:
+        close = getattr(state, "close", None)
+        if callable(close):
+            close()
+
+
+def test_terminal_deletion_audit_failure_closes_action_as_unknown() -> None:
+    state = InMemoryDurableStateStore()
+    selected = _message(message_id="audit-result-failure", text="must be removed")
+    state.append_conversation_message(selected)
+    audit = _FailDeletionResultAudit()
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket21-terminal-audit-failure-secret",
+        now=NOW,
+        id_prefix="ticket21-terminal-audit-failure",
+        state=state,
+        audit=audit,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id=TRANSPORT_SESSION,
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id=OPERATOR,
+                    chat_id=OPERATOR,
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                components.config.signing_secret,
+            )
+        )
+
+    try:
+        assert (
+            receive(
+                f"/history delete message {selected.history_id}",
+                "audit-failure-preview",
+            ).disposition
+            == "pending_action"
+        )
+        result = receive("1", "audit-failure-approve")
+
+        assert result.disposition == "action_dispatch_unknown", result.reason
+        assert (
+            state.search_conversation_messages(history_ids=(selected.history_id,)) == ()
+        )
+        assert not any(
+            record.kind == "conversation_history_deletion_result"
+            for record in audit.records
+        )
+        current = components.broker._current_working_session()
+        action = next(
+            record
+            for record in current.action_outbox
+            if record.kind == "conversation_history_delete"
+        )
+        assert action.status.value == "unknown"
+        assert components.broker.current_pending_action is None
+        replay = receive("1", "audit-failure-replay")
+        assert replay.disposition != "action_dispatched"
+    finally:
+        close = getattr(state, "close", None)
+        if callable(close):
+            close()
+
+
+def test_conversation_deletion_chunks_archive_frames_larger_than_eight_mebibytes(
+    tmp_path,
+) -> None:
+    deleted_database = tmp_path / "admin-only" / "deleted.sqlite3"
+    deleted_database.parent.mkdir()
+    messages = tuple(
+        _message(
+            message_id=f"large-archive-{index}",
+            text="x" * 75_000,
+            working_session_id="conversation-large-archive",
+            occurred_at=NOW + timedelta(seconds=index),
+        )
+        for index in range(150)
+    )
+    archive_service = start_sqlite_deleted_conversation_archive_service(
+        deleted_database
+    )
+    state = SQLiteDurableStateStore(
+        deleted_archive=archive_service.writer,
+    )
+    try:
+        for message in messages:
+            state.append_conversation_message(message)
+        preview = state.preview_conversation_deletion(
+            ConversationDeletionScope.conversation("conversation-large-archive")
+        )
+        with pytest.raises(ValueError, match="frame"):
+            conversation_archive._encode_archive_request(
+                {
+                    "operation": "archive",
+                    "messages": preview.messages,
+                    "deletion_id": "large-archive-single-frame",
+                    "deleted_at": NOW,
+                }
+            )
+
+        tombstones = state.delete_conversation_history(
+            preview,
+            deletion_id="large-archive-chunked",
+            deleted_at=NOW + timedelta(minutes=1),
+        )
+        assert len(tombstones) == len(messages)
+        assert state.list_conversation_messages() == ()
+    finally:
+        state.close()
+        archive_service.close()
+
+    admin_archive = open_sqlite_deleted_conversation_archive(deleted_database)
+    try:
+        records = admin_archive.list_records()
+        assert len(records) == len(messages)
+        assert records[0].message.text == messages[0].text
+        assert records[-1].message.text == messages[-1].text
+    finally:
+        admin_archive.close()
 
 
 def test_date_range_delete_is_frozen_before_later_messages_arrive() -> None:
