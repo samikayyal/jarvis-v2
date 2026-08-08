@@ -20,7 +20,7 @@ from .ports import (
 )
 
 _NATURAL_REMEMBER = re.compile(
-    r"^(?:please\s+)?remember(?:\s+that)?\s+(.+)$",
+    r"^(?:please\s+)?remember\s+that\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -98,7 +98,10 @@ def parse_memory_command(text: str) -> MemoryCommand | None:
     """Parse an explicit ``remember`` request or a ``/memory`` command.
 
     Ordinary conversation is intentionally represented by ``None``.  In
-    particular, phrases such as ``I remember ...`` never create a memory.
+    particular, phrases such as ``I remember ...`` and ``Remember when ...``
+    never create a memory.  The natural persistence form is deliberately
+    limited to ``remember that ...``; the slash form remains the complete
+    deterministic command surface.
     Command arguments retain their original case and punctuation so an exact
     operator preview is possible.
     """

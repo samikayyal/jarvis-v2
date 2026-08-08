@@ -12,6 +12,7 @@ from jarvis_control_plane import (
     InMemoryDurableStateStore,
     MemoryLifecycle,
     MemoryOperation,
+    MemorySearchLimitExceeded,
     SignedInboundEvent,
     SQLiteDurableStateStore,
     StateStoreError,
@@ -78,6 +79,8 @@ def test_memory_parser_requires_explicit_remember_language_and_preserves_content
     None
 ):
     assert parse_memory_command("I remember that tea is good") is None
+    assert parse_memory_command("Remember when we discussed the deployment?") is None
+    assert parse_memory_command("Please remember I prefer tea.") is None
     natural = parse_memory_command("Please remember that I prefer tea.")
     assert natural is not None
     assert natural.operation is MemoryOperation.REMEMBER
@@ -473,6 +476,115 @@ def test_memory_list_and_search_return_metadata_until_exact_inspection() -> None
     assert searched.reply is not None
     assert "memory-read-secret" in searched.reply.body
     assert "sk-proj-ticket22-read-value" not in searched.reply.body
+
+
+def test_memory_inspection_uses_lossless_multipart_delivery_for_long_content() -> None:
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.ticket22.long-inspect",
+        signing_secret=b"ticket22-long-inspect-secret",
+        now=NOW,
+        id_prefix="ticket22-long-inspect",
+    )
+    content = "remembered-value-" * 400
+    components.state.create_memory(
+        DurableMemory(
+            memory_id="memory-long-inspect",
+            content=content,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+    inspected = components.receiver.receive(
+        _event(
+            components,
+            message_id="message-long-inspect",
+            text="/memory inspect memory-long-inspect",
+        )
+    )
+
+    assert inspected.disposition == "memory_inspect"
+    parts = [
+        reply.body
+        for reply in components.outbound.sent
+        if reply.body.startswith("Durable-memory inspection part ")
+    ]
+    assert len(parts) > 1
+    assert all(len(part) <= 4_096 for part in parts)
+    reassembled = "".join(part.split("\n", 1)[1] for part in parts)
+    assert f"Exact content: {content}" in reassembled
+    assert "[truncated]" not in reassembled
+
+
+def test_sqlite_reclassifies_persisted_memories_before_rebuilding_fts(tmp_path) -> None:
+    database = tmp_path / "stale-memory-classification.sqlite3"
+    state = SQLiteDurableStateStore(database)
+    state.create_memory(
+        DurableMemory(
+            memory_id="memory-stale-secret",
+            content="The API key is sk-proj-ticket22-stale-value.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    state.connection.execute(
+        "UPDATE durable_assistant_memory SET credential_like = 0 WHERE memory_id = ?",
+        ("memory-stale-secret",),
+    )
+    state.connection.execute(
+        "INSERT INTO durable_assistant_memory_fts(memory_id, content) VALUES (?, ?)",
+        ("memory-stale-secret", "The API key is sk-proj-ticket22-stale-value."),
+    )
+    state.connection.commit()
+    state.close()
+
+    reopened = SQLiteDurableStateStore(database)
+    try:
+        persisted = reopened.get_memory("memory-stale-secret")
+        assert persisted is not None
+        assert persisted.credential_like is True
+        assert (
+            reopened.connection.execute(
+                "SELECT 1 FROM durable_assistant_memory_fts WHERE memory_id = ?",
+                ("memory-stale-secret",),
+            ).fetchone()
+            is None
+        )
+        assert (
+            reopened.select_memories_for_context(text="API key", limit=5).memories == ()
+        )
+    finally:
+        reopened.close()
+
+
+def test_sqlite_memory_search_reports_a_bounded_secret_record_scan(tmp_path) -> None:
+    state = SQLiteDurableStateStore(tmp_path / "bounded-memory-search.sqlite3")
+    try:
+        state.connection.executemany(
+            """
+            INSERT INTO durable_assistant_memory(
+                memory_id, content, created_at, updated_at, source_message_id,
+                status, credential_like, replaced_by_memory_id
+            ) VALUES (?, ?, ?, ?, ?, 'active', 1, NULL)
+            """,
+            (
+                (
+                    f"memory-scan-{index:05d}",
+                    f"API key: sk-proj-ticket22-scan-{index:05d}.",
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    None,
+                )
+                for index in range(10_001)
+            ),
+        )
+        state.connection.commit()
+
+        with pytest.raises(MemorySearchLimitExceeded):
+            state.search_memories(text="needle", limit=20)
+    finally:
+        state.close()
 
 
 def test_credential_like_memory_is_searchable_and_inspectable_but_not_automatic_context() -> (

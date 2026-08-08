@@ -45,6 +45,7 @@ from .ports import (
     AuditWriteError,
     Clock,
     IdGenerator,
+    MemorySearchLimitExceeded,
     OrchestrationAdapterError,
     OutboundConnectorError,
     StateStoreError,
@@ -1511,24 +1512,76 @@ class SQLiteDurableStateStore:
             include_terminal=include_terminal,
             limit=limit,
         )
+        terms = _history_search_terms(text or "")
+        if text is not None and not terms:
+            return ()
+
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if not include_terminal:
+            clauses.append("m.status = 'active'")
+        if memory_ids:
+            placeholders = ", ".join("?" for _ in memory_ids)
+            clauses.append(f"m.memory_id IN ({placeholders})")
+            parameters.extend(memory_ids)
+        if text is not None:
+            clauses.extend(
+                (
+                    "m.content IS NOT NULL",
+                    (
+                        "(m.credential_like = 1 OR EXISTS ("
+                        "SELECT 1 FROM durable_assistant_memory_fts AS f "
+                        "WHERE f.memory_id = m.memory_id AND f.content MATCH ?))"
+                    ),
+                )
+            )
+            parameters.append(_fts_history_query(terms))
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
-            rows = self.connection.execute(
+            cursor = self.connection.execute(
+                f"""
+                SELECT m.memory_id, m.content, m.created_at, m.updated_at,
+                       m.source_message_id, m.status, m.credential_like,
+                       m.replaced_by_memory_id
+                FROM durable_assistant_memory AS m
+                {where}
+                ORDER BY m.created_at, m.memory_id
                 """
-                SELECT memory_id, content, created_at, updated_at,
-                       source_message_id, status, credential_like,
-                       replaced_by_memory_id
-                FROM durable_assistant_memory
-                ORDER BY created_at, memory_id
-                """
-            ).fetchall()
+                + (" LIMIT ?" if text is None else ""),
+                (*parameters, limit) if text is None else parameters,
+            )
         except sqlite3.Error as exc:
             raise StateStoreError("could not search durable assistant memory") from exc
-        return _filter_memories(
-            tuple(_durable_memory_from_row(row) for row in rows),
-            text=text,
-            memory_ids=memory_ids,
-            include_terminal=include_terminal,
-            limit=limit,
+        if text is None:
+            return tuple(
+                _durable_memory_from_row(row) for row in cursor.fetchmany(limit)
+            )
+
+        matches: list[DurableMemory] = []
+        scanned_rows = 0
+        while scanned_rows < _MAX_MEMORY_SEARCH_SCAN_ROWS:
+            batch = cursor.fetchmany(
+                min(
+                    _MEMORY_SEARCH_BATCH_SIZE,
+                    _MAX_MEMORY_SEARCH_SCAN_ROWS - scanned_rows,
+                )
+            )
+            if not batch:
+                return tuple(matches)
+            scanned_rows += len(batch)
+            for row in batch:
+                memory = _durable_memory_from_row(row)
+                if _matches_memory_terms(memory, terms):
+                    matches.append(memory)
+                    if len(matches) == limit:
+                        return tuple(matches)
+
+        if cursor.fetchone() is None:
+            return tuple(matches)
+        raise MemorySearchLimitExceeded(
+            "durable-memory search exceeded its bounded scan limit",
+            scanned_rows=scanned_rows,
         )
 
     def select_memories_for_context(
@@ -1748,23 +1801,43 @@ class SQLiteDurableStateStore:
             )
 
     def _rebuild_durable_memory_index(self) -> None:
-        self.connection.execute("DELETE FROM durable_assistant_memory_fts")
-        rows = self.connection.execute(
-            """
-            SELECT memory_id, content
-            FROM durable_assistant_memory
-            WHERE status = 'active' AND credential_like = 0 AND content IS NOT NULL
-            ORDER BY created_at, memory_id
-            """
-        ).fetchall()
-        self.connection.executemany(
-            """
-            INSERT INTO durable_assistant_memory_fts(memory_id, content)
-            VALUES (?, ?)
-            """,
-            ((row["memory_id"], row["content"]) for row in rows),
-        )
-        self.connection.commit()
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute("DELETE FROM durable_assistant_memory_fts")
+            rows = self.connection.execute(
+                """
+                SELECT memory_id, content, created_at, updated_at,
+                       source_message_id, status, credential_like,
+                       replaced_by_memory_id
+                FROM durable_assistant_memory
+                WHERE status = 'active'
+                ORDER BY created_at, memory_id
+                """
+            ).fetchall()
+            for row in rows:
+                memory = _durable_memory_from_row(row)
+                credential_like = int(bool(memory.credential_like))
+                if credential_like != int(row["credential_like"]):
+                    self.connection.execute(
+                        """
+                        UPDATE durable_assistant_memory
+                        SET credential_like = ?
+                        WHERE memory_id = ?
+                        """,
+                        (credential_like, memory.memory_id),
+                    )
+                if memory.content is not None and not memory.credential_like:
+                    self.connection.execute(
+                        """
+                        INSERT INTO durable_assistant_memory_fts(memory_id, content)
+                        VALUES (?, ?)
+                        """,
+                        (memory.memory_id, memory.content),
+                    )
+            self.connection.commit()
+        except sqlite3.Error:
+            self.connection.rollback()
+            raise
 
     def _rebuild_conversation_history_for_outbound(self) -> None:
         self.connection.execute("BEGIN IMMEDIATE")
@@ -1883,6 +1956,8 @@ def _request_values(request: RequestState) -> tuple[object, ...]:
 
 _MAX_HISTORY_RESULTS = 50
 _MAX_MEMORY_RESULTS = 50
+_MAX_MEMORY_SEARCH_SCAN_ROWS = 10_000
+_MEMORY_SEARCH_BATCH_SIZE = 128
 _HISTORY_SEARCH_STOPWORDS = frozenset(
     {
         "a",

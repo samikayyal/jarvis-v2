@@ -43,6 +43,14 @@ class StateStoreError(ControlPlaneError):
     """Durable state could not be read or written."""
 
 
+class MemorySearchLimitExceeded(StateStoreError):
+    """A durable-memory search reached its deterministic scan ceiling."""
+
+    def __init__(self, message: str, *, scanned_rows: int) -> None:
+        super().__init__(message)
+        self.scanned_rows = scanned_rows
+
+
 class AuditWriteError(ControlPlaneError):
     """Required redacted audit evidence could not be appended."""
 

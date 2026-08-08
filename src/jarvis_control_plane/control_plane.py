@@ -50,6 +50,7 @@ from .ports import (
     DiagnosticTraceError,
     DurableStateStore,
     IdGenerator,
+    MemorySearchLimitExceeded,
     ModelAvailabilityProvider,
     OrchestrationAdapter,
     OrchestrationAdapterError,
@@ -2668,16 +2669,28 @@ class DeterministicCapabilityBroker:
                 disposition="audit_blocked",
                 reason=f"durable-memory read was blocked by audit: {exc}",
             )
+        except MemorySearchLimitExceeded:
+            return self._dispatch_memory_text(
+                message,
+                "Durable-memory search reached its bounded scan limit; "
+                "narrow the search and try again.",
+                disposition="memory_search_limited",
+            )
         except (StateStoreError, ValueError) as exc:
             return ReceiveResult(
                 status_code=202,
                 disposition="failed",
                 reason=f"durable-memory read failed: {exc}",
             )
+        if command.operation is MemoryOperation.INSPECT:
+            return self._dispatch_exact_text_export(
+                message,
+                body,
+                label="Durable-memory inspection",
+                disposition="memory_inspect",
+            )
         return self._dispatch_memory_text(
-            message,
-            body,
-            disposition=f"memory_{command.operation.value}",
+            message, body, disposition=f"memory_{command.operation.value}"
         )
 
     def _handle_memory_mutation(
@@ -3034,17 +3047,32 @@ class DeterministicCapabilityBroker:
         *,
         disposition: str,
     ) -> ReceiveResult:
+        return self._dispatch_exact_text_export(
+            message,
+            payload,
+            label="Conversation-history export",
+            disposition=disposition,
+        )
+
+    def _dispatch_exact_text_export(
+        self,
+        message: InboundMessage,
+        payload: str,
+        *,
+        label: str,
+        disposition: str,
+    ) -> ReceiveResult:
         control_id = self.ids.new_id("control")
         fragments = tuple(
             payload[index : index + _PROPOSAL_FRAGMENT_PAYLOAD_CHARS]
             for index in range(0, len(payload), _PROPOSAL_FRAGMENT_PAYLOAD_CHARS)
         )
         if not fragments:
-            raise InvariantViolation("history export payload must be non-blank")
+            raise InvariantViolation("exact export payload must be non-blank")
         result: ReceiveResult | None = None
         for number, fragment in enumerate(fragments, start=1):
             body = (
-                f"Conversation-history export part {number}/{len(fragments)} "
+                f"{label} part {number}/{len(fragments)} "
                 f"request_id={control_id}\n{fragment}"
             )
             result = self._dispatch_control_text(
