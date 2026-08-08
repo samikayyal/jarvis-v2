@@ -136,7 +136,26 @@ class AuditBoundary(Protocol):
 
 
 class DeletedConversationArchiveWriter(Protocol):
-    """Write-only capability for content removed from Jarvis-readable state."""
+    """Write-only capability for content removed from Jarvis-readable state.
+
+    The staged methods keep the large IPC transfer outside the live-state
+    transaction.  ``archive`` remains as a convenience for callers that do
+    not need to coordinate the finalization with another durable boundary.
+    """
+
+    def stage(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None: ...
+
+    def finalize(self, *, deletion_id: str) -> None: ...
+
+    def abort(self, *, deletion_id: str) -> None: ...
 
     def archive(
         self,

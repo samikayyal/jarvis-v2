@@ -46,7 +46,6 @@ _ARCHIVE_MESSAGE_FIELDS = frozenset(
         "working_session_id",
     }
 )
-_ARCHIVE_CLOSE_REQUEST_FIELDS = frozenset({"operation"})
 _ARCHIVE_REQUEST_FIELDS = frozenset(
     {"operation", "messages", "deletion_id", "deleted_at"}
 )
@@ -120,6 +119,16 @@ class DeletedConversationArchiveRecord:
         if not isinstance(self.deletion_id, str) or not self.deletion_id.strip():
             raise ValueError("archive record deletion_id must be non-blank")
         object.__setattr__(self, "deleted_at", ensure_utc(self.deleted_at))
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedArchiveBatch:
+    """Content accepted by the writer but not yet published to the archive."""
+
+    messages: tuple[ConversationMessage, ...]
+    deleted_at: datetime
+    expected_count: int
+    expected_digest: str
 
 
 def _validate_archive_request(
@@ -256,9 +265,10 @@ class InMemoryDeletedConversationArchive:
 
     def __init__(self) -> None:
         self._records: dict[tuple[str, str], DeletedConversationArchiveRecord] = {}
+        self._staged_batches: dict[str, _StagedArchiveBatch] = {}
         self._lock = RLock()
 
-    def archive(
+    def stage(
         self,
         messages: Sequence[ConversationMessage],
         *,
@@ -274,20 +284,72 @@ class InMemoryDeletedConversationArchive:
             expected_count=expected_count,
             expected_digest=expected_digest,
         )
+        normalized_expected_count = len(records)
+        normalized_expected_digest = expected_digest or _conversation_message_digest(
+            records
+        )
         with self._lock:
-            for message in records:
+            self._staged_batches[deletion_id] = _StagedArchiveBatch(
+                messages=records,
+                deleted_at=normalized_deleted_at,
+                expected_count=normalized_expected_count,
+                expected_digest=normalized_expected_digest,
+            )
+
+    def finalize(self, *, deletion_id: str) -> None:
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("deletion_id must be non-blank")
+        with self._lock:
+            batch = self._staged_batches.get(deletion_id)
+            if batch is None:
+                raise DeletedConversationArchiveError(
+                    "deleted archive batch was not staged"
+                )
+            records: dict[tuple[str, str], DeletedConversationArchiveRecord] = {}
+            for message in batch.messages:
                 key = (message.transport_session_id, message.message_id)
                 record = DeletedConversationArchiveRecord(
                     message=message,
                     deletion_id=deletion_id,
-                    deleted_at=normalized_deleted_at,
+                    deleted_at=batch.deleted_at,
                 )
                 existing = self._records.get(key)
                 if existing is not None and existing.message != message:
                     raise DeletedConversationArchiveError(
                         "deleted archive record does not match a prior transfer"
                     )
-                self._records[key] = record
+                records[key] = record
+            self._records.update(records)
+            del self._staged_batches[deletion_id]
+
+    def abort(self, *, deletion_id: str) -> None:
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("deletion_id must be non-blank")
+        with self._lock:
+            self._staged_batches.pop(deletion_id, None)
+
+    def archive(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None:
+        self.stage(
+            messages,
+            deletion_id=deletion_id,
+            deleted_at=deleted_at,
+            expected_count=expected_count,
+            expected_digest=expected_digest,
+        )
+        try:
+            self.finalize(deletion_id=deletion_id)
+        except DeletedConversationArchiveError:
+            with self._lock:
+                self._staged_batches.pop(deletion_id, None)
+            raise
 
     def read_records(self) -> tuple[DeletedConversationArchiveRecord, ...]:
         """Return records through the test's separate administration fixture."""
@@ -305,7 +367,8 @@ class InMemoryDeletedConversationArchive:
             )
 
     def close(self) -> None:
-        return None
+        with self._lock:
+            self._staged_batches.clear()
 
 
 def _archive_ipc_family() -> str:
@@ -434,11 +497,6 @@ def _archive_message_from_wire(value: object) -> ConversationMessage:
 
 def _encode_archive_request(request: dict[str, Any]) -> bytes:
     operation = request.get("operation")
-    if operation == "close":
-        _require_exact_mapping(
-            request, _ARCHIVE_CLOSE_REQUEST_FIELDS, "archive close request"
-        )
-        return _encode_archive_frame({"operation": "close"})
     if operation == "begin":
         _require_exact_mapping(
             request, _ARCHIVE_BEGIN_REQUEST_FIELDS, "archive begin request"
@@ -520,11 +578,6 @@ def _decode_archive_request(frame: bytes) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise TypeError("deleted archive request must be a JSON object")
     operation = payload.get("operation")
-    if operation == "close":
-        _require_exact_mapping(
-            payload, _ARCHIVE_CLOSE_REQUEST_FIELDS, "archive close request"
-        )
-        return {"operation": "close"}
     if operation == "begin":
         raw = _require_exact_mapping(
             payload, _ARCHIVE_BEGIN_REQUEST_FIELDS, "archive begin request"
@@ -771,6 +824,7 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
         self._endpoint = str(endpoint)
         self._authkey = _validate_archive_authkey(authkey)
         self._connection: Any | None = None
+        self._active_deletion_id: str | None = None
         self._closed = False
         self._lock = RLock()
         self._connect()
@@ -806,6 +860,134 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             self._close_connection()
             raise DeletedConversationArchiveError(message[:200])
 
+    @staticmethod
+    def _remaining_deadline(deadline: float) -> float:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise DeletedConversationArchiveError(
+                "deleted archive transfer deadline exceeded"
+            )
+        return remaining
+
+    def _request_until(
+        self,
+        request: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> None:
+        self._request(
+            request,
+            timeout_seconds=self._remaining_deadline(deadline),
+        )
+
+    def _abort_locked(self, *, deletion_id: str) -> None:
+        if self._active_deletion_id != deletion_id:
+            return
+        try:
+            if self._connection is not None:
+                self._request(
+                    {"operation": "abort", "deletion_id": deletion_id},
+                    timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
+                    reconnect=False,
+                )
+        finally:
+            self._active_deletion_id = None
+
+    def _stage_locked(
+        self,
+        records: tuple[ConversationMessage, ...],
+        *,
+        deletion_id: str,
+        normalized_deleted_at: datetime,
+        expected_count: int,
+        expected_digest: str,
+        deadline: float,
+    ) -> None:
+        if self._active_deletion_id is not None:
+            raise DeletedConversationArchiveError(
+                "deleted archive writer already has a staged batch"
+            )
+        try:
+            self._request_until(
+                {
+                    "operation": "begin",
+                    "deletion_id": deletion_id,
+                    "deleted_at": normalized_deleted_at,
+                    "expected_count": expected_count,
+                    "expected_digest": expected_digest,
+                },
+                deadline=deadline,
+            )
+            self._active_deletion_id = deletion_id
+            for chunk_index, chunk in enumerate(
+                _archive_message_chunks(records, deletion_id=deletion_id)
+            ):
+                self._request_until(
+                    {
+                        "operation": "chunk",
+                        "deletion_id": deletion_id,
+                        "chunk_index": chunk_index,
+                        "messages": chunk,
+                    },
+                    deadline=deadline,
+                )
+        except DeletedConversationArchiveError:
+            try:
+                self._abort_locked(deletion_id=deletion_id)
+            except DeletedConversationArchiveError:
+                pass
+            raise
+
+    def stage(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None:
+        records, normalized_deleted_at = _validate_archive_request(
+            messages,
+            deletion_id=deletion_id,
+            deleted_at=deleted_at,
+            expected_count=expected_count,
+            expected_digest=expected_digest,
+        )
+        normalized_expected_count = len(records)
+        normalized_expected_digest = expected_digest or _conversation_message_digest(
+            records
+        )
+        with self._lock:
+            self._stage_locked(
+                records,
+                deletion_id=deletion_id,
+                normalized_deleted_at=normalized_deleted_at,
+                expected_count=normalized_expected_count,
+                expected_digest=normalized_expected_digest,
+                deadline=monotonic() + _ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
+            )
+
+    def finalize(self, *, deletion_id: str) -> None:
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("deletion_id must be non-blank")
+        with self._lock:
+            if self._active_deletion_id != deletion_id:
+                raise DeletedConversationArchiveError(
+                    "deleted archive batch was not staged"
+                )
+            self._request_until(
+                {"operation": "commit", "deletion_id": deletion_id},
+                deadline=monotonic() + _ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
+            )
+            self._active_deletion_id = None
+
+    def abort(self, *, deletion_id: str) -> None:
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("deletion_id must be non-blank")
+        with self._lock:
+            self._abort_locked(deletion_id=deletion_id)
+
     def archive(
         self,
         messages: Sequence[ConversationMessage],
@@ -822,43 +1004,29 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             expected_count=expected_count,
             expected_digest=expected_digest,
         )
-        expected_count = len(records)
-        expected_digest = expected_digest or _conversation_message_digest(records)
+        normalized_expected_count = len(records)
+        normalized_expected_digest = expected_digest or _conversation_message_digest(
+            records
+        )
         with self._lock:
+            deadline = monotonic() + _ARCHIVE_RESPONSE_TIMEOUT_SECONDS
+            self._stage_locked(
+                records,
+                deletion_id=deletion_id,
+                normalized_deleted_at=normalized_deleted_at,
+                expected_count=normalized_expected_count,
+                expected_digest=normalized_expected_digest,
+                deadline=deadline,
+            )
             try:
-                self._request(
-                    {
-                        "operation": "begin",
-                        "deletion_id": deletion_id,
-                        "deleted_at": normalized_deleted_at,
-                        "expected_count": expected_count,
-                        "expected_digest": expected_digest,
-                    },
-                    timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
-                )
-                for chunk_index, chunk in enumerate(
-                    _archive_message_chunks(records, deletion_id=deletion_id)
-                ):
-                    self._request(
-                        {
-                            "operation": "chunk",
-                            "deletion_id": deletion_id,
-                            "chunk_index": chunk_index,
-                            "messages": chunk,
-                        },
-                        timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
-                    )
-                self._request(
+                self._request_until(
                     {"operation": "commit", "deletion_id": deletion_id},
-                    timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS,
+                    deadline=deadline,
                 )
+                self._active_deletion_id = None
             except DeletedConversationArchiveError:
                 try:
-                    self._request(
-                        {"operation": "abort", "deletion_id": deletion_id},
-                        timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
-                        reconnect=False,
-                    )
+                    self._abort_locked(deletion_id=deletion_id)
                 except DeletedConversationArchiveError:
                     pass
                 raise
@@ -937,18 +1105,12 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
         with self._lock:
             if self._closed:
                 return
-            try:
-                if self._connection is not None:
-                    self._request(
-                        {"operation": "close"},
-                        timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
-                        reconnect=False,
-                    )
-            except DeletedConversationArchiveError:
-                pass
-            finally:
-                self._closed = True
-                self._close_connection()
+            # Closing the client socket is deliberately not a service-shutdown
+            # request.  The archive listener has its own lifecycle and owns
+            # cleanup of any staged batch when this connection disappears.
+            self._closed = True
+            self._active_deletion_id = None
+            self._close_connection()
 
     def __del__(self) -> None:
         try:
@@ -1210,8 +1372,29 @@ def _abort_archive_batch(
         raise
 
 
-def _serve_archive_connection(connection: Any, database: str | Path) -> bool:
+def _abort_incomplete_archive_batches(
+    archive_connection: sqlite3.Connection,
+    deletion_ids: set[str],
+) -> None:
+    """Release staging owned by a client whose IPC connection disappeared."""
+
+    for deletion_id in tuple(deletion_ids):
+        try:
+            _abort_archive_batch(
+                archive_connection,
+                deletion_id=deletion_id,
+            )
+        except (DeletedConversationArchiveError, sqlite3.Error):
+            # The service is already handling a broken client connection.  A
+            # later administrative cleanup/restart can still remove a batch
+            # if the archive database itself is unavailable at this moment.
+            continue
+    deletion_ids.clear()
+
+
+def _serve_archive_connection(connection: Any, database: str | Path) -> None:
     archive_connection: sqlite3.Connection | None = None
+    active_batch_ids: set[str] = set()
     try:
         archive_connection = sqlite3.connect(
             str(_archive_database_path(database)), timeout=30
@@ -1226,17 +1409,14 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> bool:
                     connection.recv_bytes(_MAX_ARCHIVE_FRAME_BYTES)
                 )
             except (EOFError, OSError):
-                return False
+                return
             except (TypeError, ValueError) as exc:
                 try:
                     _send_archive_response(connection, ok=False, message=str(exc))
                 except (BrokenPipeError, EOFError, OSError, ValueError):
-                    return False
+                    return
                 continue
             operation = request.get("operation")
-            if operation == "close":
-                _send_archive_response(connection, ok=True)
-                return True
             try:
                 if operation == "archive":
                     records = request["messages"]
@@ -1264,6 +1444,7 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> bool:
                         expected_count=request["expected_count"],
                         expected_digest=request["expected_digest"],
                     )
+                    active_batch_ids.add(request["deletion_id"])
                 elif operation == "chunk":
                     _append_archive_batch_chunk(
                         archive_connection,
@@ -1276,11 +1457,13 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> bool:
                         archive_connection,
                         deletion_id=request["deletion_id"],
                     )
+                    active_batch_ids.discard(request["deletion_id"])
                 elif operation == "abort":
                     _abort_archive_batch(
                         archive_connection,
                         deletion_id=request["deletion_id"],
                     )
+                    active_batch_ids.discard(request["deletion_id"])
                 else:
                     raise DeletedConversationArchiveError(
                         "deleted archive service received an unsupported operation"
@@ -1290,9 +1473,10 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> bool:
                 try:
                     _send_archive_response(connection, ok=False, message=str(exc))
                 except (BrokenPipeError, EOFError, OSError, ValueError):
-                    return False
+                    return
     finally:
         if archive_connection is not None:
+            _abort_incomplete_archive_batches(archive_connection, active_batch_ids)
             archive_connection.close()
         try:
             connection.close()
@@ -1319,8 +1503,7 @@ def serve_sqlite_deleted_conversation_archive(
         while True:
             connection = listener.accept()
             try:
-                if _serve_archive_connection(connection, database):
-                    break
+                _serve_archive_connection(connection, database)
             finally:
                 connection.close()
     finally:
@@ -1342,8 +1525,7 @@ def _archive_service_process_main(
         while True:
             connection = listener.accept()
             try:
-                if _serve_archive_connection(connection, database):
-                    break
+                _serve_archive_connection(connection, database)
             finally:
                 connection.close()
     except Exception as exc:  # noqa: BLE001 - startup boundary reports typed errors

@@ -7,8 +7,11 @@ import sqlite3
 import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from multiprocessing.connection import Listener
-from threading import Event, Thread
+from threading import Event, RLock, Thread
+from time import monotonic as time_monotonic
+from time import sleep
 
 import pytest
 from test_support import build_receiver_components
@@ -64,6 +67,23 @@ class _FailDeletionStateStore(InMemoryDurableStateStore):
 
 
 class _FailDeletionArchive:
+    def stage(
+        self,
+        messages,
+        *,
+        deletion_id,
+        deleted_at,
+        expected_count=None,
+        expected_digest=None,
+    ):
+        raise DeletedConversationArchiveError("controlled archive failure")
+
+    def finalize(self, *, deletion_id):
+        raise DeletedConversationArchiveError("controlled archive failure")
+
+    def abort(self, *, deletion_id):
+        return None
+
     def archive(
         self,
         messages,
@@ -77,6 +97,31 @@ class _FailDeletionArchive:
 
     def close(self):
         return None
+
+
+class _TransactionObservingArchive:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self._archive = InMemoryDeletedConversationArchive()
+        self.stage_transaction_states: list[bool] = []
+        self.finalize_transaction_states: list[bool] = []
+
+    def stage(self, messages, **kwargs):
+        self.stage_transaction_states.append(self._connection.in_transaction)
+        self._archive.stage(messages, **kwargs)
+
+    def finalize(self, *, deletion_id):
+        self.finalize_transaction_states.append(self._connection.in_transaction)
+        self._archive.finalize(deletion_id=deletion_id)
+
+    def abort(self, *, deletion_id):
+        self._archive.abort(deletion_id=deletion_id)
+
+    def archive(self, messages, **kwargs):
+        self._archive.archive(messages, **kwargs)
+
+    def close(self):
+        self._archive.close()
 
 
 class _FailDeletionArchiveStateStore(InMemoryDurableStateStore):
@@ -237,6 +282,136 @@ def test_archive_ipc_response_timeout_closes_writer_connection(
 
     assert not server_thread.is_alive()
     assert server_errors == []
+
+
+def test_archive_transfer_uses_one_deadline_across_all_frames(monkeypatch) -> None:
+    writer = object.__new__(SQLiteDeletedConversationArchiveWriter)
+    writer._lock = RLock()  # type: ignore[attr-defined]
+    writer._closed = False  # type: ignore[attr-defined]
+    writer._active_deletion_id = None  # type: ignore[attr-defined]
+    timeouts: list[float] = []
+
+    def record_request(request, *, timeout_seconds, reconnect=True):
+        del request, reconnect
+        timeouts.append(timeout_seconds)
+
+    writer._request = record_request  # type: ignore[attr-defined]
+    monkeypatch.setattr(conversation_archive, "_MAX_ARCHIVE_FRAME_BYTES", 500)
+    messages = tuple(
+        _message(message_id=f"deadline-{index}", text="x" * 100) for index in range(20)
+    )
+
+    writer.archive(messages, deletion_id="aggregate-deadline", deleted_at=NOW)
+
+    assert len(timeouts) > 3
+    assert all(earlier > later for earlier, later in pairwise(timeouts))
+
+
+def test_archive_service_cleans_staged_batch_when_writer_disconnects(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "deleted.sqlite3"
+    service = start_sqlite_deleted_conversation_archive_service(database)
+    writer = service.writer
+    original_receive_response = writer._receive_response
+    receive_calls = 0
+
+    def disconnect_after_first_chunk(*, timeout_seconds):
+        nonlocal receive_calls
+        response = original_receive_response(timeout_seconds=timeout_seconds)
+        receive_calls += 1
+        if receive_calls == 2:
+            writer._close_connection()
+            raise DeletedConversationArchiveError(
+                "deleted archive service response timed out"
+            )
+        return response
+
+    monkeypatch.setattr(writer, "_receive_response", disconnect_after_first_chunk)
+    try:
+        with pytest.raises(DeletedConversationArchiveError, match="timed out"):
+            writer.archive(
+                (_message(message_id="orphaned", text="must not be stranded"),),
+                deletion_id="orphaned-batch",
+                deleted_at=NOW,
+            )
+
+        deadline = time_monotonic() + 2.0
+        counts = None
+        while time_monotonic() < deadline:
+            connection = sqlite3.connect(database)
+            try:
+                counts = connection.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM deleted_message_batches),
+                        (SELECT COUNT(*) FROM deleted_message_batch_items),
+                        (SELECT COUNT(*) FROM deleted_messages)
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+            if counts == (0, 0, 0):
+                break
+            sleep(0.01)
+
+        assert counts == (0, 0, 0)
+    finally:
+        service.close()
+
+
+def test_closing_one_writer_does_not_stop_the_archive_service(tmp_path) -> None:
+    database = tmp_path / "deleted.sqlite3"
+    service = start_sqlite_deleted_conversation_archive_service(database)
+    first_writer = service.writer
+    second_writer = None
+    message = _message(message_id="fresh-writer", text="service remains alive")
+    try:
+        first_writer.close()
+        second_writer = SQLiteDeletedConversationArchiveWriter(
+            service.endpoint,
+            authkey=service._authkey,  # type: ignore[attr-defined]
+        )
+        second_writer.archive(
+            (message,),
+            deletion_id="fresh-writer-deletion",
+            deleted_at=NOW,
+        )
+    finally:
+        if second_writer is not None:
+            second_writer.close()
+        service.close()
+
+    admin_archive = open_sqlite_deleted_conversation_archive(database)
+    try:
+        assert [record.message for record in admin_archive.list_records()] == [message]
+    finally:
+        admin_archive.close()
+
+
+def test_sqlite_deletion_stages_transfer_before_live_write_transaction(tmp_path):
+    connection = sqlite3.connect(tmp_path / "jarvis.sqlite3")
+    archive = _TransactionObservingArchive(connection)
+    state = SQLiteDurableStateStore(connection, deleted_archive=archive)
+    selected = _message(message_id="transaction-boundary", text="outside lock")
+    try:
+        state.append_conversation_message(selected)
+        preview = state.preview_conversation_deletion(
+            ConversationDeletionScope.message(selected.history_id)
+        )
+
+        state.delete_conversation_history(
+            preview,
+            deletion_id="transaction-boundary-deletion",
+            deleted_at=NOW,
+        )
+
+        assert archive.stage_transaction_states == [False]
+        assert archive.finalize_transaction_states == [True]
+        assert state.list_conversation_messages() == ()
+    finally:
+        state.close()
+        connection.close()
 
 
 def test_archive_writer_recovers_after_timeout_for_a_later_transaction(

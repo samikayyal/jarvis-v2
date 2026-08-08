@@ -385,53 +385,71 @@ class InMemoryDurableStateStore:
         with self._lock:
             if self.fail_conversation:
                 raise StateStoreError("controlled conversation deletion failure")
-            current = _preview_conversation_deletion(
-                self.conversation_messages.values(),
-                ConversationDeletionScope.message(preview.history_ids),
+        try:
+            _stage_deleted_archive(
+                self._deleted_archive,
+                preview.messages,
+                deletion_id=deletion_id,
+                deleted_at=deleted_at,
+                expected_count=preview.count,
+                expected_digest=preview.content_digest,
             )
-            if (
-                current.history_ids != preview.history_ids
-                or current.content_digest != preview.content_digest
-            ):
-                raise StateStoreError(
-                    "conversation deletion preview no longer matches accessible history"
-                )
+        except DeletedConversationArchiveError as exc:
+            raise StateStoreError(
+                "could not transfer conversation history to the deleted archive"
+            ) from exc
+        with self._lock:
             try:
-                self._deleted_archive.archive(
-                    preview.messages,
-                    deletion_id=deletion_id,
-                    deleted_at=deleted_at,
-                    expected_count=preview.count,
-                    expected_digest=preview.content_digest,
+                current = _preview_conversation_deletion(
+                    self.conversation_messages.values(),
+                    ConversationDeletionScope.message(preview.history_ids),
                 )
-            except DeletedConversationArchiveError as exc:
-                raise StateStoreError(
-                    "could not transfer conversation history to the deleted archive"
-                ) from exc
-            archived: list[tuple[tuple[str, str], ConversationMessage]] = []
-            tombstones: list[ConversationTombstone] = []
-            for message in preview.messages:
-                key = (message.transport_session_id, message.message_id)
-                if key not in self.conversation_messages:
+                if (
+                    current.history_ids != preview.history_ids
+                    or current.content_digest != preview.content_digest
+                ):
                     raise StateStoreError(
-                        "conversation deletion record is no longer accessible"
+                        "conversation deletion preview no longer matches accessible history"
                     )
-                archived.append((key, message))
-                tombstones.append(
-                    _conversation_tombstone(
-                        message,
+                try:
+                    _finalize_deleted_archive(
+                        self._deleted_archive,
                         deletion_id=deletion_id,
-                        deleted_at=deleted_at,
-                        scope_type=preview.scope.scope_type,
-                        ordinal=len(tombstones),
                     )
+                except DeletedConversationArchiveError as exc:
+                    raise StateStoreError(
+                        "could not transfer conversation history to the deleted archive"
+                    ) from exc
+                archived: list[tuple[tuple[str, str], ConversationMessage]] = []
+                tombstones: list[ConversationTombstone] = []
+                for message in preview.messages:
+                    key = (message.transport_session_id, message.message_id)
+                    if key not in self.conversation_messages:
+                        raise StateStoreError(
+                            "conversation deletion record is no longer accessible"
+                        )
+                    archived.append((key, message))
+                    tombstones.append(
+                        _conversation_tombstone(
+                            message,
+                            deletion_id=deletion_id,
+                            deleted_at=deleted_at,
+                            scope_type=preview.scope.scope_type,
+                            ordinal=len(tombstones),
+                        )
+                    )
+                for key, message in archived:
+                    self.conversation_messages.pop(key, None)
+                    self.outbound_outbox.pop(key, None)
+                for tombstone in tombstones:
+                    self._conversation_tombstones[tombstone.history_id] = tombstone
+                return tuple(tombstones)
+            except StateStoreError:
+                _abort_deleted_archive(
+                    self._deleted_archive,
+                    deletion_id=deletion_id,
                 )
-            for key, message in archived:
-                self.conversation_messages.pop(key, None)
-                self.outbound_outbox.pop(key, None)
-            for tombstone in tombstones:
-                self._conversation_tombstones[tombstone.history_id] = tombstone
-            return tuple(tombstones)
+                raise
 
     delete_conversation_messages = delete_conversation_history
 
@@ -1479,8 +1497,27 @@ class SQLiteDurableStateStore:
         if not isinstance(deletion_id, str) or not deletion_id.strip():
             raise ValueError("deletion_id must be non-blank")
         deleted_at = ensure_utc(deleted_at)
+        if self._deleted_archive is None:
+            raise StateStoreError(
+                "deleted conversation archive writer is not configured"
+            )
+        try:
+            _stage_deleted_archive(
+                self._deleted_archive,
+                preview.messages,
+                deletion_id=deletion_id,
+                deleted_at=deleted_at,
+                expected_count=preview.count,
+                expected_digest=preview.content_digest,
+            )
+        except DeletedConversationArchiveError as exc:
+            raise StateStoreError(
+                "could not transfer conversation history to the deleted archive"
+            ) from exc
+        transaction_started = False
         try:
             self.connection.execute("BEGIN IMMEDIATE")
+            transaction_started = True
             current = _preview_conversation_deletion(
                 self._select_conversation_messages_for_deletion(
                     ConversationDeletionScope.message(preview.history_ids)
@@ -1492,24 +1529,18 @@ class SQLiteDurableStateStore:
                 or current.content_digest != preview.content_digest
             ):
                 self.connection.rollback()
+                transaction_started = False
                 raise StateStoreError(
                     "conversation deletion preview no longer matches accessible history"
                 )
-            if self._deleted_archive is None:
-                self.connection.rollback()
-                raise StateStoreError(
-                    "deleted conversation archive writer is not configured"
-                )
             try:
-                self._deleted_archive.archive(
-                    preview.messages,
+                _finalize_deleted_archive(
+                    self._deleted_archive,
                     deletion_id=deletion_id,
-                    deleted_at=deleted_at,
-                    expected_count=preview.count,
-                    expected_digest=preview.content_digest,
                 )
             except DeletedConversationArchiveError as exc:
                 self.connection.rollback()
+                transaction_started = False
                 raise StateStoreError(
                     "could not transfer conversation history to the deleted archive"
                 ) from exc
@@ -1568,16 +1599,31 @@ class SQLiteDurableStateStore:
                 self.connection.commit()
             except sqlite3.Error as exc:
                 self.connection.rollback()
+                transaction_started = False
                 raise StateStoreError(
                     "could not delete conversation history; could not determine "
                     "whether the deletion committed",
                     may_have_dispatched=True,
                 ) from exc
+            transaction_started = False
             return tuple(tombstones)
         except StateStoreError:
+            if transaction_started:
+                try:
+                    self.connection.rollback()
+                except sqlite3.Error:
+                    pass
+            _abort_deleted_archive(
+                self._deleted_archive,
+                deletion_id=deletion_id,
+            )
             raise
         except sqlite3.IntegrityError as exc:
             self.connection.rollback()
+            _abort_deleted_archive(
+                self._deleted_archive,
+                deletion_id=deletion_id,
+            )
             raise StateStoreError(
                 "conversation deletion tombstone already exists"
             ) from exc
@@ -1586,6 +1632,10 @@ class SQLiteDurableStateStore:
                 self.connection.rollback()
             except sqlite3.Error:
                 pass
+            _abort_deleted_archive(
+                self._deleted_archive,
+                deletion_id=deletion_id,
+            )
             raise StateStoreError("could not delete conversation history") from exc
 
     delete_conversation_messages = delete_conversation_history
@@ -1862,6 +1912,48 @@ def _conversation_tombstone(
         deleted_at=deleted_at,
         scope_type=scope_type,
     )
+
+
+def _stage_deleted_archive(
+    writer: DeletedConversationArchiveWriter,
+    messages: Sequence[ConversationMessage],
+    *,
+    deletion_id: str,
+    deleted_at: datetime,
+    expected_count: int,
+    expected_digest: str,
+) -> None:
+    """Stage content before the live-state transaction."""
+
+    writer.stage(
+        messages,
+        deletion_id=deletion_id,
+        deleted_at=deleted_at,
+        expected_count=expected_count,
+        expected_digest=expected_digest,
+    )
+
+
+def _finalize_deleted_archive(
+    writer: DeletedConversationArchiveWriter,
+    *,
+    deletion_id: str,
+) -> None:
+    writer.finalize(deletion_id=deletion_id)
+
+
+def _abort_deleted_archive(
+    writer: DeletedConversationArchiveWriter,
+    *,
+    deletion_id: str,
+) -> None:
+    try:
+        writer.abort(deletion_id=deletion_id)
+    except DeletedConversationArchiveError:
+        # A disconnected writer is cleaned up by the archive service which
+        # owns the staged batch.  Do not hide the state-store failure with a
+        # second transport error.
+        pass
 
 
 def _filter_conversation_messages(
