@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import sqlite3
 import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
+from multiprocessing.connection import Listener
+from threading import Event, Thread
 
 import pytest
 from test_support import build_receiver_components
@@ -16,6 +19,7 @@ from jarvis_control_plane import (
     ConversationDeletionPreview,
     ConversationDeletionScope,
     ConversationMessage,
+    DeletedConversationArchiveError,
     InboundMessage,
     InMemoryAuditBoundary,
     InMemoryDeletedConversationArchive,
@@ -23,9 +27,11 @@ from jarvis_control_plane import (
     SignedInboundEvent,
     SQLiteDurableStateStore,
     StateStoreError,
+    conversation_archive,
 )
 from jarvis_control_plane.control_grammar import MessageKind, parse_control
 from jarvis_control_plane.conversation_archive import (
+    SQLiteDeletedConversationArchiveWriter,
     start_sqlite_deleted_conversation_archive_service,
 )
 from jarvis_control_plane.manual_admin import open_sqlite_deleted_conversation_archive
@@ -50,6 +56,16 @@ class _FailOnceCommitConnection(sqlite3.Connection):
             self.fail_next_commit = False
             raise sqlite3.OperationalError("injected live-state commit failure")
         super().commit()
+
+
+class _PickleExecutionProbe:
+    """Would create a marker if an archive server unpickled this payload."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return os.system, (f'echo executed > "{self.marker}"',)
 
 
 def _message(
@@ -85,6 +101,141 @@ def test_incomplete_history_delete_is_deterministically_malformed(command: str) 
     parsed = parse_control(command)
 
     assert parsed.kind is MessageKind.MALFORMED_COMMAND
+
+
+def test_archive_ipc_rejects_pickle_payload_without_executing_it(tmp_path) -> None:
+    archive_service = start_sqlite_deleted_conversation_archive_service(
+        tmp_path / "deleted.sqlite3"
+    )
+    marker = tmp_path / "pickle-executed.txt"
+    writer = archive_service.writer
+    try:
+        writer._connection.send_bytes(  # type: ignore[attr-defined]
+            pickle.dumps(_PickleExecutionProbe(str(marker)))
+        )
+
+        assert writer._connection.poll(2.0)  # type: ignore[attr-defined]
+        response = json.loads(  # type: ignore[attr-defined]
+            writer._connection.recv_bytes(  # type: ignore[attr-defined]
+                conversation_archive._MAX_ARCHIVE_FRAME_BYTES
+            ).decode("utf-8")
+        )
+
+        assert response["ok"] is False
+        assert not marker.exists()
+    finally:
+        archive_service.close()
+
+
+def test_archive_ipc_response_timeout_closes_writer_connection(
+    tmp_path, monkeypatch
+) -> None:
+    authkey = b"ticket21-hanging-archive"
+    endpoint = (
+        rf"\\.\pipe\jarvis-ticket21-hanging-{os.urandom(8).hex()}"
+        if os.name == "nt"
+        else str(tmp_path / "hanging.sock")
+    )
+    listener_ready = Event()
+    request_received = Event()
+    release_server = Event()
+    server_errors: list[BaseException] = []
+
+    def serve_without_reply() -> None:
+        listener = None
+        connection = None
+        try:
+            listener = Listener(
+                endpoint,
+                family=conversation_archive._archive_ipc_family(),
+                authkey=authkey,
+            )
+            listener_ready.set()
+            connection = listener.accept()
+            connection.send_bytes(b'{"ok":true}')
+            connection.recv_bytes(conversation_archive._MAX_ARCHIVE_FRAME_BYTES)
+            request_received.set()
+            release_server.wait(2.0)
+        except (EOFError, OSError):
+            request_received.set()
+        except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
+            server_errors.append(exc)
+        finally:
+            if connection is not None:
+                connection.close()
+            if listener is not None:
+                listener.close()
+            if os.name != "nt":
+                (tmp_path / "hanging.sock").unlink(missing_ok=True)
+
+    server_thread = Thread(target=serve_without_reply, daemon=True)
+    server_thread.start()
+    assert listener_ready.wait(2.0)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_RESPONSE_TIMEOUT_SECONDS", 0.2)
+
+    writer = SQLiteDeletedConversationArchiveWriter(endpoint, authkey=authkey)
+    try:
+        with pytest.raises(DeletedConversationArchiveError, match="timed out"):
+            writer.archive(
+                (_message(message_id="timeout", text="archive request hangs"),),
+                deletion_id="deletion-timeout",
+                deleted_at=NOW,
+            )
+        assert request_received.wait(2.0)
+        assert writer._closed  # type: ignore[attr-defined]
+    finally:
+        writer.close()
+        release_server.set()
+        server_thread.join(2.0)
+
+    assert not server_thread.is_alive()
+    assert server_errors == []
+
+
+def test_current_conversation_delete_is_refused_until_session_ends() -> None:
+    state = InMemoryDurableStateStore()
+    current = _message(
+        message_id="current-message",
+        text="keep the active conversation accessible",
+        working_session_id="conversation-current",
+    )
+    state.append_conversation_message(current)
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=b"ticket21-current-conversation-secret",
+        now=NOW,
+        id_prefix="ticket21-current-conversation",
+        state=state,
+        working_session_id="conversation-current",
+    )
+
+    result = components.receiver.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id=TRANSPORT_SESSION,
+                event_id="event-delete-current",
+                message_id="message-delete-current",
+                sender_id=OPERATOR,
+                chat_id=OPERATOR,
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text="/history delete conversation conversation-current",
+            ),
+            components.config.signing_secret,
+        )
+    )
+
+    assert result.disposition == "history_delete_current_refused"
+    assert result.reply is not None
+    assert "/new" in result.reply.body
+    assert components.broker.current_pending_action is None
+    assert state.list_conversation_tombstones() == ()
+    assert state.search_conversation_messages(history_ids=(current.history_id,)) == (
+        current,
+    )
 
 
 @pytest.mark.parametrize(

@@ -2469,6 +2469,16 @@ class DeterministicCapabilityBroker:
 
         try:
             scope = self._parse_history_deletion_scope(args)
+            if (
+                scope.scope_type == "conversation"
+                and scope.conversation_id == current.session_id
+            ):
+                return self._dispatch_history_text(
+                    message,
+                    "The active conversation cannot be deleted while it is open. "
+                    "Use /new first, then delete the closed conversation.",
+                    disposition="history_delete_current_refused",
+                )
             preview = self.state.preview_conversation_deletion(scope)
         except (StateStoreError, TypeError, ValueError) as exc:
             return self._dispatch_history_text(
