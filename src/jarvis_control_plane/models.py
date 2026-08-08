@@ -419,9 +419,15 @@ AssistantMemory = DurableMemory
 
 @dataclass(frozen=True, slots=True)
 class MemorySelection:
-    """Bounded non-secret memory passed to orchestration as context."""
+    """Bounded memory selected for orchestration context.
+
+    Automatic retrieval is always non-secret.  The broker may instead create
+    an explicit exact-record selection, which is the only path that can carry
+    a credential-like memory into an orchestration request.
+    """
 
     memories: tuple[DurableMemory, ...]
+    explicit: bool = False
 
     def __post_init__(self) -> None:
         memories = tuple(self.memories)
@@ -431,7 +437,9 @@ class MemorySelection:
             raise ValueError(
                 "automatic memory selection cannot include terminal records"
             )
-        if any(memory.credential_like for memory in memories):
+        if not isinstance(self.explicit, bool):
+            raise TypeError("memory selection explicit flag must be boolean")
+        if not self.explicit and any(memory.credential_like for memory in memories):
             raise ValueError("automatic memory selection cannot include credentials")
         object.__setattr__(self, "memories", memories)
 
@@ -532,6 +540,7 @@ class OrchestrationRequest:
     text: str
     history: tuple[ConversationMessage, ...] = ()
     memories: tuple[DurableMemory, ...] = ()
+    memory_selection: MemorySelection | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
@@ -543,7 +552,15 @@ class OrchestrationRequest:
             raise TypeError("orchestration memories must contain DurableMemory values")
         if any(not memory.is_active for memory in memories):
             raise ValueError("orchestration memories must be active")
-        if any(memory.credential_like for memory in memories):
+        selection = self.memory_selection
+        if selection is not None:
+            if not isinstance(selection, MemorySelection):
+                raise TypeError("memory_selection must be a MemorySelection")
+            if selection.memories != memories:
+                raise ValueError(
+                    "orchestration memory selection must match its memories"
+                )
+        elif any(memory.credential_like for memory in memories):
             raise ValueError("orchestration memories cannot contain credentials")
         object.__setattr__(self, "memories", memories)
 
@@ -992,7 +1009,7 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
         ),
     },
     "durable_memory_access": {
-        "operation": frozenset({"list", "search", "inspect"}),
+        "operation": frozenset({"list", "search", "inspect", "use"}),
         "target": None,
     },
     "durable_memory_invalid": {

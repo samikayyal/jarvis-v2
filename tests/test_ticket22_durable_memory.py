@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
@@ -13,7 +14,15 @@ from jarvis_control_plane import (
     MemoryOperation,
     SignedInboundEvent,
     SQLiteDurableStateStore,
+    StateStoreError,
     parse_memory_command,
+)
+from jarvis_control_plane.control_grammar import MessageKind, parse_control
+from jarvis_control_plane.sessions import (
+    InMemoryWorkingSessionStore,
+    PendingActionState,
+    accept_request,
+    install_pending_action,
 )
 
 NOW = datetime(2026, 8, 8, 9, 0, tzinfo=UTC)
@@ -80,6 +89,260 @@ def test_memory_parser_requires_explicit_remember_language_and_preserves_content
     assert slash.operation is MemoryOperation.REPLACE
     assert slash.memory_id == "memory-001"
     assert slash.content == "Keep Title Case"
+
+
+def test_memory_parser_is_the_only_authority_for_memory_command_grammar() -> None:
+    assert parse_control("/memory list").kind is MessageKind.UNKNOWN_COMMAND
+    command = parse_memory_command("/memory list")
+    assert command is not None
+    assert command.operation is MemoryOperation.LIST
+
+
+@pytest.mark.parametrize(
+    ("text", "operation"),
+    (
+        ("/memory search", MemoryOperation.SEARCH),
+        ("/memory remember", MemoryOperation.REMEMBER),
+    ),
+)
+def test_memory_parser_represents_missing_arguments_without_raising(
+    text: str, operation: MemoryOperation
+) -> None:
+    command = parse_memory_command(text)
+    assert command is not None
+    assert command.operation is operation
+    assert command.content is None
+    assert command.is_valid is False
+    assert command.error
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "/memory search",
+        "/memory remember",
+        "/memory list extra",
+        "/memory inspect memory-invalid extra",
+        "/memory forget memory-invalid extra",
+        "/memory unknown",
+    ),
+)
+def test_invalid_memory_commands_return_usage_instead_of_escaping_receiver(
+    text: str,
+) -> None:
+    slug = text.removeprefix("/memory ").replace(" ", "-")
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id=f"session.ticket22.invalid-{slug}",
+        signing_secret=b"ticket22-invalid-secret",
+        now=NOW,
+        id_prefix="ticket22-invalid",
+    )
+
+    result = components.receiver.receive(
+        _event(components, message_id=f"message-invalid-{slug}", text=text)
+    )
+
+    assert result.disposition == "memory_invalid"
+    assert result.reason is None
+    assert components.orchestration.calls == []
+
+
+def _set_working_session_state(components, *, pending: bool) -> None:
+    store = components.broker.working_sessions
+    current = store.load()
+    assert current is not None
+    accepted = accept_request(
+        current,
+        now=NOW,
+        request_id="ticket22-gate-request",
+        originating_message_id="ticket22-gate-message",
+    )
+    assert accepted.cancellation_token is not None
+    updated = accepted.state
+    if pending:
+        action = PendingActionState.create(
+            action_id="ticket22-gate-action",
+            session_id=updated.session_id,
+            request_id="ticket22-gate-request",
+            kind="placeholder",
+            summary="A bounded pending action",
+            created_at=NOW,
+        )
+        updated = install_pending_action(updated, action, now=NOW).state
+    store.compare_and_set(current, updated)
+
+
+@pytest.mark.parametrize(
+    "memory_command",
+    ("/memory list", "/memory search key", "/memory inspect memory-gate"),
+)
+@pytest.mark.parametrize("pending", (False, True))
+def test_memory_reads_respect_active_request_and_pending_action_gates(
+    memory_command: str, pending: bool
+) -> None:
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id=f"session.ticket22.gate-{pending}-{memory_command.count(' ')}",
+        signing_secret=b"ticket22-gate-secret",
+        now=NOW,
+        id_prefix="ticket22-gate",
+        working_sessions=InMemoryWorkingSessionStore(),
+    )
+    components.state.create_memory(
+        DurableMemory(
+            memory_id="memory-gate",
+            content="The gate test memory.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    _set_working_session_state(components, pending=pending)
+
+    result = components.receiver.receive(
+        _event(
+            components,
+            message_id=f"message-gate-{pending}-{memory_command.count(' ')}",
+            text=memory_command,
+        )
+    )
+
+    assert result.disposition == ("pending_blocked" if pending else "busy_refused")
+    assert components.orchestration.calls == []
+    assert all(
+        not (
+            reply.body.startswith("Durable assistant memory")
+            or "memory-gate |" in reply.body
+        )
+        for reply in components.outbound.sent
+    )
+
+
+def test_explicit_exact_memory_use_allows_credential_like_memory_in_orchestration() -> (
+    None
+):
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.ticket22.explicit-use",
+        signing_secret=b"ticket22-explicit-use-secret",
+        now=NOW,
+        id_prefix="ticket22-explicit-use",
+    )
+    components.state.create_memory(
+        DurableMemory(
+            memory_id="memory-explicit-secret",
+            content="The API key is sk-proj-ticket22-explicit-value.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    components.state.create_memory(
+        DurableMemory(
+            memory_id="memory-not-selected",
+            content="The operator prefers concise updates.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+    result = components.receiver.receive(
+        _event(
+            components,
+            message_id="message-explicit-use",
+            text="/memory use memory-explicit-secret What is the exact API key?",
+        )
+    )
+
+    assert result.disposition == "completed"
+    assert len(components.orchestration.calls) == 1
+    call = components.orchestration.calls[0]
+    assert call.text == "What is the exact API key?"
+    assert [memory.memory_id for memory in call.memories] == ["memory-explicit-secret"]
+    assert call.memories[0].credential_like is True
+    assert "memory-not-selected" not in {memory.memory_id for memory in call.memories}
+    assert any(
+        "memory-explicit-secret from message none" in reply.body
+        for reply in components.outbound.sent
+    )
+
+
+@pytest.mark.parametrize("store_kind", ("memory", "sqlite"))
+def test_memory_lifecycle_contract_covers_both_durable_store_adapters(
+    store_kind: str, tmp_path
+) -> None:
+    state = (
+        InMemoryDurableStateStore()
+        if store_kind == "memory"
+        else SQLiteDurableStateStore(tmp_path / "memory-lifecycle.sqlite3")
+    )
+    try:
+        original = DurableMemory(
+            memory_id="memory-contract-original",
+            content="The original contract memory.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        secret = DurableMemory(
+            memory_id="memory-contract-secret",
+            content="API key: sk-proj-ticket22-contract-value.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        replacement = DurableMemory(
+            memory_id="memory-contract-replacement",
+            content="The replacement contract memory.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        state.create_memory(original)
+        state.create_memory(secret)
+        assert state.search_memories(memory_ids=(original.memory_id,)) == (original,)
+        assert (
+            state.select_memories_for_context(text="ticket22", limit=5).memories == ()
+        )
+
+        state.replace_memory(
+            original.memory_id,
+            replacement,
+            expected_revision=original.revision_digest,
+        )
+        retired = state.get_memory(original.memory_id)
+        assert retired is not None
+        assert retired.is_terminal
+        assert retired.content is None
+        assert state.search_memories(text="replacement") == (replacement,)
+        assert state.select_memories_for_context(
+            text="replacement", limit=5
+        ).memories == (replacement,)
+        assert state.list_memories(include_terminal=False) == (replacement, secret)
+
+        with pytest.raises(StateStoreError):
+            state.replace_memory(
+                replacement.memory_id,
+                DurableMemory(
+                    memory_id="memory-contract-stale",
+                    content="A stale replacement.",
+                    created_at=NOW,
+                    updated_at=NOW,
+                ),
+                expected_revision="stale-revision",
+            )
+        assert state.get_memory("memory-contract-stale") is None
+
+        state.forget_memory(
+            secret.memory_id,
+            expected_revision=secret.revision_digest,
+            updated_at=NOW,
+        )
+        forgotten = state.get_memory(secret.memory_id)
+        assert forgotten is not None
+        assert forgotten.is_terminal
+        assert forgotten.content is None
+        assert state.select_memories_for_context(text="API key", limit=5).memories == ()
+        assert state.list_memories(include_terminal=False) == (replacement,)
+    finally:
+        if isinstance(state, SQLiteDurableStateStore):
+            state.close()
 
 
 def test_in_memory_and_sqlite_memory_contracts_use_the_same_exact_selector() -> None:

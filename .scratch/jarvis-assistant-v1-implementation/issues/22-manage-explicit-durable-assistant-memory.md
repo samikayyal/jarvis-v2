@@ -15,4 +15,5 @@
 - Added explicit `remember` and `/memory` read/write paths with approval-gated durable mutations.
 - Added SQLite and in-memory lifecycle persistence with stable IDs, provenance, exact revision checks, and content-free terminal records.
 - Added automatic safe-memory selection with credential-like exclusion and metadata-only memory audit events.
-- Validation: `uv run pytest -q` (360 passed), `uv run ruff check .`, and `uv run ruff format --check .`.
+- Defined `/memory use <memory-id> <request>` as the only explicit model-use path: the broker resolves one exact active record, permits a credential-like record only for that exact selection, and does not broaden the selection through automatic retrieval.
+- Validation: `uv run pytest -q` (378 passed), `uv run ruff check .`, and `uv run ruff format --check .`.

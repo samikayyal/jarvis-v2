@@ -28,6 +28,7 @@ from .models import (
     DurableMemory,
     FrozenActionProposal,
     InboundMessage,
+    MemorySelection,
     OrchestrationRequest,
     OrchestrationResult,
     OutboundReply,
@@ -375,6 +376,22 @@ class DeterministicCapabilityBroker:
         )
         if isinstance(result, ReceiveResult):
             return result
+        return self._complete_orchestration_result(
+            message=message,
+            request=request,
+            cancellation_token=cancellation_token,
+            result=result,
+        )
+
+    def _complete_orchestration_result(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        cancellation_token: CancellationToken,
+        result: OrchestrationResult,
+    ) -> ReceiveResult:
+        """Apply one orchestration result through the shared broker boundary."""
 
         if not cancellation_token_is_current(
             self._current_working_session(), cancellation_token
@@ -1689,24 +1706,28 @@ class DeterministicCapabilityBroker:
         message: InboundMessage,
         request: RequestState,
         cancellation_token: CancellationToken,
+        orchestration_text: str | None = None,
+        memory_selection: MemorySelection | None = None,
     ) -> OrchestrationResult | ReceiveResult:
         """Execute and durably observe the controlled orchestration stage."""
 
         try:
+            prompt_text = orchestration_text or message.text
             history = self.state.select_history_for_context(
-                text=message.text,
+                text=prompt_text,
                 excluding_working_session_id=self.current_working_session_id,
                 limit=5,
             )
-            memories = self.state.select_memories_for_context(
-                text=message.text,
+            memories = memory_selection or self.state.select_memories_for_context(
+                text=prompt_text,
                 limit=5,
             )
             orchestration_request = OrchestrationRequest(
                 state=request,
-                text=message.text,
+                text=prompt_text,
                 history=history.messages,
                 memories=memories.memories,
+                memory_selection=memories,
             )
             result = self._trace.execute(
                 request_id=request.request_id,
@@ -2468,6 +2489,10 @@ class DeterministicCapabilityBroker:
     ) -> ReceiveResult:
         """Keep memory reads explicit and route every write through approval."""
 
+        if command.is_valid:
+            blocked = self._memory_command_blocked(message, command)
+            if blocked is not None:
+                return blocked
         if not command.is_valid:
             try:
                 self._append_audit(
@@ -2492,9 +2517,117 @@ class DeterministicCapabilityBroker:
                 command.error or "Invalid durable-memory command.",
                 disposition="memory_invalid",
             )
+        if command.operation is MemoryOperation.USE:
+            return self._handle_memory_use(message, command)
         if command.is_read:
             return self._handle_memory_read(message, command)
         return self._handle_memory_mutation(message, command)
+
+    def _memory_command_blocked(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> ReceiveResult | None:
+        """Apply the working-session gate before any memory read or use."""
+
+        current = self._current_working_session()
+        if current.pending_action is not None:
+            kind = ControlTransitionKind.PENDING_BLOCKED
+            reply = (
+                "A pending action blocks this durable-memory command. "
+                "Approve or reject it first."
+            )
+            reason = "a pending action blocks unrelated durable-memory work"
+            effect = "request_refused_pending"
+        elif current.active_request is not None or any(
+            record.is_open for record in current.action_outbox
+        ):
+            kind = ControlTransitionKind.BUSY_REFUSED
+            reply = (
+                "Another request is active, so this durable-memory command was "
+                "refused. Use /status or /cancel; V1 does not queue work."
+            )
+            reason = "one active request is already present; no queue transition"
+            effect = "request_refused_busy"
+        else:
+            return None
+
+        return self._apply_session_control(
+            message,
+            current,
+            ControlTransition(
+                state=current,
+                parsed=parse_control(message.text),
+                kind=kind,
+                reply=reply,
+                effects=(effect,),
+                reason=reason,
+            ),
+        )
+
+    def _handle_memory_use(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> ReceiveResult:
+        """Run one request with exactly one operator-selected memory record."""
+
+        assert command.memory_id is not None
+        assert command.content is not None
+        try:
+            self._append_audit(
+                kind="durable_memory_access",
+                event_id=message.event_id,
+                request_id=None,
+                message_id=message.message_id,
+                outcome="requested",
+                actor="configured_operator",
+                operation_type="durable_memory_read",
+                target_category="durable_assistant_memory",
+                details={
+                    "operation": MemoryOperation.USE.value,
+                    "target": command.memory_id,
+                },
+            )
+            target = self.state.get_memory(command.memory_id)
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"durable-memory selection was blocked by audit: {exc}",
+            )
+        except (StateStoreError, ValueError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory selection failed: {exc}",
+            )
+        if target is None or not target.is_active or target.content is None:
+            return self._dispatch_memory_text(
+                message,
+                "No active durable memory has that exact ID.",
+                disposition="memory_target_missing",
+            )
+
+        admission = self._admit_memory_request(message)
+        if isinstance(admission, ReceiveResult):
+            return admission
+        selection = MemorySelection(memories=(target,), explicit=True)
+        result = self._run_orchestration(
+            message=message,
+            request=admission.request,
+            cancellation_token=admission.cancellation_token,
+            orchestration_text=command.content,
+            memory_selection=selection,
+        )
+        if isinstance(result, ReceiveResult):
+            return result
+        return self._complete_orchestration_result(
+            message=message,
+            request=admission.request,
+            cancellation_token=admission.cancellation_token,
+            result=result,
+        )
 
     def _handle_memory_read(
         self, message: InboundMessage, command: MemoryCommand

@@ -31,6 +31,7 @@ class MemoryOperation(str, Enum):
     LIST = "list"
     SEARCH = "search"
     INSPECT = "inspect"
+    USE = "use"
     REMEMBER = "remember"
     REPLACE = "replace"
     FORGET = "forget"
@@ -54,6 +55,7 @@ class MemoryCommand:
             MemoryOperation.LIST,
             MemoryOperation.SEARCH,
             MemoryOperation.INSPECT,
+            MemoryOperation.USE,
             MemoryOperation.REMEMBER,
             MemoryOperation.REPLACE,
             MemoryOperation.FORGET,
@@ -128,7 +130,7 @@ def parse_memory_command(text: str) -> MemoryCommand | None:
         query = command_parts[2].strip() if len(command_parts) == 3 else ""
         return MemoryCommand(
             operation=MemoryOperation.SEARCH,
-            content=query,
+            content=query or None,
             error=None if query else "search text is required",
         )
     if operation == MemoryOperation.INSPECT and len(parts) == 3:
@@ -137,12 +139,24 @@ def parse_memory_command(text: str) -> MemoryCommand | None:
             memory_id=parts[2].strip(),
             error=None if parts[2].strip() else "memory ID is required",
         )
+    if operation == MemoryOperation.USE and len(parts) == 4:
+        memory_id, content = parts[2], parts[3].strip()
+        return MemoryCommand(
+            operation=MemoryOperation.USE,
+            memory_id=memory_id,
+            content=content or None,
+            error=(
+                "memory ID and request text are required"
+                if not memory_id.strip() or not content
+                else None
+            ),
+        )
     if operation == MemoryOperation.REMEMBER:
         command_parts = stripped.split(None, 2)
         content = command_parts[2].strip() if len(command_parts) == 3 else ""
         return MemoryCommand(
             operation=MemoryOperation.REMEMBER,
-            content=content,
+            content=content or None,
             error=None if content else "memory content is required",
         )
     if operation == MemoryOperation.REPLACE and len(parts) == 4:
@@ -165,7 +179,10 @@ def parse_memory_command(text: str) -> MemoryCommand | None:
         )
     return MemoryCommand(
         operation=MemoryOperation.INVALID,
-        error="usage: /memory [list|search <text>|inspect <id>|remember <text>|replace <id> <text>|forget <id>",
+        error=(
+            "usage: /memory [list|search <text>|inspect <id>|use <id> <request>|"
+            "remember <text>|replace <id> <text>|forget <id>"
+        ),
     )
 
 
