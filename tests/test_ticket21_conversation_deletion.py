@@ -228,7 +228,8 @@ def test_archive_ipc_response_timeout_closes_writer_connection(
                 deleted_at=NOW,
             )
         assert request_received.wait(2.0)
-        assert writer._closed  # type: ignore[attr-defined]
+        assert not writer._closed  # type: ignore[attr-defined]
+        assert writer._connection is None  # type: ignore[attr-defined]
     finally:
         writer.close()
         release_server.set()
@@ -236,6 +237,52 @@ def test_archive_ipc_response_timeout_closes_writer_connection(
 
     assert not server_thread.is_alive()
     assert server_errors == []
+
+
+def test_archive_writer_recovers_after_timeout_for_a_later_transaction(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "deleted.sqlite3"
+    archive_service = start_sqlite_deleted_conversation_archive_service(database)
+    writer = archive_service.writer
+    original_receive_response = writer._receive_response
+    receive_calls = 0
+
+    def timeout_first_response(*, timeout_seconds):
+        nonlocal receive_calls
+        receive_calls += 1
+        if receive_calls == 1:
+            writer._close_connection()
+            raise DeletedConversationArchiveError(
+                "deleted archive service response timed out"
+            )
+        return original_receive_response(timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(writer, "_receive_response", timeout_first_response)
+    later_message = _message(message_id="recovered", text="second transaction")
+    try:
+        with pytest.raises(DeletedConversationArchiveError, match="timed out"):
+            writer.archive(
+                (_message(message_id="timeout-first", text="first transaction"),),
+                deletion_id="deletion-timeout-first",
+                deleted_at=NOW,
+            )
+
+        writer.archive(
+            (later_message,),
+            deletion_id="deletion-after-timeout",
+            deleted_at=NOW + timedelta(minutes=1),
+        )
+    finally:
+        archive_service.close()
+
+    admin_archive = open_sqlite_deleted_conversation_archive(database)
+    try:
+        assert [record.message for record in admin_archive.list_records()] == [
+            later_message
+        ]
+    finally:
+        admin_archive.close()
 
 
 def test_current_conversation_delete_is_refused_until_session_ends() -> None:
@@ -563,6 +610,44 @@ def test_sqlite_deletion_requires_an_explicit_archive_boundary(tmp_path) -> None
         state.close()
 
 
+def test_sqlite_conversation_delete_confirms_more_than_one_thousand_records(
+    tmp_path,
+) -> None:
+    state = SQLiteDurableStateStore(
+        tmp_path / "jarvis.sqlite3",
+        deleted_archive=InMemoryDeletedConversationArchive(),
+    )
+    messages = tuple(
+        _message(
+            message_id=f"large-conversation-{index}",
+            text=f"message {index}",
+            working_session_id="conversation-large-delete",
+            occurred_at=NOW + timedelta(seconds=index),
+        )
+        for index in range(1_201)
+    )
+    try:
+        for message in messages:
+            state.append_conversation_message(message)
+
+        preview = state.preview_conversation_deletion(
+            ConversationDeletionScope.conversation("conversation-large-delete")
+        )
+        assert preview.messages == messages
+
+        tombstones = state.delete_conversation_history(
+            preview,
+            deletion_id="large-conversation-delete",
+            deleted_at=NOW + timedelta(minutes=1),
+        )
+
+        assert len(tombstones) == len(messages)
+        assert state.list_conversation_messages() == ()
+        assert set(state.list_conversation_tombstones()) == set(tombstones)
+    finally:
+        state.close()
+
+
 def test_history_delete_command_freezes_exact_preview_and_dispatches_once() -> None:
     state = InMemoryDurableStateStore()
     selected = _message(message_id="delete-me", text="remove this exact record")
@@ -839,6 +924,48 @@ def test_conversation_deletion_chunks_archive_frames_larger_than_eight_mebibytes
         assert records[-1].message.text == messages[-1].text
     finally:
         admin_archive.close()
+
+
+def test_archive_chunk_sizing_does_not_encode_every_growing_candidate(
+    monkeypatch,
+) -> None:
+    messages = tuple(
+        _message(
+            message_id=f"small-archive-{index}",
+            text="small message",
+            working_session_id="conversation-small-archive",
+            occurred_at=NOW + timedelta(seconds=index),
+        )
+        for index in range(2_000)
+    )
+    original_encode = conversation_archive._encode_archive_request
+    encode_calls = 0
+
+    def counted_encode(request):
+        nonlocal encode_calls
+        encode_calls += 1
+        return original_encode(request)
+
+    monkeypatch.setattr(conversation_archive, "_encode_archive_request", counted_encode)
+    chunks = tuple(
+        conversation_archive._archive_message_chunks(
+            messages,
+            deletion_id="linear-small-archive",
+        )
+    )
+
+    assert sum(len(chunk) for chunk in chunks) == len(messages)
+    assert encode_calls == 0
+    for chunk_index, chunk in enumerate(chunks):
+        frame = original_encode(
+            {
+                "operation": "chunk",
+                "deletion_id": "linear-small-archive",
+                "chunk_index": chunk_index,
+                "messages": chunk,
+            }
+        )
+        assert len(frame) <= conversation_archive._MAX_ARCHIVE_FRAME_BYTES
 
 
 def test_date_range_delete_is_frozen_before_later_messages_arrive() -> None:

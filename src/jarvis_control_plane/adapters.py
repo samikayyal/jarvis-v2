@@ -1417,19 +1417,50 @@ class SQLiteDurableStateStore:
     ) -> tuple[ConversationMessage, ...]:
         """Read only the indexed rows belonging to one deletion scope."""
 
-        clauses, values = _conversation_deletion_query(scope)
         try:
-            rows = self.connection.execute(
-                """
-                SELECT transport_session_id, working_session_id, message_id,
-                       event_id, chat_id, sender_id, text, occurred_at,
-                       direction, request_id, credential_like
-                FROM conversation_history
-                WHERE """
-                + clauses
-                + " ORDER BY occurred_at, transport_session_id, message_id",
-                values,
-            ).fetchall()
+            if scope.scope_type == "message":
+                rows: list[sqlite3.Row] = []
+                for offset in range(
+                    0, len(scope.history_ids), _DELETION_SELECTOR_BATCH_SIZE
+                ):
+                    batch_scope = ConversationDeletionScope.message(
+                        scope.history_ids[
+                            offset : offset + _DELETION_SELECTOR_BATCH_SIZE
+                        ]
+                    )
+                    clauses, values = _conversation_deletion_query(batch_scope)
+                    rows.extend(
+                        self.connection.execute(
+                            """
+                            SELECT transport_session_id, working_session_id, message_id,
+                                   event_id, chat_id, sender_id, text, occurred_at,
+                                   direction, request_id, credential_like
+                            FROM conversation_history
+                            WHERE """
+                            + clauses,
+                            values,
+                        ).fetchall()
+                    )
+                rows.sort(
+                    key=lambda row: (
+                        row["occurred_at"],
+                        row["transport_session_id"],
+                        row["message_id"],
+                    )
+                )
+            else:
+                clauses, values = _conversation_deletion_query(scope)
+                rows = self.connection.execute(
+                    """
+                    SELECT transport_session_id, working_session_id, message_id,
+                           event_id, chat_id, sender_id, text, occurred_at,
+                           direction, request_id, credential_like
+                    FROM conversation_history
+                    WHERE """
+                    + clauses
+                    + " ORDER BY occurred_at, transport_session_id, message_id",
+                    values,
+                ).fetchall()
         except sqlite3.Error as exc:
             raise StateStoreError(
                 "could not select conversation history for deletion"
@@ -1718,6 +1749,8 @@ def _request_values(request: RequestState) -> tuple[object, ...]:
 
 
 _MAX_HISTORY_RESULTS = 50
+# Keep exact-selector predicates below SQLite's default expression-depth limit.
+_DELETION_SELECTOR_BATCH_SIZE = 400
 _HISTORY_SEARCH_STOPWORDS = frozenset(
     {
         "a",

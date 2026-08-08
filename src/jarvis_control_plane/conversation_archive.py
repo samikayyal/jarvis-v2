@@ -618,39 +618,60 @@ def _archive_message_chunks(
     """Yield complete-message chunks whose encoded IPC frames stay bounded."""
 
     current: list[ConversationMessage] = []
-    for message in records:
-        candidate = (*current, message)
-        try:
-            _encode_archive_request(
+    chunk_index = 0
+    empty_chunk_size = (
+        len(
+            _encode_archive_frame(
                 {
                     "operation": "chunk",
                     "deletion_id": deletion_id,
-                    "chunk_index": 0,
-                    "messages": candidate,
+                    "chunk_index": chunk_index,
+                    "messages": [],
                 }
             )
+        )
+        - 2
+    )
+    current_size = empty_chunk_size
+    for message in records:
+        try:
+            encoded_message_size = len(
+                _encode_archive_frame(_archive_message_to_wire(message))
+            )
         except ValueError as exc:
+            raise DeletedConversationArchiveError(
+                "one deleted conversation message exceeds the archive frame limit"
+            ) from exc
+        candidate_size = current_size + encoded_message_size + (1 if current else 0)
+        if candidate_size > _MAX_ARCHIVE_FRAME_BYTES:
             if not current:
                 raise DeletedConversationArchiveError(
                     "one deleted conversation message exceeds the archive frame limit"
-                ) from exc
-            yield tuple(current)
-            current = [message]
-            try:
-                _encode_archive_request(
-                    {
-                        "operation": "chunk",
-                        "deletion_id": deletion_id,
-                        "chunk_index": 0,
-                        "messages": current,
-                    }
                 )
-            except ValueError as single_message_error:
+            yield tuple(current)
+            chunk_index += 1
+            current = [message]
+            current_size = (
+                len(
+                    _encode_archive_frame(
+                        {
+                            "operation": "chunk",
+                            "deletion_id": deletion_id,
+                            "chunk_index": chunk_index,
+                            "messages": [],
+                        }
+                    )
+                )
+                - 2
+            )
+            if current_size + encoded_message_size > _MAX_ARCHIVE_FRAME_BYTES:
                 raise DeletedConversationArchiveError(
                     "one deleted conversation message exceeds the archive frame limit"
-                ) from single_message_error
-        else:
-            current.append(message)
+                )
+            current_size += encoded_message_size
+            continue
+        current.append(message)
+        current_size = candidate_size
     if current:
         yield tuple(current)
 
@@ -749,6 +770,18 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
     def __init__(self, endpoint: str | Path, *, authkey: bytes) -> None:
         self._endpoint = str(endpoint)
         self._authkey = _validate_archive_authkey(authkey)
+        self._connection: Any | None = None
+        self._closed = False
+        self._lock = RLock()
+        self._connect()
+
+    def _connect(self) -> None:
+        if self._closed:
+            raise DeletedConversationArchiveError(
+                "deleted archive service is unavailable"
+            )
+        if self._connection is not None:
+            return
         try:
             self._connection = Client(
                 self._endpoint,
@@ -759,20 +792,18 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             raise DeletedConversationArchiveError(
                 "deleted archive service is unavailable"
             ) from exc
-        self._lock = RLock()
-        self._closed = False
         try:
             response = self._receive_response(
                 timeout_seconds=_ARCHIVE_RESPONSE_TIMEOUT_SECONDS
             )
         except DeletedConversationArchiveError as exc:
-            self.close()
+            self._close_connection()
             raise DeletedConversationArchiveError(
                 "deleted archive service did not become ready"
             ) from exc
         if not response["ok"]:
             message = str(response.get("message", "deleted archive service failed"))
-            self.close()
+            self._close_connection()
             raise DeletedConversationArchiveError(message[:200])
 
     def archive(
@@ -826,6 +857,7 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
                     self._request(
                         {"operation": "abort", "deletion_id": deletion_id},
                         timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
+                        reconnect=False,
                     )
                 except DeletedConversationArchiveError:
                     pass
@@ -833,13 +865,18 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
 
     def _receive_response(self, *, timeout_seconds: float) -> dict[str, object]:
         deadline = monotonic() + timeout_seconds
+        connection = self._connection
+        if connection is None:
+            raise DeletedConversationArchiveError(
+                "deleted archive service is unavailable"
+            )
         try:
-            if not self._connection.poll(max(0.0, deadline - monotonic())):
+            if not connection.poll(max(0.0, deadline - monotonic())):
                 raise DeletedConversationArchiveError(
                     "deleted archive service response timed out"
                 )
             return _decode_archive_response(
-                self._connection.recv_bytes(_MAX_ARCHIVE_FRAME_BYTES)
+                connection.recv_bytes(_MAX_ARCHIVE_FRAME_BYTES)
             )
         except DeletedConversationArchiveError:
             self._close_connection()
@@ -850,13 +887,30 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
                 "deleted archive service returned an invalid response"
             ) from exc
 
-    def _request(self, request: dict[str, Any], *, timeout_seconds: float) -> None:
+    def _request(
+        self,
+        request: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        reconnect: bool = True,
+    ) -> None:
         if self._closed:
             raise DeletedConversationArchiveError(
                 "deleted archive service is unavailable"
             )
+        if self._connection is None:
+            if not reconnect:
+                raise DeletedConversationArchiveError(
+                    "deleted archive service is unavailable"
+                )
+            self._connect()
+        connection = self._connection
+        if connection is None:
+            raise DeletedConversationArchiveError(
+                "deleted archive service is unavailable"
+            )
         try:
-            self._connection.send_bytes(_encode_archive_request(request))
+            connection.send_bytes(_encode_archive_request(request))
             response = self._receive_response(timeout_seconds=timeout_seconds)
         except DeletedConversationArchiveError:
             raise
@@ -870,27 +924,30 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             raise DeletedConversationArchiveError(message[:200])
 
     def _close_connection(self) -> None:
-        if self._closed:
+        connection = self._connection
+        self._connection = None
+        if connection is None:
             return
         try:
-            self._connection.close()
+            connection.close()
         except (OSError, ValueError):
             pass
-        finally:
-            self._closed = True
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             try:
-                self._request(
-                    {"operation": "close"},
-                    timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
-                )
+                if self._connection is not None:
+                    self._request(
+                        {"operation": "close"},
+                        timeout_seconds=_ARCHIVE_CLOSE_TIMEOUT_SECONDS,
+                        reconnect=False,
+                    )
             except DeletedConversationArchiveError:
                 pass
             finally:
+                self._closed = True
                 self._close_connection()
 
     def __del__(self) -> None:
@@ -1153,7 +1210,7 @@ def _abort_archive_batch(
         raise
 
 
-def _serve_archive_connection(connection: Any, database: str | Path) -> None:
+def _serve_archive_connection(connection: Any, database: str | Path) -> bool:
     archive_connection: sqlite3.Connection | None = None
     try:
         archive_connection = sqlite3.connect(
@@ -1169,17 +1226,17 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> None:
                     connection.recv_bytes(_MAX_ARCHIVE_FRAME_BYTES)
                 )
             except (EOFError, OSError):
-                return
+                return False
             except (TypeError, ValueError) as exc:
                 try:
                     _send_archive_response(connection, ok=False, message=str(exc))
                 except (BrokenPipeError, EOFError, OSError, ValueError):
-                    return
+                    return False
                 continue
             operation = request.get("operation")
             if operation == "close":
                 _send_archive_response(connection, ok=True)
-                break
+                return True
             try:
                 if operation == "archive":
                     records = request["messages"]
@@ -1233,7 +1290,7 @@ def _serve_archive_connection(connection: Any, database: str | Path) -> None:
                 try:
                     _send_archive_response(connection, ok=False, message=str(exc))
                 except (BrokenPipeError, EOFError, OSError, ValueError):
-                    return
+                    return False
     finally:
         if archive_connection is not None:
             archive_connection.close()
@@ -1259,11 +1316,13 @@ def serve_sqlite_deleted_conversation_archive(
 
     listener = _create_archive_listener(endpoint, authkey)
     try:
-        connection = listener.accept()
-        try:
-            _serve_archive_connection(connection, database)
-        finally:
-            connection.close()
+        while True:
+            connection = listener.accept()
+            try:
+                if _serve_archive_connection(connection, database):
+                    break
+            finally:
+                connection.close()
     finally:
         listener.close()
         _remove_archive_endpoint(endpoint)
@@ -1280,11 +1339,13 @@ def _archive_service_process_main(
         listener = _create_archive_listener(endpoint, authkey)
         _send_archive_response(startup_connection, ok=True)
         startup_connection.close()
-        connection = listener.accept()
-        try:
-            _serve_archive_connection(connection, database)
-        finally:
-            connection.close()
+        while True:
+            connection = listener.accept()
+            try:
+                if _serve_archive_connection(connection, database):
+                    break
+            finally:
+                connection.close()
     except Exception as exc:  # noqa: BLE001 - startup boundary reports typed errors
         try:
             _send_archive_response(startup_connection, ok=False, message=str(exc))
