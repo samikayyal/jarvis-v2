@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -38,6 +39,7 @@ from .models import (
     OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundAttemptStatus,
     OutboundReply,
     ReceiveResult,
     RequestState,
@@ -422,6 +424,10 @@ class DeterministicCapabilityBroker:
             raise TypeError("vault_write_proposal_preparer must provide propose")
         self.vault_write_proposal_preparer = vault_write_proposal_preparer
         existing_session = self.working_sessions.load()
+        durable_restart_state = bool(
+            self.state.list_requests()
+            or self.state.list_outbound_conversation_attempts()
+        )
         if existing_session is None:
             self.working_sessions.create(
                 WorkingSession.initial(
@@ -436,6 +442,8 @@ class DeterministicCapabilityBroker:
             )
         else:
             self._invalidate_restart_work()
+        if existing_session is not None or durable_restart_state:
+            self._reconcile_restart_state()
             self._record_pending_session_migration()
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
@@ -807,6 +815,7 @@ class DeterministicCapabilityBroker:
 
         def send() -> dict[str, str]:
             nonlocal outbound_id
+            self._mark_outbound_attempted(reply)
             delivery = self.outbound.send(reply)
             outbound_id = getattr(delivery, "outbound_id", None)
             if getattr(delivery, "accepted", None) is not True or not isinstance(
@@ -1895,6 +1904,66 @@ class DeterministicCapabilityBroker:
             except SessionStoreError:
                 continue
         raise SessionStoreError("could not invalidate work during restart")
+
+    def _reconcile_restart_state(self) -> None:
+        """Close every durable nonterminal edge before accepting new work."""
+
+        interrupted = 0
+        terminal_request_statuses = {
+            "blocked",
+            "cancelled",
+            "completed",
+            "failed",
+            "interrupted",
+            "not_started",
+            "unknown",
+        }
+        for request in self.state.list_requests():
+            if request.status in terminal_request_statuses:
+                continue
+            self.state.update_request(
+                replace(
+                    request,
+                    updated_at=self.clock.now(),
+                    status="interrupted",
+                    phase="interrupted",
+                    outcome="interrupted",
+                    error_code="service_restart",
+                )
+            )
+            interrupted += 1
+        reconciled = self.state.reconcile_outbound_conversation_attempts(
+            interrupted_at=self.clock.now()
+        )
+        not_started = sum(
+            record.status is OutboundAttemptStatus.NOT_STARTED for record in reconciled
+        )
+        unknown = sum(
+            record.status is OutboundAttemptStatus.UNKNOWN for record in reconciled
+        )
+        # The injected ID generator can intentionally restart from its first
+        # value in reconstructed test and recovery graphs. Restart evidence is
+        # process-boundary evidence, so it needs an identity independent of
+        # that request-scoped sequence.
+        self.audit.append(
+            AuditEvidence(
+                evidence_id=f"restart-{uuid.uuid4()}",
+                kind="service_restart",
+                occurred_at=self.clock.now(),
+                event_id=None,
+                request_id=None,
+                outcome="interrupted",
+                actor="control_plane",
+                operation_type="working_session",
+                target_category="working_session",
+                execution_status="recorded",
+                details={
+                    "interrupted_requests": str(interrupted),
+                    "outbound_not_started": str(not_started),
+                    "outbound_unknown": str(unknown),
+                },
+            )
+        )
 
     def _admit_request(
         self,
@@ -4098,6 +4167,7 @@ class DeterministicCapabilityBroker:
     def _send_and_confirm(
         self, reply: OutboundReply, *, message: InboundMessage
     ) -> dict[str, str]:
+        self._mark_outbound_attempted(reply)
         self.outbound.send(reply)
         self._accept_outbound_history(reply)
         return {"result": "accepted"}
@@ -4139,6 +4209,7 @@ class DeterministicCapabilityBroker:
             self.state.accept_reserved_outbound_conversation_message(
                 transport_session_id=reply.session_id,
                 message_id=reply.reply_id,
+                terminal_at=self.clock.now(),
             )
         except StateStoreError as exc:
             raise OutboundConnectorError(
@@ -4163,6 +4234,7 @@ class DeterministicCapabilityBroker:
                 raise _CancelledBeforeDispatch(
                     "request was cancelled before outbound dispatch"
                 )
+            self._mark_outbound_attempted(reply)
             self.outbound.send(reply)
             self._accept_outbound_history(reply)
             if not self._finish_session_request(
@@ -4174,7 +4246,21 @@ class DeterministicCapabilityBroker:
                     "outbound was accepted but session completion is uncertain",
                     may_have_sent=True,
                 )
-            return {"result": "accepted"}
+        return {"result": "accepted"}
+
+    def _mark_outbound_attempted(self, reply: OutboundReply) -> None:
+        """Persist the ambiguity boundary immediately before connector entry."""
+
+        try:
+            self.state.mark_outbound_conversation_attempted(
+                transport_session_id=reply.session_id,
+                message_id=reply.reply_id,
+                attempted_at=self.clock.now(),
+            )
+        except StateStoreError as exc:
+            raise OutboundConnectorError(
+                "outbound attempt could not be persisted before dispatch"
+            ) from exc
 
     def _late_result_result(
         self,

@@ -38,6 +38,8 @@ from .models import (
     MemorySelection,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundAttemptRecord,
+    OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
     RequestState,
@@ -131,6 +133,7 @@ class InMemoryDurableStateStore:
         self.claims: dict[tuple[str, str], IngressClaim] = {}
         self.conversation_messages: dict[tuple[str, str], ConversationMessage] = {}
         self.outbound_outbox: dict[tuple[str, str], ConversationMessage] = {}
+        self.outbound_attempts: dict[tuple[str, str], OutboundAttemptRecord] = {}
         self._deleted_archive = deleted_archive or InMemoryDeletedConversationArchive()
         self._conversation_tombstones: dict[str, ConversationTombstone] = {}
         self.memories: dict[str, DurableMemory] = {}
@@ -304,6 +307,10 @@ class InMemoryDurableStateStore:
             raise StateStoreError(
                 "only outbound messages can enter the outbound outbox"
             )
+        if message.request_id is None:
+            raise StateStoreError(
+                "outbound outbox messages require a request identifier"
+            )
         with self._lock:
             if self.fail_conversation:
                 raise StateStoreError("controlled conversation write failure")
@@ -311,9 +318,39 @@ class InMemoryDurableStateStore:
             if key in self.conversation_messages or key in self.outbound_outbox:
                 raise StateStoreError("conversation message identifier already exists")
             self.outbound_outbox[key] = message
+            self.outbound_attempts[key] = OutboundAttemptRecord(
+                transport_session_id=message.transport_session_id,
+                message_id=message.message_id,
+                request_id=message.request_id,
+                status=OutboundAttemptStatus.UNATTEMPTED,
+                reserved_at=message.occurred_at,
+                message=message,
+            )
+
+    def mark_outbound_conversation_attempted(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        attempted_at: datetime,
+    ) -> None:
+        with self._lock:
+            key = (transport_session_id, message_id)
+            record = self.outbound_attempts.get(key)
+            if record is None or record.status is not OutboundAttemptStatus.UNATTEMPTED:
+                raise StateStoreError("outbound attempt is not known-unattempted")
+            self.outbound_attempts[key] = replace(
+                record,
+                status=OutboundAttemptStatus.ATTEMPTED,
+                attempted_at=ensure_utc(attempted_at),
+            )
 
     def accept_reserved_outbound_conversation_message(
-        self, *, transport_session_id: str, message_id: str
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        terminal_at: datetime | None = None,
     ) -> None:
         with self._lock:
             if self.fail_conversation:
@@ -326,8 +363,62 @@ class InMemoryDurableStateStore:
                 )
             if key in self.conversation_messages:
                 raise StateStoreError("conversation message identifier already exists")
+            record = self.outbound_attempts.get(key)
+            if record is None or record.status is not OutboundAttemptStatus.ATTEMPTED:
+                raise StateStoreError("outbound message was not durably attempted")
             self.conversation_messages[key] = message
             del self.outbound_outbox[key]
+            self.outbound_attempts[key] = replace(
+                record,
+                status=OutboundAttemptStatus.CONFIRMED,
+                message=None,
+                terminal_at=ensure_utc(
+                    terminal_at or record.attempted_at or record.reserved_at
+                ),
+            )
+
+    def list_outbound_conversation_attempts(
+        self,
+    ) -> tuple[OutboundAttemptRecord, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    self.outbound_attempts.values(),
+                    key=lambda record: (
+                        record.reserved_at,
+                        record.transport_session_id,
+                        record.message_id,
+                    ),
+                )
+            )
+
+    def reconcile_outbound_conversation_attempts(
+        self, *, interrupted_at: datetime
+    ) -> tuple[OutboundAttemptRecord, ...]:
+        interrupted_at = ensure_utc(interrupted_at)
+        with self._lock:
+            reconciled: list[OutboundAttemptRecord] = []
+            for key, record in tuple(self.outbound_attempts.items()):
+                if record.status not in {
+                    OutboundAttemptStatus.UNATTEMPTED,
+                    OutboundAttemptStatus.ATTEMPTED,
+                }:
+                    continue
+                status = (
+                    OutboundAttemptStatus.NOT_STARTED
+                    if record.status is OutboundAttemptStatus.UNATTEMPTED
+                    else OutboundAttemptStatus.UNKNOWN
+                )
+                updated = replace(
+                    record,
+                    status=status,
+                    message=None,
+                    terminal_at=interrupted_at,
+                )
+                self.outbound_attempts[key] = updated
+                self.outbound_outbox.pop(key, None)
+                reconciled.append(updated)
+            return tuple(reconciled)
 
     def search_conversation_messages(
         self,
@@ -763,6 +854,18 @@ class SQLiteDurableStateStore:
                     credential_like INTEGER NOT NULL CHECK (credential_like IN (0, 1)),
                     PRIMARY KEY (transport_session_id, message_id)
                 );
+                CREATE TABLE IF NOT EXISTS outbound_attempt_record (
+                    transport_session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('unattempted', 'attempted', 'confirmed', 'unknown', 'not_started')
+                    ),
+                    reserved_at TEXT NOT NULL,
+                    attempted_at TEXT,
+                    terminal_at TEXT,
+                    PRIMARY KEY (transport_session_id, message_id)
+                );
                 CREATE INDEX IF NOT EXISTS conversation_history_by_working_session
                     ON conversation_history(working_session_id, occurred_at, transport_session_id, message_id);
                 CREATE INDEX IF NOT EXISTS conversation_history_by_request
@@ -805,6 +908,21 @@ class SQLiteDurableStateStore:
                     slot INTEGER PRIMARY KEY CHECK (slot = 1),
                     synchronized_at TEXT NOT NULL
                 );
+                """
+            )
+            # Ticket 20 databases may already contain a reserved outbound body
+            # without the Ticket 12 attempt record.  Its connector boundary is
+            # unknowable after upgrade, so migrate it as attempted; broker
+            # startup will close it unknown and remove the private payload.
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO outbound_attempt_record(
+                    transport_session_id, message_id, request_id, status,
+                    reserved_at, attempted_at, terminal_at
+                )
+                SELECT transport_session_id, message_id, request_id, 'attempted',
+                       occurred_at, occurred_at, NULL
+                FROM outbound_conversation_outbox
                 """
             )
             self.connection.commit()
@@ -1383,6 +1501,10 @@ class SQLiteDurableStateStore:
             raise StateStoreError(
                 "only outbound messages can enter the outbound outbox"
             )
+        if message.request_id is None:
+            raise StateStoreError(
+                "outbound outbox messages require a request identifier"
+            )
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             self.connection.execute(
@@ -1405,6 +1527,20 @@ class SQLiteDurableStateStore:
                     int(message.credential_like),
                 ),
             )
+            self.connection.execute(
+                """
+                INSERT INTO outbound_attempt_record(
+                    transport_session_id, message_id, request_id, status,
+                    reserved_at, attempted_at, terminal_at
+                ) VALUES (?, ?, ?, 'unattempted', ?, NULL, NULL)
+                """,
+                (
+                    message.transport_session_id,
+                    message.message_id,
+                    message.request_id,
+                    ensure_utc(message.occurred_at).isoformat(),
+                ),
+            )
             self.connection.commit()
         except sqlite3.IntegrityError as exc:
             self.connection.rollback()
@@ -1417,8 +1553,43 @@ class SQLiteDurableStateStore:
                 "could not reserve outbound conversation history"
             ) from exc
 
+    def mark_outbound_conversation_attempted(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        attempted_at: datetime,
+    ) -> None:
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE outbound_attempt_record
+                SET status = 'attempted', attempted_at = ?
+                WHERE transport_session_id = ? AND message_id = ?
+                  AND status = 'unattempted'
+                """,
+                (
+                    ensure_utc(attempted_at).isoformat(),
+                    transport_session_id,
+                    message_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                raise StateStoreError("outbound attempt is not known-unattempted")
+            self.connection.commit()
+        except StateStoreError:
+            raise
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError("could not mark outbound attempt") from exc
+
     def accept_reserved_outbound_conversation_message(
-        self, *, transport_session_id: str, message_id: str
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        terminal_at: datetime | None = None,
     ) -> None:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -1435,6 +1606,16 @@ class SQLiteDurableStateStore:
                 raise StateStoreError(
                     "reserved outbound conversation message does not exist"
                 )
+            attempt = self.connection.execute(
+                """
+                SELECT status, attempted_at, reserved_at
+                FROM outbound_attempt_record
+                WHERE transport_session_id = ? AND message_id = ?
+                """,
+                (transport_session_id, message_id),
+            ).fetchone()
+            if attempt is None or attempt["status"] != "attempted":
+                raise StateStoreError("outbound message was not durably attempted")
             self._insert_conversation_message(
                 ConversationMessage(
                     working_session_id=row["working_session_id"],
@@ -1457,6 +1638,21 @@ class SQLiteDurableStateStore:
                 """,
                 (transport_session_id, message_id),
             )
+            confirmed_at = terminal_at or datetime.fromisoformat(
+                attempt["attempted_at"] or attempt["reserved_at"]
+            )
+            self.connection.execute(
+                """
+                UPDATE outbound_attempt_record
+                SET status = 'confirmed', terminal_at = ?
+                WHERE transport_session_id = ? AND message_id = ?
+                """,
+                (
+                    ensure_utc(confirmed_at).isoformat(),
+                    transport_session_id,
+                    message_id,
+                ),
+            )
             self.connection.commit()
         except StateStoreError:
             self.connection.rollback()
@@ -1471,6 +1667,89 @@ class SQLiteDurableStateStore:
             raise StateStoreError(
                 "could not accept outbound conversation history"
             ) from exc
+
+    def list_outbound_conversation_attempts(
+        self,
+    ) -> tuple[OutboundAttemptRecord, ...]:
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT a.transport_session_id, a.message_id, a.request_id, a.status,
+                       a.reserved_at, a.attempted_at, a.terminal_at,
+                       o.working_session_id, o.event_id, o.chat_id, o.sender_id,
+                       o.text, o.occurred_at, o.credential_like
+                FROM outbound_attempt_record AS a
+                LEFT JOIN outbound_conversation_outbox AS o
+                  ON o.transport_session_id = a.transport_session_id
+                 AND o.message_id = a.message_id
+                ORDER BY a.reserved_at, a.transport_session_id, a.message_id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not list outbound attempts") from exc
+        return tuple(_outbound_attempt_from_row(row) for row in rows)
+
+    def reconcile_outbound_conversation_attempts(
+        self, *, interrupted_at: datetime
+    ) -> tuple[OutboundAttemptRecord, ...]:
+        interrupted_at = ensure_utc(interrupted_at)
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            rows = self.connection.execute(
+                """
+                SELECT a.transport_session_id, a.message_id, a.request_id, a.status,
+                       a.reserved_at, a.attempted_at, a.terminal_at,
+                       o.working_session_id, o.event_id, o.chat_id, o.sender_id,
+                       o.text, o.occurred_at, o.credential_like
+                FROM outbound_attempt_record AS a
+                LEFT JOIN outbound_conversation_outbox AS o
+                  ON o.transport_session_id = a.transport_session_id
+                 AND o.message_id = a.message_id
+                WHERE a.status IN ('unattempted', 'attempted')
+                ORDER BY a.reserved_at, a.transport_session_id, a.message_id
+                """,
+            ).fetchall()
+            reconciled: list[OutboundAttemptRecord] = []
+            for row in rows:
+                current = _outbound_attempt_from_row(row)
+                status = (
+                    OutboundAttemptStatus.NOT_STARTED
+                    if current.status is OutboundAttemptStatus.UNATTEMPTED
+                    else OutboundAttemptStatus.UNKNOWN
+                )
+                self.connection.execute(
+                    """
+                    UPDATE outbound_attempt_record SET status = ?, terminal_at = ?
+                    WHERE transport_session_id = ? AND message_id = ? AND status = ?
+                    """,
+                    (
+                        status.value,
+                        interrupted_at.isoformat(),
+                        current.transport_session_id,
+                        current.message_id,
+                        current.status.value,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM outbound_conversation_outbox
+                    WHERE transport_session_id = ? AND message_id = ?
+                    """,
+                    (current.transport_session_id, current.message_id),
+                )
+                reconciled.append(
+                    replace(
+                        current,
+                        status=status,
+                        message=None,
+                        terminal_at=interrupted_at,
+                    )
+                )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError("could not reconcile outbound attempts") from exc
+        return tuple(reconciled)
 
     def search_conversation_messages(
         self,
@@ -2716,6 +2995,42 @@ def _conversation_message_from_row(row: sqlite3.Row) -> ConversationMessage:
         direction=row["direction"],
         request_id=row["request_id"],
         credential_like=bool(row["credential_like"]),
+    )
+
+
+def _outbound_attempt_from_row(row: sqlite3.Row) -> OutboundAttemptRecord:
+    message = None
+    if row["text"] is not None:
+        message = ConversationMessage(
+            working_session_id=row["working_session_id"],
+            transport_session_id=row["transport_session_id"],
+            message_id=row["message_id"],
+            event_id=row["event_id"],
+            chat_id=row["chat_id"],
+            sender_id=row["sender_id"],
+            text=row["text"],
+            occurred_at=datetime.fromisoformat(row["occurred_at"]),
+            direction="outbound",
+            request_id=row["request_id"],
+            credential_like=bool(row["credential_like"]),
+        )
+    return OutboundAttemptRecord(
+        transport_session_id=row["transport_session_id"],
+        message_id=row["message_id"],
+        request_id=row["request_id"],
+        status=row["status"],
+        reserved_at=datetime.fromisoformat(row["reserved_at"]),
+        message=message,
+        attempted_at=(
+            datetime.fromisoformat(row["attempted_at"])
+            if row["attempted_at"] is not None
+            else None
+        ),
+        terminal_at=(
+            datetime.fromisoformat(row["terminal_at"])
+            if row["terminal_at"] is not None
+            else None
+        ),
     )
 
 

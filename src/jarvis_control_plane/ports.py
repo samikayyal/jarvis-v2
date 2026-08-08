@@ -28,6 +28,7 @@ from .models import (
     MemorySelection,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundAttemptRecord,
     OutboundDelivery,
     OutboundReply,
     RequestState,
@@ -229,7 +230,24 @@ class DurableStateStore(Protocol):
         *,
         transport_session_id: str,
         message_id: str,
+        terminal_at: datetime | None = None,
     ) -> None: ...
+
+    def mark_outbound_conversation_attempted(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        attempted_at: datetime,
+    ) -> None: ...
+
+    def list_outbound_conversation_attempts(
+        self,
+    ) -> tuple[OutboundAttemptRecord, ...]: ...
+
+    def reconcile_outbound_conversation_attempts(
+        self, *, interrupted_at: datetime
+    ) -> tuple[OutboundAttemptRecord, ...]: ...
 
     def search_conversation_messages(
         self,

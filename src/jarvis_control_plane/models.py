@@ -282,6 +282,61 @@ class ConversationMessage:
         return transport_session_id, message_id
 
 
+class OutboundAttemptStatus(str, Enum):
+    """Durable outcome boundary for one exact outbound message."""
+
+    UNATTEMPTED = "unattempted"
+    ATTEMPTED = "attempted"
+    CONFIRMED = "confirmed"
+    UNKNOWN = "unknown"
+    NOT_STARTED = "not_started"
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundAttemptRecord:
+    """Private outbox state that prevents automatic duplicate delivery."""
+
+    transport_session_id: str
+    message_id: str
+    request_id: str
+    status: OutboundAttemptStatus | str
+    reserved_at: datetime
+    message: ConversationMessage | None
+    attempted_at: datetime | None = None
+    terminal_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("transport_session_id", "message_id", "request_id"):
+            _non_empty_identifier(getattr(self, name), name)
+        status = OutboundAttemptStatus(self.status)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "reserved_at", ensure_utc(self.reserved_at))
+        if self.attempted_at is not None:
+            object.__setattr__(self, "attempted_at", ensure_utc(self.attempted_at))
+        if self.terminal_at is not None:
+            object.__setattr__(self, "terminal_at", ensure_utc(self.terminal_at))
+        if status in {
+            OutboundAttemptStatus.UNATTEMPTED,
+            OutboundAttemptStatus.ATTEMPTED,
+        }:
+            if self.message is None:
+                raise ValueError("open outbound attempts require the exact message")
+            if (
+                self.message.transport_session_id,
+                self.message.message_id,
+                self.message.request_id,
+            ) != (self.transport_session_id, self.message_id, self.request_id):
+                raise ValueError("outbound attempt identity does not match its message")
+            if self.terminal_at is not None:
+                raise ValueError("open outbound attempts cannot have terminal_at")
+        elif self.message is not None or self.terminal_at is None:
+            raise ValueError(
+                "terminal outbound attempts remove message content and require terminal_at"
+            )
+        if status is OutboundAttemptStatus.ATTEMPTED and self.attempted_at is None:
+            raise ValueError("attempted outbound records require attempted_at")
+
+
 def _deletion_scope_datetime(
     value: date | datetime, name: str, *, end: bool
 ) -> datetime:
@@ -1103,6 +1158,8 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "model",
         "mode",
         "operation",
+        "outbound_not_started",
+        "outbound_unknown",
         "path",
         "permission_scope",
         "permission_id",
@@ -1118,6 +1175,7 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "stack_trace",
         "state",
         "status",
+        "interrupted_requests",
         "target",
         "target_category",
         "tool_input",
@@ -1209,6 +1267,11 @@ _OUTBOUND_RESULTS = frozenset(
     }
 )
 _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
+    "service_restart": {
+        "interrupted_requests": None,
+        "outbound_not_started": None,
+        "outbound_unknown": None,
+    },
     "action_outcome": {
         "channel": frozenset({"controlled"}),
         "command": None,
@@ -1304,6 +1367,13 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     },
 }
 _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str]]] = {
+    "service_restart": (
+        "working_session",
+        "working_session",
+        "control_plane",
+        frozenset({"interrupted"}),
+        frozenset({"recorded"}),
+    ),
     "inbound_admitted": (
         "inbound_admission",
         "messaging_gateway",
