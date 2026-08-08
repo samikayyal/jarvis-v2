@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from threading import RLock
@@ -20,6 +21,7 @@ from .models import (
     ConversationMessage,
     FrozenActionProposal,
     InboundMessage,
+    OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
     OutboundReply,
@@ -41,6 +43,7 @@ from .ports import (
     DiagnosticTraceError,
     DurableStateStore,
     IdGenerator,
+    KnowledgeVaultWriteProposalPreparer,
     ModelAvailabilityProvider,
     OrchestrationAdapter,
     OrchestrationAdapterError,
@@ -234,6 +237,8 @@ class DeterministicCapabilityBroker:
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
         action_lifecycle: BoundActionLifecycle | None = None,
+        vault_write_proposal_preparer: KnowledgeVaultWriteProposalPreparer
+        | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError(
@@ -255,6 +260,11 @@ class DeterministicCapabilityBroker:
             )
         self.action_dispatcher = selected_dispatcher
         self.action_lifecycle = action_lifecycle or _NoopActionLifecycle()
+        if vault_write_proposal_preparer is not None and not callable(
+            getattr(vault_write_proposal_preparer, "propose", None)
+        ):
+            raise TypeError("vault_write_proposal_preparer must provide propose")
+        self.vault_write_proposal_preparer = vault_write_proposal_preparer
         existing_session = self.working_sessions.load()
         if existing_session is None:
             self.working_sessions.create(
@@ -1601,6 +1611,9 @@ class DeterministicCapabilityBroker:
             selected_host = self._validate_orchestration_result(
                 result, request_id=request.request_id
             )
+            result = self._prepare_orchestration_proposal(
+                result, request_id=request.request_id
+            )
             if selected_host is not None:
                 self._record_execution_host(request, cancellation_token, selected_host)
             self._append_audit(
@@ -1704,6 +1717,71 @@ class DeterministicCapabilityBroker:
 
         return result
 
+    def _prepare_orchestration_proposal(
+        self, result: OrchestrationResult, *, request_id: str
+    ) -> OrchestrationResult:
+        """Turn a model intent into an exact action only at the broker boundary."""
+
+        intent = result.proposal_intent
+        if intent is None:
+            return result
+        if not isinstance(intent, OrchestrationProposalIntent):
+            raise OrchestrationAdapterError(
+                "orchestration adapter returned an invalid proposal intent"
+            )
+        if intent.kind != "knowledge_vault_write":
+            raise OrchestrationAdapterError(
+                "orchestration proposal intent is outside the broker boundary"
+            )
+        preparer = self.vault_write_proposal_preparer
+        if preparer is None:
+            raise OrchestrationAdapterError(
+                "knowledge-vault write capability is not configured"
+            )
+        if set(intent.payload) != {"changes"}:
+            raise OrchestrationAdapterError(
+                "knowledge-vault write proposal intent has an unexpected shape"
+            )
+        changes = intent.payload.get("changes")
+        if not isinstance(changes, Mapping) or any(
+            not isinstance(path, str) or not isinstance(content, str)
+            for path, content in changes.items()
+        ):
+            raise OrchestrationAdapterError(
+                "knowledge-vault write proposal intent has an unexpected shape"
+            )
+
+        def prepare() -> OrchestrationResult:
+            try:
+                action = preparer.propose(request_id=request_id, changes=changes)
+            except OrchestrationAdapterError:
+                raise
+            except Exception as exc:
+                raise OrchestrationAdapterError(
+                    "knowledge-vault proposal preparation failed"
+                ) from exc
+            if not isinstance(action, FrozenActionProposal):
+                raise OrchestrationAdapterError(
+                    "knowledge-vault proposal preparer returned an invalid action"
+                )
+            if action.request_id != request_id or action.kind != intent.kind:
+                raise OrchestrationAdapterError(
+                    "knowledge-vault proposal preparer returned a mismatched action"
+                )
+            return replace(result, proposal=action, proposal_intent=None)
+
+        return self._trace.execute(
+            request_id=request_id,
+            operation_id=f"{request_id}:vault-proposal",
+            operation_type="connector_proposal_preparation",
+            input_payload=intent,
+            arguments={"kind": intent.kind},
+            telemetry={"phase": "connector_proposal_preparation"},
+            operation=prepare,
+            result_limit_bytes=self.config.max_text_length * 8 + 4_096,
+            error_limit_bytes=8_192,
+        )
+
     @staticmethod
     def _validate_orchestration_result(
         result: object, *, request_id: str
@@ -1730,6 +1808,19 @@ class DeterministicCapabilityBroker:
             raise OrchestrationAdapterError(
                 "orchestration adapter returned an untyped proposal"
             )
+        if result.proposal_intent is not None:
+            if not isinstance(result.proposal_intent, OrchestrationProposalIntent):
+                raise OrchestrationAdapterError(
+                    "orchestration adapter returned an invalid proposal intent"
+                )
+            if result.proposal_intent.request_id != request_id:
+                raise OrchestrationAdapterError(
+                    "orchestration proposal intent correlation mismatch"
+                )
+            if result.proposal_intent.kind != "knowledge_vault_write":
+                raise OrchestrationAdapterError(
+                    "orchestration proposal intent is outside the configured boundary"
+                )
         selected_host = result.execution_host
         if result.proposal is None or result.proposal.kind != "terminal":
             return selected_host

@@ -10,15 +10,21 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from subprocess import DEVNULL, CompletedProcess, TimeoutExpired, run
+from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .knowledge_vault_common import (
+    _EXCLUDED_TOP_LEVEL_DIRECTORIES,
+    _remaining_seconds,
+)
 
 _MAX_QUERY_CHARS = 200
 _MAX_RETURNED_EXCERPTS = 8
@@ -26,11 +32,9 @@ _MAX_EXCERPT_CHARS = 600
 _MAX_NOTES_INSPECTED = 128
 _MAX_BYTES_PER_NOTE = 64 * 1024
 _MAX_TOTAL_BYTES_SCANNED = 512 * 1024
-_EXCLUDED_TOP_LEVEL_DIRECTORIES = frozenset(
-    {"attachments", "plugins", "templates", "themes", "trash"}
-)
 _WIKILINK = re.compile(r"\[\[([^\]]+)\]\]")
 _MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+_UNIFIED_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 
 
 class VaultReadError(Exception):
@@ -47,6 +51,14 @@ class VaultRemoteUnavailable(VaultSynchronizationError):
 
 class VaultRepositoryConflict(VaultSynchronizationError):
     """The local clone requires explicit administrator recovery."""
+
+
+class VaultPushPreDispatchFailure(VaultSynchronizationError):
+    """The push process did not start, so no remote update could have occurred."""
+
+
+class VaultPushUnknownOutcome(VaultSynchronizationError):
+    """The push process started, but its remote side effect cannot be established."""
 
 
 class VaultSynchronizationMetadataStore(Protocol):
@@ -213,12 +225,256 @@ class SubprocessVaultSynchronizer:
         self._synchronization_state.save_knowledge_vault_synchronized_at(now)
         return now
 
+    def current_commit(self, root: Path, *, deadline: float | None = None) -> str:
+        """Return the dedicated clone's exact checked-out commit."""
+
+        return self._git(
+            root,
+            "rev-parse",
+            "HEAD",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout.strip()
+
+    def fetch_remote_commit(self, root: Path, *, deadline: float | None = None) -> str:
+        """Fetch without merging, then return the exact fetched remote base."""
+
+        self._git(
+            root,
+            "fetch",
+            "--prune",
+            "--no-tags",
+            "origin",
+            failure_type=VaultRemoteUnavailable,
+            deadline=deadline,
+        )
+        return self._git(
+            root,
+            "rev-parse",
+            "FETCH_HEAD",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout.strip()
+
+    def render_diff(
+        self,
+        root: Path,
+        _originals: Mapping[str, str | None],
+        changes: Mapping[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        """Render a canonical patch through the same Git edge as verification.
+
+        The temporary index keeps proposal creation side-effect free while making
+        Git, rather than a second diff algorithm, the authority for hunk headers,
+        newline markers, and diff attributes.
+        """
+
+        if not changes:
+            raise VaultRepositoryConflict("knowledge-vault write has no changes")
+        ordered_changes = tuple(sorted(changes.items()))
+        with TemporaryDirectory(prefix="jarvis-vault-diff-") as directory:
+            temporary_index = Path(directory) / "index"
+            temporary_objects = Path(directory) / "objects"
+            temporary_objects.mkdir()
+            source_objects = self._git(
+                root,
+                "rev-parse",
+                "--git-path",
+                "objects",
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+            ).stdout.strip()
+            if not source_objects:
+                raise VaultRepositoryConflict(
+                    "knowledge-vault Git object database is unavailable"
+                )
+            source_objects_path = Path(source_objects)
+            if not source_objects_path.is_absolute():
+                source_objects_path = root / source_objects_path
+            alternate_objects = str(source_objects_path.resolve())
+            configured_alternates = self._environment.get(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            )
+            if configured_alternates:
+                alternate_objects = os.pathsep.join(
+                    (alternate_objects, configured_alternates)
+                )
+            environment = {
+                **self._environment,
+                "GIT_INDEX_FILE": str(temporary_index),
+                "GIT_OBJECT_DIRECTORY": str(temporary_objects),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_objects,
+            }
+            self._git(
+                root,
+                "read-tree",
+                "HEAD",
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+                environment=environment,
+            )
+            content_path = Path(directory) / "content"
+            for path, content in ordered_changes:
+                content_path.write_bytes(content.encode("utf-8"))
+                blob = self._git(
+                    root,
+                    "hash-object",
+                    "-w",
+                    f"--path={path}",
+                    str(content_path),
+                    failure_type=VaultRepositoryConflict,
+                    deadline=deadline,
+                    environment=environment,
+                ).stdout.strip()
+                self._git(
+                    root,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"100644,{blob},{path}",
+                    failure_type=VaultRepositoryConflict,
+                    deadline=deadline,
+                    environment=environment,
+                )
+            output = self._git(
+                root,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-color",
+                "--unified=3",
+                "--",
+                *(path for path, _content in ordered_changes),
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+                environment=environment,
+            ).stdout
+        return _normalise_staged_diff(output)
+
+    def stage(
+        self, root: Path, paths: Sequence[str], *, deadline: float | None = None
+    ) -> None:
+        """Stage only the already validated Markdown paths."""
+
+        if not paths:
+            raise VaultRepositoryConflict("knowledge-vault write has no paths")
+        self._git(
+            root,
+            "add",
+            "--",
+            *paths,
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        )
+
+    def staged_diff(self, root: Path, *, deadline: float | None = None) -> str:
+        """Return the complete canonical diff for the current Git index."""
+
+        output = self._git(
+            root,
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-renames",
+            "--no-color",
+            "--unified=3",
+            "--",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout
+        return _normalise_staged_diff(output)
+
+    def commit(
+        self,
+        root: Path,
+        *,
+        author_name: str,
+        author_email: str,
+        subject: str,
+        body: str,
+        deadline: float | None = None,
+    ) -> str:
+        """Create one normal commit with the frozen configured identity."""
+
+        self._git(
+            root,
+            "-c",
+            f"user.name={author_name}",
+            "-c",
+            f"user.email={author_email}",
+            "commit",
+            "--no-verify",
+            "-m",
+            subject,
+            "-m",
+            body,
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        )
+        return self.current_commit(root, deadline=deadline)
+
+    def push(
+        self,
+        root: Path,
+        *,
+        expected_base: str,
+        commit_id: str,
+        deadline: float | None = None,
+    ) -> None:
+        """Push the checked-out branch normally; force and history rewrites are absent."""
+
+        branch = self._git(
+            root,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+            failure_type=VaultRepositoryConflict,
+            deadline=deadline,
+        ).stdout.strip()
+        if not branch or branch == "HEAD":
+            raise VaultRepositoryConflict("knowledge-vault clone is detached")
+        local = self.current_commit(root, deadline=deadline)
+        if local != commit_id:
+            raise VaultRepositoryConflict("knowledge-vault commit changed before push")
+        try:
+            self._git(
+                root,
+                "push",
+                "--porcelain",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+                failure_type=VaultRepositoryConflict,
+                pre_dispatch_failure_type=VaultPushPreDispatchFailure,
+                started_failure_type=VaultPushUnknownOutcome,
+                deadline=deadline,
+            )
+        except VaultPushPreDispatchFailure:
+            raise
+        except VaultPushUnknownOutcome:
+            raise
+        except VaultRepositoryConflict as exc:
+            message = str(exc).casefold()
+            if "non-fast-forward" in message or "rejected" in message:
+                raise VaultRepositoryConflict(
+                    "knowledge-vault remote rejected a non-fast-forward push"
+                ) from exc
+            raise VaultPushUnknownOutcome(
+                "knowledge-vault push outcome is unknown"
+            ) from exc
+
     def _git(
         self,
         root: Path,
         *arguments: str,
         failure_type: type[VaultSynchronizationError],
+        pre_dispatch_failure_type: type[VaultSynchronizationError] | None = None,
+        started_failure_type: type[VaultSynchronizationError] | None = None,
         deadline: float | None,
+        environment: Mapping[str, str] | None = None,
     ) -> CompletedProcess[str]:
         timeout = 15.0
         if deadline is not None:
@@ -231,16 +487,26 @@ class SubprocessVaultSynchronizer:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=self._environment,
+                env=self._environment if environment is None else environment,
             )
         except OSError as exc:
-            raise failure_type("knowledge-vault Git is unavailable") from exc
+            failure = pre_dispatch_failure_type or failure_type
+            raise failure("knowledge-vault Git is unavailable") from exc
         except (TimeoutError, TimeoutExpired) as exc:
-            raise failure_type("knowledge-vault synchronization timed out") from exc
+            failure = started_failure_type or failure_type
+            raise failure("knowledge-vault synchronization timed out") from exc
         if deadline is not None:
             _remaining_seconds(deadline, failure_type)
         if completed.returncode != 0:
-            raise failure_type("knowledge-vault synchronization failed")
+            detail = " ".join(
+                part.strip()
+                for part in (completed.stderr, completed.stdout)
+                if part.strip()
+            )[:200]
+            message = "knowledge-vault synchronization failed"
+            if detail:
+                message = f"{message}: {detail}"
+            raise failure_type(message)
         return completed
 
 
@@ -600,13 +866,6 @@ def _note_title(content: str) -> str | None:
     return None
 
 
-def _remaining_seconds(deadline: float, error_type: type[Exception]) -> float:
-    remaining = deadline - monotonic()
-    if remaining <= 0:
-        raise error_type("knowledge-vault read exceeded its overall deadline")
-    return remaining
-
-
 def _stale_warning(age) -> str:
     minutes = max(0, int(age.total_seconds() // 60))
     hours, minutes = divmod(minutes, 60)
@@ -625,3 +884,49 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
             seen.add(path)
             unique.append(path)
     return unique
+
+
+def _normalise_staged_diff(output: str) -> str:
+    """Remove Git-only headers while retaining every unified-diff line."""
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    ignored_prefixes = (
+        "diff --git ",
+        "index ",
+        "new file mode ",
+        "old mode ",
+        "new mode ",
+        "deleted file mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+    )
+    lines = output.replace("\r\n", "\n").splitlines()
+    hunk_lines_remaining = 0
+    for line in lines:
+        is_file_header = line.startswith("--- ") and hunk_lines_remaining == 0
+        if is_file_header:
+            if current:
+                chunks.append(current)
+            current = [line]
+            continue
+        if not current:
+            continue
+        if line.startswith(ignored_prefixes):
+            continue
+        current.append(line)
+        if line.startswith("@@ "):
+            hunk = _UNIFIED_HUNK.match(line)
+            if hunk is not None:
+                old_count = int(hunk.group(1) or "1")
+                new_count = int(hunk.group(2) or "1")
+                hunk_lines_remaining = old_count + new_count
+        elif hunk_lines_remaining and line and line[0] in " +-":
+            hunk_lines_remaining -= 1
+    if current:
+        chunks.append(current)
+    if not chunks:
+        return ""
+    return "\n".join("\n".join(chunk) for chunk in chunks).rstrip("\n") + "\n"
