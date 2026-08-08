@@ -13,16 +13,22 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
+from .conversation_archive import (
+    InMemoryDeletedConversationArchive,
+)
 from .models import (
     AuditEvidence,
     AuditFilter,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
     ConversationMessage,
+    ConversationTombstone,
     FrozenActionProposal,
     HistorySelection,
     IngressAdmissionResult,
@@ -32,6 +38,7 @@ from .models import (
     OutboundDelivery,
     OutboundReply,
     RequestState,
+    _conversation_message_digest,
     ensure_utc,
 )
 from .ports import (
@@ -41,6 +48,8 @@ from .ports import (
     AuditBoundary,
     AuditWriteError,
     Clock,
+    DeletedConversationArchiveError,
+    DeletedConversationArchiveWriter,
     IdGenerator,
     OrchestrationAdapterError,
     OutboundConnectorError,
@@ -110,10 +119,16 @@ class DeterministicIdGenerator:
 class InMemoryDurableStateStore:
     """A failure-controllable state port for narrow unit tests."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        deleted_archive: DeletedConversationArchiveWriter | None = None,
+    ) -> None:
         self.claims: dict[tuple[str, str], IngressClaim] = {}
         self.conversation_messages: dict[tuple[str, str], ConversationMessage] = {}
         self.outbound_outbox: dict[tuple[str, str], ConversationMessage] = {}
+        self._deleted_archive = deleted_archive or InMemoryDeletedConversationArchive()
+        self._conversation_tombstones: dict[str, ConversationTombstone] = {}
         self.requests: dict[str, RequestState] = {}
         self._knowledge_vault_synchronized_at: datetime | None = None
         self.fail_claim = False
@@ -347,6 +362,98 @@ class InMemoryDurableStateStore:
             limit=limit,
         )
 
+    def preview_conversation_deletion(
+        self, scope: ConversationDeletionScope
+    ) -> ConversationDeletionPreview:
+        with self._lock:
+            return _preview_conversation_deletion(
+                self.conversation_messages.values(), scope
+            )
+
+    def delete_conversation_history(
+        self,
+        preview: ConversationDeletionPreview,
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> tuple[ConversationTombstone, ...]:
+        if not isinstance(preview, ConversationDeletionPreview):
+            raise TypeError("preview must be a ConversationDeletionPreview")
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("deletion_id must be non-blank")
+        deleted_at = ensure_utc(deleted_at)
+        with self._lock:
+            if self.fail_conversation:
+                raise StateStoreError("controlled conversation deletion failure")
+            current = _preview_conversation_deletion(
+                self.conversation_messages.values(),
+                ConversationDeletionScope.message(preview.history_ids),
+            )
+            if (
+                current.history_ids != preview.history_ids
+                or current.content_digest != preview.content_digest
+            ):
+                raise StateStoreError(
+                    "conversation deletion preview no longer matches accessible history"
+                )
+            try:
+                self._deleted_archive.archive(
+                    preview.messages,
+                    deletion_id=deletion_id,
+                    deleted_at=deleted_at,
+                )
+            except DeletedConversationArchiveError as exc:
+                raise StateStoreError(
+                    "could not transfer conversation history to the deleted archive"
+                ) from exc
+            archived: list[tuple[tuple[str, str], ConversationMessage]] = []
+            tombstones: list[ConversationTombstone] = []
+            for message in preview.messages:
+                key = (message.transport_session_id, message.message_id)
+                if key not in self.conversation_messages:
+                    raise StateStoreError(
+                        "conversation deletion record is no longer accessible"
+                    )
+                archived.append((key, message))
+                tombstones.append(
+                    _conversation_tombstone(
+                        message,
+                        deletion_id=deletion_id,
+                        deleted_at=deleted_at,
+                        scope_type=preview.scope.scope_type,
+                        ordinal=len(tombstones),
+                    )
+                )
+            for key, message in archived:
+                self.conversation_messages.pop(key, None)
+                self.outbound_outbox.pop(key, None)
+            for tombstone in tombstones:
+                self._conversation_tombstones[tombstone.history_id] = tombstone
+            return tuple(tombstones)
+
+    delete_conversation_messages = delete_conversation_history
+
+    def list_conversation_tombstones(
+        self, *, history_ids: tuple[str, ...] = ()
+    ) -> tuple[ConversationTombstone, ...]:
+        with self._lock:
+            selected = set(history_ids)
+            for history_id in history_ids:
+                ConversationMessage.history_id_parts(history_id)
+            return tuple(
+                sorted(
+                    (
+                        tombstone
+                        for tombstone in self._conversation_tombstones.values()
+                        if not selected or tombstone.history_id in selected
+                    ),
+                    key=lambda tombstone: (
+                        tombstone.deleted_at,
+                        tombstone.tombstone_id,
+                    ),
+                )
+            )
+
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
             if self.fail_claim:
@@ -404,7 +511,12 @@ class InMemoryDurableStateStore:
 class SQLiteDurableStateStore:
     """Small SQLite-backed durable state adapter for the primary seam."""
 
-    def __init__(self, database: str | Path | sqlite3.Connection = ":memory:") -> None:
+    def __init__(
+        self,
+        database: str | Path | sqlite3.Connection = ":memory:",
+        *,
+        deleted_archive: DeletedConversationArchiveWriter | None = None,
+    ) -> None:
         self._owns_connection = not isinstance(database, sqlite3.Connection)
         self.connection = (
             database
@@ -413,6 +525,7 @@ class SQLiteDurableStateStore:
         )
         self.connection.row_factory = sqlite3.Row
         self._conversation_has_legacy_session = False
+        self._deleted_archive = deleted_archive
         try:
             self.connection.executescript(
                 """
@@ -480,6 +593,19 @@ class SQLiteDurableStateStore:
                     ON conversation_history(request_id, occurred_at, transport_session_id, message_id);
                 CREATE INDEX IF NOT EXISTS conversation_history_by_direction
                     ON conversation_history(direction, occurred_at, transport_session_id, message_id);
+                CREATE TABLE IF NOT EXISTS conversation_tombstones (
+                    tombstone_id TEXT PRIMARY KEY,
+                    deletion_id TEXT NOT NULL,
+                    history_id TEXT NOT NULL UNIQUE,
+                    transport_session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    working_session_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    scope_type TEXT NOT NULL CHECK (scope_type IN ('message', 'conversation', 'date_range'))
+                );
+                CREATE INDEX IF NOT EXISTS conversation_tombstones_by_deleted_at
+                    ON conversation_tombstones(deleted_at, tombstone_id);
                 CREATE TABLE IF NOT EXISTS knowledge_vault_synchronization (
                     slot INTEGER PRIMARY KEY CHECK (slot = 1),
                     synchronized_at TEXT NOT NULL
@@ -576,6 +702,7 @@ class SQLiteDurableStateStore:
                 self._conversation_has_legacy_session = False
             self._classify_and_index_conversation_history()
         except sqlite3.Error as exc:
+            self.close()
             raise StateStoreError("could not initialize SQLite state") from exc
 
     def admit_ingress(
@@ -1269,6 +1396,169 @@ class SQLiteDurableStateStore:
             )
         )
 
+    def preview_conversation_deletion(
+        self, scope: ConversationDeletionScope
+    ) -> ConversationDeletionPreview:
+        try:
+            return _preview_conversation_deletion(
+                self.list_conversation_messages(), scope
+            )
+        except StateStoreError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError("could not preview conversation deletion") from exc
+
+    def delete_conversation_history(
+        self,
+        preview: ConversationDeletionPreview,
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> tuple[ConversationTombstone, ...]:
+        if not isinstance(preview, ConversationDeletionPreview):
+            raise TypeError("preview must be a ConversationDeletionPreview")
+        if not isinstance(deletion_id, str) or not deletion_id.strip():
+            raise ValueError("deletion_id must be non-blank")
+        deleted_at = ensure_utc(deleted_at)
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            current = _preview_conversation_deletion(
+                self.list_conversation_messages(),
+                ConversationDeletionScope.message(preview.history_ids),
+            )
+            if (
+                current.history_ids != preview.history_ids
+                or current.content_digest != preview.content_digest
+            ):
+                self.connection.rollback()
+                raise StateStoreError(
+                    "conversation deletion preview no longer matches accessible history"
+                )
+            if self._deleted_archive is None:
+                self.connection.rollback()
+                raise StateStoreError(
+                    "deleted conversation archive writer is not configured"
+                )
+            try:
+                self._deleted_archive.archive(
+                    preview.messages,
+                    deletion_id=deletion_id,
+                    deleted_at=deleted_at,
+                )
+            except DeletedConversationArchiveError as exc:
+                self.connection.rollback()
+                raise StateStoreError(
+                    "could not transfer conversation history to the deleted archive"
+                ) from exc
+            tombstones: list[ConversationTombstone] = []
+            for ordinal, message in enumerate(preview.messages):
+                tombstone = _conversation_tombstone(
+                    message,
+                    deletion_id=deletion_id,
+                    deleted_at=deleted_at,
+                    scope_type=preview.scope.scope_type,
+                    ordinal=ordinal,
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM conversation_history_fts
+                    WHERE transport_session_id = ? AND message_id = ?
+                    """,
+                    (message.transport_session_id, message.message_id),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM conversation_history
+                    WHERE transport_session_id = ? AND message_id = ?
+                    """,
+                    (message.transport_session_id, message.message_id),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM outbound_conversation_outbox
+                    WHERE transport_session_id = ? AND message_id = ?
+                    """,
+                    (message.transport_session_id, message.message_id),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO conversation_tombstones(
+                        tombstone_id, deletion_id, history_id,
+                        transport_session_id, message_id, working_session_id,
+                        occurred_at, deleted_at, scope_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tombstone.tombstone_id,
+                        tombstone.deletion_id,
+                        tombstone.history_id,
+                        tombstone.transport_session_id,
+                        tombstone.message_id,
+                        tombstone.working_session_id,
+                        tombstone.occurred_at.isoformat(),
+                        tombstone.deleted_at.isoformat(),
+                        tombstone.scope_type,
+                    ),
+                )
+                tombstones.append(tombstone)
+            self.connection.commit()
+            return tuple(tombstones)
+        except StateStoreError:
+            raise
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "conversation deletion tombstone already exists"
+            ) from exc
+        except sqlite3.Error as exc:
+            try:
+                self.connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise StateStoreError("could not delete conversation history") from exc
+
+    delete_conversation_messages = delete_conversation_history
+
+    def list_conversation_tombstones(
+        self, *, history_ids: tuple[str, ...] = ()
+    ) -> tuple[ConversationTombstone, ...]:
+        for history_id in history_ids:
+            ConversationMessage.history_id_parts(history_id)
+        try:
+            clauses: list[str] = []
+            values: list[object] = []
+            if history_ids:
+                clauses.append(
+                    "history_id IN (" + ",".join("?" for _ in history_ids) + ")"
+                )
+                values.extend(history_ids)
+            query = (
+                "SELECT tombstone_id, deletion_id, history_id, "
+                "transport_session_id, message_id, working_session_id, "
+                "occurred_at, deleted_at, scope_type "
+                "FROM conversation_tombstones"
+            )
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY deleted_at, tombstone_id"
+            rows = self.connection.execute(query, values).fetchall()
+        except sqlite3.Error as exc:
+            raise StateStoreError("could not list conversation tombstones") from exc
+        return tuple(
+            ConversationTombstone(
+                tombstone_id=row["tombstone_id"],
+                deletion_id=row["deletion_id"],
+                history_id=row["history_id"],
+                transport_session_id=row["transport_session_id"],
+                message_id=row["message_id"],
+                working_session_id=row["working_session_id"],
+                occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                deleted_at=datetime.fromisoformat(row["deleted_at"]),
+                scope_type=row["scope_type"],
+            )
+            for row in rows
+        )
+
     def _rebuild_conversation_history_for_outbound(self) -> None:
         self.connection.execute("BEGIN IMMEDIATE")
         self.connection.execute(
@@ -1360,6 +1650,7 @@ class SQLiteDurableStateStore:
         self.connection.commit()
 
     def close(self) -> None:
+        self._deleted_archive = None
         if self._owns_connection:
             self.connection.close()
 
@@ -1402,6 +1693,72 @@ _HISTORY_SEARCH_STOPWORDS = frozenset(
         "where",
     }
 )
+
+
+def _preview_conversation_deletion(
+    messages: Iterable[ConversationMessage],
+    scope: ConversationDeletionScope,
+) -> ConversationDeletionPreview:
+    """Select accessible records once using one canonical ordering."""
+
+    if not isinstance(scope, ConversationDeletionScope):
+        raise TypeError("scope must be a ConversationDeletionScope")
+    ordered = tuple(
+        sorted(
+            messages,
+            key=lambda message: (
+                message.occurred_at,
+                message.transport_session_id,
+                message.message_id,
+            ),
+        )
+    )
+    if scope.scope_type == "message":
+        selected_ids = set(scope.history_ids)
+        selected = tuple(
+            message for message in ordered if message.history_id in selected_ids
+        )
+    elif scope.scope_type == "conversation":
+        selected = tuple(
+            message
+            for message in ordered
+            if message.working_session_id == scope.conversation_id
+        )
+    else:
+        assert scope.start_at is not None and scope.end_at is not None
+        selected = tuple(
+            message
+            for message in ordered
+            if scope.start_at <= message.occurred_at <= scope.end_at
+        )
+    return ConversationDeletionPreview(
+        scope=scope,
+        messages=selected,
+        content_digest=_conversation_message_digest(selected),
+    )
+
+
+def _conversation_tombstone(
+    message: ConversationMessage,
+    *,
+    deletion_id: str,
+    deleted_at: datetime,
+    scope_type: str,
+    ordinal: int,
+) -> ConversationTombstone:
+    """Build metadata that can reference a moved record without retaining text."""
+
+    return ConversationTombstone(
+        tombstone_id=f"tombstone-{ordinal + 1}-{message.history_id}",
+        deletion_id=deletion_id,
+        history_id=message.history_id,
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        working_session_id=message.working_session_id,
+        occurred_at=message.occurred_at,
+        deleted_at=deleted_at,
+        scope_type=scope_type,
+    )
 
 
 def _filter_conversation_messages(

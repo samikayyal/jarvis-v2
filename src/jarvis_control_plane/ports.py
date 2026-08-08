@@ -16,7 +16,10 @@ if TYPE_CHECKING:
 from .models import (
     AuditEvidence,
     AuditFilter,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
     ConversationMessage,
+    ConversationTombstone,
     FrozenActionProposal,
     HistorySelection,
     IngressAdmissionResult,
@@ -39,6 +42,10 @@ class InvalidEnvelopeError(ControlPlaneError):
 
 class StateStoreError(ControlPlaneError):
     """Durable state could not be read or written."""
+
+
+class DeletedConversationArchiveError(ControlPlaneError):
+    """The manual-administration archival boundary could not accept content."""
 
 
 class AuditWriteError(ControlPlaneError):
@@ -124,6 +131,20 @@ class AuditBoundary(Protocol):
     def export_json(self, query: AuditFilter | None = None) -> str: ...
 
 
+class DeletedConversationArchiveWriter(Protocol):
+    """Write-only capability for content removed from Jarvis-readable state."""
+
+    def archive(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class DurableStateStore(Protocol):
     """Authoritative local state and replay-claim port."""
 
@@ -195,6 +216,22 @@ class DurableStateStore(Protocol):
         excluding_working_session_id: str,
         limit: int = 5,
     ) -> HistorySelection: ...
+
+    def preview_conversation_deletion(
+        self, scope: ConversationDeletionScope
+    ) -> ConversationDeletionPreview: ...
+
+    def delete_conversation_history(
+        self,
+        preview: ConversationDeletionPreview,
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> tuple[ConversationTombstone, ...]: ...
+
+    def list_conversation_tombstones(
+        self, *, history_ids: tuple[str, ...] = ()
+    ) -> tuple[ConversationTombstone, ...]: ...
 
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
 

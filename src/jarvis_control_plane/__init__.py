@@ -21,6 +21,12 @@ from .control_plane import (
     DeterministicCapabilityBroker,
     SignedMessageReceiver,
 )
+from .conversation_archive import (
+    DeletedConversationArchiveRecord,
+    InMemoryDeletedConversationArchive,
+    SQLiteDeletedConversationArchiveWriter,
+    serve_sqlite_deleted_conversation_archive,
+)
 from .gmail_actions import (
     GMAIL_SEND_SCOPE,
     GmailMessage,
@@ -115,7 +121,10 @@ from .knowledge_vault import (
 from .models import (
     AuditEvidence,
     AuditFilter,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
     ConversationMessage,
+    ConversationTombstone,
     FrozenActionProposal,
     HistorySelection,
     InboundMessage,
@@ -141,6 +150,7 @@ from .ports import (
     AuditWriteError,
     BoundActionLifecycle,
     ControlPlaneError,
+    DeletedConversationArchiveError,
     DiagnosticTraceError,
     OrchestrationAdapterError,
     OutboundConnectorError,
@@ -213,7 +223,12 @@ __all__ = [
     "ControlledOutboundConnector",
     "ControlledVaultSynchronizer",
     "ControlledWorkerTransport",
+    "ConversationDeletionPreview",
+    "ConversationDeletionScope",
     "ConversationMessage",
+    "ConversationTombstone",
+    "DeletedConversationArchiveError",
+    "DeletedConversationArchiveRecord",
     "DeterministicCapabilityBroker",
     "DeterministicIdGenerator",
     "DiagnosticTrace",
@@ -255,6 +270,7 @@ __all__ = [
     "GoogleTokenExchangeResult",
     "HistorySelection",
     "InMemoryAuditBoundary",
+    "InMemoryDeletedConversationArchive",
     "InMemoryDiagnosticTraceStore",
     "InMemoryDurableStateStore",
     "InMemoryGoogleCredentialStore",
@@ -280,6 +296,7 @@ __all__ = [
     "RequestState",
     "RoutedActionDispatcher",
     "SQLiteAuditBoundary",
+    "SQLiteDeletedConversationArchiveWriter",
     "SQLiteDiagnosticTraceStore",
     "SQLiteDurableStateStore",
     "SQLiteGoogleOAuthStateStore",
@@ -321,5 +338,6 @@ __all__ = [
     "gmail_proposal_payload",
     "gmail_proposal_preview",
     "gmail_write_request_from_proposal",
+    "serve_sqlite_deleted_conversation_archive",
     "sign_body",
 ]

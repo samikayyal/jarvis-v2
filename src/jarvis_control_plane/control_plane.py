@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from datetime import date, datetime
 from threading import RLock
 
 from .control_grammar import (
@@ -17,6 +19,8 @@ from .control_grammar import (
 )
 from .models import (
     AuditEvidence,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
     ConversationMessage,
     FrozenActionProposal,
     InboundMessage,
@@ -67,6 +71,7 @@ from .sessions import (
     TransitionKind,
     WorkingSession,
     WorkingSessionStore,
+    accept_request,
     apply_request_result,
     approve_pending_action,
     cancel_active_request,
@@ -109,6 +114,49 @@ def _bounded_informational_reply(reply_text: str, *, request_id: str) -> str:
         - len(suffix)
     )
     return f"{reply_text[:content_limit]}{_INFORMATIONAL_TRUNCATION_MARKER}{suffix}"
+
+
+def _deletion_payload(preview: ConversationDeletionPreview) -> dict[str, object]:
+    """Freeze only exact selectors and content evidence, never message bodies."""
+
+    scope = preview.scope
+    return {
+        "content_digest": preview.content_digest,
+        "conversation_id": scope.conversation_id,
+        "end_at": scope.end_at.isoformat() if scope.end_at is not None else None,
+        "history_ids": list(preview.history_ids),
+        "scope_type": scope.scope_type,
+        "start_at": scope.start_at.isoformat() if scope.start_at is not None else None,
+    }
+
+
+def _deletion_scope_from_payload(payload: object) -> ConversationDeletionScope:
+    if not isinstance(payload, dict):
+        raise TypeError("conversation deletion payload must be an object")
+    scope_type = payload.get("scope_type")
+    if scope_type == "message":
+        history_ids = payload.get("history_ids")
+        if not isinstance(history_ids, list) or not all(
+            isinstance(value, str) for value in history_ids
+        ):
+            raise ValueError(
+                "conversation deletion payload has invalid message selectors"
+            )
+        return ConversationDeletionScope.message(tuple(history_ids))
+    if scope_type == "conversation":
+        conversation_id = payload.get("conversation_id")
+        if not isinstance(conversation_id, str):
+            raise ValueError("conversation deletion payload has no conversation ID")
+        return ConversationDeletionScope.conversation(conversation_id)
+    if scope_type == "date_range":
+        start_at = payload.get("start_at")
+        end_at = payload.get("end_at")
+        if not isinstance(start_at, str) or not isinstance(end_at, str):
+            raise ValueError("conversation deletion payload has no date range")
+        return ConversationDeletionScope.date_range(
+            datetime.fromisoformat(start_at), datetime.fromisoformat(end_at)
+        )
+    raise ValueError("conversation deletion payload has an invalid scope")
 
 
 def _dispatch_failure_status(error: BaseException) -> DispatchStatus:
@@ -185,6 +233,83 @@ class _NoopActionLifecycle:
 
     def validate_pending_action(self, action: FrozenActionProposal) -> None:
         return
+
+
+class _ConversationDeletionDispatch:
+    """Prepared local deletion edge for one exact frozen history selection."""
+
+    def __init__(
+        self,
+        *,
+        state: DurableStateStore,
+        action: FrozenActionProposal,
+        clock: Clock,
+    ) -> None:
+        self._state = state
+        self._action = action
+        self._clock = clock
+        self._lock = RLock()
+        self._started = False
+        self._cancelled = False
+
+    def run(self) -> None:
+        with self._lock:
+            if self._cancelled:
+                raise ActionDispatcherError(
+                    "conversation deletion was cancelled before dispatch"
+                )
+            self._started = True
+        try:
+            payload = json.loads(self._action.payload)
+            scope = _deletion_scope_from_payload(payload)
+            if not isinstance(payload, dict):
+                raise TypeError("conversation deletion payload must be an object")
+            raw_history_ids = payload.get("history_ids")
+            if not isinstance(raw_history_ids, list) or not all(
+                isinstance(history_id, str) for history_id in raw_history_ids
+            ):
+                raise ValueError(
+                    "conversation deletion payload has invalid history IDs"
+                )
+            history_ids = tuple(raw_history_ids)
+            content_digest = payload.get("content_digest")
+            if not isinstance(content_digest, str):
+                raise TypeError(
+                    "conversation deletion payload has an invalid content digest"
+                )
+            exact_preview = self._state.preview_conversation_deletion(
+                ConversationDeletionScope.message(history_ids)
+            )
+            if (
+                exact_preview.history_ids != history_ids
+                or exact_preview.content_digest != content_digest
+            ):
+                raise ActionDispatcherError(
+                    "conversation deletion preview no longer matches accessible history"
+                )
+            preview = ConversationDeletionPreview(
+                scope=scope,
+                messages=exact_preview.messages,
+                content_digest=exact_preview.content_digest,
+            )
+            self._state.delete_conversation_history(
+                preview,
+                deletion_id=self._action.action_id,
+                deleted_at=self._clock.now(),
+            )
+        except ActionDispatcherError:
+            raise
+        except (StateStoreError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ActionDispatcherError(
+                f"conversation deletion could not be committed: {exc}"
+            ) from exc
+
+    def cancel(self) -> ActionCancellationResult:
+        with self._lock:
+            if not self._started:
+                self._cancelled = True
+                return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +430,8 @@ class DeterministicCapabilityBroker:
                 return self._consume_pending_approval(message, choice)
         parsed = parse_control(message.text)
         if parsed.is_command and parsed.command is ControlCommand.HISTORY:
+            if parsed.args and parsed.args[0] == "delete":
+                return self._handle_history_deletion_control(message, parsed.args)
             return self._handle_history_control(message, parsed.args)
         try:
             model_availability = self._model_availability()
@@ -744,7 +871,10 @@ class DeterministicCapabilityBroker:
         if isinstance(prepared_or_result, ReceiveResult):
             return prepared_or_result
         if not self._dispatch_is_still_attempted(prepared_or_result.action.action_id):
-            self._release_prepared_dispatch(prepared_or_result.action.action_id)
+            self._release_prepared_dispatch(
+                prepared_or_result.action.action_id,
+                handle=prepared_or_result.handle,
+            )
             self._finalize_dispatch(prepared_or_result.action.action_id)
             return self._late_action_result(
                 message,
@@ -956,6 +1086,15 @@ class DeterministicCapabilityBroker:
             )
         if isinstance(frozen_or_result, ReceiveResult):
             return frozen_or_result
+        if frozen_or_result.kind == "conversation_history_delete":
+            return _PreparedActionDispatch(
+                action=frozen_or_result,
+                handle=_ConversationDeletionDispatch(
+                    state=self.state,
+                    action=frozen_or_result,
+                    clock=self.clock,
+                ),
+            )
         try:
             handle = self.action_dispatcher.prepare(frozen_or_result)
             if not isinstance(handle, ActionDispatchHandle):
@@ -1063,6 +1202,28 @@ class DeterministicCapabilityBroker:
                     "the action was not dispatched"
                 ),
             )
+        if action.kind == "conversation_history_delete":
+            try:
+                self._append_audit(
+                    kind="conversation_history_deletion_attempt",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome="attempted",
+                    actor="control_plane",
+                    operation_type="conversation_history_delete",
+                    target_category="operator_conversation",
+                    approval_decision="approved",
+                    execution_status="attempted",
+                    details={"action": action.action_id},
+                )
+            except AuditWriteError as exc:
+                self._close_unattempted_action(action.action_id)
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"conversation deletion was blocked by audit: {exc}",
+                )
         try:
             attempted = mark_action_dispatch_attempted(
                 dispatching, action_id=action.action_id, now=self.clock
@@ -1113,7 +1274,10 @@ class DeterministicCapabilityBroker:
                     error_limit_bytes=2 * 1024 * 1024 + 16 * 1024,
                 )
         except (DiagnosticTraceError, ActionDispatcherError) as exc:
-            self._release_prepared_dispatch(prepared.action.action_id)
+            self._release_prepared_dispatch(
+                prepared.action.action_id,
+                handle=prepared.handle,
+            )
             terminal_status = _dispatch_failure_status(exc)
             if not self._finish_frozen_action(
                 prepared.action.action_id, terminal_status
@@ -1145,11 +1309,19 @@ class DeterministicCapabilityBroker:
             )
             return record is not None and record.status is DispatchStatus.ATTEMPTED
 
-    def _release_prepared_dispatch(self, action_id: str) -> None:
+    def _release_prepared_dispatch(
+        self,
+        action_id: str,
+        *,
+        handle: ActionDispatchHandle | None = None,
+    ) -> None:
         """Close a prepared edge when trace admission fails before dispatch."""
 
         try:
-            self.action_dispatcher.cancel(action_id=action_id)
+            if handle is not None and callable(getattr(handle, "cancel", None)):
+                handle.cancel()  # type: ignore[attr-defined]
+            else:
+                self.action_dispatcher.cancel(action_id=action_id)
         except Exception:  # noqa: BLE001 - an unavailable edge is unknown
             # The durable action outcome below remains authoritative. A concrete
             # dispatcher must make cancellation bounded, but cleanup cannot
@@ -2250,6 +2422,169 @@ class DeterministicCapabilityBroker:
         if not isinstance(availability, ModelAvailability):
             raise TypeError("model availability provider returned an invalid value")
         return availability
+
+    def _handle_history_deletion_control(
+        self,
+        message: InboundMessage,
+        args: tuple[str, ...],
+    ) -> ReceiveResult:
+        """Preview one exact history scope, then freeze it behind approval."""
+
+        try:
+            self._append_audit(
+                kind="conversation_history_deletion_preview",
+                event_id=message.event_id,
+                request_id=None,
+                message_id=message.message_id,
+                outcome="requested",
+                actor="configured_operator",
+                operation_type="conversation_history_delete",
+                target_category="operator_conversation",
+                details={"scope": args[1]},
+            )
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"conversation deletion preview was blocked by audit: {exc}",
+            )
+
+        current = self._current_working_session()
+        if current.pending_action is not None:
+            return self._dispatch_history_text(
+                message,
+                "A pending action already owns this working session. Approve, reject, "
+                "or cancel it before requesting deletion.",
+                disposition="pending_blocked",
+            )
+        if current.active_request is not None or any(
+            record.is_open for record in current.action_outbox
+        ):
+            return self._dispatch_history_text(
+                message,
+                "A request is still active. Use /status or /cancel before requesting "
+                "conversation deletion.",
+                disposition="busy_refused",
+            )
+
+        try:
+            scope = self._parse_history_deletion_scope(args)
+            preview = self.state.preview_conversation_deletion(scope)
+        except (StateStoreError, TypeError, ValueError) as exc:
+            return self._dispatch_history_text(
+                message,
+                f"Conversation deletion preview failed: {type(exc).__name__}.",
+                disposition="history_delete_failed",
+            )
+        if not preview.messages:
+            return self._dispatch_history_text(
+                message,
+                "No accessible conversation messages matched that deletion scope.",
+                disposition="history_delete_empty",
+            )
+
+        request_id = self.ids.new_id("request")
+        session_transition = accept_request(
+            current,
+            now=self.clock,
+            request_id=request_id,
+            originating_message_id=message.message_id,
+            phase="processing",
+        )
+        if session_transition.kind is not TransitionKind.REQUEST_ACCEPTED:
+            return self._dispatch_history_text(
+                message,
+                "Conversation deletion could not start because the working session "
+                "changed. Use /status and try again.",
+                disposition="history_delete_busy",
+            )
+        admission = self._admit_request(
+            message=message,
+            session=current,
+            session_transition=ControlTransition(
+                state=session_transition.state,
+                parsed=parse_control(message.text),
+                kind=ControlTransitionKind.REQUEST_ACCEPTED,
+                cancellation_token=session_transition.cancellation_token,
+            ),
+            request_id=request_id,
+        )
+        if isinstance(admission, ReceiveResult):
+            return admission
+
+        proposal = FrozenActionProposal.create(
+            action_id=self.ids.new_id("history-delete"),
+            request_id=admission.request.request_id,
+            kind="conversation_history_delete",
+            preview=self._render_history_deletion_preview(preview),
+            payload=_deletion_payload(preview),
+        )
+        try:
+            action = self.freeze_action(proposal)
+            self._present_action(action, message)
+        except (
+            AuditWriteError,
+            ActionDispatcherError,
+            DiagnosticTraceError,
+            InvariantViolation,
+            OutboundConnectorError,
+            SessionStoreError,
+            StateStoreError,
+            ValueError,
+        ) as exc:
+            return self._finish_proposal_failure(
+                message=message,
+                request=admission.request,
+                token=admission.cancellation_token,
+                error=exc,
+            )
+        return ReceiveResult(
+            status_code=202,
+            disposition="pending_action",
+            request=admission.request,
+            reason="exact conversation deletion proposal is frozen pending approval",
+        )
+
+    @staticmethod
+    def _parse_history_deletion_scope(
+        args: tuple[str, ...],
+    ) -> ConversationDeletionScope:
+        if len(args) < 3 or args[0] != "delete":
+            raise ValueError("history deletion arguments are malformed")
+        selector_type = args[1]
+        if selector_type == "message" and len(args) == 3:
+            return ConversationDeletionScope.message(args[2])
+        if selector_type == "conversation" and len(args) == 3:
+            return ConversationDeletionScope.conversation(args[2])
+        if selector_type in {"date", "range"} and len(args) == 4:
+            try:
+                start = date.fromisoformat(args[2])
+                end = date.fromisoformat(args[3])
+            except ValueError as exc:
+                raise ValueError("history deletion dates must be ISO dates") from exc
+            return ConversationDeletionScope.date_range(start, end)
+        raise ValueError("history deletion arguments are malformed")
+
+    @staticmethod
+    def _render_history_deletion_preview(
+        preview: ConversationDeletionPreview,
+    ) -> str:
+        lines = [
+            "Conversation-history deletion preview",
+            f"Scope: {preview.scope.describe()}",
+            f"Messages: {preview.count}",
+            f"Selection digest: {preview.content_digest}",
+            "Selected records:",
+        ]
+        lines.extend(
+            (
+                f"{message.history_id} | {message.occurred_at.isoformat()} | "
+                f"{message.direction} | conversation {message.working_session_id} | "
+                f"request {message.request_id or 'none'}"
+            )
+            for message in preview.messages
+        )
+        return "\n".join(lines)
 
     def _handle_history_control(
         self,
