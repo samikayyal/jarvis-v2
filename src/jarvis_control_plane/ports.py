@@ -17,10 +17,12 @@ from .models import (
     AuditEvidence,
     AuditFilter,
     ConversationMessage,
+    DurableMemory,
     FrozenActionProposal,
     HistorySelection,
     IngressAdmissionResult,
     IngressClaim,
+    MemorySelection,
     OrchestrationRequest,
     OrchestrationResult,
     OutboundDelivery,
@@ -39,6 +41,14 @@ class InvalidEnvelopeError(ControlPlaneError):
 
 class StateStoreError(ControlPlaneError):
     """Durable state could not be read or written."""
+
+
+class MemorySearchLimitExceeded(StateStoreError):
+    """A durable-memory search reached its deterministic scan ceiling."""
+
+    def __init__(self, message: str, *, scanned_rows: int) -> None:
+        super().__init__(message)
+        self.scanned_rows = scanned_rows
 
 
 class AuditWriteError(ControlPlaneError):
@@ -195,6 +205,43 @@ class DurableStateStore(Protocol):
         excluding_working_session_id: str,
         limit: int = 5,
     ) -> HistorySelection: ...
+
+    def list_memories(
+        self, *, include_terminal: bool = True, limit: int = 50
+    ) -> tuple[DurableMemory, ...]: ...
+
+    def get_memory(self, memory_id: str) -> DurableMemory | None: ...
+
+    def search_memories(
+        self,
+        *,
+        text: str | None = None,
+        memory_ids: tuple[str, ...] = (),
+        include_terminal: bool = True,
+        limit: int = 50,
+    ) -> tuple[DurableMemory, ...]: ...
+
+    def select_memories_for_context(
+        self, *, text: str, limit: int = 5
+    ) -> MemorySelection: ...
+
+    def create_memory(self, memory: DurableMemory) -> None: ...
+
+    def replace_memory(
+        self,
+        memory_id: str,
+        replacement: DurableMemory,
+        *,
+        expected_revision: str | None = None,
+    ) -> DurableMemory: ...
+
+    def forget_memory(
+        self,
+        memory_id: str,
+        *,
+        expected_revision: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> DurableMemory: ...
 
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
 

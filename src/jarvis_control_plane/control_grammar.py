@@ -393,7 +393,7 @@ def _usage(parsed: ParsedControl) -> str:
         return usage.get(parsed.command, f"Usage: /{parsed.command.value}")
     return (
         "Unknown or malformed control command. Valid: /new, /status, /cancel, "
-        "/model, /reasoning, /config, /permissions, /revoke, /history."
+        "/model, /reasoning, /config, /permissions, /revoke, /history, /memory."
     )
 
 
@@ -729,6 +729,29 @@ def _apply_message(
             reply="Empty messages have no effect.",
         )
 
+    return _admit_orchestration_request(
+        session,
+        parsed,
+        now=now,
+        request_id=request_id,
+        originating_message_id=originating_message_id,
+        phase=phase,
+        model_availability=model_availability,
+    )
+
+
+def _admit_orchestration_request(
+    session: WorkingSession,
+    parsed: ParsedControl,
+    *,
+    now: datetime_or_clock,
+    request_id: str | None,
+    originating_message_id: str | None,
+    phase: RequestPhase | str,
+    model_availability: ModelAvailability,
+) -> ControlTransition:
+    """Apply the one shared admission policy for model-backed requests."""
+
     # Ordinary text is not an approval implementation in this foundation.  A
     # pending action blocks it; otherwise one active request refuses it rather
     # than creating a queue entry.
@@ -808,6 +831,38 @@ def _apply_message(
             if transition.state.active_request is not None
             else "Request accepted."
         ),
+    )
+
+
+def admit_orchestration_request(
+    session: WorkingSession,
+    request_text: str,
+    *,
+    now: datetime_or_clock,
+    request_id: str | None = None,
+    originating_message_id: str | None = None,
+    phase: RequestPhase | str = RequestPhase.INTERPRETING,
+    model_availability: ModelAvailability,
+) -> ControlTransition:
+    """Apply model-backed admission to text embedded in an explicit command.
+
+    The embedded text is always treated as the request body, even when it
+    happens to begin with a slash command.  The surrounding command parser
+    remains responsible for the outer control surface.
+    """
+
+    normalized = normalize_message(request_text)
+    if not normalized:
+        raise ValueError("orchestration request text must be non-blank")
+    parsed = ParsedControl(normalized=normalized, kind=MessageKind.ORDINARY)
+    return _admit_orchestration_request(
+        session,
+        parsed,
+        now=now,
+        request_id=request_id,
+        originating_message_id=originating_message_id,
+        phase=phase,
+        model_availability=model_availability,
     )
 
 
