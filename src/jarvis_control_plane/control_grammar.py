@@ -393,7 +393,7 @@ def _usage(parsed: ParsedControl) -> str:
         return usage.get(parsed.command, f"Usage: /{parsed.command.value}")
     return (
         "Unknown or malformed control command. Valid: /new, /status, /cancel, "
-        "/model, /reasoning, /config, /permissions, /revoke, /history."
+        "/model, /reasoning, /config, /permissions, /revoke, /history, /memory."
     )
 
 
