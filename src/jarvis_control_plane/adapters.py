@@ -21,7 +21,6 @@ from typing import ClassVar
 
 from .conversation_archive import (
     InMemoryDeletedConversationArchive,
-    SQLiteDeletedConversationArchiveWriter,
 )
 from .models import (
     AuditEvidence,
@@ -516,21 +515,8 @@ class SQLiteDurableStateStore:
         self,
         database: str | Path | sqlite3.Connection = ":memory:",
         *,
-        deleted_database: str | Path | None = None,
         deleted_archive: DeletedConversationArchiveWriter | None = None,
     ) -> None:
-        if deleted_database is not None and deleted_archive is not None:
-            raise ValueError(
-                "configure either deleted_database or deleted_archive, not both"
-            )
-        if (
-            deleted_database is not None
-            and isinstance(database, (str, Path))
-            and str(database) != ":memory:"
-            and Path(database).expanduser().resolve()
-            == Path(deleted_database).expanduser().resolve()
-        ):
-            raise ValueError("deleted archive must use a separate database path")
         self._owns_connection = not isinstance(database, sqlite3.Connection)
         self.connection = (
             database
@@ -540,16 +526,6 @@ class SQLiteDurableStateStore:
         self.connection.row_factory = sqlite3.Row
         self._conversation_has_legacy_session = False
         self._deleted_archive = deleted_archive
-        self._owns_deleted_archive = deleted_database is not None
-        if deleted_database is not None:
-            try:
-                self._deleted_archive = SQLiteDeletedConversationArchiveWriter(
-                    deleted_database
-                )
-            except Exception:
-                if self._owns_connection:
-                    self.connection.close()
-                raise
         try:
             self.connection.executescript(
                 """
@@ -1674,16 +1650,9 @@ class SQLiteDurableStateStore:
         self.connection.commit()
 
     def close(self) -> None:
-        archive = self._deleted_archive if self._owns_deleted_archive else None
         self._deleted_archive = None
-        try:
-            if archive is not None:
-                close_archive = getattr(archive, "close", None)
-                if callable(close_archive):
-                    close_archive()
-        finally:
-            if self._owns_connection:
-                self.connection.close()
+        if self._owns_connection:
+            self.connection.close()
 
 
 def _request_values(request: RequestState) -> tuple[object, ...]:

@@ -9,11 +9,16 @@ attaching, querying, or otherwise exposing deleted message bodies.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
+import tempfile
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Pipe, Process
+from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -102,6 +107,24 @@ def _archive_values(
     )
 
 
+def _archive_content_values(
+    message: ConversationMessage,
+) -> tuple[object, ...]:
+    return (
+        message.transport_session_id,
+        message.working_session_id,
+        message.message_id,
+        message.event_id,
+        message.chat_id,
+        message.sender_id,
+        message.text,
+        message.occurred_at.isoformat(),
+        message.direction,
+        message.request_id,
+        int(message.credential_like),
+    )
+
+
 def _archive_record_from_row(row: sqlite3.Row) -> DeletedConversationArchiveRecord:
     return DeletedConversationArchiveRecord(
         message=ConversationMessage(
@@ -150,7 +173,7 @@ class InMemoryDeletedConversationArchive:
                     deleted_at=normalized_deleted_at,
                 )
                 existing = self._records.get(key)
-                if existing is not None and existing != record:
+                if existing is not None and existing.message != message:
                     raise DeletedConversationArchiveError(
                         "deleted archive record does not match a prior transfer"
                     )
@@ -175,55 +198,95 @@ class InMemoryDeletedConversationArchive:
         return None
 
 
-class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
-    """Write-only capability backed by an isolated archival helper process.
+def _archive_ipc_family() -> str:
+    return "AF_PIPE" if os.name == "nt" else "AF_UNIX"
 
-    ``database`` must be an explicitly configured path in the separately
-    permissioned administrative storage area.  The ordinary state store does
-    not open this database, retain its connection, or receive a read method.
-    In deployment the helper is run with the administrative storage identity;
-    the process boundary is also exercised by the local tests.
+
+def _validate_archive_authkey(authkey: bytes) -> bytes:
+    if not isinstance(authkey, bytes) or not authkey:
+        raise ValueError("deleted archive IPC authkey must be non-empty bytes")
+    return authkey
+
+
+def _archive_endpoint_path(endpoint: str | Path) -> Path:
+    if os.name == "nt":
+        raise RuntimeError("Windows named-pipe endpoints do not have filesystem paths")
+    return Path(endpoint).expanduser().resolve()
+
+
+def _create_archive_listener(endpoint: str | Path, authkey: bytes) -> Listener:
+    family = _archive_ipc_family()
+    if family == "AF_UNIX":
+        endpoint_path = _archive_endpoint_path(endpoint)
+        if endpoint_path.exists():
+            raise DeletedConversationArchiveError(
+                "deleted archive IPC endpoint already exists"
+            )
+        endpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        listener = Listener(
+            str(endpoint_path),
+            family=family,
+            authkey=_validate_archive_authkey(authkey),
+        )
+        os.chmod(
+            endpoint_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP
+        )
+        return listener
+    return Listener(
+        str(endpoint),
+        family=family,
+        authkey=_validate_archive_authkey(authkey),
+    )
+
+
+def _remove_archive_endpoint(endpoint: str | Path) -> None:
+    if os.name != "nt":
+        _archive_endpoint_path(endpoint).unlink(missing_ok=True)
+
+
+def _archive_database_path(database: str | Path) -> Path:
+    if str(database) == ":memory:":
+        raise ValueError("deleted archive requires a durable database path")
+    return Path(database).expanduser().resolve()
+
+
+class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
+    """Write-only client for an independently supervised archive service.
+
+    The client receives only an IPC endpoint and authentication key.  It never
+    receives the archive database path or a read-capable SQLite connection.
+    Production must run :func:`serve_sqlite_deleted_conversation_archive`
+    under the separate administrative storage identity, with the endpoint
+    permissioned so ordinary Jarvis code can only submit archive writes.
     """
 
-    def __init__(self, database: str | Path) -> None:
-        if str(database) == ":memory:":
-            raise ValueError("deleted archive requires a durable database path")
-        path = Path(database).expanduser().resolve()
-        self._connection, child_connection = Pipe(duplex=True)
-        self._process = Process(
-            target=_deleted_archive_process_main,
-            args=(child_connection, str(path)),
-            daemon=True,
-        )
+    def __init__(self, endpoint: str | Path, *, authkey: bytes) -> None:
+        self._endpoint = str(endpoint)
+        self._authkey = _validate_archive_authkey(authkey)
+        try:
+            self._connection = Client(
+                self._endpoint,
+                family=_archive_ipc_family(),
+                authkey=self._authkey,
+            )
+        except (OSError, EOFError) as exc:
+            raise DeletedConversationArchiveError(
+                "deleted archive service is unavailable"
+            ) from exc
         self._lock = RLock()
         self._closed = False
-        try:
-            self._process.start()
-        except Exception as exc:
-            self._connection.close()
-            child_connection.close()
-            raise DeletedConversationArchiveError(
-                "deleted archive helper could not start"
-            ) from exc
-        finally:
-            child_connection.close()
-        if not self._connection.poll(_ARCHIVE_RESPONSE_TIMEOUT_SECONDS):
-            self.close()
-            raise DeletedConversationArchiveError(
-                "deleted archive helper did not become ready"
-            )
         try:
             response = self._connection.recv()
         except (EOFError, OSError) as exc:
             self.close()
             raise DeletedConversationArchiveError(
-                "deleted archive helper did not become ready"
+                "deleted archive service did not become ready"
             ) from exc
         if not isinstance(response, dict) or not response.get("ok", False):
             message = (
-                str(response.get("message", "deleted archive helper failed"))
+                str(response.get("message", "deleted archive service failed"))
                 if isinstance(response, dict)
-                else "deleted archive helper failed"
+                else "deleted archive service failed"
             )
             self.close()
             raise DeletedConversationArchiveError(message[:200])
@@ -251,22 +314,18 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             )
 
     def _request(self, request: dict[str, Any]) -> None:
-        if self._closed or not self._process.is_alive():
+        if self._closed:
             raise DeletedConversationArchiveError(
-                "deleted archive helper is unavailable"
+                "deleted archive service is unavailable"
             )
         try:
             self._connection.send(request)
-            if not self._connection.poll(_ARCHIVE_RESPONSE_TIMEOUT_SECONDS):
-                raise DeletedConversationArchiveError(
-                    "deleted archive helper did not acknowledge the transfer"
-                )
             response = self._connection.recv()
         except DeletedConversationArchiveError:
             raise
         except (EOFError, OSError) as exc:
             raise DeletedConversationArchiveError(
-                "deleted archive helper is unavailable"
+                "deleted archive service is unavailable"
             ) from exc
         if not isinstance(response, dict) or not response.get("ok", False):
             message = (
@@ -280,16 +339,11 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
         with self._lock:
             if self._closed:
                 return
-            if self._process.is_alive():
-                try:
-                    self._request({"operation": "close"})
-                except DeletedConversationArchiveError:
-                    pass
+            try:
+                self._request({"operation": "close"})
+            except DeletedConversationArchiveError:
+                pass
             self._connection.close()
-            self._process.join(_ARCHIVE_CLOSE_TIMEOUT_SECONDS)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(_ARCHIVE_CLOSE_TIMEOUT_SECONDS)
             self._closed = True
 
     def __del__(self) -> None:
@@ -299,72 +353,111 @@ class SQLiteDeletedConversationArchiveWriter(DeletedConversationArchiveWriter):
             return
 
 
-def _deleted_archive_process_main(connection: Any, database: str) -> None:
+def _archive_batch(
+    archive_connection: sqlite3.Connection,
+    records: Sequence[ConversationMessage],
+    *,
+    deletion_id: str,
+    deleted_at: datetime,
+) -> None:
+    archive_connection.execute("BEGIN IMMEDIATE")
+    try:
+        for message in records:
+            values = _archive_values(
+                message,
+                deletion_id=deletion_id,
+                deleted_at=deleted_at,
+            )
+            archive_connection.execute(
+                """
+                INSERT INTO deleted_messages(
+                    transport_session_id, working_session_id, message_id,
+                    event_id, chat_id, sender_id, text, occurred_at,
+                    direction, request_id, credential_like, deletion_id,
+                    deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(transport_session_id, message_id) DO NOTHING
+                """,
+                values,
+            )
+            existing = archive_connection.execute(
+                """
+                SELECT transport_session_id, working_session_id, message_id,
+                       event_id, chat_id, sender_id, text, occurred_at,
+                       direction, request_id, credential_like
+                FROM deleted_messages
+                WHERE transport_session_id = ? AND message_id = ?
+                """,
+                (message.transport_session_id, message.message_id),
+            ).fetchone()
+            if existing is None or tuple(existing) != _archive_content_values(message):
+                raise DeletedConversationArchiveError(
+                    "deleted archive record does not match a prior transfer"
+                )
+            # The message body is immutable, but the deletion metadata belongs
+            # to the successful live-state deletion attempt.  Updating it here
+            # lets a fresh action adopt a prior archive after a live commit
+            # failure without duplicating or rejecting the retained content.
+            archive_connection.execute(
+                """
+                UPDATE deleted_messages
+                SET deletion_id = ?, deleted_at = ?
+                WHERE transport_session_id = ? AND message_id = ?
+                """,
+                (
+                    deletion_id,
+                    deleted_at.isoformat(),
+                    message.transport_session_id,
+                    message.message_id,
+                ),
+            )
+        archive_connection.commit()
+    except Exception:
+        archive_connection.rollback()
+        raise
+
+
+def _serve_archive_connection(connection: Any, database: str | Path) -> None:
     archive_connection: sqlite3.Connection | None = None
     try:
-        archive_connection = sqlite3.connect(database, timeout=30)
+        archive_connection = sqlite3.connect(
+            str(_archive_database_path(database)), timeout=30
+        )
+        archive_connection.row_factory = sqlite3.Row
         archive_connection.executescript(_ARCHIVE_SCHEMA)
         archive_connection.commit()
         connection.send({"ok": True})
         while True:
-            request = connection.recv()
+            try:
+                request = connection.recv()
+            except (EOFError, OSError):
+                return
             operation = request.get("operation")
             if operation == "close":
                 connection.send({"ok": True})
                 break
-            if operation != "archive":
-                raise DeletedConversationArchiveError(
-                    "deleted archive helper received an unsupported operation"
-                )
-            records, normalized_deleted_at = _validate_archive_request(
-                request["messages"],
-                deletion_id=request["deletion_id"],
-                deleted_at=request["deleted_at"],
-            )
-            archive_connection.execute("BEGIN IMMEDIATE")
             try:
-                for message in records:
-                    values = _archive_values(
-                        message,
-                        deletion_id=request["deletion_id"],
-                        deleted_at=normalized_deleted_at,
+                if operation != "archive":
+                    raise DeletedConversationArchiveError(
+                        "deleted archive service received an unsupported operation"
                     )
-                    archive_connection.execute(
-                        """
-                        INSERT INTO deleted_messages(
-                            transport_session_id, working_session_id, message_id,
-                            event_id, chat_id, sender_id, text, occurred_at,
-                            direction, request_id, credential_like, deletion_id,
-                            deleted_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(transport_session_id, message_id) DO NOTHING
-                        """,
-                        values,
-                    )
-                    existing = archive_connection.execute(
-                        """
-                        SELECT working_session_id, event_id, chat_id, sender_id,
-                               text, occurred_at, direction, request_id,
-                               credential_like, deletion_id, deleted_at
-                        FROM deleted_messages
-                        WHERE transport_session_id = ? AND message_id = ?
-                        """,
-                        (message.transport_session_id, message.message_id),
-                    ).fetchone()
-                    if existing is None or tuple(existing) != values[1:2] + values[3:]:
-                        raise DeletedConversationArchiveError(
-                            "deleted archive record does not match a prior transfer"
-                        )
-                archive_connection.commit()
-            except Exception:
-                archive_connection.rollback()
-                raise
-            connection.send({"ok": True})
-    except Exception as exc:  # noqa: BLE001 - process boundary reports one typed error
-        try:
-            connection.send({"ok": False, "message": str(exc)[:200]})
-        except (BrokenPipeError, EOFError, OSError):
-            pass
+                records, normalized_deleted_at = _validate_archive_request(
+                    request["messages"],
+                    deletion_id=request["deletion_id"],
+                    deleted_at=request["deleted_at"],
+                )
+                _archive_batch(
+                    archive_connection,
+                    records,
+                    deletion_id=request["deletion_id"],
+                    deleted_at=normalized_deleted_at,
+                )
+                connection.send({"ok": True})
+            except Exception as exc:  # noqa: BLE001 - IPC reports typed failures
+                try:
+                    connection.send({"ok": False, "message": str(exc)[:200]})
+                except (BrokenPipeError, EOFError, OSError):
+                    return
     finally:
         if archive_connection is not None:
             archive_connection.close()
@@ -374,8 +467,179 @@ def _deleted_archive_process_main(connection: Any, database: str) -> None:
             pass
 
 
+def serve_sqlite_deleted_conversation_archive(
+    database: str | Path,
+    endpoint: str | Path,
+    *,
+    authkey: bytes,
+) -> None:
+    """Serve the archive from a separately supervised administrative process.
+
+    A deployment must invoke this entry point as the administrative storage
+    identity, with filesystem permissions that let that identity traverse and
+    read ``database`` while the Jarvis identity cannot.  The Jarvis process
+    connects only to ``endpoint`` and receives no database path.
+    """
+
+    listener = _create_archive_listener(endpoint, authkey)
+    try:
+        connection = listener.accept()
+        try:
+            _serve_archive_connection(connection, database)
+        finally:
+            connection.close()
+    finally:
+        listener.close()
+        _remove_archive_endpoint(endpoint)
+
+
+def _archive_service_process_main(
+    startup_connection: Any,
+    database: str,
+    endpoint: str,
+    authkey: bytes,
+) -> None:
+    listener: Listener | None = None
+    try:
+        listener = _create_archive_listener(endpoint, authkey)
+        startup_connection.send({"ok": True})
+        startup_connection.close()
+        connection = listener.accept()
+        try:
+            _serve_archive_connection(connection, database)
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001 - startup boundary reports typed errors
+        try:
+            startup_connection.send({"ok": False, "message": str(exc)[:200]})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        if listener is not None:
+            listener.close()
+            _remove_archive_endpoint(endpoint)
+
+
+class SQLiteDeletedConversationArchiveService:
+    """Test/development launcher for the separately addressed archive service.
+
+    Production should launch :func:`serve_sqlite_deleted_conversation_archive`
+    from an administrative service manager so the service has a distinct OS
+    identity.  This helper exists only to give local tests a real IPC client
+    and a separate process without pretending that same-user process
+    separation is a filesystem permission boundary.
+    """
+
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        endpoint: str | Path | None = None,
+        authkey: bytes | None = None,
+    ) -> None:
+        _archive_database_path(database)
+        self._owns_endpoint_directory = endpoint is None and os.name != "nt"
+        if endpoint is None:
+            if os.name == "nt":
+                endpoint = rf"\\.\pipe\jarvis-deleted-{uuid.uuid4().hex}"
+            else:
+                directory = Path(tempfile.mkdtemp(prefix="jarvis-deleted-"))
+                endpoint = directory / "writer.sock"
+        self.endpoint = str(endpoint)
+        self._endpoint_directory = (
+            Path(self.endpoint).parent if self._owns_endpoint_directory else None
+        )
+        self._authkey = _validate_archive_authkey(authkey or os.urandom(32))
+        startup_parent, startup_child = Pipe(duplex=True)
+        self._process = Process(
+            target=_archive_service_process_main,
+            args=(startup_child, str(database), self.endpoint, self._authkey),
+            daemon=True,
+        )
+        try:
+            self._process.start()
+        except Exception:
+            startup_parent.close()
+            startup_child.close()
+            self._cleanup()
+            raise
+        finally:
+            startup_child.close()
+        try:
+            if not startup_parent.poll(_ARCHIVE_RESPONSE_TIMEOUT_SECONDS):
+                raise DeletedConversationArchiveError(
+                    "deleted archive service did not start"
+                )
+            response = startup_parent.recv()
+        except DeletedConversationArchiveError:
+            self.close()
+            raise
+        except (EOFError, OSError) as exc:
+            self.close()
+            raise DeletedConversationArchiveError(
+                "deleted archive service did not start"
+            ) from exc
+        finally:
+            startup_parent.close()
+        if not isinstance(response, dict) or not response.get("ok", False):
+            message = (
+                str(response.get("message", "deleted archive service failed"))
+                if isinstance(response, dict)
+                else "deleted archive service failed"
+            )
+            self.close()
+            raise DeletedConversationArchiveError(message[:200])
+        try:
+            self.writer = SQLiteDeletedConversationArchiveWriter(
+                self.endpoint,
+                authkey=self._authkey,
+            )
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            writer.close()
+            self.writer = None
+        process = getattr(self, "_process", None)
+        if process is not None:
+            process.join(_ARCHIVE_CLOSE_TIMEOUT_SECONDS)
+            if process.is_alive():
+                process.terminate()
+                process.join(_ARCHIVE_CLOSE_TIMEOUT_SECONDS)
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._endpoint_directory is not None:
+            _remove_archive_endpoint(self.endpoint)
+            try:
+                self._endpoint_directory.rmdir()
+            except OSError:
+                pass
+
+
+def start_sqlite_deleted_conversation_archive_service(
+    database: str | Path,
+    *,
+    endpoint: str | Path | None = None,
+    authkey: bytes | None = None,
+) -> SQLiteDeletedConversationArchiveService:
+    """Start the local test/development archive service launcher."""
+
+    return SQLiteDeletedConversationArchiveService(
+        database,
+        endpoint=endpoint,
+        authkey=authkey,
+    )
+
+
 __all__ = [
     "DeletedConversationArchiveRecord",
     "InMemoryDeletedConversationArchive",
+    "SQLiteDeletedConversationArchiveService",
     "SQLiteDeletedConversationArchiveWriter",
+    "serve_sqlite_deleted_conversation_archive",
+    "start_sqlite_deleted_conversation_archive_service",
 ]

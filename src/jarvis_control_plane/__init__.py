@@ -25,6 +25,7 @@ from .conversation_archive import (
     DeletedConversationArchiveRecord,
     InMemoryDeletedConversationArchive,
     SQLiteDeletedConversationArchiveWriter,
+    serve_sqlite_deleted_conversation_archive,
 )
 from .gmail_actions import (
     GMAIL_SEND_SCOPE,
@@ -337,5 +338,6 @@ __all__ = [
     "gmail_proposal_payload",
     "gmail_proposal_preview",
     "gmail_write_request_from_proposal",
+    "serve_sqlite_deleted_conversation_archive",
     "sign_body",
 ]

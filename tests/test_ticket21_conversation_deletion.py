@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -22,6 +25,9 @@ from jarvis_control_plane import (
     StateStoreError,
 )
 from jarvis_control_plane.control_grammar import MessageKind, parse_control
+from jarvis_control_plane.conversation_archive import (
+    start_sqlite_deleted_conversation_archive_service,
+)
 from jarvis_control_plane.manual_admin import open_sqlite_deleted_conversation_archive
 
 NOW = datetime(2026, 8, 8, 9, 0, tzinfo=UTC)
@@ -34,6 +40,16 @@ class _FailDeletionAttemptAudit(InMemoryAuditBoundary):
         if evidence.kind == "conversation_history_deletion_attempt":
             raise AuditWriteError("controlled deletion-attempt audit failure")
         super().append(evidence)
+
+
+class _FailOnceCommitConnection(sqlite3.Connection):
+    fail_next_commit = False
+
+    def commit(self) -> None:
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise sqlite3.OperationalError("injected live-state commit failure")
+        super().commit()
 
 
 def _message(
@@ -144,13 +160,17 @@ def test_confirmed_deletion_moves_exact_content_and_leaves_only_tombstones(
 ) -> None:
     archive = InMemoryDeletedConversationArchive()
     admin_archive = None
+    archive_service = None
     if store_type is SQLiteDurableStateStore:
         database = tmp_path / "jarvis.sqlite3"
         archive_path = tmp_path / "admin-only" / "deleted.sqlite3"
         archive_path.parent.mkdir()
+        archive_service = start_sqlite_deleted_conversation_archive_service(
+            archive_path
+        )
         state = store_type(  # type: ignore[operator]
             database=database,
-            deleted_database=archive_path,
+            deleted_archive=archive_service.writer,
         )
         admin_archive = open_sqlite_deleted_conversation_archive(archive_path)
     else:
@@ -218,6 +238,78 @@ def test_confirmed_deletion_moves_exact_content_and_leaves_only_tombstones(
         close = getattr(state, "close", None)
         if callable(close):
             close()
+        if archive_service is not None:
+            archive_service.close()
+
+
+def test_sqlite_state_cannot_receive_a_deleted_database_path_with_a_connection(
+    tmp_path,
+) -> None:
+    database = tmp_path / "jarvis.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        with pytest.raises(TypeError, match="deleted_database"):
+            SQLiteDurableStateStore(connection, deleted_database=database)  # type: ignore[call-arg]
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() != 0,
+    reason="requires POSIX root privileges to exercise a second filesystem identity",
+)
+def test_posix_archive_read_requires_the_administrative_identity(tmp_path) -> None:
+    import pwd
+
+    nobody = pwd.getpwnam("nobody")
+    if nobody.pw_uid == os.geteuid():
+        pytest.skip("the nobody account is the current test identity")
+
+    archive_path = tmp_path / "admin-only" / "deleted.sqlite3"
+    archive_path.parent.mkdir()
+    service = start_sqlite_deleted_conversation_archive_service(archive_path)
+    message = _message(message_id="permission-boundary", text="admin-only content")
+
+    def drop_to_nobody() -> None:
+        os.setgid(nobody.pw_gid)
+        os.setuid(nobody.pw_uid)
+
+    try:
+        service.writer.archive(
+            [message],
+            deletion_id="permission-deletion",
+            deleted_at=NOW + timedelta(minutes=1),
+        )
+        direct_read = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sqlite3
+import sys
+
+try:
+    connection = sqlite3.connect(sys.argv[1])
+    connection.execute("SELECT text FROM deleted_messages").fetchall()
+except (PermissionError, sqlite3.OperationalError):
+    raise SystemExit(0)
+raise SystemExit(1)
+""",
+                str(archive_path),
+            ],
+            preexec_fn=drop_to_nobody,
+            check=False,
+        )
+        assert direct_read.returncode == 0
+        admin_archive = open_sqlite_deleted_conversation_archive(archive_path)
+        try:
+            assert [record.message.text for record in admin_archive.list_records()] == [
+                message.text
+            ]
+        finally:
+            admin_archive.close()
+    finally:
+        service.close()
 
 
 def test_sqlite_deletion_requires_an_explicit_archive_boundary(tmp_path) -> None:
@@ -431,9 +523,12 @@ def test_sqlite_deleted_area_and_tombstones_survive_restart(tmp_path) -> None:
     deleted_database = tmp_path / "admin-only" / "deleted.sqlite3"
     deleted_database.parent.mkdir()
     selected = _message(message_id="persistent-delete", text="retained outside Jarvis")
+    archive_service = start_sqlite_deleted_conversation_archive_service(
+        deleted_database
+    )
     state = SQLiteDurableStateStore(
         database=database,
-        deleted_database=deleted_database,
+        deleted_archive=archive_service.writer,
     )
     try:
         state.append_conversation_message(selected)
@@ -447,10 +542,14 @@ def test_sqlite_deleted_area_and_tombstones_survive_restart(tmp_path) -> None:
         )
     finally:
         state.close()
+        archive_service.close()
 
+    reopened_service = start_sqlite_deleted_conversation_archive_service(
+        deleted_database
+    )
     reopened = SQLiteDurableStateStore(
         database=database,
-        deleted_database=deleted_database,
+        deleted_archive=reopened_service.writer,
     )
     try:
         assert reopened.list_conversation_messages() == ()
@@ -473,3 +572,58 @@ def test_sqlite_deleted_area_and_tombstones_survive_restart(tmp_path) -> None:
             admin_archive.close()
     finally:
         reopened.close()
+        reopened_service.close()
+
+
+def test_sqlite_deletion_adopts_archive_after_live_commit_failure(tmp_path) -> None:
+    database = tmp_path / "jarvis.sqlite3"
+    deleted_database = tmp_path / "admin-only" / "deleted.sqlite3"
+    deleted_database.parent.mkdir()
+    archive_service = start_sqlite_deleted_conversation_archive_service(
+        deleted_database
+    )
+    connection = sqlite3.connect(database, factory=_FailOnceCommitConnection)
+    state = SQLiteDurableStateStore(
+        connection,
+        deleted_archive=archive_service.writer,
+    )
+    selected = _message(message_id="retry-delete", text="retryable retained content")
+    admin_archive = open_sqlite_deleted_conversation_archive(deleted_database)
+    try:
+        state.append_conversation_message(selected)
+        preview = state.preview_conversation_deletion(
+            ConversationDeletionScope.message(selected.history_id)
+        )
+        connection.fail_next_commit = True
+        with pytest.raises(
+            StateStoreError, match="could not delete conversation history"
+        ):
+            state.delete_conversation_history(
+                preview,
+                deletion_id="failed-deletion-attempt",
+                deleted_at=NOW + timedelta(minutes=3),
+            )
+
+        retry_preview = state.preview_conversation_deletion(
+            ConversationDeletionScope.message(selected.history_id)
+        )
+        tombstones = state.delete_conversation_history(
+            retry_preview,
+            deletion_id="successful-deletion-retry",
+            deleted_at=NOW + timedelta(minutes=4),
+        )
+
+        assert [tombstone.deletion_id for tombstone in tombstones] == [
+            "successful-deletion-retry"
+        ]
+        assert state.list_conversation_messages() == ()
+        records = admin_archive.list_records()
+        assert len(records) == 1
+        assert records[0].message == selected
+        assert records[0].deletion_id == "successful-deletion-retry"
+        assert records[0].deleted_at == NOW + timedelta(minutes=4)
+    finally:
+        admin_archive.close()
+        state.close()
+        connection.close()
+        archive_service.close()
