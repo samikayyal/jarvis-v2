@@ -8,7 +8,7 @@ that the deterministic capability broker still validates, audits, and approves.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
@@ -23,6 +23,7 @@ from .gmail_actions import (
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
+    OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
 )
@@ -54,7 +55,12 @@ class AgentsSdkProposal(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["terminal", "gmail_send", "gmail_reply"]
+    kind: Literal[
+        "terminal",
+        "gmail_send",
+        "gmail_reply",
+        "knowledge_vault_write",
+    ]
     preview: str = Field(min_length=1, max_length=2_000)
     payload: dict[str, object]
 
@@ -188,6 +194,7 @@ class AgentsSdkOrchestrationAdapter:
         read_tool: BoundedReadTool | None = None,
         google_read_connector: object | None = None,
         vault_read_tool: BoundedReadTool | None = None,
+        vault_write_enabled: bool = False,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -203,6 +210,8 @@ class AgentsSdkOrchestrationAdapter:
             raise ValueError(
                 f"max_tool_invocations must be between 1 and {_MAX_TOOL_INVOCATIONS}"
             )
+        if not isinstance(vault_write_enabled, bool):
+            raise TypeError("vault_write_enabled must be a bool")
         if any(
             value is None
             for value in (
@@ -257,6 +266,7 @@ class AgentsSdkOrchestrationAdapter:
         if vault_read_tool is not None:
             read_tools.append(vault_read_tool)
         self._read_tools = tuple(read_tools)
+        self._vault_write_enabled = vault_write_enabled
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
         milestones = [
@@ -285,7 +295,8 @@ class AgentsSdkOrchestrationAdapter:
                 instructions=_instructions(
                     has_vault_read=any(
                         tool.name == "read_knowledge_vault" for tool in self._read_tools
-                    )
+                    ),
+                    has_vault_write=self._vault_write_enabled,
                 ),
                 model=request.model,
                 model_settings=self._model_settings_factory(
@@ -327,6 +338,12 @@ class AgentsSdkOrchestrationAdapter:
             plan,
             selected_host[0] if selected_host is not None else None,
         )
+        proposal_intent = (
+            proposal if isinstance(proposal, OrchestrationProposalIntent) else None
+        )
+        frozen_proposal = (
+            proposal if isinstance(proposal, FrozenActionProposal) else None
+        )
         if selected_host is None:
             reply_text = plan.reply_text
             host = None
@@ -342,7 +359,8 @@ class AgentsSdkOrchestrationAdapter:
             outcome="completed",
             reply_text=reply_text,
             adapter="agents_sdk_responses",
-            proposal=proposal,
+            proposal=frozen_proposal,
+            proposal_intent=proposal_intent,
             execution_host=host,
             host_reason_code=host_reason_code,
             milestones=tuple(milestones),
@@ -417,12 +435,12 @@ class AgentsSdkOrchestrationAdapter:
             )
         return tools
 
-    @staticmethod
     def _frozen_proposal(
+        self,
         request: OrchestrationRequest,
         plan: AgentsSdkPlan,
         host: Literal["ubuntu", "windows"] | None,
-    ) -> FrozenActionProposal | None:
+    ) -> FrozenActionProposal | OrchestrationProposalIntent | None:
         if plan.proposal is None:
             return None
         payload = plan.proposal.payload
@@ -457,6 +475,24 @@ class AgentsSdkOrchestrationAdapter:
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
                     **payload,
+                )
+            elif plan.proposal.kind == "knowledge_vault_write":
+                if set(payload) != {"changes"}:
+                    raise OrchestrationAdapterError(
+                        "knowledge-vault write proposal has an unexpected shape"
+                    )
+                changes = payload["changes"]
+                if not isinstance(changes, Mapping) or any(
+                    not isinstance(path, str) or not isinstance(content, str)
+                    for path, content in changes.items()
+                ):
+                    raise OrchestrationAdapterError(
+                        "knowledge-vault write proposal has an unexpected shape"
+                    )
+                candidate = OrchestrationProposalIntent(
+                    request_id=request.state.request_id,
+                    kind=plan.proposal.kind,
+                    payload={"changes": dict(changes)},
                 )
             else:
                 candidate = create_gmail_reply_proposal(
@@ -500,7 +536,7 @@ def _model_input_with_history(request: OrchestrationRequest) -> str:
     return "\n\n".join(sections)
 
 
-def _instructions(*, has_vault_read: bool) -> str:
+def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
     """Keep the model on a closed planning contract with no authority tools."""
 
     return (
@@ -520,6 +556,14 @@ def _instructions(*, has_vault_read: bool) -> str:
             "The read_knowledge_vault tool is a local, deterministic, read-only "
             "search of the configured vault and returns only bounded excerpts. "
             if has_vault_read
+            else ""
+        )
+        + (
+            "For an approved knowledge-vault note change, emit one complete "
+            "knowledge_vault_write proposal containing only a path-to-new-content "
+            "changes mapping; the broker will independently synchronize and freeze "
+            "the exact base and diff. "
+            if has_vault_write
             else ""
         )
         + "Read tools never mutate, dispatch, approve, create permissions, expose "

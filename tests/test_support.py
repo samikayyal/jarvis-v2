@@ -63,6 +63,7 @@ def build_receiver_components(
     trace: DiagnosticTraceRecorder | None = None,
     action_dispatcher: ActionDispatcher | None = None,
     action_lifecycle: BoundActionLifecycle | None = None,
+    vault_write_proposal_preparer: Any | None = None,
     working_sessions: Any | None = None,
 ) -> ReceiverComponents:
     """Build the repeated receiver/broker graph while preserving test overrides."""
@@ -105,6 +106,7 @@ def build_receiver_components(
         model_availability_provider=provider,
         action_dispatcher=action_dispatcher,
         action_lifecycle=action_lifecycle,
+        vault_write_proposal_preparer=vault_write_proposal_preparer,
         working_sessions=working_sessions,
     )
     receiver = SignedMessageReceiver(
