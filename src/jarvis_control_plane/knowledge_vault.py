@@ -53,6 +53,14 @@ class VaultRepositoryConflict(VaultSynchronizationError):
     """The local clone requires explicit administrator recovery."""
 
 
+class VaultPushPreDispatchFailure(VaultSynchronizationError):
+    """The push process did not start, so no remote update could have occurred."""
+
+
+class VaultPushUnknownOutcome(VaultSynchronizationError):
+    """The push process started, but its remote side effect cannot be established."""
+
+
 class VaultSynchronizationMetadataStore(Protocol):
     """Authoritative durable metadata for the last successful vault sync."""
 
@@ -440,16 +448,22 @@ class SubprocessVaultSynchronizer:
                 "origin",
                 f"HEAD:refs/heads/{branch}",
                 failure_type=VaultRepositoryConflict,
+                pre_dispatch_failure_type=VaultPushPreDispatchFailure,
+                started_failure_type=VaultPushUnknownOutcome,
                 deadline=deadline,
             )
+        except VaultPushPreDispatchFailure:
+            raise
+        except VaultPushUnknownOutcome:
+            raise
         except VaultRepositoryConflict as exc:
             message = str(exc).casefold()
             if "non-fast-forward" in message or "rejected" in message:
                 raise VaultRepositoryConflict(
                     "knowledge-vault remote rejected a non-fast-forward push"
                 ) from exc
-            raise VaultRemoteUnavailable(
-                "knowledge-vault push was unavailable"
+            raise VaultPushUnknownOutcome(
+                "knowledge-vault push outcome is unknown"
             ) from exc
 
     def _git(
@@ -457,6 +471,8 @@ class SubprocessVaultSynchronizer:
         root: Path,
         *arguments: str,
         failure_type: type[VaultSynchronizationError],
+        pre_dispatch_failure_type: type[VaultSynchronizationError] | None = None,
+        started_failure_type: type[VaultSynchronizationError] | None = None,
         deadline: float | None,
         environment: Mapping[str, str] | None = None,
     ) -> CompletedProcess[str]:
@@ -474,9 +490,11 @@ class SubprocessVaultSynchronizer:
                 env=self._environment if environment is None else environment,
             )
         except OSError as exc:
-            raise failure_type("knowledge-vault Git is unavailable") from exc
+            failure = pre_dispatch_failure_type or failure_type
+            raise failure("knowledge-vault Git is unavailable") from exc
         except (TimeoutError, TimeoutExpired) as exc:
-            raise failure_type("knowledge-vault synchronization timed out") from exc
+            failure = started_failure_type or failure_type
+            raise failure("knowledge-vault synchronization timed out") from exc
         if deadline is not None:
             _remaining_seconds(deadline, failure_type)
         if completed.returncode != 0:

@@ -513,6 +513,22 @@ class OrchestrationMilestone:
 
 
 @dataclass(frozen=True, slots=True)
+class OrchestrationProposalIntent:
+    """Non-authoritative action intent awaiting broker-side preparation."""
+
+    request_id: str
+    kind: str
+    payload: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        _non_empty_identifier(self.request_id, "request_id")
+        _non_empty_identifier(self.kind, "kind")
+        if not isinstance(self.payload, Mapping):
+            raise TypeError("orchestration proposal intent payload must be a mapping")
+        object.__setattr__(self, "payload", dict(self.payload))
+
+
+@dataclass(frozen=True, slots=True)
 class OrchestrationResult:
     """Typed, non-authoritative result returned by orchestration."""
 
@@ -521,6 +537,7 @@ class OrchestrationResult:
     reply_text: str
     adapter: str = "controlled"
     proposal: FrozenActionProposal | None = None
+    proposal_intent: OrchestrationProposalIntent | None = None
     execution_host: str | None = None
     host_reason_code: str | None = None
     milestones: tuple[OrchestrationMilestone, ...] = ()
@@ -543,6 +560,17 @@ class OrchestrationResult:
         if self.proposal is not None and self.proposal.request_id != self.request_id:
             raise ValueError(
                 "action proposal request_id must match orchestration result"
+            )
+        if (
+            self.proposal_intent is not None
+            and self.proposal_intent.request_id != self.request_id
+        ):
+            raise ValueError(
+                "action proposal intent request_id must match orchestration result"
+            )
+        if self.proposal is not None and self.proposal_intent is not None:
+            raise ValueError(
+                "orchestration result cannot contain both a proposal and an intent"
             )
         if self.execution_host is None:
             if self.host_reason_code is not None:

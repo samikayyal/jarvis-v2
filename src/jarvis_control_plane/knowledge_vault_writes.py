@@ -15,6 +15,8 @@ from time import monotonic
 from typing import Literal, NoReturn, Protocol
 
 from .knowledge_vault import (
+    VaultPushPreDispatchFailure,
+    VaultPushUnknownOutcome,
     VaultRemoteUnavailable,
     VaultRepositoryConflict,
 )
@@ -47,6 +49,10 @@ class VaultWriteError(Exception):
 
 class VaultWriteRemoteUnavailable(VaultWriteError):
     """The remote could not be reached while a write was being prepared."""
+
+
+class VaultWritePushPreDispatchFailure(VaultWriteError):
+    """A bounded push retry ended before the push process ever started."""
 
 
 class VaultWriteConflict(VaultWriteError):
@@ -461,6 +467,10 @@ class KnowledgeVaultWriteConnector:
             return self._dispatch_exact(request, deadline=deadline, progress=progress)
         except VaultWriteConflict as exc:
             self._raise_dispatch_failure(exc, progress=progress)
+        except VaultPushUnknownOutcome as exc:
+            self._raise_dispatch_failure(exc, progress=progress, unknown_push=True)
+        except VaultWritePushPreDispatchFailure as exc:
+            self._raise_dispatch_failure(exc, progress=progress)
         except VaultWriteRemoteUnavailable as exc:
             self._raise_dispatch_failure(exc, progress=progress, unknown_push=True)
         except VaultWriteError as exc:
@@ -580,12 +590,18 @@ class KnowledgeVaultWriteConnector:
                     deadline=deadline,
                 )
                 return
-            except (VaultRemoteUnavailable, VaultWriteRemoteUnavailable) as exc:
+            except VaultPushPreDispatchFailure as exc:
                 if attempt == 0:
                     _remaining_seconds(deadline, VaultWriteRemoteUnavailable)
                     continue
-                raise VaultWriteRemoteUnavailable(
-                    "knowledge-vault push was unavailable"
+                raise VaultWritePushPreDispatchFailure(
+                    "knowledge-vault push failed before dispatch; manual recovery is required"
+                ) from exc
+            except VaultPushUnknownOutcome:
+                raise
+            except (VaultRemoteUnavailable, VaultWriteRemoteUnavailable) as exc:
+                raise VaultPushUnknownOutcome(
+                    "knowledge-vault push outcome is unknown"
                 ) from exc
             except VaultRepositoryConflict as exc:
                 raise VaultWriteConflict(
@@ -1230,7 +1246,7 @@ class ControlledVaultWriteRepository:
     ) -> None:
         self.push_calls.append({"expected_base": expected_base, "commit_id": commit_id})
         if self.push_remote_unavailable:
-            raise VaultWriteRemoteUnavailable("remote push was unavailable")
+            raise VaultPushPreDispatchFailure("remote push was unavailable")
         if self.push_failure is not None:
             raise VaultWriteConflict(self.push_failure)
         if self.remote_commit != expected_base:

@@ -8,7 +8,7 @@ that the deterministic capability broker still validates, audits, and approves.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
@@ -20,14 +20,10 @@ from .gmail_actions import (
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
 )
-from .knowledge_vault_writes import (
-    KNOWLEDGE_VAULT_WRITE_KIND,
-    KnowledgeVaultWriteConnector,
-    VaultWriteError,
-)
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
+    OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
 )
@@ -198,7 +194,7 @@ class AgentsSdkOrchestrationAdapter:
         read_tool: BoundedReadTool | None = None,
         google_read_connector: object | None = None,
         vault_read_tool: BoundedReadTool | None = None,
-        vault_write_connector: KnowledgeVaultWriteConnector | None = None,
+        vault_write_enabled: bool = False,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -214,6 +210,8 @@ class AgentsSdkOrchestrationAdapter:
             raise ValueError(
                 f"max_tool_invocations must be between 1 and {_MAX_TOOL_INVOCATIONS}"
             )
+        if not isinstance(vault_write_enabled, bool):
+            raise TypeError("vault_write_enabled must be a bool")
         if any(
             value is None
             for value in (
@@ -268,13 +266,7 @@ class AgentsSdkOrchestrationAdapter:
         if vault_read_tool is not None:
             read_tools.append(vault_read_tool)
         self._read_tools = tuple(read_tools)
-        if vault_write_connector is not None and not isinstance(
-            vault_write_connector, KnowledgeVaultWriteConnector
-        ):
-            raise TypeError(
-                "vault_write_connector must be a KnowledgeVaultWriteConnector"
-            )
-        self._vault_write_connector = vault_write_connector
+        self._vault_write_enabled = vault_write_enabled
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
         milestones = [
@@ -304,7 +296,7 @@ class AgentsSdkOrchestrationAdapter:
                     has_vault_read=any(
                         tool.name == "read_knowledge_vault" for tool in self._read_tools
                     ),
-                    has_vault_write=self._vault_write_connector is not None,
+                    has_vault_write=self._vault_write_enabled,
                 ),
                 model=request.model,
                 model_settings=self._model_settings_factory(
@@ -346,6 +338,12 @@ class AgentsSdkOrchestrationAdapter:
             plan,
             selected_host[0] if selected_host is not None else None,
         )
+        proposal_intent = (
+            proposal if isinstance(proposal, OrchestrationProposalIntent) else None
+        )
+        frozen_proposal = (
+            proposal if isinstance(proposal, FrozenActionProposal) else None
+        )
         if selected_host is None:
             reply_text = plan.reply_text
             host = None
@@ -361,7 +359,8 @@ class AgentsSdkOrchestrationAdapter:
             outcome="completed",
             reply_text=reply_text,
             adapter="agents_sdk_responses",
-            proposal=proposal,
+            proposal=frozen_proposal,
+            proposal_intent=proposal_intent,
             execution_host=host,
             host_reason_code=host_reason_code,
             milestones=tuple(milestones),
@@ -441,7 +440,7 @@ class AgentsSdkOrchestrationAdapter:
         request: OrchestrationRequest,
         plan: AgentsSdkPlan,
         host: Literal["ubuntu", "windows"] | None,
-    ) -> FrozenActionProposal | None:
+    ) -> FrozenActionProposal | OrchestrationProposalIntent | None:
         if plan.proposal is None:
             return None
         payload = plan.proposal.payload
@@ -477,18 +476,23 @@ class AgentsSdkOrchestrationAdapter:
                     request_id=request.state.request_id,
                     **payload,
                 )
-            elif plan.proposal.kind == KNOWLEDGE_VAULT_WRITE_KIND:
-                if self._vault_write_connector is None:
-                    raise OrchestrationAdapterError(
-                        "knowledge-vault write capability is not configured"
-                    )
+            elif plan.proposal.kind == "knowledge_vault_write":
                 if set(payload) != {"changes"}:
                     raise OrchestrationAdapterError(
                         "knowledge-vault write proposal has an unexpected shape"
                     )
-                candidate = self._vault_write_connector.propose(
+                changes = payload["changes"]
+                if not isinstance(changes, Mapping) or any(
+                    not isinstance(path, str) or not isinstance(content, str)
+                    for path, content in changes.items()
+                ):
+                    raise OrchestrationAdapterError(
+                        "knowledge-vault write proposal has an unexpected shape"
+                    )
+                candidate = OrchestrationProposalIntent(
                     request_id=request.state.request_id,
-                    changes=payload["changes"],  # type: ignore[arg-type]
+                    kind=plan.proposal.kind,
+                    payload={"changes": dict(changes)},
                 )
             else:
                 candidate = create_gmail_reply_proposal(
@@ -496,7 +500,7 @@ class AgentsSdkOrchestrationAdapter:
                     request_id=request.state.request_id,
                     **payload,
                 )
-        except (TypeError, ValueError, KeyError, VaultWriteError) as exc:
+        except (TypeError, ValueError, KeyError) as exc:
             raise OrchestrationAdapterError(
                 "model returned a malformed action proposal"
             ) from exc
@@ -545,8 +549,8 @@ def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
         + (
             "For an approved knowledge-vault note change, emit one complete "
             "knowledge_vault_write proposal containing only a path-to-new-content "
-            "changes mapping; the connector will independently synchronize and "
-            "freeze the exact base and diff. "
+            "changes mapping; the broker will independently synchronize and freeze "
+            "the exact base and diff. "
             if has_vault_write
             else ""
         )

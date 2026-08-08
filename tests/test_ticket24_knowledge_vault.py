@@ -19,6 +19,8 @@ from jarvis_control_plane import (
     RoutedActionDispatcher,
     SignedInboundEvent,
     SubprocessVaultSynchronizer,
+    VaultPushPreDispatchFailure,
+    VaultPushUnknownOutcome,
 )
 from jarvis_control_plane.knowledge_vault_writes import (
     ControlledVaultWriteRepository,
@@ -590,6 +592,109 @@ def test_subprocess_vault_edge_uses_fetch_only_verification_and_normal_push(
     assert all("rebase" not in args and "merge" not in args for args, _kwargs in calls)
 
 
+@pytest.mark.parametrize("failure_mode", ("timeout", "generic"))
+def test_subprocess_ambiguous_push_outcomes_are_unknown_and_never_retried(
+    tmp_path: Path, failure_mode: str
+) -> None:
+    calls: list[list[str]] = []
+
+    def run_process(arguments: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(arguments)
+        if "symbolic-ref" in arguments:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout=f"{BASE}\n", stderr="")
+        if "push" in arguments:
+            if failure_mode == "timeout":
+                raise subprocess.TimeoutExpired(arguments, kwargs["timeout"])
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="fatal: remote connection dropped after negotiation",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    state = type(
+        "SyncState",
+        (),
+        {
+            "load_knowledge_vault_synchronized_at": lambda self: NOW,
+            "save_knowledge_vault_synchronized_at": lambda self, value: None,
+        },
+    )()
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=PurePosixPath("/usr/bin/git"),
+        ssh_executable=PurePosixPath("/usr/bin/ssh"),
+        ssh_config_path=PurePosixPath("/etc/jarvis/vault-ssh-config"),
+        known_hosts_path=PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        synchronization_state=state,
+        run_process=run_process,
+    )
+
+    with pytest.raises(VaultPushUnknownOutcome):
+        synchronizer.push(tmp_path, expected_base=BASE, commit_id=BASE)
+
+    assert len([args for args in calls if "push" in args]) == 1
+
+
+def test_subprocess_push_launch_failure_is_provably_pre_dispatch(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run_process(arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(arguments)
+        if "symbolic-ref" in arguments:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout=f"{BASE}\n", stderr="")
+        if "push" in arguments:
+            raise OSError("temporary process-launch failure")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    state = type(
+        "SyncState",
+        (),
+        {
+            "load_knowledge_vault_synchronized_at": lambda self: NOW,
+            "save_knowledge_vault_synchronized_at": lambda self, value: None,
+        },
+    )()
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=PurePosixPath("/usr/bin/git"),
+        ssh_executable=PurePosixPath("/usr/bin/ssh"),
+        ssh_config_path=PurePosixPath("/etc/jarvis-vault-ssh-config"),
+        known_hosts_path=PurePosixPath("/etc/jarvis-vault-known-hosts"),
+        synchronization_state=state,
+        run_process=run_process,
+    )
+
+    with pytest.raises(VaultPushPreDispatchFailure):
+        synchronizer.push(tmp_path, expected_base=BASE, commit_id=BASE)
+
+    assert len([args for args in calls if "push" in args]) == 1
+
+
+def test_provably_pre_dispatch_push_failure_gets_only_one_bounded_retry(
+    tmp_path: Path,
+) -> None:
+    repository = ControlledVaultWriteRepository(
+        current_commit=BASE,
+        remote_commit=BASE,
+        push_remote_unavailable=True,
+    )
+    connector, _repository = _connector(tmp_path, repository=repository)
+    proposal = connector.propose(
+        request_id="request-pre-dispatch-retry",
+        changes={"Projects/Alpha.md": "# Alpha\n\nStatus: retry\n"},
+    )
+
+    with pytest.raises(ActionDispatcherError, match="manual recovery"):
+        connector.dispatch(proposal)
+
+    assert len(repository.push_calls) == 2
+
+
 def test_subprocess_renderer_and_staged_verifier_share_git_newline_semantics(
     tmp_path: Path,
 ) -> None:
@@ -647,11 +752,7 @@ def test_subprocess_renderer_and_staged_verifier_share_git_newline_semantics(
     assert "diff --git " not in rendered
 
 
-def test_agents_adapter_turns_a_vault_write_plan_into_a_connector_frozen_proposal(
-    tmp_path: Path,
-) -> None:
-    connector, _repository = _connector(tmp_path)
-
+def test_agents_adapter_returns_a_vault_write_intent_for_broker_preparation() -> None:
     def run_sync(_agent: object, _text: str, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
@@ -672,20 +773,97 @@ def test_agents_adapter_turns_a_vault_write_plan_into_a_connector_frozen_proposa
         model_settings_factory=lambda **kwargs: kwargs,
         reasoning_factory=lambda **kwargs: kwargs,
         run_config_factory=lambda **kwargs: kwargs,
-        vault_write_connector=connector,
+        vault_write_enabled=True,
     )
 
     result = adapter.run(_orchestration_request())
 
-    assert result.proposal is not None
-    assert result.proposal.kind == "knowledge_vault_write"
-    assert result.proposal.action_id == "request-orchestration:proposal"
-    assert "Base commit: " + BASE in result.proposal.preview
+    assert result.proposal is None
+    assert result.proposal_intent is not None
+    assert result.proposal_intent.kind == "knowledge_vault_write"
+    assert result.proposal_intent.payload == {
+        "changes": {"Projects/Alpha.md": "# Alpha\n\nStatus: model\n"}
+    }
 
 
-def test_agents_adapter_rejects_model_supplied_commit_metadata(tmp_path: Path) -> None:
-    connector, _repository = _connector(tmp_path)
+def test_broker_prepares_agents_vault_intent_before_freezing_exact_action(
+    tmp_path: Path,
+) -> None:
+    connector, repository = _connector(tmp_path)
 
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the note change for approval.",
+                proposal=AgentsSdkProposal(
+                    kind="knowledge_vault_write",
+                    preview="untrusted model preview",
+                    payload={
+                        "changes": {
+                            "Projects/Alpha.md": "# Alpha\n\nStatus: approved\n"
+                        }
+                    },
+                ),
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=lambda **kwargs: kwargs,
+        reasoning_factory=lambda **kwargs: kwargs,
+        run_config_factory=lambda **kwargs: kwargs,
+        vault_write_enabled=True,
+    )
+    router = RoutedActionDispatcher(
+        terminal=ControlledActionDispatcher(),
+        gmail=ControlledActionDispatcher(),
+        gmail_lifecycle=_IdentityLifecycle(),
+        vault=connector,
+        vault_lifecycle=connector,
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket24-broker-boundary-secret",
+        now=NOW,
+        id_prefix="ticket24-broker-boundary",
+        orchestration=adapter,  # type: ignore[arg-type]
+        action_dispatcher=router,
+        action_lifecycle=router,
+        vault_write_proposal_preparer=connector,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket24-broker-boundary-secret",
+            )
+        )
+
+    assert receive("change Alpha", "1").disposition == "pending_action"
+    assert repository.synchronize_calls == 1
+    pending = components.broker.current_pending_action
+    assert pending is not None
+    assert "Base commit: " + BASE in (pending.preview or "")
+    assert receive("yes", "2").disposition == "action_dispatched"
+    assert len(repository.commit_calls) == 1
+    assert len(repository.push_calls) == 1
+
+
+def test_agents_adapter_rejects_model_supplied_commit_metadata() -> None:
     def run_sync(_agent: object, _text: str, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
@@ -707,7 +885,7 @@ def test_agents_adapter_rejects_model_supplied_commit_metadata(tmp_path: Path) -
         model_settings_factory=lambda **kwargs: kwargs,
         reasoning_factory=lambda **kwargs: kwargs,
         run_config_factory=lambda **kwargs: kwargs,
-        vault_write_connector=connector,
+        vault_write_enabled=True,
     )
 
     with pytest.raises(OrchestrationAdapterError, match="unexpected shape"):

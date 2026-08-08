@@ -12,8 +12,9 @@
 
 ## Implementation evidence
 
-- Added the approval-frozen Markdown-only write proposal, bounded canonical path/content validation, exact staged-diff verification, configured Jarvis commit metadata, normal push, retry-only transient push handling, and manual-recovery blocking after commit ambiguity.
-- Wired the write connector through the orchestration proposal boundary and routed broker dispatch/cancellation/finalization without giving the model write authority.
-- Added contract coverage for path and nested-repository exclusions, base races, dirty state, staged mismatch, trailing-space and diff-header exactness, operation mismatch, push conflicts, broker dispatch, and the subprocess Git edge.
-- Validation: `uv run pytest -q` — 368 passed; `uv run ruff check .`; `uv run ruff format --check src tests`; `uv run python -m compileall -q src tests`; `git diff --check`.
+- Added the approval-frozen Markdown-only write proposal, bounded canonical path/content validation, exact staged-diff verification, configured Jarvis commit metadata, normal push, and manual-recovery blocking after an unknown push outcome.
+- Kept the Agents SDK orchestration adapter non-authoritative: it emits only a typed path-to-new-content intent, while the deterministic broker invokes the narrow proposal-preparation port and freezes the connector-produced base, diff, and metadata before approval.
+- Classified the subprocess Git push edge into explicit pre-dispatch failure, repository conflict, and unknown outcome categories; only a provably pre-dispatch failure receives one bounded same-commit retry.
+- Added contract coverage for path and nested-repository exclusions, base races, dirty state, staged mismatch, trailing-space and diff-header exactness, operation mismatch, push conflicts, broker preparation/dispatch, ambiguous timeout and generic push failures with no retry, and the subprocess Git edge.
+- Validation: `uv run pytest -q` — 377 passed; `uv run ruff check .`; `uv run ruff format --check src tests`; `uv run python -m compileall -q src tests`; `git diff --check`.
 
