@@ -10,11 +10,12 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from subprocess import DEVNULL, CompletedProcess, TimeoutExpired, run
+from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Literal, Protocol
 
@@ -247,6 +248,104 @@ class SubprocessVaultSynchronizer:
             deadline=deadline,
         ).stdout.strip()
 
+    def render_diff(
+        self,
+        root: Path,
+        _originals: Mapping[str, str | None],
+        changes: Mapping[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        """Render a canonical patch through the same Git edge as verification.
+
+        The temporary index keeps proposal creation side-effect free while making
+        Git, rather than a second diff algorithm, the authority for hunk headers,
+        newline markers, and diff attributes.
+        """
+
+        if not changes:
+            raise VaultRepositoryConflict("knowledge-vault write has no changes")
+        ordered_changes = tuple(sorted(changes.items()))
+        with TemporaryDirectory(prefix="jarvis-vault-diff-") as directory:
+            temporary_index = Path(directory) / "index"
+            temporary_objects = Path(directory) / "objects"
+            temporary_objects.mkdir()
+            source_objects = self._git(
+                root,
+                "rev-parse",
+                "--git-path",
+                "objects",
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+            ).stdout.strip()
+            if not source_objects:
+                raise VaultRepositoryConflict(
+                    "knowledge-vault Git object database is unavailable"
+                )
+            source_objects_path = Path(source_objects)
+            if not source_objects_path.is_absolute():
+                source_objects_path = root / source_objects_path
+            alternate_objects = str(source_objects_path.resolve())
+            configured_alternates = self._environment.get(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            )
+            if configured_alternates:
+                alternate_objects = os.pathsep.join(
+                    (alternate_objects, configured_alternates)
+                )
+            environment = {
+                **self._environment,
+                "GIT_INDEX_FILE": str(temporary_index),
+                "GIT_OBJECT_DIRECTORY": str(temporary_objects),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_objects,
+            }
+            self._git(
+                root,
+                "read-tree",
+                "HEAD",
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+                environment=environment,
+            )
+            content_path = Path(directory) / "content"
+            for path, content in ordered_changes:
+                content_path.write_bytes(content.encode("utf-8"))
+                blob = self._git(
+                    root,
+                    "hash-object",
+                    "-w",
+                    f"--path={path}",
+                    str(content_path),
+                    failure_type=VaultRepositoryConflict,
+                    deadline=deadline,
+                    environment=environment,
+                ).stdout.strip()
+                self._git(
+                    root,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"100644,{blob},{path}",
+                    failure_type=VaultRepositoryConflict,
+                    deadline=deadline,
+                    environment=environment,
+                )
+            output = self._git(
+                root,
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-color",
+                "--unified=3",
+                "--",
+                *(path for path, _content in ordered_changes),
+                failure_type=VaultRepositoryConflict,
+                deadline=deadline,
+                environment=environment,
+            ).stdout
+        return _normalise_staged_diff(output)
+
     def stage(
         self, root: Path, paths: Sequence[str], *, deadline: float | None = None
     ) -> None:
@@ -263,13 +362,9 @@ class SubprocessVaultSynchronizer:
             deadline=deadline,
         )
 
-    def staged_diff(
-        self, root: Path, paths: Sequence[str], *, deadline: float | None = None
-    ) -> str:
-        """Return a path-only unified diff without Git metadata or rename headers."""
+    def staged_diff(self, root: Path, *, deadline: float | None = None) -> str:
+        """Return the complete canonical diff for the current Git index."""
 
-        if not paths:
-            raise VaultRepositoryConflict("knowledge-vault write has no paths")
         output = self._git(
             root,
             "diff",
@@ -279,7 +374,6 @@ class SubprocessVaultSynchronizer:
             "--no-color",
             "--unified=3",
             "--",
-            *paths,
             failure_type=VaultRepositoryConflict,
             deadline=deadline,
         ).stdout
@@ -364,6 +458,7 @@ class SubprocessVaultSynchronizer:
         *arguments: str,
         failure_type: type[VaultSynchronizationError],
         deadline: float | None,
+        environment: Mapping[str, str] | None = None,
     ) -> CompletedProcess[str]:
         timeout = 15.0
         if deadline is not None:
@@ -376,7 +471,7 @@ class SubprocessVaultSynchronizer:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=self._environment,
+                env=self._environment if environment is None else environment,
             )
         except OSError as exc:
             raise failure_type("knowledge-vault Git is unavailable") from exc
@@ -801,7 +896,7 @@ def _normalise_staged_diff(output: str) -> str:
             continue
         if not current:
             continue
-        if line.startswith(ignored_prefixes) or line == r"\ No newline at end of file":
+        if line.startswith(ignored_prefixes):
             continue
         current.append(line)
         if line.startswith("@@ "):

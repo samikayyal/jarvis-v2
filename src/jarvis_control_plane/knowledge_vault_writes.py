@@ -72,12 +72,21 @@ class VaultWriteRepository(Protocol):
         self, root: Path, *, deadline: float | None = None
     ) -> str: ...
 
+    def render_diff(
+        self,
+        root: Path,
+        originals: Mapping[str, str | None],
+        changes: Mapping[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> str: ...
+
     def stage(
         self, root: Path, paths: Sequence[str], *, deadline: float | None = None
     ) -> None: ...
 
     def staged_diff(
-        self, root: Path, paths: Sequence[str], *, deadline: float | None = None
+        self, root: Path, *, deadline: float | None = None
     ) -> str | None: ...
 
     def commit(
@@ -329,6 +338,7 @@ class KnowledgeVaultWriteConnector:
             "synchronize",
             "current_commit",
             "fetch_remote_commit",
+            "render_diff",
             "stage",
             "staged_diff",
             "commit",
@@ -361,7 +371,6 @@ class KnowledgeVaultWriteConnector:
         *,
         request_id: str,
         changes: Mapping[str, str] | Sequence[VaultWriteChange],
-        commit_subject: str | None = None,
         deadline: float | None = None,
     ) -> FrozenActionProposal:
         """Synchronize and freeze a complete patch without changing the clone."""
@@ -393,9 +402,7 @@ class KnowledgeVaultWriteConnector:
         self._require_clean(deadline=deadline)
         base_commit = self._current_commit(deadline=deadline)
         normalized, originals = self._prepare_changes(changes)
-        patch = render_vault_unified_diff(originals, normalized)
-        subject = self._commit_subject if commit_subject is None else commit_subject
-        _validate_commit_subject(subject)
+        patch = self._render_patch(originals, normalized, deadline=deadline)
         body = _commit_body(request_id, normalized)
         return VaultWriteProposal.create(
             action_id=f"{request_id}:proposal",
@@ -404,7 +411,7 @@ class KnowledgeVaultWriteConnector:
             changes=normalized,
             diff=patch,
             commit_identity=self._commit_identity,
-            commit_subject=subject,
+            commit_subject=self._commit_subject,
             commit_body=body,
         )
 
@@ -493,7 +500,9 @@ class KnowledgeVaultWriteConnector:
         progress: _VaultWriteProgress,
     ) -> VaultWriteDispatchResult:
         originals = self._verify_base(request, deadline=deadline)
-        current_patch = render_vault_unified_diff(originals, request.changes)
+        current_patch = self._render_patch(
+            originals, request.changes, deadline=deadline
+        )
         if current_patch != request.patch:
             raise VaultWriteConflict(
                 "knowledge-vault content changed after the proposal was frozen"
@@ -526,17 +535,13 @@ class KnowledgeVaultWriteConnector:
         deadline: float,
     ) -> None:
         resulting = self._read_change_contents(request.changes)
-        resulting_patch = render_vault_unified_diff(originals, resulting)
+        resulting_patch = self._render_patch(originals, resulting, deadline=deadline)
         if resulting_patch != request.patch:
             raise VaultWriteConflict(
                 "applied knowledge-vault diff did not match the proposal"
             )
-        staged_patch = self._repository.staged_diff(
-            self._root, request.paths, deadline=deadline
-        )
-        if staged_patch is not None and _normalise_patch(
-            staged_patch
-        ) != _normalise_patch(request.patch):
+        staged_patch = self._repository.staged_diff(self._root, deadline=deadline)
+        if staged_patch != request.patch:
             raise VaultWriteConflict(
                 "staged knowledge-vault diff did not match the proposal"
             )
@@ -719,15 +724,36 @@ class KnowledgeVaultWriteConnector:
             raise ActionDispatcherError(
                 "knowledge-vault commit identity changed after the proposal"
             )
-        if not request.commit_subject.startswith(
-            self._commit_subject.split(":", 1)[0] + ":"
-        ):
+        if request.commit_subject != self._commit_subject:
             raise ActionDispatcherError(
-                "knowledge-vault commit subject is outside the configured prefix"
+                "knowledge-vault commit subject changed after the proposal"
             )
         for change in request.changes:
             self._canonical_allowed_path(change.path)
         return request
+
+    def _render_patch(
+        self,
+        originals: Mapping[str, str | None],
+        changes: Sequence[VaultWriteChange],
+        *,
+        deadline: float,
+    ) -> str:
+        try:
+            patch = self._repository.render_diff(
+                self._root,
+                originals,
+                {change.path: change.content for change in changes},
+                deadline=deadline,
+            )
+            _validate_patch(patch)
+            return patch
+        except VaultWriteError:
+            raise
+        except Exception as exc:
+            raise VaultWriteRepositoryError(
+                "knowledge-vault diff could not be rendered"
+            ) from exc
 
     def _canonical_allowed_path(self, value: object) -> str:
         path = _canonical_note_path(value)
@@ -849,7 +875,11 @@ class _VaultWriteDispatch:
 def render_vault_unified_diff(
     originals: Mapping[str, str | None], changes: Sequence[VaultWriteChange]
 ) -> str:
-    """Render a deterministic, complete unified diff for the approved paths."""
+    """Render the deterministic diff used only by the controlled test repository.
+
+    Production proposals use ``VaultWriteRepository.render_diff`` so Git is the
+    sole canonical renderer. This helper remains for low-level proposal fixtures.
+    """
 
     chunks: list[str] = []
     for change in sorted(changes, key=lambda item: item.path):
@@ -857,7 +887,7 @@ def render_vault_unified_diff(
         old_lines = [] if old is None else old.splitlines(keepends=True)
         new_lines = change.content.splitlines(keepends=True)
         from_file = "/dev/null" if old is None else f"a/{change.path}"
-        diff = list(
+        raw_diff = list(
             difflib.unified_diff(
                 old_lines,
                 new_lines,
@@ -867,8 +897,13 @@ def render_vault_unified_diff(
                 lineterm="\n",
             )
         )
-        if not diff:
+        if not raw_diff:
             continue
+        diff: list[str] = []
+        for line in raw_diff:
+            diff.append(line)
+            if not line.endswith("\n"):
+                diff.append(r"\ No newline at end of file" + "\n")
         chunks.append("".join(diff).rstrip("\n") + "\n")
     patch = "".join(chunks)
     _validate_patch(patch)
@@ -1067,17 +1102,6 @@ def _commit_hash(value: object) -> str:
     return value.lower()
 
 
-def _normalise_patch(value: str) -> str:
-    return (
-        "\n".join(
-            line
-            for line in value.replace("\r\n", "\n").splitlines()
-            if line != r"\ No newline at end of file"
-        ).rstrip("\n")
-        + "\n"
-    )
-
-
 class ControlledVaultWriteRepository:
     """Deterministic repository double for connector and broker contract tests."""
 
@@ -1110,6 +1134,7 @@ class ControlledVaultWriteRepository:
         self.stage_calls: list[tuple[str, ...]] = []
         self.commit_calls: list[dict[str, object]] = []
         self.push_calls: list[dict[str, object]] = []
+        self._rendered_diff: str | None = None
         self._next_commit_number = 1
 
     def is_clean(self, _root: Path, *, deadline: float | None = None) -> bool:
@@ -1135,6 +1160,25 @@ class ControlledVaultWriteRepository:
             raise VaultWriteRemoteUnavailable(self.fetch_failure)
         return self.remote_commit
 
+    def render_diff(
+        self,
+        _root: Path,
+        originals: Mapping[str, str | None],
+        changes: Mapping[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        normalized = tuple(
+            VaultWriteChange(
+                path=path,
+                operation="modify" if originals[path] is not None else "create",
+                content=content,
+            )
+            for path, content in sorted(changes.items())
+        )
+        self._rendered_diff = render_vault_unified_diff(originals, normalized)
+        return self._rendered_diff
+
     def stage(
         self, _root: Path, paths: Sequence[str], *, deadline: float | None = None
     ) -> None:
@@ -1143,10 +1187,12 @@ class ControlledVaultWriteRepository:
         self.stage_calls.append(tuple(paths))
         self.clean = False
 
-    def staged_diff(
-        self, _root: Path, _paths: Sequence[str], *, deadline: float | None = None
-    ) -> str | None:
-        return self.staged_diff_override
+    def staged_diff(self, _root: Path, *, deadline: float | None = None) -> str | None:
+        return (
+            self.staged_diff_override
+            if self.staged_diff_override is not None
+            else self._rendered_diff
+        )
 
     def commit(
         self,

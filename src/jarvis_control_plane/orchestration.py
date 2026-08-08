@@ -482,17 +482,13 @@ class AgentsSdkOrchestrationAdapter:
                     raise OrchestrationAdapterError(
                         "knowledge-vault write capability is not configured"
                     )
-                if (
-                    set(payload) - {"changes", "commit_subject"}
-                    or "changes" not in payload
-                ):
+                if set(payload) != {"changes"}:
                     raise OrchestrationAdapterError(
                         "knowledge-vault write proposal has an unexpected shape"
                     )
                 candidate = self._vault_write_connector.propose(
                     request_id=request.state.request_id,
                     changes=payload["changes"],  # type: ignore[arg-type]
-                    commit_subject=payload.get("commit_subject"),  # type: ignore[arg-type]
                 )
             else:
                 candidate = create_gmail_reply_proposal(

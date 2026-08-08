@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -33,7 +35,7 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkPlan,
     AgentsSdkProposal,
 )
-from jarvis_control_plane.ports import ActionDispatcherError
+from jarvis_control_plane.ports import ActionDispatcherError, OrchestrationAdapterError
 
 NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 BASE = "a" * 40
@@ -343,6 +345,82 @@ def test_staged_diff_mismatch_stops_and_post_commit_push_conflict_blocks_later_w
         )
 
 
+class _UnrelatedStagedRepository(ControlledVaultWriteRepository):
+    """Expose the difference between path-scoped and complete-index checks."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.path_scoped_diff: str | None = None
+        self.complete_index_diff: str | None = None
+        self.staged_diff_requests: list[tuple[object, ...]] = []
+
+    def staged_diff(
+        self,
+        _root: Path,
+        *paths: object,
+        deadline: float | None = None,
+    ) -> str | None:
+        self.staged_diff_requests.append(paths)
+        if paths:
+            return self.path_scoped_diff
+        return self.complete_index_diff
+
+
+def test_staged_verification_rejects_an_unrelated_index_path(
+    tmp_path: Path,
+) -> None:
+    repository = _UnrelatedStagedRepository(
+        current_commit=BASE,
+        remote_commit=BASE,
+    )
+    connector, _repository = _connector(tmp_path, repository=repository)
+    proposal = connector.propose(
+        request_id="request-unrelated-index",
+        changes={"Projects/Alpha.md": "# Alpha\n\nStatus: staged\n"},
+    )
+    proposal_patch = json.loads(proposal.payload)["diff"]
+    repository.path_scoped_diff = proposal_patch
+    repository.complete_index_diff = (
+        proposal_patch
+        + "--- a/Projects/Other.md\n"
+        + "+++ b/Projects/Other.md\n"
+        + "@@ -1 +1 @@\n"
+        + "-old\n"
+        + "+unrelated\n"
+    )
+
+    with pytest.raises(ActionDispatcherError, match="staged"):
+        connector.dispatch(proposal)
+
+    assert repository.staged_diff_requests == [()]
+    assert repository.commit_calls == []
+
+
+def test_dispatch_rejects_a_commit_subject_that_is_not_configured(
+    tmp_path: Path,
+) -> None:
+    connector, _repository = _connector(tmp_path)
+    change = VaultWriteChange(
+        path="Projects/Alpha.md",
+        operation="modify",
+        content="# Alpha\n\nStatus: forged\n",
+    )
+    proposal = VaultWriteProposal.create(
+        action_id="request-subject:proposal",
+        request_id="request-subject",
+        base_commit=BASE,
+        changes=(change,),
+        diff=render_vault_unified_diff(
+            {"Projects/Alpha.md": "# Alpha\n\nStatus: draft\n"}, (change,)
+        ),
+        commit_subject="jarvis: injected metadata",
+        commit_body="Changed knowledge-vault note paths:\n- Projects/Alpha.md\nRequest ID: request-subject",
+    )
+
+    with pytest.raises(ActionDispatcherError, match="subject changed"):
+        connector.dispatch(proposal)
+
+
 def test_dispatch_rejects_a_frozen_operation_that_does_not_match_the_live_base(
     tmp_path: Path,
 ) -> None:
@@ -482,7 +560,7 @@ def test_subprocess_vault_edge_uses_fetch_only_verification_and_normal_push(
     assert synchronizer.current_commit(tmp_path) == BASE
     assert synchronizer.fetch_remote_commit(tmp_path) == BASE
     synchronizer.stage(tmp_path, ("Projects/Alpha.md",))
-    staged_diff = synchronizer.staged_diff(tmp_path, ("Projects/Alpha.md",))
+    staged_diff = synchronizer.staged_diff(tmp_path)
     assert staged_diff.startswith("--- a/Projects/Alpha.md\n+++ b/Projects/Alpha.md\n")
     assert "--- old-looking removed\n" in staged_diff
     assert "+++ new-looking added\n" in staged_diff
@@ -510,6 +588,63 @@ def test_subprocess_vault_edge_uses_fetch_only_verification_and_normal_push(
     ]
     assert all("--force" not in args for args, _kwargs in calls)
     assert all("rebase" not in args and "merge" not in args for args, _kwargs in calls)
+
+
+def test_subprocess_renderer_and_staged_verifier_share_git_newline_semantics(
+    tmp_path: Path,
+) -> None:
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        pytest.skip("git is required for the canonical diff integration test")
+    root = tmp_path / "vault"
+    (root / "Projects").mkdir(parents=True)
+    note = root / "Projects" / "Alpha.md"
+    original = b"A\nkeep\nold\nremove"
+    replacement = b"A\nkeep\nnew"
+    note.write_bytes(original)
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            [git_executable, "-C", str(root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "--quiet")
+    git("config", "user.name", "Probe")
+    git("config", "user.email", "probe@example.com")
+    git("add", "--", "Projects/Alpha.md")
+    git("commit", "--quiet", "-m", "base")
+
+    state = type(
+        "SyncState",
+        (),
+        {
+            "load_knowledge_vault_synchronized_at": lambda self: NOW,
+            "save_knowledge_vault_synchronized_at": lambda self, value: None,
+        },
+    )()
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=Path(git_executable),
+        ssh_executable=Path(git_executable),
+        ssh_config_path=tmp_path / "ssh-config",
+        known_hosts_path=tmp_path / "known-hosts",
+        synchronization_state=state,
+    )
+
+    rendered = synchronizer.render_diff(
+        root,
+        {"Projects/Alpha.md": original.decode("utf-8")},
+        {"Projects/Alpha.md": replacement.decode("utf-8")},
+    )
+    note.write_bytes(replacement)
+    synchronizer.stage(root, ("Projects/Alpha.md",))
+    staged = synchronizer.staged_diff(root)
+
+    assert rendered == staged
+    assert r"\ No newline at end of file" in rendered
+    assert "diff --git " not in rendered
 
 
 def test_agents_adapter_turns_a_vault_write_plan_into_a_connector_frozen_proposal(
@@ -546,3 +681,34 @@ def test_agents_adapter_turns_a_vault_write_plan_into_a_connector_frozen_proposa
     assert result.proposal.kind == "knowledge_vault_write"
     assert result.proposal.action_id == "request-orchestration:proposal"
     assert "Base commit: " + BASE in result.proposal.preview
+
+
+def test_agents_adapter_rejects_model_supplied_commit_metadata(tmp_path: Path) -> None:
+    connector, _repository = _connector(tmp_path)
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the exact note patch for approval.",
+                proposal=AgentsSdkProposal(
+                    kind="knowledge_vault_write",
+                    preview="model preview is not authoritative",
+                    payload={
+                        "changes": {"Projects/Alpha.md": "# Alpha\n\nStatus: model\n"},
+                        "commit_subject": "jarvis: leaked conversation text",
+                    },
+                ),
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=lambda **kwargs: kwargs,
+        reasoning_factory=lambda **kwargs: kwargs,
+        run_config_factory=lambda **kwargs: kwargs,
+        vault_write_connector=connector,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="unexpected shape"):
+        adapter.run(_orchestration_request())
