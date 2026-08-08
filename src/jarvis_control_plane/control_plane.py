@@ -12,6 +12,8 @@ from .control_grammar import (
     ControlCommand,
     ControlTransition,
     ControlTransitionKind,
+    MessageKind,
+    admit_orchestration_request,
     handle_message,
     parse_approval_choice,
     parse_control,
@@ -338,32 +340,29 @@ class DeterministicCapabilityBroker:
         parsed = parse_control(message.text)
         if parsed.is_command and parsed.command is ControlCommand.HISTORY:
             return self._handle_history_control(message, parsed.args)
-        try:
-            model_availability = self._model_availability()
-        except (TypeError, ValueError, RuntimeError) as exc:
-            return ReceiveResult(
-                status_code=503,
-                disposition="model_availability_unavailable",
-                reason=f"runtime model availability was unavailable: {exc}",
+        if parsed.kind is not MessageKind.ORDINARY:
+            try:
+                model_availability = self._model_availability()
+            except (TypeError, ValueError, RuntimeError) as exc:
+                return ReceiveResult(
+                    status_code=503,
+                    disposition="model_availability_unavailable",
+                    reason=f"runtime model availability was unavailable: {exc}",
+                )
+            session_transition = handle_message(
+                session,
+                message.text,
+                now=self.clock,
+                request_id=self.ids.new_id("request"),
+                originating_message_id=message.message_id,
+                phase="processing",
+                model_availability=model_availability,
             )
-        request_id = self.ids.new_id("request")
-        session_transition = handle_message(
-            session,
-            message.text,
-            now=self.clock,
-            request_id=request_id,
-            originating_message_id=message.message_id,
-            phase="processing",
-            model_availability=model_availability,
-        )
-        if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
             return self._handle_session_control(message, session, session_transition)
-
-        admission = self._admit_request(
+        admission = self._admit_orchestration_request(
             message=message,
             session=session,
-            session_transition=session_transition,
-            request_id=request_id,
+            request_text=message.text,
         )
         if isinstance(admission, ReceiveResult):
             return admission
@@ -1701,6 +1700,43 @@ class DeterministicCapabilityBroker:
             cancellation_token=cancellation_token,
         )
 
+    def _admit_orchestration_request(
+        self,
+        *,
+        message: InboundMessage,
+        session: WorkingSession,
+        request_text: str,
+    ) -> _RequestAdmission | ReceiveResult:
+        """Apply shared model availability and request admission policy."""
+
+        try:
+            model_availability = self._model_availability()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return ReceiveResult(
+                status_code=503,
+                disposition="model_availability_unavailable",
+                reason=f"runtime model availability was unavailable: {exc}",
+            )
+
+        request_id = self.ids.new_id("request")
+        session_transition = admit_orchestration_request(
+            session,
+            request_text,
+            now=self.clock,
+            request_id=request_id,
+            originating_message_id=message.message_id,
+            phase="processing",
+            model_availability=model_availability,
+        )
+        if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
+            return self._handle_session_control(message, session, session_transition)
+        return self._admit_request(
+            message=message,
+            session=session,
+            session_transition=session_transition,
+            request_id=request_id,
+        )
+
     def _run_orchestration(
         self,
         *,
@@ -2490,7 +2526,7 @@ class DeterministicCapabilityBroker:
     ) -> ReceiveResult:
         """Keep memory reads explicit and route every write through approval."""
 
-        if command.is_valid:
+        if command.is_valid and command.operation is not MemoryOperation.USE:
             blocked = self._memory_command_blocked(message, command)
             if blocked is not None:
                 return blocked
@@ -2610,7 +2646,19 @@ class DeterministicCapabilityBroker:
                 disposition="memory_target_missing",
             )
 
-        admission = self._admit_memory_request(message)
+        try:
+            session = self._current_working_session()
+        except SessionStoreError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory request could not start: {exc}",
+            )
+        admission = self._admit_orchestration_request(
+            message=message,
+            session=session,
+            request_text=command.content,
+        )
         if isinstance(admission, ReceiveResult):
             return admission
         selection = MemorySelection(memories=(target,), explicit=True)

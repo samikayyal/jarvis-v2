@@ -243,13 +243,6 @@ class DurableStateStore(Protocol):
         updated_at: datetime | None = None,
     ) -> DurableMemory: ...
 
-    def export_memories(
-        self,
-        *,
-        memory_ids: tuple[str, ...] = (),
-        include_terminal: bool = True,
-    ) -> str: ...
-
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
 
     def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...

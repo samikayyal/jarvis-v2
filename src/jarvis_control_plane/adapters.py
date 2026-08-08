@@ -503,19 +503,6 @@ class InMemoryDurableStateStore:
             self.memories[memory_id] = forgotten
             return forgotten
 
-    def export_memories(
-        self,
-        *,
-        memory_ids: tuple[str, ...] = (),
-        include_terminal: bool = True,
-    ) -> str:
-        return _export_memories(
-            self.search_memories(
-                memory_ids=memory_ids,
-                include_terminal=include_terminal,
-            )
-        )
-
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
             if self.fail_claim:
@@ -1759,19 +1746,6 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not forget durable assistant memory") from exc
 
-    def export_memories(
-        self,
-        *,
-        memory_ids: tuple[str, ...] = (),
-        include_terminal: bool = True,
-    ) -> str:
-        return _export_memories(
-            self.search_memories(
-                memory_ids=memory_ids,
-                include_terminal=include_terminal,
-            )
-        )
-
     def _insert_memory(self, memory: DurableMemory) -> None:
         self.connection.execute(
             """
@@ -2055,26 +2029,6 @@ def _select_memories_for_context(
             include_terminal=False,
             limit=limit,
         )
-    )
-
-
-def _export_memories(memories: tuple[DurableMemory, ...]) -> str:
-    return json.dumps(
-        [
-            {
-                "content": memory.content,
-                "created_at": memory.created_at.isoformat(),
-                "credential_like": memory.credential_like,
-                "memory_id": memory.memory_id,
-                "replaced_by_memory_id": memory.replaced_by_memory_id,
-                "source_message_id": memory.source_message_id,
-                "status": memory.status.value,
-                "updated_at": memory.updated_at.isoformat(),
-            }
-            for memory in memories
-        ],
-        ensure_ascii=False,
-        separators=(",", ":"),
     )
 
 

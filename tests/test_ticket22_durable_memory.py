@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 
 import pytest
@@ -19,14 +18,21 @@ from jarvis_control_plane import (
     parse_memory_command,
 )
 from jarvis_control_plane.control_grammar import MessageKind, parse_control
+from jarvis_control_plane.models import MemorySelection
 from jarvis_control_plane.sessions import (
     InMemoryWorkingSessionStore,
+    ModelAvailability,
     PendingActionState,
     accept_request,
     install_pending_action,
 )
 
 NOW = datetime(2026, 8, 8, 9, 0, tzinfo=UTC)
+
+
+class _UnavailableModelProvider:
+    def current(self) -> ModelAvailability:
+        raise RuntimeError("model provider is unavailable")
 
 
 def test_durable_memory_is_explicitly_created_inspectable_and_persists_across_restart(
@@ -48,19 +54,6 @@ def test_durable_memory_is_explicitly_created_inspectable_and_persists_across_re
 
         assert state.get_memory("memory-001") == memory
         assert state.list_memories() == (memory,)
-        exported = json.loads(state.export_memories(memory_ids=("memory-001",)))
-        assert exported == [
-            {
-                "content": "The operator prefers concise status updates.",
-                "created_at": "2026-08-08T09:00:00+00:00",
-                "credential_like": False,
-                "memory_id": "memory-001",
-                "replaced_by_memory_id": None,
-                "source_message_id": "message-remember-001",
-                "status": "active",
-                "updated_at": "2026-08-08T09:00:00+00:00",
-            }
-        ]
     finally:
         state.close()
 
@@ -267,6 +260,121 @@ def test_explicit_exact_memory_use_allows_credential_like_memory_in_orchestratio
         "memory-explicit-secret from message none" in reply.body
         for reply in components.outbound.sent
     )
+
+
+@pytest.mark.parametrize(
+    ("availability", "expected_disposition"),
+    (
+        (
+            ModelAvailability(
+                available_models=("gpt-5.6-sol",),
+                available_reasoning_levels=("medium",),
+            ),
+            "model_unavailable",
+        ),
+        (
+            ModelAvailability(
+                available_models=("gpt-5.6-terra",),
+                available_reasoning_levels=("high",),
+            ),
+            "reasoning_unavailable",
+        ),
+    ),
+)
+def test_explicit_memory_use_reuses_model_availability_admission(
+    availability: ModelAvailability, expected_disposition: str
+) -> None:
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id=f"session.ticket22.availability-{expected_disposition}",
+        signing_secret=b"ticket22-availability-secret",
+        now=NOW,
+        id_prefix=f"ticket22-availability-{expected_disposition}",
+        availability=availability,
+    )
+    components.state.create_memory(
+        DurableMemory(
+            memory_id="memory-availability",
+            content="The API key is sk-proj-ticket22-availability-value.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+    result = components.receiver.receive(
+        _event(
+            components,
+            message_id=f"message-availability-{expected_disposition}",
+            text="/memory use memory-availability What is the exact API key?",
+        )
+    )
+
+    assert result.disposition == expected_disposition
+    assert components.orchestration.calls == []
+    current = components.broker.working_sessions.load()
+    assert current is not None
+    assert current.active_request is None
+    assert components.state.list_requests() == ()
+
+
+def test_explicit_memory_use_fails_closed_when_model_availability_provider_fails() -> (
+    None
+):
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.ticket22.availability-provider",
+        signing_secret=b"ticket22-provider-secret",
+        now=NOW,
+        id_prefix="ticket22-provider",
+    )
+    components.broker.model_availability_provider = _UnavailableModelProvider()
+    components.state.create_memory(
+        DurableMemory(
+            memory_id="memory-provider-failure",
+            content="The API key is sk-proj-ticket22-provider-value.",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+    result = components.receiver.receive(
+        _event(
+            components,
+            message_id="message-provider-failure",
+            text="/memory use memory-provider-failure What is the exact API key?",
+        )
+    )
+
+    assert result.status_code == 503
+    assert result.disposition == "model_availability_unavailable"
+    assert components.orchestration.calls == []
+    current = components.broker.working_sessions.load()
+    assert current is not None
+    assert current.active_request is None
+    assert components.state.list_requests() == ()
+
+
+def test_explicit_memory_selection_requires_one_active_record() -> None:
+    with pytest.raises(ValueError, match="exactly one active memory"):
+        MemorySelection(memories=(), explicit=True)
+
+    first_secret = DurableMemory(
+        memory_id="memory-selection-secret-1",
+        content="API key: sk-proj-ticket22-selection-one",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    second_secret = DurableMemory(
+        memory_id="memory-selection-secret-2",
+        content="API key: sk-proj-ticket22-selection-two",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    assert first_secret.credential_like is True
+    assert second_secret.credential_like is True
+
+    with pytest.raises(ValueError, match="exactly one active memory"):
+        MemorySelection(memories=(first_secret, second_secret), explicit=True)
 
 
 @pytest.mark.parametrize("store_kind", ("memory", "sqlite"))

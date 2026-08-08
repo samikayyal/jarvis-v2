@@ -439,6 +439,10 @@ class MemorySelection:
             )
         if not isinstance(self.explicit, bool):
             raise TypeError("memory selection explicit flag must be boolean")
+        if self.explicit and len(memories) != 1:
+            raise ValueError(
+                "explicit memory selection requires exactly one active memory"
+            )
         if not self.explicit and any(memory.credential_like for memory in memories):
             raise ValueError("automatic memory selection cannot include credentials")
         object.__setattr__(self, "memories", memories)
