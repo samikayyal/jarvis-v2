@@ -4,9 +4,9 @@
 
 **Blocked by:** 08 — Present oversized proposals through the universal envelope; 20 — Search, inspect, and export accessible conversation history.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Exact message, date-range, and conversation scopes produce deterministic previews before confirmation.
-- [ ] Confirmed deletion moves content intact outside Jarvis-readable paths and removes indexes, caches, and every other readable derivative.
-- [ ] Jarvis exposes only content-free tombstones afterward and provides no restoration path.
+- [x] Exact message, date-range, and conversation scopes produce deterministic previews before confirmation.
+- [x] Confirmed deletion moves content intact outside Jarvis-readable paths and removes indexes, caches, and every other readable derivative.
+- [x] Jarvis exposes only content-free tombstones afterward and provides no restoration path.
 

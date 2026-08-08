@@ -16,7 +16,10 @@ if TYPE_CHECKING:
 from .models import (
     AuditEvidence,
     AuditFilter,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
     ConversationMessage,
+    ConversationTombstone,
     DurableMemory,
     FrozenActionProposal,
     HistorySelection,
@@ -41,6 +44,14 @@ class InvalidEnvelopeError(ControlPlaneError):
 
 class StateStoreError(ControlPlaneError):
     """Durable state could not be read or written."""
+
+    def __init__(self, message: str, *, may_have_dispatched: bool = False) -> None:
+        super().__init__(message)
+        self.may_have_dispatched = may_have_dispatched
+
+
+class DeletedConversationArchiveError(ControlPlaneError):
+    """The manual-administration archival boundary could not accept content."""
 
 
 class MemorySearchLimitExceeded(StateStoreError):
@@ -134,6 +145,41 @@ class AuditBoundary(Protocol):
     def export_json(self, query: AuditFilter | None = None) -> str: ...
 
 
+class DeletedConversationArchiveWriter(Protocol):
+    """Write-only capability for content removed from Jarvis-readable state.
+
+    The staged methods keep the large IPC transfer outside the live-state
+    transaction.  ``archive`` remains as a convenience for callers that do
+    not need to coordinate the finalization with another durable boundary.
+    """
+
+    def stage(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None: ...
+
+    def finalize(self, *, deletion_id: str) -> None: ...
+
+    def abort(self, *, deletion_id: str) -> None: ...
+
+    def archive(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class DurableStateStore(Protocol):
     """Authoritative local state and replay-claim port."""
 
@@ -205,6 +251,22 @@ class DurableStateStore(Protocol):
         excluding_working_session_id: str,
         limit: int = 5,
     ) -> HistorySelection: ...
+
+    def preview_conversation_deletion(
+        self, scope: ConversationDeletionScope
+    ) -> ConversationDeletionPreview: ...
+
+    def delete_conversation_history(
+        self,
+        preview: ConversationDeletionPreview,
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> tuple[ConversationTombstone, ...]: ...
+
+    def list_conversation_tombstones(
+        self, *, history_ids: tuple[str, ...] = ()
+    ) -> tuple[ConversationTombstone, ...]: ...
 
     def list_memories(
         self, *, include_terminal: bool = True, limit: int = 50
