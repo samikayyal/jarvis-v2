@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -13,17 +14,28 @@ from .control_grammar import (
     ControlCommand,
     ControlTransition,
     ControlTransitionKind,
+    MessageKind,
+    admit_orchestration_request,
     handle_message,
     parse_approval_choice,
     parse_control,
+)
+from .memory import (
+    DurableMemoryActionDispatcher,
+    MemoryCommand,
+    MemoryOperation,
+    parse_memory_command,
 )
 from .models import (
     AuditEvidence,
     ConversationDeletionPreview,
     ConversationDeletionScope,
     ConversationMessage,
+    DurableMemory,
     FrozenActionProposal,
     InboundMessage,
+    MemorySelection,
+    OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
     OutboundReply,
@@ -45,6 +57,8 @@ from .ports import (
     DiagnosticTraceError,
     DurableStateStore,
     IdGenerator,
+    KnowledgeVaultWriteProposalPreparer,
+    MemorySearchLimitExceeded,
     ModelAvailabilityProvider,
     OrchestrationAdapter,
     OrchestrationAdapterError,
@@ -68,6 +82,7 @@ from .sessions import (
     RequestResult,
     SessionConfig,
     SessionStoreError,
+    SessionTransition,
     TransitionKind,
     WorkingSession,
     WorkingSessionStore,
@@ -182,6 +197,16 @@ def _dispatch_disposition(status: DispatchStatus) -> str:
         DispatchStatus.NOT_STARTED: "action_dispatch_not_started",
         DispatchStatus.FAILED: "action_dispatch_failed",
     }.get(status, "action_dispatch_unknown")
+
+
+def _memory_action_operation(payload: str) -> str:
+    """Read only the bounded operation name for metadata-only audit evidence."""
+
+    try:
+        value = json.loads(payload).get("operation")
+    except (TypeError, json.JSONDecodeError, AttributeError):
+        return "unknown"
+    return value if isinstance(value, str) and value else "unknown"
 
 
 class _CancelledBeforeDispatch(OutboundConnectorError):
@@ -364,6 +389,8 @@ class DeterministicCapabilityBroker:
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
         action_lifecycle: BoundActionLifecycle | None = None,
+        vault_write_proposal_preparer: KnowledgeVaultWriteProposalPreparer
+        | None = None,
     ) -> None:
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError(
@@ -384,7 +411,16 @@ class DeterministicCapabilityBroker:
                 "action_dispatcher must implement the prepared cancellable dispatch port"
             )
         self.action_dispatcher = selected_dispatcher
+        self.memory_action_dispatcher = DurableMemoryActionDispatcher(
+            state=state,
+            clock=clock,
+        )
         self.action_lifecycle = action_lifecycle or _NoopActionLifecycle()
+        if vault_write_proposal_preparer is not None and not callable(
+            getattr(vault_write_proposal_preparer, "propose", None)
+        ):
+            raise TypeError("vault_write_proposal_preparer must provide propose")
+        self.vault_write_proposal_preparer = vault_write_proposal_preparer
         existing_session = self.working_sessions.load()
         if existing_session is None:
             self.working_sessions.create(
@@ -433,37 +469,40 @@ class DeterministicCapabilityBroker:
                 if current.pending_action.is_expired(self.clock):
                     return self._expire_pending_action(message, current)
                 return self._consume_pending_approval(message, choice)
+        memory_command = parse_memory_command(message.text)
+        if memory_command is not None:
+            return self._handle_memory_command(
+                message,
+                memory_command,
+            )
         parsed = parse_control(message.text)
         if parsed.is_command and parsed.command is ControlCommand.HISTORY:
             if parsed.args and parsed.args[0] == "delete":
                 return self._handle_history_deletion_control(message, parsed.args)
             return self._handle_history_control(message, parsed.args)
-        try:
-            model_availability = self._model_availability()
-        except (TypeError, ValueError, RuntimeError) as exc:
-            return ReceiveResult(
-                status_code=503,
-                disposition="model_availability_unavailable",
-                reason=f"runtime model availability was unavailable: {exc}",
+        if parsed.kind is not MessageKind.ORDINARY:
+            try:
+                model_availability = self._model_availability()
+            except (TypeError, ValueError, RuntimeError) as exc:
+                return ReceiveResult(
+                    status_code=503,
+                    disposition="model_availability_unavailable",
+                    reason=f"runtime model availability was unavailable: {exc}",
+                )
+            session_transition = handle_message(
+                session,
+                message.text,
+                now=self.clock,
+                request_id=self.ids.new_id("request"),
+                originating_message_id=message.message_id,
+                phase="processing",
+                model_availability=model_availability,
             )
-        request_id = self.ids.new_id("request")
-        session_transition = handle_message(
-            session,
-            message.text,
-            now=self.clock,
-            request_id=request_id,
-            originating_message_id=message.message_id,
-            phase="processing",
-            model_availability=model_availability,
-        )
-        if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
             return self._handle_session_control(message, session, session_transition)
-
-        admission = self._admit_request(
+        admission = self._admit_orchestration_request(
             message=message,
             session=session,
-            session_transition=session_transition,
-            request_id=request_id,
+            request_text=message.text,
         )
         if isinstance(admission, ReceiveResult):
             return admission
@@ -477,6 +516,22 @@ class DeterministicCapabilityBroker:
         )
         if isinstance(result, ReceiveResult):
             return result
+        return self._complete_orchestration_result(
+            message=message,
+            request=request,
+            cancellation_token=cancellation_token,
+            result=result,
+        )
+
+    def _complete_orchestration_result(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        cancellation_token: CancellationToken,
+        result: OrchestrationResult,
+    ) -> ReceiveResult:
+        """Apply one orchestration result through the shared broker boundary."""
 
         if not cancellation_token_is_current(
             self._current_working_session(), cancellation_token
@@ -926,11 +981,12 @@ class DeterministicCapabilityBroker:
                 )
             return ReceiveResult(status_code=202, disposition="action_rejected")
 
-        invalidated = self._invalidate_changed_connector_action(
-            message, session, action
-        )
-        if invalidated is not None:
-            return invalidated
+        if action.kind != "durable_memory":
+            invalidated = self._invalidate_changed_connector_action(
+                message, session, action
+            )
+            if invalidated is not None:
+                return invalidated
 
         transition = approve_pending_action(session, now=self.clock)
         approved_state = transition.state
@@ -1100,8 +1156,9 @@ class DeterministicCapabilityBroker:
                     clock=self.clock,
                 ),
             )
+        dispatcher = self._dispatcher_for_action_kind(frozen_or_result.kind)
         try:
-            handle = self.action_dispatcher.prepare(frozen_or_result)
+            handle = dispatcher.prepare(frozen_or_result)
             if not isinstance(handle, ActionDispatchHandle):
                 raise ActionDispatcherError(
                     "action dispatcher returned an invalid dispatch handle"
@@ -1113,6 +1170,22 @@ class DeterministicCapabilityBroker:
                     status_code=202,
                     disposition="action_dispatch_unknown",
                     reason="dispatcher failed and terminal state could not be persisted",
+                )
+            if action.kind == "durable_memory":
+                self._best_effort_audit(
+                    kind="durable_memory_dispatch",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome=terminal_status.value,
+                    actor="control_plane",
+                    operation_type="durable_memory_mutation",
+                    target_category="durable_assistant_memory",
+                    execution_status=terminal_status.value,
+                    details={
+                        "action": action.action_id,
+                        "operation": _memory_action_operation(frozen_or_result.payload),
+                    },
                 )
             return ReceiveResult(
                 status_code=202,
@@ -1228,6 +1301,31 @@ class DeterministicCapabilityBroker:
                     status_code=202,
                     disposition="audit_blocked",
                     reason=f"conversation deletion was blocked by audit: {exc}",
+                )
+        if action.kind == "durable_memory":
+            try:
+                self._append_audit(
+                    kind="durable_memory_dispatch",
+                    event_id=message.event_id,
+                    request_id=action.request_id,
+                    message_id=message.message_id,
+                    outcome="attempted",
+                    actor="control_plane",
+                    operation_type="durable_memory_mutation",
+                    target_category="durable_assistant_memory",
+                    approval_decision="approved",
+                    execution_status="not_started",
+                    details={
+                        "action": action.action_id,
+                        "operation": _memory_action_operation(action.payload),
+                    },
+                )
+            except AuditWriteError as exc:
+                self._close_unattempted_action(action.action_id)
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"durable-memory dispatch was blocked by audit: {exc}",
                 )
         try:
             attempted = mark_action_dispatch_attempted(
@@ -1351,6 +1449,22 @@ class DeterministicCapabilityBroker:
                         f"outcome: {audit_error}"
                     ),
                 )
+            if prepared.action.kind == "durable_memory":
+                self._best_effort_audit(
+                    kind="durable_memory_dispatch",
+                    event_id=message.event_id,
+                    request_id=prepared.action.request_id,
+                    message_id=message.message_id,
+                    outcome=terminal_status.value,
+                    actor="control_plane",
+                    operation_type="durable_memory_mutation",
+                    target_category="durable_assistant_memory",
+                    execution_status=terminal_status.value,
+                    details={
+                        "action": prepared.action.action_id,
+                        "operation": _memory_action_operation(prepared.action.payload),
+                    },
+                )
             return ReceiveResult(
                 status_code=202,
                 disposition=_dispatch_disposition(terminal_status),
@@ -1382,6 +1496,22 @@ class DeterministicCapabilityBroker:
                     "conversation deletion may have completed but its terminal "
                     f"audit outcome was unavailable: {audit_error}"
                 ),
+            )
+        if prepared.action.kind == "durable_memory":
+            self._best_effort_audit(
+                kind="durable_memory_dispatch",
+                event_id=message.event_id,
+                request_id=prepared.action.request_id,
+                message_id=message.message_id,
+                outcome="completed",
+                actor="control_plane",
+                operation_type="durable_memory_mutation",
+                target_category="durable_assistant_memory",
+                execution_status="completed",
+                details={
+                    "action": prepared.action.action_id,
+                    "operation": _memory_action_operation(prepared.action.payload),
+                },
             )
         return ReceiveResult(status_code=202, disposition="action_dispatched")
 
@@ -1438,11 +1568,12 @@ class DeterministicCapabilityBroker:
     ) -> None:
         """Close a prepared edge when trace admission fails before dispatch."""
 
+        dispatcher = self._dispatcher_for_action_id(action_id)
         try:
             if handle is not None and callable(getattr(handle, "cancel", None)):
                 handle.cancel()  # type: ignore[attr-defined]
             else:
-                self.action_dispatcher.cancel(action_id=action_id)
+                dispatcher.cancel(action_id=action_id)
         except Exception:  # noqa: BLE001 - an unavailable edge is unknown
             # The durable action outcome below remains authoritative. A concrete
             # dispatcher must make cancellation bounded, but cleanup cannot
@@ -1628,12 +1759,31 @@ class DeterministicCapabilityBroker:
     def _finalize_dispatch(self, action_id: str) -> None:
         """Run an optional transport retirement handshake after durable closure."""
 
-        if not isinstance(self.action_dispatcher, ActionFinalizer):
+        dispatcher = self._dispatcher_for_action_id(action_id)
+        if not isinstance(dispatcher, ActionFinalizer):
             return
         try:
-            self.action_dispatcher.finalize(action_id=action_id)
+            dispatcher.finalize(action_id=action_id)
         except Exception:  # noqa: BLE001 - bounded retention is the fallback
             return
+
+    def _dispatcher_for_action_kind(self, kind: str) -> ActionDispatcher:
+        return (
+            self.memory_action_dispatcher
+            if kind == "durable_memory"
+            else self.action_dispatcher
+        )
+
+    def _dispatcher_for_action_id(self, action_id: str) -> ActionDispatcher:
+        try:
+            record = next(
+                item
+                for item in self._current_working_session().action_outbox
+                if item.action_id == action_id
+            )
+        except (SessionStoreError, StopIteration):
+            return self.action_dispatcher
+        return self._dispatcher_for_action_kind(record.kind)
 
     @staticmethod
     def _unavailable_terminal_host(
@@ -1851,25 +2001,71 @@ class DeterministicCapabilityBroker:
             cancellation_token=cancellation_token,
         )
 
+    def _admit_orchestration_request(
+        self,
+        *,
+        message: InboundMessage,
+        session: WorkingSession,
+        request_text: str,
+    ) -> _RequestAdmission | ReceiveResult:
+        """Apply shared model availability and request admission policy."""
+
+        try:
+            model_availability = self._model_availability()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return ReceiveResult(
+                status_code=503,
+                disposition="model_availability_unavailable",
+                reason=f"runtime model availability was unavailable: {exc}",
+            )
+
+        request_id = self.ids.new_id("request")
+        session_transition = admit_orchestration_request(
+            session,
+            request_text,
+            now=self.clock,
+            request_id=request_id,
+            originating_message_id=message.message_id,
+            phase="processing",
+            model_availability=model_availability,
+        )
+        if session_transition.kind is not ControlTransitionKind.REQUEST_ACCEPTED:
+            return self._handle_session_control(message, session, session_transition)
+        return self._admit_request(
+            message=message,
+            session=session,
+            session_transition=session_transition,
+            request_id=request_id,
+        )
+
     def _run_orchestration(
         self,
         *,
         message: InboundMessage,
         request: RequestState,
         cancellation_token: CancellationToken,
+        orchestration_text: str | None = None,
+        memory_selection: MemorySelection | None = None,
     ) -> OrchestrationResult | ReceiveResult:
         """Execute and durably observe the controlled orchestration stage."""
 
         try:
+            prompt_text = orchestration_text or message.text
             history = self.state.select_history_for_context(
-                text=message.text,
+                text=prompt_text,
                 excluding_working_session_id=self.current_working_session_id,
+                limit=5,
+            )
+            memories = memory_selection or self.state.select_memories_for_context(
+                text=prompt_text,
                 limit=5,
             )
             orchestration_request = OrchestrationRequest(
                 state=request,
-                text=message.text,
+                text=prompt_text,
                 history=history.messages,
+                memories=memories.memories,
+                memory_selection=memories,
             )
             result = self._trace.execute(
                 request_id=request.request_id,
@@ -1894,6 +2090,9 @@ class DeterministicCapabilityBroker:
             selected_host = self._validate_orchestration_result(
                 result, request_id=request.request_id
             )
+            result = self._prepare_orchestration_proposal(
+                result, request_id=request.request_id
+            )
             if selected_host is not None:
                 self._record_execution_host(request, cancellation_token, selected_host)
             self._append_audit(
@@ -1915,6 +2114,11 @@ class DeterministicCapabilityBroker:
                 result = replace(
                     result,
                     reply_text=f"{history.provenance_disclosure}\n{result.reply_text}",
+                )
+            if memories.provenance_disclosure is not None:
+                result = replace(
+                    result,
+                    reply_text=f"{memories.provenance_disclosure}\n{result.reply_text}",
                 )
         except (
             DiagnosticTraceError,
@@ -1997,6 +2201,71 @@ class DeterministicCapabilityBroker:
 
         return result
 
+    def _prepare_orchestration_proposal(
+        self, result: OrchestrationResult, *, request_id: str
+    ) -> OrchestrationResult:
+        """Turn a model intent into an exact action only at the broker boundary."""
+
+        intent = result.proposal_intent
+        if intent is None:
+            return result
+        if not isinstance(intent, OrchestrationProposalIntent):
+            raise OrchestrationAdapterError(
+                "orchestration adapter returned an invalid proposal intent"
+            )
+        if intent.kind != "knowledge_vault_write":
+            raise OrchestrationAdapterError(
+                "orchestration proposal intent is outside the broker boundary"
+            )
+        preparer = self.vault_write_proposal_preparer
+        if preparer is None:
+            raise OrchestrationAdapterError(
+                "knowledge-vault write capability is not configured"
+            )
+        if set(intent.payload) != {"changes"}:
+            raise OrchestrationAdapterError(
+                "knowledge-vault write proposal intent has an unexpected shape"
+            )
+        changes = intent.payload.get("changes")
+        if not isinstance(changes, Mapping) or any(
+            not isinstance(path, str) or not isinstance(content, str)
+            for path, content in changes.items()
+        ):
+            raise OrchestrationAdapterError(
+                "knowledge-vault write proposal intent has an unexpected shape"
+            )
+
+        def prepare() -> OrchestrationResult:
+            try:
+                action = preparer.propose(request_id=request_id, changes=changes)
+            except OrchestrationAdapterError:
+                raise
+            except Exception as exc:
+                raise OrchestrationAdapterError(
+                    "knowledge-vault proposal preparation failed"
+                ) from exc
+            if not isinstance(action, FrozenActionProposal):
+                raise OrchestrationAdapterError(
+                    "knowledge-vault proposal preparer returned an invalid action"
+                )
+            if action.request_id != request_id or action.kind != intent.kind:
+                raise OrchestrationAdapterError(
+                    "knowledge-vault proposal preparer returned a mismatched action"
+                )
+            return replace(result, proposal=action, proposal_intent=None)
+
+        return self._trace.execute(
+            request_id=request_id,
+            operation_id=f"{request_id}:vault-proposal",
+            operation_type="connector_proposal_preparation",
+            input_payload=intent,
+            arguments={"kind": intent.kind},
+            telemetry={"phase": "connector_proposal_preparation"},
+            operation=prepare,
+            result_limit_bytes=self.config.max_text_length * 8 + 4_096,
+            error_limit_bytes=8_192,
+        )
+
     @staticmethod
     def _validate_orchestration_result(
         result: object, *, request_id: str
@@ -2023,6 +2292,19 @@ class DeterministicCapabilityBroker:
             raise OrchestrationAdapterError(
                 "orchestration adapter returned an untyped proposal"
             )
+        if result.proposal_intent is not None:
+            if not isinstance(result.proposal_intent, OrchestrationProposalIntent):
+                raise OrchestrationAdapterError(
+                    "orchestration adapter returned an invalid proposal intent"
+                )
+            if result.proposal_intent.request_id != request_id:
+                raise OrchestrationAdapterError(
+                    "orchestration proposal intent correlation mismatch"
+                )
+            if result.proposal_intent.kind != "knowledge_vault_write":
+                raise OrchestrationAdapterError(
+                    "orchestration proposal intent is outside the configured boundary"
+                )
         selected_host = result.execution_host
         if result.proposal is None or result.proposal.kind != "terminal":
             return selected_host
@@ -2792,6 +3074,545 @@ class DeterministicCapabilityBroker:
             disposition=f"history_{operation}",
         )
 
+    def _handle_memory_command(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> ReceiveResult:
+        """Keep memory reads explicit and route every write through approval."""
+
+        if command.is_valid and command.operation is not MemoryOperation.USE:
+            blocked = self._memory_command_blocked(message, command)
+            if blocked is not None:
+                return blocked
+        if not command.is_valid:
+            try:
+                self._append_audit(
+                    kind="durable_memory_invalid",
+                    event_id=message.event_id,
+                    request_id=None,
+                    message_id=message.message_id,
+                    outcome="rejected",
+                    actor="configured_operator",
+                    operation_type="durable_memory",
+                    target_category="durable_assistant_memory",
+                    details={"operation": MemoryOperation.INVALID.value},
+                )
+            except AuditWriteError as exc:
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="audit_blocked",
+                    reason=f"memory command was blocked by audit: {exc}",
+                )
+            return self._dispatch_memory_text(
+                message,
+                command.error or "Invalid durable-memory command.",
+                disposition="memory_invalid",
+            )
+        if command.operation is MemoryOperation.USE:
+            return self._handle_memory_use(message, command)
+        if command.is_read:
+            return self._handle_memory_read(message, command)
+        return self._handle_memory_mutation(message, command)
+
+    def _memory_command_blocked(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> ReceiveResult | None:
+        """Apply the working-session gate before any memory read or use."""
+
+        current = self._current_working_session()
+        if current.pending_action is not None:
+            kind = ControlTransitionKind.PENDING_BLOCKED
+            reply = (
+                "A pending action blocks this durable-memory command. "
+                "Approve or reject it first."
+            )
+            reason = "a pending action blocks unrelated durable-memory work"
+            effect = "request_refused_pending"
+        elif current.active_request is not None or any(
+            record.is_open for record in current.action_outbox
+        ):
+            kind = ControlTransitionKind.BUSY_REFUSED
+            reply = (
+                "Another request is active, so this durable-memory command was "
+                "refused. Use /status or /cancel; V1 does not queue work."
+            )
+            reason = "one active request is already present; no queue transition"
+            effect = "request_refused_busy"
+        else:
+            return None
+
+        return self._apply_session_control(
+            message,
+            current,
+            ControlTransition(
+                state=current,
+                parsed=parse_control(message.text),
+                kind=kind,
+                reply=reply,
+                effects=(effect,),
+                reason=reason,
+            ),
+        )
+
+    def _handle_memory_use(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> ReceiveResult:
+        """Run one request with exactly one operator-selected memory record."""
+
+        assert command.memory_id is not None
+        assert command.content is not None
+        try:
+            self._append_audit(
+                kind="durable_memory_access",
+                event_id=message.event_id,
+                request_id=None,
+                message_id=message.message_id,
+                outcome="requested",
+                actor="configured_operator",
+                operation_type="durable_memory_read",
+                target_category="durable_assistant_memory",
+                details={
+                    "operation": MemoryOperation.USE.value,
+                    "target": command.memory_id,
+                },
+            )
+            target = self.state.get_memory(command.memory_id)
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"durable-memory selection was blocked by audit: {exc}",
+            )
+        except (StateStoreError, ValueError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory selection failed: {exc}",
+            )
+        if target is None or not target.is_active or target.content is None:
+            return self._dispatch_memory_text(
+                message,
+                "No active durable memory has that exact ID.",
+                disposition="memory_target_missing",
+            )
+
+        try:
+            session = self._current_working_session()
+        except SessionStoreError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory request could not start: {exc}",
+            )
+        admission = self._admit_orchestration_request(
+            message=message,
+            session=session,
+            request_text=command.content,
+        )
+        if isinstance(admission, ReceiveResult):
+            return admission
+        selection = MemorySelection(memories=(target,), explicit=True)
+        result = self._run_orchestration(
+            message=message,
+            request=admission.request,
+            cancellation_token=admission.cancellation_token,
+            orchestration_text=command.content,
+            memory_selection=selection,
+        )
+        if isinstance(result, ReceiveResult):
+            return result
+        return self._complete_orchestration_result(
+            message=message,
+            request=admission.request,
+            cancellation_token=admission.cancellation_token,
+            result=result,
+        )
+
+    def _handle_memory_read(
+        self, message: InboundMessage, command: MemoryCommand
+    ) -> ReceiveResult:
+        try:
+            self._append_audit(
+                kind="durable_memory_access",
+                event_id=message.event_id,
+                request_id=None,
+                message_id=message.message_id,
+                outcome="requested",
+                actor="configured_operator",
+                operation_type="durable_memory_read",
+                target_category="durable_assistant_memory",
+                details={
+                    "operation": command.operation.value,
+                    "target": command.memory_id or "none",
+                },
+            )
+            if command.operation is MemoryOperation.LIST:
+                memories = self.state.list_memories(include_terminal=True, limit=20)
+                body = self._render_memory_list(memories)
+            elif command.operation is MemoryOperation.SEARCH:
+                assert command.content is not None
+                memories = self.state.search_memories(
+                    text=command.content,
+                    include_terminal=True,
+                    limit=20,
+                )
+                body = self._render_memory_list(memories, searched=True)
+            else:
+                assert command.memory_id is not None
+                memory = self.state.get_memory(command.memory_id)
+                body = self._render_memory_inspect(memory)
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"durable-memory read was blocked by audit: {exc}",
+            )
+        except MemorySearchLimitExceeded:
+            return self._dispatch_memory_text(
+                message,
+                "Durable-memory search reached its bounded scan limit; "
+                "narrow the search and try again.",
+                disposition="memory_search_limited",
+            )
+        except (StateStoreError, ValueError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory read failed: {exc}",
+            )
+        if command.operation is MemoryOperation.INSPECT:
+            return self._dispatch_exact_text_export(
+                message,
+                body,
+                label="Durable-memory inspection",
+                disposition="memory_inspect",
+            )
+        return self._dispatch_memory_text(
+            message, body, disposition=f"memory_{command.operation.value}"
+        )
+
+    def _handle_memory_mutation(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> ReceiveResult:
+        try:
+            self._append_audit(
+                kind="durable_memory_mutation",
+                event_id=message.event_id,
+                request_id=None,
+                message_id=message.message_id,
+                outcome="requested",
+                actor="configured_operator",
+                operation_type="durable_memory_mutation",
+                target_category="durable_assistant_memory",
+                details={"operation": command.operation.value},
+            )
+        except AuditWriteError as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="audit_blocked",
+                reason=f"durable-memory change was blocked by audit: {exc}",
+            )
+        target_result = self._memory_mutation_target(message, command)
+        if isinstance(target_result, ReceiveResult):
+            return target_result
+        target = target_result
+        admission = self._admit_memory_request(message)
+        if isinstance(admission, ReceiveResult):
+            return admission
+        request = admission.request
+        token = admission.cancellation_token
+        try:
+            proposal = self._memory_action_proposal(
+                message=message,
+                request=request,
+                command=command,
+                target=target,
+            )
+            action = self.freeze_action(proposal)
+            self._present_action(action, message)
+        except (
+            AuditWriteError,
+            DiagnosticTraceError,
+            InvariantViolation,
+            OutboundConnectorError,
+            SessionStoreError,
+            ValueError,
+        ) as exc:
+            return self._finish_proposal_failure(
+                message=message,
+                request=request,
+                token=token,
+                error=exc,
+            )
+        return ReceiveResult(
+            status_code=202,
+            disposition="pending_action",
+            request=request,
+            reason="explicit durable-memory change is frozen pending operator approval",
+        )
+
+    def _memory_mutation_target(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+    ) -> DurableMemory | ReceiveResult | None:
+        if command.operation is MemoryOperation.REMEMBER:
+            return None
+        assert command.memory_id is not None
+        try:
+            target = self.state.get_memory(command.memory_id)
+        except (StateStoreError, ValueError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory target could not be inspected: {exc}",
+            )
+        if target is None:
+            return self._dispatch_memory_text(
+                message,
+                "No active durable memory has that exact ID.",
+                disposition="memory_target_missing",
+            )
+        if not target.is_active:
+            return self._dispatch_memory_text(
+                message,
+                "That durable memory is already terminal and cannot be changed.",
+                disposition="memory_target_terminal",
+            )
+        return target
+
+    def _admit_memory_request(
+        self, message: InboundMessage
+    ) -> _RequestAdmission | ReceiveResult:
+        try:
+            current = self._current_working_session()
+            request_id = self.ids.new_id("request")
+            accepted = accept_request(
+                current,
+                now=self.clock,
+                request_id=request_id,
+                originating_message_id=message.message_id,
+                phase="processing",
+            )
+        except (SessionStoreError, ValueError) as exc:
+            return ReceiveResult(
+                status_code=202,
+                disposition="failed",
+                reason=f"durable-memory request could not start: {exc}",
+            )
+        if accepted.kind is not TransitionKind.REQUEST_ACCEPTED:
+            return self._memory_request_blocked(message, current, accepted)
+        session_transition = self._memory_request_transition(message, accepted)
+        return self._admit_request(
+            message=message,
+            session=current,
+            session_transition=session_transition,
+            request_id=request_id,
+        )
+
+    def _memory_request_blocked(
+        self,
+        message: InboundMessage,
+        current: WorkingSession,
+        accepted: SessionTransition,
+    ) -> ReceiveResult:
+        blocked_kind = (
+            ControlTransitionKind.PENDING_BLOCKED
+            if accepted.kind is TransitionKind.PENDING_BLOCKED
+            else ControlTransitionKind.BUSY_REFUSED
+        )
+        blocked_reply = (
+            "A durable-memory change cannot start while an approval is pending. "
+            "Approve or reject it first."
+            if blocked_kind is ControlTransitionKind.PENDING_BLOCKED
+            else "A durable-memory change cannot start while another request is active."
+        )
+        return self._apply_session_control(
+            message,
+            current,
+            ControlTransition(
+                state=current,
+                parsed=parse_control(message.text),
+                kind=blocked_kind,
+                reply=blocked_reply,
+                effects=accepted.effects,
+                reason=accepted.reason,
+            ),
+        )
+
+    @staticmethod
+    def _memory_request_transition(
+        message: InboundMessage, accepted: SessionTransition
+    ) -> ControlTransition:
+        return ControlTransition(
+            state=accepted.state,
+            parsed=parse_control(message.text),
+            kind=ControlTransitionKind.REQUEST_ACCEPTED,
+            effects=accepted.effects,
+            cancellation_token=accepted.cancellation_token,
+            reason=accepted.reason,
+        )
+
+    def _memory_action_proposal(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        command: MemoryCommand,
+        target: DurableMemory | None,
+    ) -> FrozenActionProposal:
+        if command.operation is MemoryOperation.REMEMBER:
+            preview, payload = self._remember_memory_proposal(message, command)
+        elif command.operation is MemoryOperation.REPLACE:
+            preview, payload = self._replace_memory_proposal(message, command, target)
+        else:
+            assert command.operation is MemoryOperation.FORGET
+            preview, payload = self._forget_memory_proposal(message, target)
+        return FrozenActionProposal.create(
+            action_id=self.ids.new_id("action"),
+            request_id=request.request_id,
+            kind="durable_memory",
+            preview=preview,
+            payload=payload,
+        )
+
+    def _remember_memory_proposal(
+        self, message: InboundMessage, command: MemoryCommand
+    ) -> tuple[str, dict[str, object]]:
+        if command.content is None:
+            raise ValueError("durable-memory content is required")
+        memory_id = self.ids.new_id("memory")
+        payload = {
+            "operation": MemoryOperation.REMEMBER.value,
+            "memory_id": memory_id,
+            "content": command.content,
+            "source_message_id": message.message_id,
+        }
+        preview = (
+            "Create durable assistant memory\n"
+            f"Memory ID: {memory_id}\n"
+            f"Exact content: {command.content}\n"
+            f"Source message: {message.message_id}"
+        )
+        return preview, payload
+
+    def _replace_memory_proposal(
+        self,
+        message: InboundMessage,
+        command: MemoryCommand,
+        target: DurableMemory | None,
+    ) -> tuple[str, dict[str, object]]:
+        if target is None or target.content is None or command.content is None:
+            raise ValueError(
+                "durable-memory replacement target and content are required"
+            )
+        new_memory_id = self.ids.new_id("memory")
+        payload = {
+            "operation": MemoryOperation.REPLACE.value,
+            "memory_id": target.memory_id,
+            "new_memory_id": new_memory_id,
+            "content": command.content,
+            "expected_revision": target.revision_digest,
+            "source_message_id": message.message_id,
+        }
+        preview = (
+            f"Replace durable assistant memory {target.memory_id}\n"
+            f"Current exact content: {target.content}\n"
+            f"Replacement exact content: {command.content}\n"
+            f"New memory ID: {new_memory_id}\n"
+            f"Source message: {message.message_id}"
+        )
+        return preview, payload
+
+    def _forget_memory_proposal(
+        self, message: InboundMessage, target: DurableMemory | None
+    ) -> tuple[str, dict[str, object]]:
+        if target is None or target.content is None:
+            raise ValueError("durable-memory forget target is required")
+        payload = {
+            "operation": MemoryOperation.FORGET.value,
+            "memory_id": target.memory_id,
+            "expected_revision": target.revision_digest,
+            "source_message_id": message.message_id,
+        }
+        preview = (
+            f"Forget durable assistant memory {target.memory_id}\n"
+            f"Exact content to remove: {target.content}\n"
+            f"Source message: {target.source_message_id or 'none'}"
+        )
+        return preview, payload
+
+    @staticmethod
+    def _render_memory_list(
+        memories: tuple[DurableMemory, ...], *, searched: bool = False
+    ) -> str:
+        if not memories:
+            return (
+                "No durable assistant memories matched."
+                if searched
+                else "No durable assistant memories exist."
+            )
+        heading = (
+            "Durable assistant memory matches (inspect by exact ID):"
+            if searched
+            else "Durable assistant memories (inspect by exact ID):"
+        )
+        return "\n".join(
+            (
+                heading,
+                *(
+                    f"{memory.memory_id} | {memory.status.value} | "
+                    f"credential-like={str(memory.credential_like).lower()} | "
+                    f"source={memory.source_message_id or 'none'} | "
+                    f"updated={memory.updated_at.isoformat()}"
+                    for memory in memories
+                ),
+            )
+        )
+
+    @staticmethod
+    def _render_memory_inspect(memory: DurableMemory | None) -> str:
+        if memory is None:
+            return "No durable assistant memory has that exact ID."
+        content = (
+            memory.content
+            if memory.content is not None
+            else "[content unavailable: terminal memory record]"
+        )
+        return (
+            f"Durable assistant memory {memory.memory_id}\n"
+            f"Status: {memory.status.value}\n"
+            f"Credential-like: {str(memory.credential_like).lower()}\n"
+            f"Source message: {memory.source_message_id or 'none'}\n"
+            f"Created: {memory.created_at.isoformat()}\n"
+            f"Updated: {memory.updated_at.isoformat()}\n"
+            f"Exact content: {content}"
+        )
+
+    def _dispatch_memory_text(
+        self,
+        message: InboundMessage,
+        text: str,
+        *,
+        disposition: str,
+    ) -> ReceiveResult:
+        control_id = self.ids.new_id("control")
+        result = self._dispatch_control_text(
+            message,
+            body=_bounded_informational_reply(text, request_id=control_id),
+            control_id=control_id,
+        )
+        if result.disposition != "control_sent":
+            return result
+        return replace(result, disposition=disposition)
+
     @staticmethod
     def _render_history_search(messages: tuple[ConversationMessage, ...]) -> str:
         if not messages:
@@ -2829,17 +3650,32 @@ class DeterministicCapabilityBroker:
         *,
         disposition: str,
     ) -> ReceiveResult:
+        return self._dispatch_exact_text_export(
+            message,
+            payload,
+            label="Conversation-history export",
+            disposition=disposition,
+        )
+
+    def _dispatch_exact_text_export(
+        self,
+        message: InboundMessage,
+        payload: str,
+        *,
+        label: str,
+        disposition: str,
+    ) -> ReceiveResult:
         control_id = self.ids.new_id("control")
         fragments = tuple(
             payload[index : index + _PROPOSAL_FRAGMENT_PAYLOAD_CHARS]
             for index in range(0, len(payload), _PROPOSAL_FRAGMENT_PAYLOAD_CHARS)
         )
         if not fragments:
-            raise InvariantViolation("history export payload must be non-blank")
+            raise InvariantViolation("exact export payload must be non-blank")
         result: ReceiveResult | None = None
         for number, fragment in enumerate(fragments, start=1):
             body = (
-                f"Conversation-history export part {number}/{len(fragments)} "
+                f"{label} part {number}/{len(fragments)} "
                 f"request_id={control_id}\n{fragment}"
             )
             result = self._dispatch_control_text(
@@ -3012,8 +3848,9 @@ class DeterministicCapabilityBroker:
 
         results: list[_CancellationOutcome] = []
         for action_id, kind in action_refs:
+            dispatcher = self._dispatcher_for_action_kind(kind)
             try:
-                result = self.action_dispatcher.cancel(action_id=action_id)
+                result = dispatcher.cancel(action_id=action_id)
                 if not isinstance(result, ActionCancellationResult):
                     raise TypeError("action cancellation returned an invalid result")
             except Exception:  # noqa: BLE001 - an unavailable edge is unknown
