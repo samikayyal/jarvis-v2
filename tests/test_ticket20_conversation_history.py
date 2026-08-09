@@ -13,6 +13,7 @@ from jarvis_control_plane import (
     ConversationMessage,
     InboundMessage,
     InMemoryDurableStateStore,
+    OutboundAttemptStatus,
     SignedInboundEvent,
     SQLiteDurableStateStore,
 )
@@ -419,7 +420,7 @@ def test_outbound_history_write_failure_blocks_connector_before_dispatch() -> No
     ]
 
 
-def test_failed_outbound_attempt_remains_only_in_private_outbox() -> None:
+def test_failed_outbound_attempt_is_terminal_and_not_searchable() -> None:
     state = InMemoryDurableStateStore()
     components = build_receiver_components(
         operator_id=OPERATOR,
@@ -454,7 +455,12 @@ def test_failed_outbound_attempt_remains_only_in_private_outbox() -> None:
 
     assert result.disposition == "failed"
     assert state.search_conversation_messages(direction="outbound") == ()
-    assert len(state.outbound_outbox) == 1
+    assert state.outbound_outbox == {}
+    attempts = state.list_outbound_conversation_attempts()
+    assert len(attempts) == 1
+    assert attempts[0].status is OutboundAttemptStatus.NOT_STARTED
+    assert attempts[0].message is None
+    assert attempts[0].terminal_at is not None
 
 
 def test_history_selector_is_stable_and_exact_across_transport_sessions() -> None:

@@ -29,6 +29,7 @@ from .models import (
     OrchestrationRequest,
     OrchestrationResult,
     OutboundAttemptRecord,
+    OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
     RequestState,
@@ -231,6 +232,17 @@ class DurableStateStore(Protocol):
         transport_session_id: str,
         message_id: str,
         terminal_at: datetime | None = None,
+        outbound_id: str | None = None,
+    ) -> None: ...
+
+    def terminalize_outbound_conversation_attempt(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        status: OutboundAttemptStatus | str,
+        terminal_at: datetime,
+        outbound_id: str | None = None,
     ) -> None: ...
 
     def mark_outbound_conversation_attempted(

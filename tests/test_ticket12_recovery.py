@@ -9,14 +9,19 @@ import pytest
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
+    AuditWriteError,
     ConversationMessage,
     InboundMessage,
+    InMemoryAuditBoundary,
     InMemoryDurableStateStore,
     OutboundAttemptStatus,
     RequestState,
     SignedInboundEvent,
     SQLiteDurableStateStore,
 )
+from jarvis_control_plane.models import OutboundDelivery
+from jarvis_control_plane.ports import OutboundConnectorError
+from jarvis_control_plane.sessions import InMemoryWorkingSessionStore
 
 NOW = datetime(2026, 8, 9, 8, 0, tzinfo=UTC)
 OPERATOR = "operator-001"
@@ -105,6 +110,226 @@ def test_restart_interrupts_only_nonterminal_requests_and_records_safe_evidence(
         "outbound_not_started": "0",
         "outbound_unknown": "0",
     }
+
+
+def test_restart_audit_failure_does_not_mutate_recovery_state() -> None:
+    state = InMemoryDurableStateStore()
+    audit = InMemoryAuditBoundary()
+    initial = _components(state=state, audit=audit)
+    active = _request("request-audit-gated", status="accepted", phase="orchestration")
+    message = _outbound_message(message_id="reply-audit-gated")
+    state.save_request(active)
+    state.reserve_outbound_conversation_message(message)
+    state.mark_outbound_conversation_attempted(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        attempted_at=NOW + timedelta(seconds=1),
+    )
+    before_session = initial.broker.working_sessions.load()
+    before_requests = state.list_requests()
+    before_attempts = state.list_outbound_conversation_attempts()
+    audit.fail = True
+
+    with pytest.raises(AuditWriteError, match="controlled audit append failure"):
+        _components(
+            state=state,
+            audit=audit,
+            working_sessions=initial.broker.working_sessions,
+        )
+
+    assert initial.broker.working_sessions.load() == before_session
+    assert state.list_requests() == before_requests
+    assert state.list_outbound_conversation_attempts() == before_attempts
+    assert audit.records == []
+
+    audit.fail = False
+    restarted = _components(
+        state=state,
+        audit=audit,
+        working_sessions=initial.broker.working_sessions,
+    )
+    interrupted = state.get_request(active.request_id)
+    assert interrupted is not None
+    assert interrupted.status == "interrupted"
+    attempt = state.list_outbound_conversation_attempts()[0]
+    assert attempt.status is OutboundAttemptStatus.UNKNOWN
+    assert attempt.message is None
+    restart_records = [
+        record for record in restarted.audit.records if record.kind == "service_restart"
+    ]
+    assert restart_records[-1].details == {
+        "interrupted_requests": "1",
+        "outbound_not_started": "0",
+        "outbound_unknown": "1",
+    }
+
+
+def test_restart_audit_failure_does_not_create_missing_working_session() -> None:
+    state = InMemoryDurableStateStore()
+    active = _request("request-no-session", status="accepted", phase="orchestration")
+    state.save_request(active)
+    audit = InMemoryAuditBoundary(fail=True)
+    working_sessions = InMemoryWorkingSessionStore()
+    before_requests = state.list_requests()
+
+    with pytest.raises(AuditWriteError, match="controlled audit append failure"):
+        _components(
+            state=state,
+            audit=audit,
+            working_sessions=working_sessions,
+        )
+
+    assert working_sessions.load() is None
+    assert state.list_requests() == before_requests
+    assert audit.records == []
+
+    audit.fail = False
+    recovered = _components(
+        state=state,
+        audit=audit,
+        working_sessions=working_sessions,
+    )
+    assert working_sessions.load() is not None
+    assert state.get_request(active.request_id).status == "interrupted"
+    assert any(record.kind == "service_restart" for record in recovered.audit.records)
+
+
+@pytest.mark.parametrize(
+    ("may_have_sent", "expected_status", "expected_disposition"),
+    [
+        (False, OutboundAttemptStatus.NOT_STARTED, "failed"),
+        (True, OutboundAttemptStatus.UNKNOWN, "unknown"),
+    ],
+)
+def test_normal_outbound_failure_terminalizes_private_attempt(
+    may_have_sent: bool,
+    expected_status: OutboundAttemptStatus,
+    expected_disposition: str,
+) -> None:
+    components = _components(state=InMemoryDurableStateStore())
+
+    def fail_after_admission(_reply: object) -> object:
+        raise OutboundConnectorError(
+            "controlled outbound failure", may_have_sent=may_have_sent
+        )
+
+    components.outbound.send = fail_after_admission  # type: ignore[method-assign]
+    result = components.receiver.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id=TRANSPORT_SESSION,
+                event_id=f"event-failure-{may_have_sent}",
+                message_id=f"message-failure-{may_have_sent}",
+                sender_id=OPERATOR,
+                chat_id=OPERATOR,
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text="summarize the controlled result",
+            ),
+            components.config.signing_secret,
+        )
+    )
+
+    assert result.disposition == expected_disposition
+    attempts = components.state.list_outbound_conversation_attempts()
+    assert len(attempts) == 1
+    assert attempts[0].status is expected_status, result.reason
+    assert attempts[0].message is None
+    assert attempts[0].terminal_at is not None
+    assert components.outbound.sent == []
+
+
+def test_normal_outbound_confirmation_persists_gateway_message_id() -> None:
+    components = _components(state=InMemoryDurableStateStore())
+
+    def send_with_gateway_id(reply: object) -> OutboundDelivery:
+        components.outbound.preflight(reply)
+        components.outbound.sent.append(reply)  # type: ignore[arg-type]
+        return OutboundDelivery(outbound_id="openwa-message-001", accepted=True)
+
+    components.outbound.send = send_with_gateway_id  # type: ignore[method-assign]
+    result = components.receiver.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id=TRANSPORT_SESSION,
+                event_id="event-gateway-id",
+                message_id="message-gateway-id",
+                sender_id=OPERATOR,
+                chat_id=OPERATOR,
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text="summarize the controlled result",
+            ),
+            components.config.signing_secret,
+        )
+    )
+
+    assert result.disposition == "completed"
+    attempts = components.state.list_outbound_conversation_attempts()
+    assert len(attempts) == 1
+    assert attempts[0].status is OutboundAttemptStatus.CONFIRMED
+    assert attempts[0].outbound_id == "openwa-message-001"
+    assert attempts[0].message is None
+
+
+def test_sqlite_terminal_transition_removes_payload_and_persists_gateway_id(
+    tmp_path,
+) -> None:
+    state = SQLiteDurableStateStore(tmp_path / "terminal-outbound.sqlite3")
+    message = _outbound_message(message_id="reply-sqlite-confirmed")
+    state.reserve_outbound_conversation_message(message)
+    state.mark_outbound_conversation_attempted(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        attempted_at=NOW + timedelta(seconds=1),
+    )
+    state.terminalize_outbound_conversation_attempt(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        status=OutboundAttemptStatus.CONFIRMED,
+        terminal_at=NOW + timedelta(seconds=2),
+        outbound_id="openwa-sqlite-message-001",
+    )
+
+    record = state.list_outbound_conversation_attempts()[0]
+    assert record.status is OutboundAttemptStatus.CONFIRMED
+    assert record.outbound_id == "openwa-sqlite-message-001"
+    assert record.message is None
+    assert state.list_conversation_messages()[0].message_id == message.message_id
+    state.close()
+
+
+@pytest.mark.parametrize("outbound_id", [None, "openwa-message-recovered"])
+def test_restart_preserves_confirmed_attempt_with_or_without_gateway_id(
+    outbound_id: str | None,
+) -> None:
+    state = InMemoryDurableStateStore()
+    initial = _components(state=state)
+    message = _outbound_message(message_id=f"reply-confirmed-{outbound_id}")
+    state.reserve_outbound_conversation_message(message)
+    state.mark_outbound_conversation_attempted(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        attempted_at=NOW + timedelta(seconds=1),
+    )
+    state.terminalize_outbound_conversation_attempt(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        status=OutboundAttemptStatus.CONFIRMED,
+        terminal_at=NOW + timedelta(seconds=2),
+        outbound_id=outbound_id,
+    )
+
+    _components(state=state, working_sessions=initial.broker.working_sessions)
+
+    attempt = state.list_outbound_conversation_attempts()[0]
+    assert attempt.status is OutboundAttemptStatus.CONFIRMED
+    assert attempt.outbound_id == outbound_id
+    assert attempt.message is None
 
 
 def test_sqlite_restart_persists_unknown_outcome_and_removes_private_payload(
@@ -236,7 +461,12 @@ def test_pre_ticket12_sqlite_outbox_is_migrated_unknown_without_delivery(
     state.close()
 
 
-def _components(*, state: object, working_sessions: object | None = None):
+def _components(
+    *,
+    state: object,
+    audit: object | None = None,
+    working_sessions: object | None = None,
+):
     return build_receiver_components(
         operator_id=OPERATOR,
         transport_session_id=TRANSPORT_SESSION,
@@ -244,6 +474,7 @@ def _components(*, state: object, working_sessions: object | None = None):
         now=NOW,
         id_prefix="ticket12",
         state=state,
+        audit=audit,
         working_sessions=working_sessions,
     )
 

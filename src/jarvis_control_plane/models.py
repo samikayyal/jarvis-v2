@@ -304,6 +304,7 @@ class OutboundAttemptRecord:
     message: ConversationMessage | None
     attempted_at: datetime | None = None
     terminal_at: datetime | None = None
+    outbound_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("transport_session_id", "message_id", "request_id"):
@@ -315,6 +316,8 @@ class OutboundAttemptRecord:
             object.__setattr__(self, "attempted_at", ensure_utc(self.attempted_at))
         if self.terminal_at is not None:
             object.__setattr__(self, "terminal_at", ensure_utc(self.terminal_at))
+        if self.outbound_id is not None:
+            _non_empty_identifier(self.outbound_id, "outbound_id")
         if status in {
             OutboundAttemptStatus.UNATTEMPTED,
             OutboundAttemptStatus.ATTEMPTED,
@@ -329,6 +332,8 @@ class OutboundAttemptRecord:
                 raise ValueError("outbound attempt identity does not match its message")
             if self.terminal_at is not None:
                 raise ValueError("open outbound attempts cannot have terminal_at")
+            if self.outbound_id is not None:
+                raise ValueError("open outbound attempts cannot have outbound_id")
         elif self.message is not None or self.terminal_at is None:
             raise ValueError(
                 "terminal outbound attempts remove message content and require terminal_at"
