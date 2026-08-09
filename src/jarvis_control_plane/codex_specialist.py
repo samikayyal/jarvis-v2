@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -40,6 +41,31 @@ _MAX_TIMEOUT_SECONDS = 15 * 60
 _MAX_TASK_CHARS = 8_000
 _MAX_SUMMARY_CHARS = 8_000
 _MAX_RESULT_ITEMS = 128
+_MAX_PROPOSAL_PATCH_CHARS = 256_000
+_CONTENT_DIGEST_LENGTH = 64
+_FORBIDDEN_COMMAND_PATTERNS = (
+    re.compile(
+        r"\bgit(?:\s+[^;&|]+)*?\s+(?:push|commit|reset|rebase|merge|"
+        r"cherry-pick|revert|clean|checkout|switch|branch|worktree)(?:\s|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|[\s;&|])(?:rm|rmdir|del|erase|remove-item|set-content|"
+        r"add-content|move-item|copy-item)(?:\s|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:>|>>|\btee\b|\bsudo\b|\bsu\b)", re.IGNORECASE),
+    re.compile(
+        r"\b(?:systemctl|service|kubectl\s+apply|docker\s+(?:compose\s+)?"
+        r"(?:up|run))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:danger-full-access|trust-critical)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:python(?:3)?|pwsh|powershell|bash|sh|node)\s+-(?:c|command)\b",
+        re.IGNORECASE,
+    ),
+)
 
 
 class CodexSpecialistError(RuntimeError):
@@ -110,12 +136,90 @@ def _canonical_paths(values: tuple[str, ...], name: str) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def _canonical_digest(value: str | None, name: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != _CONTENT_DIGEST_LENGTH
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _canonical_patch(value: str, name: str = "workspace proposal patch") -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > _MAX_PROPOSAL_PATCH_CHARS
+        or "\x00" in value
+    ):
+        raise ValueError(f"{name} must be a bounded non-empty patch")
+    return value
+
+
+def _canonical_remote_refs(
+    values: tuple[tuple[str, str], ...], name: str = "remote ref"
+) -> tuple[tuple[str, str], ...]:
+    refs = tuple(sorted(values))
+    if len({ref_name for ref_name, _value in refs}) != len(refs):
+        raise ValueError(f"{name} contains duplicates")
+    for ref_name, value in refs:
+        _canonical_text(ref_name, name, max_chars=256)
+        _canonical_text(value, f"{name} value", max_chars=256)
+    return refs
+
+
+def _canonical_file_digests(
+    values: tuple[tuple[str, str | None], ...], name: str
+) -> tuple[tuple[str, str | None], ...]:
+    digests = tuple(
+        (
+            _relative_path(path, f"{name} path"),
+            _canonical_digest(digest, f"{name} value"),
+        )
+        for path, digest in values
+    )
+    if len({path for path, _digest in digests}) != len(digests):
+        raise ValueError(f"{name} contains duplicate paths")
+    return tuple(sorted(digests))
+
+
 def _path_is_allowed(path: str, allowed: tuple[str, ...]) -> bool:
     for prefix in allowed:
         normalized_prefix = prefix.rstrip("/")
         if path == normalized_prefix or path.startswith(f"{normalized_prefix}/"):
             return True
     return False
+
+
+@dataclass(frozen=True, slots=True)
+class CodexWorkspaceChange:
+    """One exact file-content transition authorized by a workspace proposal."""
+
+    path: str
+    before_digest: str | None
+    after_digest: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "path", _relative_path(self.path, "workspace change path")
+        )
+        before = _canonical_digest(self.before_digest, "workspace before digest")
+        after = _canonical_digest(self.after_digest, "workspace after digest")
+        if before == after:
+            raise ValueError("workspace change must alter file content or existence")
+        object.__setattr__(self, "before_digest", before)
+        object.__setattr__(self, "after_digest", after)
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "before_digest": self.before_digest,
+            "after_digest": self.after_digest,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +310,10 @@ class CodexWorkspaceProposal:
     workspace: str
     task: str
     allowed_paths: tuple[str, ...]
+    base_head: str
+    base_remote_refs: tuple[tuple[str, str], ...]
+    changes: tuple[CodexWorkspaceChange, ...]
+    patch: str
     digest: str
 
     def __post_init__(self) -> None:
@@ -215,7 +323,28 @@ class CodexWorkspaceProposal:
         paths = _canonical_paths(tuple(self.allowed_paths), "approved path")
         if not paths:
             raise ValueError("workspace proposal requires an approved path")
+        _canonical_text(self.base_head, "workspace proposal base head", max_chars=256)
+        remote_refs = _canonical_remote_refs(
+            tuple(self.base_remote_refs), "workspace proposal remote ref"
+        )
+        changes = tuple(self.changes)
+        if not changes or any(
+            not isinstance(change, CodexWorkspaceChange) for change in changes
+        ):
+            raise ValueError("workspace proposal requires exact file changes")
+        if tuple(change.path for change in changes) != tuple(
+            sorted(change.path for change in changes)
+        ):
+            raise ValueError("workspace proposal changes must be sorted canonically")
+        if len({change.path for change in changes}) != len(changes):
+            raise ValueError("workspace proposal changes must be unique")
+        if any(not _path_is_allowed(change.path, paths) for change in changes):
+            raise ValueError("workspace proposal change is outside its allowed paths")
+        patch = _canonical_patch(self.patch)
         object.__setattr__(self, "allowed_paths", paths)
+        object.__setattr__(self, "base_remote_refs", remote_refs)
+        object.__setattr__(self, "changes", changes)
+        object.__setattr__(self, "patch", patch)
         if self.digest != _proposal_digest(self._payload()):
             raise ValueError("workspace proposal digest does not match its payload")
 
@@ -226,6 +355,10 @@ class CodexWorkspaceProposal:
             "workspace": self.workspace,
             "task": self.task,
             "allowed_paths": list(self.allowed_paths),
+            "base_head": self.base_head,
+            "base_remote_refs": [list(ref) for ref in self.base_remote_refs],
+            "changes": [change.as_payload() for change in self.changes],
+            "patch": self.patch,
         }
 
     @classmethod
@@ -237,14 +370,27 @@ class CodexWorkspaceProposal:
         workspace: str,
         task: str,
         allowed_paths: tuple[str, ...],
+        base_head: str,
+        base_remote_refs: tuple[tuple[str, str], ...],
+        changes: tuple[CodexWorkspaceChange, ...],
+        patch: str,
     ) -> CodexWorkspaceProposal:
         paths = _canonical_paths(tuple(allowed_paths), "approved path")
+        remote_refs = _canonical_remote_refs(
+            tuple(base_remote_refs), "workspace proposal remote ref"
+        )
+        normalized_changes = tuple(sorted(changes, key=lambda change: change.path))
+        patch = _canonical_patch(patch)
         payload = {
             "action_id": action_id,
             "request_id": request_id,
             "workspace": workspace,
             "task": task,
             "allowed_paths": list(paths),
+            "base_head": base_head,
+            "base_remote_refs": [list(ref) for ref in remote_refs],
+            "changes": [change.as_payload() for change in normalized_changes],
+            "patch": patch,
         }
         return cls(
             digest=_proposal_digest(payload),
@@ -253,6 +399,10 @@ class CodexWorkspaceProposal:
             request_id=request_id,
             workspace=workspace,
             task=task,
+            base_head=base_head,
+            base_remote_refs=remote_refs,
+            changes=normalized_changes,
+            patch=patch,
         )
 
 
@@ -265,8 +415,9 @@ class CodexWorkspaceApproval:
     proposal_digest: str
 
     def __post_init__(self) -> None:
-        for name in ("action_id", "request_id", "proposal_digest"):
+        for name in ("action_id", "request_id"):
             _canonical_text(getattr(self, name), name, max_chars=128)
+        _canonical_digest(self.proposal_digest, "proposal digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +455,10 @@ class CodexExecutionEnvelope:
     operation: CodexOperation
     allowed_paths: tuple[str, ...]
     proposal_digest: str | None
+    proposal_base_head: str | None = None
+    proposal_remote_refs: tuple[tuple[str, str], ...] = ()
+    proposal_changes: tuple[CodexWorkspaceChange, ...] = ()
+    proposal_patch: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,17 +530,13 @@ class CodexWorkspaceSnapshot:
     head: str
     remote_refs: tuple[tuple[str, str], ...]
     changed_paths: tuple[str, ...]
+    file_digests: tuple[tuple[str, str | None], ...] = ()
     forbidden_events: tuple[str, ...] = ()
     test_evidence: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _canonical_text(self.head, "workspace head", max_chars=256)
-        refs = tuple(sorted(self.remote_refs))
-        if len({name for name, _value in refs}) != len(refs):
-            raise ValueError("workspace remote refs contain duplicates")
-        for name, value in refs:
-            _canonical_text(name, "remote ref", max_chars=256)
-            _canonical_text(value, "remote ref value", max_chars=256)
+        refs = _canonical_remote_refs(tuple(self.remote_refs))
         events = tuple(sorted(set(self.forbidden_events)))
         unknown = set(events) - _FORBIDDEN_EVENTS
         if unknown:
@@ -395,6 +546,11 @@ class CodexWorkspaceSnapshot:
             self,
             "changed_paths",
             _canonical_paths(tuple(self.changed_paths), "observed changed path"),
+        )
+        object.__setattr__(
+            self,
+            "file_digests",
+            _canonical_file_digests(tuple(self.file_digests), "observed file digest"),
         )
         object.__setattr__(self, "forbidden_events", events)
         evidence = tuple(self.test_evidence)
@@ -508,14 +664,129 @@ class CodexMcpAdapter:
             raise CodexVerificationError(
                 "Codex MCP approval callback received an untyped request"
             )
+        if envelope.operation in _READ_ONLY_OPERATIONS:
+            decision = self._approval_handler(envelope, request)
+            if decision not in {"allow", "deny"}:
+                raise CodexVerificationError(
+                    "Codex MCP approval callback returned an invalid decision"
+                )
+            return "deny"
+        if request.action == "apply_patch":
+            if not self._matches_exact_patch(envelope, request.details):
+                return "deny"
+        elif request.action == "exec_command":
+            if not self._is_safe_read_command(envelope, request.details):
+                return "deny"
+        else:  # pragma: no cover - CodexMcpApprovalRequest validates the action.
+            return "deny"
         decision = self._approval_handler(envelope, request)
         if decision not in {"allow", "deny"}:
             raise CodexVerificationError(
                 "Codex MCP approval callback returned an invalid decision"
             )
-        if envelope.operation in _READ_ONLY_OPERATIONS:
-            return "deny"
         return decision
+
+    @staticmethod
+    def _request_cwd(details: Mapping[str, object]) -> str | None:
+        value = details.get("cwd")
+        if not isinstance(value, str):
+            return None
+        try:
+            return _canonical_cwd(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _request_paths(details: Mapping[str, object]) -> tuple[str, ...] | None:
+        raw_paths: object | None = None
+        if "paths" in details:
+            raw_paths = details["paths"]
+        elif "affected_paths" in details:
+            raw_paths = details["affected_paths"]
+        elif "fileChanges" in details:
+            raw_changes = details["fileChanges"]
+            if not isinstance(raw_changes, list):
+                return None
+            paths: list[str] = []
+            for change in raw_changes:
+                if not isinstance(change, Mapping) or set(change) != {"path"}:
+                    return None
+                path = change.get("path")
+                if not isinstance(path, str):
+                    return None
+                paths.append(path)
+            raw_paths = paths
+        if raw_paths is None:
+            return ()
+        if not isinstance(raw_paths, (list, tuple)) or any(
+            not isinstance(path, str) for path in raw_paths
+        ):
+            return None
+        try:
+            return _canonical_paths(tuple(raw_paths), "Codex approval path")
+        except ValueError:
+            return None
+
+    @classmethod
+    def _matches_exact_patch(
+        cls, envelope: CodexExecutionEnvelope, details: Mapping[str, object]
+    ) -> bool:
+        if envelope.operation != "workspace_prepare":
+            return False
+        if set(details) != {"cwd", "fileChanges", "patch"}:
+            return False
+        if envelope.proposal_patch is None or not envelope.proposal_changes:
+            return False
+        if cls._request_cwd(details) != envelope.cwd:
+            return False
+        patch = details.get("patch")
+        if not isinstance(patch, str) or patch != envelope.proposal_patch:
+            return False
+        paths = cls._request_paths(details)
+        expected_paths = tuple(change.path for change in envelope.proposal_changes)
+        return paths == expected_paths
+
+    @classmethod
+    def _is_safe_read_command(
+        cls, envelope: CodexExecutionEnvelope, details: Mapping[str, object]
+    ) -> bool:
+        if envelope.operation != "workspace_prepare":
+            return False
+        allowed_keys = {
+            "argv",
+            "affected_paths",
+            "command",
+            "cwd",
+            "operation",
+            "paths",
+        }
+        if set(details) - allowed_keys:
+            return False
+        if "command" in details and "argv" in details:
+            return False
+        if "paths" in details and "affected_paths" in details:
+            return False
+        if cls._request_cwd(details) != envelope.cwd:
+            return False
+        operation = details.get("operation", "read")
+        if operation != "read":
+            return False
+        command = details.get("command")
+        if command is None:
+            argv = details.get("argv")
+            if not isinstance(argv, list) or any(
+                not isinstance(value, str) for value in argv
+            ):
+                return False
+            command = " ".join(argv)
+        if not isinstance(command, str) or not command.strip():
+            return False
+        if any(pattern.search(command) for pattern in _FORBIDDEN_COMMAND_PATTERNS):
+            return False
+        paths = cls._request_paths(details)
+        return paths is not None and all(
+            _path_is_allowed(path, envelope.allowed_paths) for path in paths
+        )
 
     @staticmethod
     def _developer_instructions(envelope: CodexExecutionEnvelope) -> str:
@@ -531,7 +802,8 @@ class CodexMcpAdapter:
         paths = ", ".join(envelope.allowed_paths)
         return (
             f"{common} Workspace preparation is limited to these approved paths: "
-            f"{paths}. The approval digest is {envelope.proposal_digest}."
+            f"{paths}. Apply only the exact approved patch, whose digest is "
+            f"{envelope.proposal_digest}; command approvals are read-only."
         )
 
     @staticmethod
@@ -619,18 +891,50 @@ class CodexSpecialist:
             adapter_result = future.result(timeout=envelope.timeout_seconds)
         except FutureTimeout as exc:
             interrupted = self._adapter.interrupt(invocation.request_id)
-            future.cancel()
+            # A running Python thread cannot be cancelled.  Join it before
+            # inspecting the workspace or returning control to orchestration;
+            # otherwise a late Codex write can occur after this method returns.
+            try:
+                interrupted_result = future.result()
+            except Exception as error:  # noqa: BLE001 - normalize adapter failure after join
+                interrupted_result = None
+                worker_error = error
+            else:
+                worker_error = None
             if interrupted is not True:
                 raise CodexVerificationError(
                     "Codex interrupt could not be independently confirmed"
                 ) from exc
+            if worker_error is not None:
+                raise CodexVerificationError(
+                    "Codex interrupt stopped without a typed result"
+                ) from worker_error
+            if not isinstance(interrupted_result, CodexAdapterResult):
+                raise CodexVerificationError(
+                    "Codex interrupt stopped without a typed result"
+                ) from exc
             after = self._inspector.snapshot(workspace)
-            self._verify_transition(envelope, before, after)
-            raise CodexTimeoutError(
-                "Codex specialist exceeded its frozen deadline"
-            ) from exc
+            changed_paths, test_evidence = self._verify(
+                envelope, interrupted_result, before, after
+            )
+            unresolved_questions = tuple(
+                dict.fromkeys(
+                    (
+                        *interrupted_result.unresolved_questions,
+                        "Codex specialist did not complete before its frozen deadline.",
+                    )
+                )
+            )
+            return CodexSpecialistResult(
+                status="incomplete",
+                summary="Codex specialist did not complete before its frozen deadline.",
+                changed_paths=changed_paths,
+                test_evidence=test_evidence,
+                unresolved_questions=unresolved_questions[:_MAX_RESULT_ITEMS],
+                thread_id=interrupted_result.thread_id,
+            )
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
         if not isinstance(adapter_result, CodexAdapterResult):
             raise CodexVerificationError("Codex adapter returned an untyped result")
         after = self._inspector.snapshot(workspace)
@@ -651,6 +955,7 @@ class CodexSpecialist:
     ) -> CodexExecutionEnvelope:
         proposal_digest: str | None = None
         allowed_paths: tuple[str, ...] = ()
+        proposal: CodexWorkspaceProposal | None = None
         if invocation.operation in _READ_ONLY_OPERATIONS:
             if invocation.proposal is not None or invocation.approval is not None:
                 raise CodexPolicyError("read-only Codex work cannot consume approval")
@@ -703,6 +1008,12 @@ class CodexSpecialist:
             operation=invocation.operation,
             allowed_paths=allowed_paths,
             proposal_digest=proposal_digest,
+            proposal_base_head=proposal.base_head if proposal is not None else None,
+            proposal_remote_refs=(
+                proposal.base_remote_refs if proposal is not None else ()
+            ),
+            proposal_changes=proposal.changes if proposal is not None else (),
+            proposal_patch=proposal.patch if proposal is not None else None,
         )
 
     @staticmethod
@@ -750,10 +1061,47 @@ class CodexSpecialist:
             raise CodexVerificationError(
                 "independent verification detected mutation during read-only work"
             )
-        if envelope.operation == "workspace_prepare" and any(
-            not _path_is_allowed(path, envelope.allowed_paths) for path in changed_paths
-        ):
-            raise CodexVerificationError(
-                "independent verification found changes outside the approved paths"
-            )
+        if envelope.operation == "workspace_prepare":
+            expected_changes = envelope.proposal_changes
+            expected_paths = tuple(change.path for change in expected_changes)
+            if (
+                envelope.proposal_base_head is None
+                or dict(before.remote_refs) != dict(envelope.proposal_remote_refs)
+                or before.head != envelope.proposal_base_head
+            ):
+                raise CodexVerificationError(
+                    "workspace base changed before the approved proposal executed"
+                )
+            if before.head != after.head:
+                raise CodexVerificationError(
+                    "independent verification detected a workspace commit"
+                )
+            if changed_paths != expected_paths:
+                raise CodexVerificationError(
+                    "independent verification did not match the exact approved paths"
+                )
+            before_digests = dict(before.file_digests)
+            after_digests = dict(after.file_digests)
+            if set(before_digests) != set(expected_paths) or set(after_digests) != set(
+                expected_paths
+            ):
+                raise CodexVerificationError(
+                    "independent verification lacks exact file-content evidence"
+                )
+            for change in expected_changes:
+                if before_digests[change.path] != change.before_digest:
+                    raise CodexVerificationError(
+                        "workspace base content changed before the approved proposal"
+                    )
+                if after_digests[change.path] != change.after_digest:
+                    raise CodexVerificationError(
+                        "independent verification found content outside the approved transition"
+                    )
+            if any(
+                not _path_is_allowed(path, envelope.allowed_paths)
+                for path in changed_paths
+            ):
+                raise CodexVerificationError(
+                    "independent verification found changes outside the approved paths"
+                )
         return changed_paths

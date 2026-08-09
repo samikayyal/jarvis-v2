@@ -16,10 +16,10 @@ from jarvis_control_plane.codex_specialist import (
     CodexPolicyError,
     CodexSpecialist,
     CodexSpecialistConfig,
-    CodexTimeoutError,
     CodexVerificationError,
     CodexWorkspace,
     CodexWorkspaceApproval,
+    CodexWorkspaceChange,
     CodexWorkspaceProposal,
     CodexWorkspaceSnapshot,
 )
@@ -30,6 +30,45 @@ from jarvis_control_plane.orchestration import (
 )
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+SRC_BEFORE = "a" * 64
+SRC_AFTER = "b" * 64
+TEST_BEFORE = "c" * 64
+TEST_AFTER = "d" * 64
+
+
+def _change(
+    path: str, before_digest: str = SRC_BEFORE, after_digest: str = SRC_AFTER
+) -> CodexWorkspaceChange:
+    return CodexWorkspaceChange(
+        path=path,
+        before_digest=before_digest,
+        after_digest=after_digest,
+    )
+
+
+def _proposal(
+    *,
+    action_id: str = "action-001",
+    request_id: str = "request-001",
+    workspace: str = "jarvis",
+    task: str = "Prepare the requested source change.",
+    allowed_paths: tuple[str, ...] = ("src/",),
+    changes: tuple[CodexWorkspaceChange, ...] = (_change("src/feature.py"),),
+    base_head: str = "abc123",
+    base_remote_refs: tuple[tuple[str, str], ...] = (("origin/main", "abc123"),),
+    patch: str = "diff --git a/src/feature.py b/src/feature.py\n+approved\n",
+) -> CodexWorkspaceProposal:
+    return CodexWorkspaceProposal.create(
+        action_id=action_id,
+        request_id=request_id,
+        workspace=workspace,
+        task=task,
+        allowed_paths=allowed_paths,
+        base_head=base_head,
+        base_remote_refs=base_remote_refs,
+        changes=changes,
+        patch=patch,
+    )
 
 
 class _Adapter:
@@ -93,6 +132,7 @@ class _ApprovalVerifier:
 def _snapshot(
     *,
     changed_paths: tuple[str, ...] = (),
+    file_digests: tuple[tuple[str, str | None], ...] = (),
     head: str = "abc123",
     remote_head: str = "abc123",
     forbidden_events: tuple[str, ...] = (),
@@ -102,6 +142,7 @@ def _snapshot(
         head=head,
         remote_refs=(("origin/main", remote_head),),
         changed_paths=changed_paths,
+        file_digests=file_digests,
         forbidden_events=forbidden_events,
         test_evidence=test_evidence,
     )
@@ -208,15 +249,41 @@ def test_workspace_preparation_requires_an_exact_approved_proposal() -> None:
         )
 
 
+def test_workspace_proposal_digest_binds_base_patch_and_file_transition() -> None:
+    proposal = _proposal()
+
+    payload = proposal._payload()
+    assert payload["base_head"] == "abc123"
+    assert payload["base_remote_refs"] == [["origin/main", "abc123"]]
+    assert payload["patch"] == proposal.patch
+    assert payload["changes"] == [
+        {
+            "path": "src/feature.py",
+            "before_digest": SRC_BEFORE,
+            "after_digest": SRC_AFTER,
+        }
+    ]
+    assert (
+        _proposal(
+            patch="diff --git a/src/feature.py b/src/feature.py\nchanged\n"
+        ).digest
+        != proposal.digest
+    )
+
+
 def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths() -> (
     None
 ):
-    proposal = CodexWorkspaceProposal.create(
-        action_id="action-001",
-        request_id="request-001",
-        workspace="jarvis",
-        task="Prepare the requested source change.",
+    proposal = _proposal(
         allowed_paths=("src/", "tests/"),
+        changes=(
+            _change("src/feature.py"),
+            _change("tests/test_feature.py", TEST_BEFORE, TEST_AFTER),
+        ),
+        patch=(
+            "diff --git a/src/feature.py b/src/feature.py\n"
+            "diff --git a/tests/test_feature.py b/tests/test_feature.py\n"
+        ),
     )
     approval = CodexWorkspaceApproval(
         action_id=proposal.action_id,
@@ -237,7 +304,17 @@ def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths(
         adapter=adapter,
         after=_snapshot(
             changed_paths=("src/feature.py", "tests/test_feature.py"),
+            file_digests=(
+                ("src/feature.py", SRC_AFTER),
+                ("tests/test_feature.py", TEST_AFTER),
+            ),
             test_evidence=("2 passed",),
+        ),
+        before=_snapshot(
+            file_digests=(
+                ("src/feature.py", SRC_BEFORE),
+                ("tests/test_feature.py", TEST_BEFORE),
+            )
         ),
     )
 
@@ -259,13 +336,7 @@ def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths(
 
 
 def test_workspace_preparation_rejects_a_forged_approval_object() -> None:
-    proposal = CodexWorkspaceProposal.create(
-        action_id="action-001",
-        request_id="request-001",
-        workspace="jarvis",
-        task="Prepare the requested source change.",
-        allowed_paths=("src/",),
-    )
+    proposal = _proposal()
     specialist, adapter = _specialist(
         approval_verifier=_ApprovalVerifier(approved=False)
     )
@@ -322,21 +393,42 @@ def test_independent_verification_rejects_a_read_only_head_change() -> None:
 
 
 def test_independent_verification_rejects_out_of_scope_workspace_changes() -> None:
-    proposal = CodexWorkspaceProposal.create(
-        action_id="action-001",
-        request_id="request-001",
-        workspace="jarvis",
-        task="Prepare the requested source change.",
-        allowed_paths=("src/",),
-    )
+    proposal = _proposal()
     specialist, _adapter = _specialist(
         after=_snapshot(changed_paths=("deployment/service.ini",)),
     )
 
-    with pytest.raises(CodexVerificationError, match="outside the approved paths"):
+    with pytest.raises(CodexVerificationError, match="exact approved paths"):
         specialist.invoke(
             CodexInvocation(
                 request_id="request-001",
+                workspace="jarvis",
+                operation="workspace_prepare",
+                task=proposal.task,
+                proposal=proposal,
+                approval=CodexWorkspaceApproval(
+                    action_id=proposal.action_id,
+                    request_id=proposal.request_id,
+                    proposal_digest=proposal.digest,
+                ),
+            )
+        )
+
+
+def test_independent_verification_rejects_content_that_is_not_in_the_proposal() -> None:
+    proposal = _proposal()
+    specialist, _adapter = _specialist(
+        before=_snapshot(file_digests=(("src/feature.py", SRC_BEFORE),)),
+        after=_snapshot(
+            changed_paths=("src/feature.py",),
+            file_digests=(("src/feature.py", "e" * 64),),
+        ),
+    )
+
+    with pytest.raises(CodexVerificationError, match="content outside"):
+        specialist.invoke(
+            CodexInvocation(
+                request_id=proposal.request_id,
                 workspace="jarvis",
                 operation="workspace_prepare",
                 task=proposal.task,
@@ -417,17 +509,18 @@ def test_specialist_interrupts_the_adapter_at_the_frozen_deadline() -> None:
         config=_config(timeout_seconds=0.01),
     )
 
-    with pytest.raises(CodexTimeoutError, match="deadline"):
-        specialist.invoke(
-            CodexInvocation(
-                request_id="request-timeout",
-                workspace="jarvis",
-                operation="inspect",
-                task="Inspect the repository.",
-            )
+    result = specialist.invoke(
+        CodexInvocation(
+            request_id="request-timeout",
+            workspace="jarvis",
+            operation="inspect",
+            task="Inspect the repository.",
         )
+    )
 
     assert adapter.interrupted == ["request-timeout"]
+    assert result.status == "incomplete"
+    assert "frozen deadline" in result.summary
 
 
 def test_timeout_rejects_an_unconfirmed_interrupt_or_late_mutation() -> None:
@@ -461,6 +554,36 @@ def test_timeout_rejects_an_unconfirmed_interrupt_or_late_mutation() -> None:
                 task="Inspect the repository.",
             )
         )
+
+
+def test_timeout_does_not_return_until_the_worker_is_quiescent() -> None:
+    class _LateWorker(_Adapter):
+        def __init__(self) -> None:
+            super().__init__(delay_seconds=0.05)
+            self.finished = False
+
+        def invoke(self, envelope, *, deadline: float) -> CodexAdapterResult:
+            result = super().invoke(envelope, deadline=deadline)
+            self.finished = True
+            return result
+
+    adapter = _LateWorker()
+    specialist, _adapter = _specialist(
+        adapter=adapter,
+        config=_config(timeout_seconds=0.01),
+    )
+
+    result = specialist.invoke(
+        CodexInvocation(
+            request_id="request-quiescent",
+            workspace="jarvis",
+            operation="inspect",
+            task="Inspect the repository.",
+        )
+    )
+
+    assert result.status == "incomplete"
+    assert adapter.finished is True
 
 
 def test_agents_orchestration_exposes_only_the_closed_read_only_codex_tool() -> None:
@@ -536,6 +659,73 @@ def test_agents_orchestration_exposes_only_the_closed_read_only_codex_tool() -> 
     assert codex_adapter.envelopes[0].request_id == "request-agent"
     assert codex_adapter.envelopes[0].sandbox == "read-only"
     assert result.reply_text == "Review complete."
+
+
+def test_agents_orchestration_preserves_a_typed_incomplete_codex_result() -> None:
+    specialist, _codex_adapter = _specialist(
+        adapter=_Adapter(delay_seconds=0.05),
+        config=_config(timeout_seconds=0.01),
+    )
+    captured: dict[str, object] = {}
+
+    class _Reasoning:
+        def __init__(self, *, effort: str) -> None:
+            self.effort = effort
+
+    def agent_factory(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        tools = captured["tools"]
+        codex_tool = next(
+            tool for tool in tools if tool.name == "invoke_codex_specialist"
+        )
+        captured["codex_output"] = asyncio.run(
+            codex_tool.on_invoke_tool(
+                None,
+                json.dumps(
+                    {
+                        "workspace": "jarvis",
+                        "operation": "inspect",
+                        "task": "Inspect the repository.",
+                    }
+                ),
+            )
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Inspection timed out safely.")
+        )
+
+    request = OrchestrationRequest(
+        state=RequestState(
+            request_id="request-agent-timeout",
+            event_id="event-agent-timeout",
+            message_id="message-agent-timeout",
+            operator_id="operator.test",
+            session_id="session-agent-timeout",
+            chat_id="operator.test",
+            created_at=NOW,
+            updated_at=NOW,
+            status="accepted",
+            phase="orchestration",
+            model="gpt-5.6-terra",
+            reasoning="medium",
+        ),
+        text="Ask Codex to inspect the repository.",
+    )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=agent_factory,
+        run_sync=run_sync,
+        model_settings_factory=lambda **values: values,
+        reasoning_factory=_Reasoning,
+        run_config_factory=lambda **values: values,
+        codex_specialist=specialist,
+    ).run(request)
+
+    assert captured["codex_output"]["status"] == "incomplete"
+    assert result.reply_text == "Inspection timed out safely."
 
 
 def test_mcp_adapter_maps_only_the_frozen_envelope_to_the_codex_tool() -> None:
@@ -739,12 +929,11 @@ def test_mcp_adapter_surfaces_approval_context_and_denies_read_only_escalation()
 
 
 def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None:
-    proposal = CodexWorkspaceProposal.create(
+    proposal = _proposal(
         action_id="action-mcp-001",
         request_id="request-mcp-write",
-        workspace="jarvis",
-        task="Prepare the requested source change.",
-        allowed_paths=("src/",),
+        changes=(_change("src/feature.py"),),
+        patch="diff --git a/src/feature.py b/src/feature.py\n+approved\n",
     )
     approval = CodexWorkspaceApproval(
         action_id=proposal.action_id,
@@ -768,7 +957,11 @@ def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None
                         thread_id="thread-mcp-write",
                         request_id="call-write-001",
                         action="apply_patch",
-                        details={"fileChanges": [{"path": "src/feature.py"}]},
+                        details={
+                            "cwd": "C:/work/Jarvis-v2",
+                            "fileChanges": [{"path": "src/feature.py"}],
+                            "patch": proposal.patch,
+                        },
                     )
                 )
             )
@@ -798,7 +991,11 @@ def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None
         assert request.thread_id == "thread-mcp-write"
         assert request.request_id == "call-write-001"
         assert request.action == "apply_patch"
-        assert request.details == {"fileChanges": [{"path": "src/feature.py"}]}
+        assert request.details == {
+            "cwd": "C:/work/Jarvis-v2",
+            "fileChanges": [{"path": "src/feature.py"}],
+            "patch": proposal.patch,
+        }
         return "allow"
 
     adapter = CodexMcpAdapter(
@@ -809,8 +1006,11 @@ def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None
         config=_config(),
         adapter=adapter,
         inspector=_Inspector(
-            _snapshot(),
-            _snapshot(changed_paths=("src/feature.py",)),
+            _snapshot(file_digests=(("src/feature.py", SRC_BEFORE),)),
+            _snapshot(
+                changed_paths=("src/feature.py",),
+                file_digests=(("src/feature.py", SRC_AFTER),),
+            ),
         ),
         approval_verifier=_ApprovalVerifier(),
     )
@@ -827,4 +1027,92 @@ def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None
     )
 
     assert decisions == ["allow"]
+    assert result.changed_paths == ("src/feature.py",)
+
+
+def test_mcp_adapter_denies_forbidden_exec_command_before_operator_handler() -> None:
+    proposal = _proposal(
+        action_id="action-mcp-forbidden",
+        request_id="request-mcp-forbidden",
+    )
+    approval = CodexWorkspaceApproval(
+        action_id=proposal.action_id,
+        request_id=proposal.request_id,
+        proposal_digest=proposal.digest,
+    )
+    decisions = []
+    handler_calls = []
+
+    class _McpClient:
+        def call_tool(
+            self,
+            _name: str,
+            _arguments: dict,
+            *,
+            deadline: float,
+            approval_callback,
+        ) -> dict:
+            decisions.append(
+                approval_callback(
+                    CodexMcpApprovalRequest(
+                        thread_id="thread-mcp-forbidden",
+                        request_id="call-forbidden-001",
+                        action="exec_command",
+                        details={
+                            "command": "git push --force origin main",
+                            "cwd": "C:/work/Jarvis-v2",
+                        },
+                    )
+                )
+            )
+            return {
+                "structuredContent": {
+                    "threadId": "thread-mcp-forbidden",
+                    "content": json.dumps(
+                        {
+                            "status": "completed",
+                            "summary": "No workspace change was applied.",
+                            "changed_paths": ["src/feature.py"],
+                            "test_evidence": [],
+                            "unresolved_questions": [],
+                        }
+                    ),
+                }
+            }
+
+        def interrupt(self, _request_id: str) -> bool:
+            return True
+
+    adapter = CodexMcpAdapter(
+        client=_McpClient(),
+        approval_handler=lambda _envelope, _request: (
+            handler_calls.append(True) or "allow"
+        ),
+    )
+    specialist = CodexSpecialist(
+        config=_config(),
+        adapter=adapter,
+        inspector=_Inspector(
+            _snapshot(file_digests=(("src/feature.py", SRC_BEFORE),)),
+            _snapshot(
+                changed_paths=("src/feature.py",),
+                file_digests=(("src/feature.py", SRC_AFTER),),
+            ),
+        ),
+        approval_verifier=_ApprovalVerifier(),
+    )
+
+    result = specialist.invoke(
+        CodexInvocation(
+            request_id=proposal.request_id,
+            workspace="jarvis",
+            operation="workspace_prepare",
+            task=proposal.task,
+            proposal=proposal,
+            approval=approval,
+        )
+    )
+
+    assert decisions == ["deny"]
+    assert handler_calls == []
     assert result.changed_paths == ("src/feature.py",)
