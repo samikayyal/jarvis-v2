@@ -282,6 +282,132 @@ class ConversationMessage:
         return transport_session_id, message_id
 
 
+class OutboundAttemptStatus(str, Enum):
+    """Durable outcome boundary for one exact outbound message."""
+
+    UNATTEMPTED = "unattempted"
+    ATTEMPTED = "attempted"
+    CONFIRMED = "confirmed"
+    UNKNOWN = "unknown"
+    NOT_STARTED = "not_started"
+
+
+OUTBOUND_TERMINAL_TRANSITIONS: Mapping[
+    OutboundAttemptStatus, frozenset[OutboundAttemptStatus]
+] = MappingProxyType(
+    {
+        OutboundAttemptStatus.UNATTEMPTED: frozenset(
+            {OutboundAttemptStatus.NOT_STARTED}
+        ),
+        OutboundAttemptStatus.ATTEMPTED: frozenset(
+            {OutboundAttemptStatus.UNKNOWN, OutboundAttemptStatus.CONFIRMED}
+        ),
+        OutboundAttemptStatus.CONFIRMED: frozenset({OutboundAttemptStatus.CONFIRMED}),
+        OutboundAttemptStatus.UNKNOWN: frozenset({OutboundAttemptStatus.UNKNOWN}),
+        OutboundAttemptStatus.NOT_STARTED: frozenset(
+            {OutboundAttemptStatus.NOT_STARTED}
+        ),
+    }
+)
+
+
+def is_outbound_terminal_transition_allowed(
+    current: OutboundAttemptStatus | str,
+    target: OutboundAttemptStatus | str,
+) -> bool:
+    """Return whether one terminal outbound transition preserves the state machine."""
+
+    current_status = OutboundAttemptStatus(current)
+    target_status = OutboundAttemptStatus(target)
+    return target_status in OUTBOUND_TERMINAL_TRANSITIONS[current_status]
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundAttemptRecord:
+    """Private outbox state that prevents automatic duplicate delivery."""
+
+    transport_session_id: str
+    message_id: str
+    request_id: str
+    status: OutboundAttemptStatus | str
+    reserved_at: datetime
+    message: ConversationMessage | None
+    attempted_at: datetime | None = None
+    terminal_at: datetime | None = None
+    outbound_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("transport_session_id", "message_id", "request_id"):
+            _non_empty_identifier(getattr(self, name), name)
+        status = OutboundAttemptStatus(self.status)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "reserved_at", ensure_utc(self.reserved_at))
+        if self.attempted_at is not None:
+            object.__setattr__(self, "attempted_at", ensure_utc(self.attempted_at))
+        if self.terminal_at is not None:
+            object.__setattr__(self, "terminal_at", ensure_utc(self.terminal_at))
+        if self.outbound_id is not None:
+            _non_empty_identifier(self.outbound_id, "outbound_id")
+        if status in {
+            OutboundAttemptStatus.UNATTEMPTED,
+            OutboundAttemptStatus.ATTEMPTED,
+        }:
+            if self.message is None:
+                raise ValueError("open outbound attempts require the exact message")
+            if (
+                self.message.transport_session_id,
+                self.message.message_id,
+                self.message.request_id,
+            ) != (self.transport_session_id, self.message_id, self.request_id):
+                raise ValueError("outbound attempt identity does not match its message")
+            if self.terminal_at is not None:
+                raise ValueError("open outbound attempts cannot have terminal_at")
+            if self.outbound_id is not None:
+                raise ValueError("open outbound attempts cannot have outbound_id")
+        elif self.message is not None or self.terminal_at is None:
+            raise ValueError(
+                "terminal outbound attempts remove message content and require terminal_at"
+            )
+        if status is OutboundAttemptStatus.ATTEMPTED and self.attempted_at is None:
+            raise ValueError("attempted outbound records require attempted_at")
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundAttemptRecoveryProjection:
+    """Body-free raw facts used before strict outbound-state validation.
+
+    Restart recovery must be able to describe a damaged attempt/outbox pair
+    without constructing :class:`OutboundAttemptRecord`, whose invariants are
+    intentionally strict for healthy state.  The projection therefore keeps
+    only bounded identity, status, timestamp, and row-presence facts; it never
+    carries the private outbound body.
+    """
+
+    transport_session_id: str
+    message_id: str
+    attempt_present: bool
+    outbox_present: bool
+    attempt_request_id: str | None = None
+    outbox_request_id: str | None = None
+    status: str | None = None
+    reserved_at: str | None = None
+    attempted_at: str | None = None
+    terminal_at: str | None = None
+    outbound_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryDegradedMarker:
+    """Durable evidence that restart recovery requires administrative repair."""
+
+    reason: str
+    marked_at: datetime
+
+    def __post_init__(self) -> None:
+        _non_empty_identifier(self.reason, "reason")
+        object.__setattr__(self, "marked_at", ensure_utc(self.marked_at))
+
+
 def _deletion_scope_datetime(
     value: date | datetime, name: str, *, end: bool
 ) -> datetime:
@@ -1103,6 +1229,8 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "model",
         "mode",
         "operation",
+        "outbound_not_started",
+        "outbound_unknown",
         "path",
         "permission_scope",
         "permission_id",
@@ -1118,6 +1246,7 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "stack_trace",
         "state",
         "status",
+        "interrupted_requests",
         "target",
         "target_category",
         "tool_input",
@@ -1209,6 +1338,24 @@ _OUTBOUND_RESULTS = frozenset(
     }
 )
 _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
+    "service_restart": {
+        "interrupted_requests": None,
+        "outbound_not_started": None,
+        "outbound_unknown": None,
+    },
+    "restart_inconsistency": {
+        "count": None,
+        "reason": frozenset(
+            {
+                "attempt_outbox_request_mismatch",
+                "open_attempt_without_outbox",
+                "outbox_without_attempt",
+                "terminal_attempt_with_outbox",
+                "unsupported_attempt_status",
+            }
+        ),
+        "state": frozenset({"administrative_degraded"}),
+    },
     "action_outcome": {
         "channel": frozenset({"controlled"}),
         "command": None,
@@ -1304,6 +1451,20 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     },
 }
 _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str]]] = {
+    "service_restart": (
+        "working_session",
+        "working_session",
+        "control_plane",
+        frozenset({"interrupted"}),
+        frozenset({"recorded"}),
+    ),
+    "restart_inconsistency": (
+        "state_recovery",
+        "durable_state",
+        "control_plane",
+        frozenset({"degraded"}),
+        frozenset({"recorded"}),
+    ),
     "inbound_admitted": (
         "inbound_admission",
         "messaging_gateway",

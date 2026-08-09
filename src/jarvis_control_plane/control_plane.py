@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import uuid
+from collections import Counter
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -38,8 +40,12 @@ from .models import (
     OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundAttemptRecoveryProjection,
+    OutboundAttemptStatus,
+    OutboundDelivery,
     OutboundReply,
     ReceiveResult,
+    RecoveryDegradedMarker,
     RequestState,
     SignedInboundEvent,
 )
@@ -421,7 +427,25 @@ class DeterministicCapabilityBroker:
         ):
             raise TypeError("vault_write_proposal_preparer must provide propose")
         self.vault_write_proposal_preparer = vault_write_proposal_preparer
+        recovery_marker: RecoveryDegradedMarker | None = (
+            self.state.load_recovery_degraded_marker()
+        )
+        self._recovery_degraded = recovery_marker is not None
+        self._recovery_degraded_reason = (
+            recovery_marker.reason if recovery_marker is not None else None
+        )
         existing_session = self.working_sessions.load()
+        durable_requests = self.state.list_requests()
+        durable_outbound_attempts = (
+            self.state.list_outbound_conversation_attempt_recovery()
+        )
+        durable_restart_state = bool(durable_requests or durable_outbound_attempts)
+        if existing_session is not None or durable_restart_state:
+            self._reconcile_restart_state(
+                existing_session=existing_session,
+                requests=durable_requests,
+                outbound_attempts=durable_outbound_attempts,
+            )
         if existing_session is None:
             self.working_sessions.create(
                 WorkingSession.initial(
@@ -434,8 +458,9 @@ class DeterministicCapabilityBroker:
                     config=SessionConfig(operator_id=config.operator_id),
                 )
             )
-        else:
-            self._invalidate_restart_work()
+        if (
+            existing_session is not None or durable_restart_state
+        ) and not self._recovery_degraded:
             self._record_pending_session_migration()
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
@@ -446,6 +471,12 @@ class DeterministicCapabilityBroker:
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive its named lifecycle stages."""
 
+        if self._recovery_degraded:
+            return ReceiveResult(
+                status_code=503,
+                disposition="recovery_degraded",
+                reason=self._recovery_degraded_reason,
+            )
         session = self._reconcile_inactivity()
         if session.pending_action is not None and session.pending_action.is_expired(
             self.clock
@@ -804,18 +835,20 @@ class DeterministicCapabilityBroker:
         )
         self._reserve_outbound_history(reply, message=message)
         outbound_id: str | None = None
+        outbound_attempt_started = False
+
+        def mark_outbound_attempt_started() -> None:
+            nonlocal outbound_attempt_started
+            outbound_attempt_started = True
 
         def send() -> dict[str, str]:
             nonlocal outbound_id
+            self._mark_outbound_attempted(
+                reply, on_started=mark_outbound_attempt_started
+            )
             delivery = self.outbound.send(reply)
-            outbound_id = getattr(delivery, "outbound_id", None)
-            if getattr(delivery, "accepted", None) is not True or not isinstance(
-                outbound_id, str
-            ):
-                raise OutboundConnectorError(
-                    "proposal gateway outcome was unknown", may_have_sent=True
-                )
-            self._accept_outbound_history(reply)
+            outbound_id = self._accepted_outbound_id(delivery)
+            self._accept_outbound_history(reply, outbound_id=outbound_id)
             return {"outbound_id": outbound_id, "result": "accepted"}
 
         try:
@@ -831,7 +864,19 @@ class DeterministicCapabilityBroker:
                 error_limit_bytes=8_192,
             )
         except (DiagnosticTraceError, OutboundConnectorError) as exc:
-            result = "unknown" if getattr(exc, "may_have_sent", False) else "failed"
+            may_have_sent = bool(getattr(exc, "may_have_sent", False)) or (
+                isinstance(exc, TraceWriteError) and exc.operation_started
+            )
+            result = "unknown" if may_have_sent else "failed"
+            self._try_terminalize_outbound_attempt(
+                reply,
+                status=(
+                    OutboundAttemptStatus.UNKNOWN
+                    if outbound_attempt_started
+                    else OutboundAttemptStatus.NOT_STARTED
+                ),
+                outbound_id=outbound_id,
+            )
             self._best_effort_audit(
                 kind="outbound_result",
                 event_id=message.event_id,
@@ -1881,20 +1926,150 @@ class DeterministicCapabilityBroker:
         except SessionStoreError:
             pass
 
-    def _invalidate_restart_work(self) -> None:
-        """A recreated broker must never make a stale proposal executable."""
+    def _reconcile_restart_state(
+        self,
+        *,
+        existing_session: WorkingSession | None,
+        requests: tuple[RequestState, ...],
+        outbound_attempts: tuple[OutboundAttemptRecoveryProjection, ...],
+    ) -> None:
+        """Admit restart evidence before closing any durable nonterminal edge."""
 
-        for _ in range(3):
-            session = self._current_working_session()
-            transition = interrupt_for_restart(session, now=self.clock)
-            if transition.kind is TransitionKind.NOOP:
-                return
-            try:
-                self.working_sessions.compare_and_set(session, transition.state)
-                return
-            except SessionStoreError:
+        terminal_request_statuses = {
+            "blocked",
+            "cancelled",
+            "completed",
+            "failed",
+            "interrupted",
+            "not_started",
+            "unknown",
+        }
+        interrupted = sum(
+            request.status not in terminal_request_statuses for request in requests
+        )
+        open_statuses = {
+            OutboundAttemptStatus.UNATTEMPTED.value,
+            OutboundAttemptStatus.ATTEMPTED.value,
+        }
+        terminal_statuses = {
+            OutboundAttemptStatus.CONFIRMED.value,
+            OutboundAttemptStatus.UNKNOWN.value,
+            OutboundAttemptStatus.NOT_STARTED.value,
+        }
+        inconsistency_counts: Counter[str] = Counter()
+        not_started = sum(
+            record.status == OutboundAttemptStatus.UNATTEMPTED.value
+            for record in outbound_attempts
+        )
+        unknown = sum(
+            record.status == OutboundAttemptStatus.ATTEMPTED.value
+            for record in outbound_attempts
+        )
+        for record in outbound_attempts:
+            if not record.attempt_present:
+                inconsistency_counts["outbox_without_attempt"] += 1
+            elif record.status in open_statuses:
+                if not record.outbox_present:
+                    inconsistency_counts["open_attempt_without_outbox"] += 1
+                elif record.outbox_request_id != record.attempt_request_id:
+                    inconsistency_counts["attempt_outbox_request_mismatch"] += 1
+            elif record.status not in terminal_statuses:
+                inconsistency_counts["unsupported_attempt_status"] += 1
+            elif record.outbox_present:
+                inconsistency_counts["terminal_attempt_with_outbox"] += 1
+        restart_at = self.clock.now()
+        session_transition = (
+            interrupt_for_restart(existing_session, now=restart_at)
+            if existing_session is not None
+            else None
+        )
+        # The injected ID generator can intentionally restart from its first
+        # value in reconstructed test and recovery graphs. Restart evidence is
+        # process-boundary evidence, so it needs an identity independent of
+        # that request-scoped sequence.
+        restart_evidence = AuditEvidence(
+            evidence_id=f"restart-{uuid.uuid4()}",
+            kind="service_restart",
+            occurred_at=restart_at,
+            event_id=None,
+            request_id=None,
+            outcome="interrupted",
+            actor="control_plane",
+            operation_type="working_session",
+            target_category="working_session",
+            execution_status="recorded",
+            details={
+                "interrupted_requests": str(interrupted),
+                "outbound_not_started": str(not_started),
+                "outbound_unknown": str(unknown),
+            },
+        )
+        inconsistency_evidence = tuple(
+            AuditEvidence(
+                evidence_id=f"restart-inconsistency-{uuid.uuid4()}-{reason}",
+                kind="restart_inconsistency",
+                occurred_at=restart_at,
+                event_id=None,
+                request_id=None,
+                outcome="degraded",
+                actor="control_plane",
+                operation_type="state_recovery",
+                target_category="durable_state",
+                execution_status="recorded",
+                details={
+                    "count": str(count),
+                    "reason": reason,
+                    "state": "administrative_degraded",
+                },
+            )
+            for reason, count in sorted(inconsistency_counts.items())
+        )
+        # Admit the required restart evidence before closing any durable
+        # nonterminal edge. When a working session exists, use its
+        # state-plus-audit compare-and-set so the session cannot be changed
+        # without this evidence. A missing session has no state transition to
+        # atomically join, so audit admission remains the gate before session
+        # creation in the constructor.
+        if session_transition is None:
+            self.audit.append_batch((restart_evidence, *inconsistency_evidence))
+        else:
+            # A session CAS can atomically carry one audit record.  Admit any
+            # additional bounded inconsistency evidence first; no request or
+            # outbound state is changed until both evidence paths succeed.
+            if inconsistency_evidence:
+                self.audit.append_batch(inconsistency_evidence)
+        if inconsistency_counts:
+            reason = (
+                "restart found inconsistent durable outbound state; "
+                "administrative repair is required"
+            )
+            self.state.mark_recovery_degraded(
+                reason=reason,
+                marked_at=restart_at,
+            )
+            self._recovery_degraded = True
+            self._recovery_degraded_reason = reason
+        if session_transition is not None:
+            self.working_sessions.compare_and_set_with_audit(
+                existing_session,
+                session_transition.state,
+                audit=self.audit,
+                evidence=restart_evidence,
+            )
+        for request in requests:
+            if request.status in terminal_request_statuses:
                 continue
-        raise SessionStoreError("could not invalidate work during restart")
+            self.state.update_request(
+                replace(
+                    request,
+                    updated_at=restart_at,
+                    status="interrupted",
+                    phase="interrupted",
+                    outcome="interrupted",
+                    error_code="service_restart",
+                )
+            )
+        self.state.reconcile_outbound_conversation_attempts(interrupted_at=restart_at)
 
     def _admit_request(
         self,
@@ -2454,6 +2629,13 @@ class DeterministicCapabilityBroker:
             )
 
         side_effect_may_have_happened = False
+        outbound_reserved = False
+        outbound_attempt_started = False
+
+        def mark_outbound_attempt_started() -> None:
+            nonlocal outbound_attempt_started
+            outbound_attempt_started = True
+
         try:
             preflight = getattr(self.outbound, "preflight", None)
             if not callable(preflight):
@@ -2522,6 +2704,7 @@ class DeterministicCapabilityBroker:
                 )
             )
             self._reserve_outbound_history(reply, message=message)
+            outbound_reserved = True
             self._trace.execute(
                 request_id=request.request_id,
                 operation_id=f"{request.request_id}:connector:outbound",
@@ -2534,6 +2717,7 @@ class DeterministicCapabilityBroker:
                     cancellation_token,
                     outcome=result.outcome,
                     message=message,
+                    on_attempt_started=mark_outbound_attempt_started,
                 ),
                 result_limit_bytes=4_096,
                 error_limit_bytes=8_192,
@@ -2622,6 +2806,10 @@ class DeterministicCapabilityBroker:
                 details={"phase": "completed", "status": "completed"},
             )
         except _CancelledBeforeDispatch:
+            if outbound_reserved:
+                self._try_terminalize_outbound_attempt(
+                    reply, status=OutboundAttemptStatus.NOT_STARTED
+                )
             self._best_effort_audit(
                 kind="outbound_completion",
                 event_id=message.event_id,
@@ -2647,6 +2835,16 @@ class DeterministicCapabilityBroker:
                 or (isinstance(exc, OutboundConnectorError) and exc.may_have_sent)
                 or (isinstance(exc, TraceWriteError) and exc.operation_started)
             )
+            terminalization_error = None
+            if outbound_reserved:
+                terminalization_error = self._try_terminalize_outbound_attempt(
+                    reply,
+                    status=(
+                        OutboundAttemptStatus.UNKNOWN
+                        if outbound_attempt_started
+                        else OutboundAttemptStatus.NOT_STARTED
+                    ),
+                )
             outcome = (
                 "trace_unavailable"
                 if isinstance(exc, TraceCapacityError)
@@ -2724,7 +2922,12 @@ class DeterministicCapabilityBroker:
                     "state could not be persisted: "
                     f"{transition_error}"
                 )
-                if may_have_sent and isinstance(exc, StateStoreError):
+                if terminalization_error is not None:
+                    reason = (
+                        f"{reason}; outbound terminal state was not persisted: "
+                        f"{terminalization_error}"
+                    )
+                if may_have_sent:
                     reason = (
                         "outbound reply was accepted, but durable completion state "
                         f"could not be persisted: {exc}; {reason}"
@@ -2764,12 +2967,18 @@ class DeterministicCapabilityBroker:
                     ),
                     details={"result": outcome},
                 )
+            reason = str(exc) or "outbound connector failed"
+            if terminalization_error is not None:
+                reason = (
+                    f"{reason}; outbound terminal state was not persisted: "
+                    f"{terminalization_error}"
+                )
             return ReceiveResult(
                 status_code=202,
                 disposition="unknown" if may_have_sent else "failed",
                 request=failed,
                 reply=reply if may_have_sent else None,
-                reason=str(exc) or "outbound connector failed",
+                reason=reason,
             )
 
         return ReceiveResult(
@@ -2784,6 +2993,18 @@ class DeterministicCapabilityBroker:
         """Expose only the current conversation boundary to ingress admission."""
 
         return self._reconcile_inactivity().session_id
+
+    @property
+    def recovery_degraded(self) -> bool:
+        """Whether restart found state requiring manual administrative repair."""
+
+        return self._recovery_degraded
+
+    @property
+    def recovery_degraded_reason(self) -> str | None:
+        """Return only the bounded administrative recovery reason code."""
+
+        return self._recovery_degraded_reason
 
     def _current_working_session(self) -> WorkingSession:
         session = self.working_sessions.load()
@@ -3966,6 +4187,13 @@ class DeterministicCapabilityBroker:
             recipient_id=message.chat_id,
             body=body,
         )
+        outbound_reserved = False
+        outbound_attempt_started = False
+
+        def mark_outbound_attempt_started() -> None:
+            nonlocal outbound_attempt_started
+            outbound_attempt_started = True
+
         try:
             self.outbound.preflight(reply)
             self.audit.append_batch(
@@ -4012,6 +4240,7 @@ class DeterministicCapabilityBroker:
             # outbox failure is a definite no-send result, not an ambiguous
             # connector outcome.
             self._reserve_outbound_history(reply, message=message)
+            outbound_reserved = True
             self._trace.execute(
                 request_id=control_id,
                 operation_id=f"{control_id}:connector:outbound",
@@ -4019,7 +4248,11 @@ class DeterministicCapabilityBroker:
                 input_payload=reply,
                 arguments={"operation": "send", "channel": "controlled_outbound"},
                 telemetry={"phase": "control_reply"},
-                operation=lambda: self._send_and_confirm(reply, message=message),
+                operation=lambda: self._send_and_confirm(
+                    reply,
+                    message=message,
+                    on_attempt_started=mark_outbound_attempt_started,
+                ),
                 result_limit_bytes=4_096,
                 error_limit_bytes=8_192,
             )
@@ -4044,11 +4277,24 @@ class DeterministicCapabilityBroker:
             may_have_sent = (
                 isinstance(exc, OutboundConnectorError) and exc.may_have_sent
             ) or (isinstance(exc, TraceWriteError) and exc.operation_started)
+            terminalization_error = None
+            if outbound_reserved:
+                terminalization_error = self._try_terminalize_outbound_attempt(
+                    reply,
+                    status=(
+                        OutboundAttemptStatus.UNKNOWN
+                        if outbound_attempt_started
+                        else OutboundAttemptStatus.NOT_STARTED
+                    ),
+                )
+            reason = str(exc) or "control reply failed"
+            if terminalization_error is not None:
+                reason = f"{reason}; outbound terminal state was not persisted: {terminalization_error}"
             return ReceiveResult(
                 status_code=202,
                 disposition="unknown" if may_have_sent else "failed",
                 reply=reply if may_have_sent else None,
-                reason=str(exc) or "control reply failed",
+                reason=reason,
             )
         return ReceiveResult(
             status_code=202,
@@ -4096,11 +4342,17 @@ class DeterministicCapabilityBroker:
         return False
 
     def _send_and_confirm(
-        self, reply: OutboundReply, *, message: InboundMessage
+        self,
+        reply: OutboundReply,
+        *,
+        message: InboundMessage,
+        on_attempt_started: Callable[[], None] | None = None,
     ) -> dict[str, str]:
-        self.outbound.send(reply)
-        self._accept_outbound_history(reply)
-        return {"result": "accepted"}
+        self._mark_outbound_attempted(reply, on_started=on_attempt_started)
+        delivery = self.outbound.send(reply)
+        outbound_id = self._accepted_outbound_id(delivery)
+        self._accept_outbound_history(reply, outbound_id=outbound_id)
+        return {"outbound_id": outbound_id, "result": "accepted"}
 
     def _reserve_outbound_history(
         self, reply: OutboundReply, *, message: InboundMessage
@@ -4132,13 +4384,18 @@ class DeterministicCapabilityBroker:
                 "outbound reply could not be reserved before dispatch",
             ) from exc
 
-    def _accept_outbound_history(self, reply: OutboundReply) -> None:
+    def _accept_outbound_history(
+        self, reply: OutboundReply, *, outbound_id: str | None
+    ) -> None:
         """Atomically promote an accepted outbox record into accessible history."""
 
         try:
-            self.state.accept_reserved_outbound_conversation_message(
+            self.state.terminalize_outbound_conversation_attempt(
                 transport_session_id=reply.session_id,
                 message_id=reply.reply_id,
+                status=OutboundAttemptStatus.CONFIRMED,
+                terminal_at=self.clock.now(),
+                outbound_id=outbound_id,
             )
         except StateStoreError as exc:
             raise OutboundConnectorError(
@@ -4153,6 +4410,7 @@ class DeterministicCapabilityBroker:
         *,
         outcome: str,
         message: InboundMessage,
+        on_attempt_started: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Linearize cancellation against the start of outbound dispatch."""
 
@@ -4163,8 +4421,10 @@ class DeterministicCapabilityBroker:
                 raise _CancelledBeforeDispatch(
                     "request was cancelled before outbound dispatch"
                 )
-            self.outbound.send(reply)
-            self._accept_outbound_history(reply)
+            self._mark_outbound_attempted(reply, on_started=on_attempt_started)
+            delivery = self.outbound.send(reply)
+            outbound_id = self._accepted_outbound_id(delivery)
+            self._accept_outbound_history(reply, outbound_id=outbound_id)
             if not self._finish_session_request(
                 token,
                 outcome=outcome,
@@ -4174,7 +4434,65 @@ class DeterministicCapabilityBroker:
                     "outbound was accepted but session completion is uncertain",
                     may_have_sent=True,
                 )
-            return {"result": "accepted"}
+        return {"result": "accepted"}
+
+    @staticmethod
+    def _accepted_outbound_id(delivery: OutboundDelivery) -> str:
+        if not isinstance(delivery, OutboundDelivery):
+            raise OutboundConnectorError(
+                "outbound gateway returned an invalid delivery",
+                may_have_sent=True,
+            )
+        if delivery.accepted is not True:
+            raise OutboundConnectorError(
+                "outbound gateway outcome was unknown", may_have_sent=True
+            )
+        outbound_id = delivery.outbound_id
+        if not isinstance(outbound_id, str) or not outbound_id.strip():
+            raise OutboundConnectorError(
+                "outbound gateway identifier was invalid", may_have_sent=True
+            )
+        return outbound_id
+
+    def _try_terminalize_outbound_attempt(
+        self,
+        reply: OutboundReply,
+        *,
+        status: OutboundAttemptStatus,
+        outbound_id: str | None = None,
+    ) -> StateStoreError | None:
+        try:
+            self.state.terminalize_outbound_conversation_attempt(
+                transport_session_id=reply.session_id,
+                message_id=reply.reply_id,
+                status=status,
+                terminal_at=self.clock.now(),
+                outbound_id=outbound_id,
+            )
+        except StateStoreError as exc:
+            return exc
+        return None
+
+    def _mark_outbound_attempted(
+        self,
+        reply: OutboundReply,
+        *,
+        on_started: Callable[[], None] | None = None,
+    ) -> None:
+        """Persist the ambiguity boundary immediately before connector entry."""
+
+        try:
+            self.state.mark_outbound_conversation_attempted(
+                transport_session_id=reply.session_id,
+                message_id=reply.reply_id,
+                attempted_at=self.clock.now(),
+            )
+        except StateStoreError as exc:
+            raise OutboundConnectorError(
+                "outbound attempt could not be persisted before dispatch"
+            ) from exc
+        if on_started is not None:
+            on_started()
 
     def _late_result_result(
         self,
@@ -4409,6 +4727,13 @@ class SignedMessageReceiver:
                 status_code=204,
                 disposition="rejected",
                 reason=rejection,
+            )
+
+        if self.broker.recovery_degraded:
+            return ReceiveResult(
+                status_code=503,
+                disposition="recovery_degraded",
+                reason=self.broker.recovery_degraded_reason,
             )
 
         try:
