@@ -42,6 +42,7 @@ from .models import (
     OrchestrationResult,
     OutboundAttemptRecoveryProjection,
     OutboundAttemptStatus,
+    OutboundDelivery,
     OutboundReply,
     ReceiveResult,
     RequestState,
@@ -834,11 +835,6 @@ class DeterministicCapabilityBroker:
             self._mark_outbound_attempted(reply)
             delivery = self.outbound.send(reply)
             outbound_id = self._accepted_outbound_id(delivery)
-            if outbound_id is None:
-                raise OutboundConnectorError(
-                    "proposal gateway outcome did not return an ID",
-                    may_have_sent=True,
-                )
             self._accept_outbound_history(reply, outbound_id=outbound_id)
             return {"outbound_id": outbound_id, "result": "accepted"}
 
@@ -4316,10 +4312,7 @@ class DeterministicCapabilityBroker:
         delivery = self.outbound.send(reply)
         outbound_id = self._accepted_outbound_id(delivery)
         self._accept_outbound_history(reply, outbound_id=outbound_id)
-        result = {"result": "accepted"}
-        if outbound_id is not None:
-            result["outbound_id"] = outbound_id
-        return result
+        return {"outbound_id": outbound_id, "result": "accepted"}
 
     def _reserve_outbound_history(
         self, reply: OutboundReply, *, message: InboundMessage
@@ -4403,19 +4396,17 @@ class DeterministicCapabilityBroker:
         return {"result": "accepted"}
 
     @staticmethod
-    def _accepted_outbound_id(delivery: object) -> str | None:
-        # Older connector seams returned no value after a successful send. That
-        # still represents a confirmed delivery, but without a gateway
-        # correlation identifier; the durable attempt keeps that distinction.
-        if delivery is None:
-            return None
-        outbound_id = getattr(delivery, "outbound_id", None)
-        if getattr(delivery, "accepted", None) is not True:
+    def _accepted_outbound_id(delivery: OutboundDelivery) -> str:
+        if not isinstance(delivery, OutboundDelivery):
+            raise OutboundConnectorError(
+                "outbound gateway returned an invalid delivery",
+                may_have_sent=True,
+            )
+        if delivery.accepted is not True:
             raise OutboundConnectorError(
                 "outbound gateway outcome was unknown", may_have_sent=True
             )
-        if outbound_id is None:
-            return None
+        outbound_id = delivery.outbound_id
         if not isinstance(outbound_id, str) or not outbound_id.strip():
             raise OutboundConnectorError(
                 "outbound gateway identifier was invalid", may_have_sent=True

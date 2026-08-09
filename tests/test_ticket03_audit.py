@@ -27,6 +27,7 @@ from jarvis_control_plane import (
     SignedMessageReceiver,
     SQLiteAuditBoundary,
 )
+from jarvis_control_plane.models import OutboundDelivery
 
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 SECRET = b"ticket03-test-secret"
@@ -283,8 +284,11 @@ class PlainOutbound:
     def preflight(self, reply: object) -> None:
         del reply
 
-    def send(self, reply: object) -> None:
+    def send(self, reply: object) -> OutboundDelivery:
         self.sent.append(reply)
+        return OutboundDelivery(
+            outbound_id=f"plain-outbound-{len(self.sent)}", accepted=True
+        )
 
 
 def test_audit_append_failure_prevents_plain_outbound_dispatch() -> None:

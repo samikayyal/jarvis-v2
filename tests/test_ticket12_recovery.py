@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from test_support import build_receiver_components
@@ -276,6 +277,59 @@ def test_normal_outbound_confirmation_persists_gateway_message_id() -> None:
     assert attempts[0].status is OutboundAttemptStatus.CONFIRMED
     assert attempts[0].outbound_id == "openwa-message-001"
     assert attempts[0].message is None
+
+
+@pytest.mark.parametrize(
+    "message_text",
+    ["summarize the controlled result", "/status"],
+    ids=["ordinary", "control"],
+)
+@pytest.mark.parametrize(
+    "delivery",
+    [None, SimpleNamespace(accepted=True, outbound_id="duck-typed-id")],
+    ids=["missing-delivery", "invalid-delivery-object"],
+)
+def test_invalid_outbound_delivery_is_unknown_and_not_retried(
+    message_text: str,
+    delivery: object,
+) -> None:
+    components = _components(state=InMemoryDurableStateStore())
+    send_calls: list[object] = []
+
+    def send_with_invalid_delivery(reply: object) -> object:
+        components.outbound.preflight(reply)
+        send_calls.append(reply)
+        components.outbound.sent.append(reply)  # type: ignore[arg-type]
+        return delivery
+
+    components.outbound.send = send_with_invalid_delivery  # type: ignore[method-assign]
+    result = components.receiver.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id=TRANSPORT_SESSION,
+                event_id=f"event-invalid-delivery-{len(send_calls)}",
+                message_id=f"message-invalid-delivery-{len(send_calls)}",
+                sender_id=OPERATOR,
+                chat_id=OPERATOR,
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text=message_text,
+            ),
+            components.config.signing_secret,
+        )
+    )
+
+    assert result.disposition == "unknown", result.reason
+    assert len(send_calls) == 1
+    assert components.state.outbound_outbox == {}
+    assert components.state.search_conversation_messages(direction="outbound") == ()
+    attempts = components.state.list_outbound_conversation_attempts()
+    assert len(attempts) == 1
+    assert attempts[0].status is OutboundAttemptStatus.UNKNOWN
+    assert attempts[0].message is None
+    assert attempts[0].outbound_id is None
 
 
 def test_sqlite_terminal_transition_removes_payload_and_persists_gateway_id(
