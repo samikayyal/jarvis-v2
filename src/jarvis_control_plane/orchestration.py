@@ -520,18 +520,14 @@ class AgentsSdkOrchestrationAdapter:
                     on_invoke_tool=invoke_codex,
                     strict_json_schema=True,
                     needs_approval=False,
-                    timeout_seconds=self._configurable_codex_timeout(),
+                    # CodexSpecialist.invoke is the sole hard-deadline owner.
+                    # Its timeout path interrupts Codex and verifies the final
+                    # workspace snapshot before returning control.
+                    timeout_seconds=None,
                     output_json_schema=CodexToolOutput.model_json_schema(),
                 )
             )
         return tools
-
-    def _configurable_codex_timeout(self) -> float:
-        """Expose only the already-frozen specialist timeout to the SDK."""
-
-        if self._codex_specialist is None:
-            raise RuntimeError("Codex specialist is not configured")
-        return float(self._codex_specialist.timeout_seconds)
 
     def _frozen_proposal(
         self,

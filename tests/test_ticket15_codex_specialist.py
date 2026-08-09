@@ -12,6 +12,7 @@ from jarvis_control_plane.codex_specialist import (
     CodexAdapterResult,
     CodexInvocation,
     CodexMcpAdapter,
+    CodexMcpApprovalRequest,
     CodexPolicyError,
     CodexSpecialist,
     CodexSpecialistConfig,
@@ -526,6 +527,7 @@ def test_agents_orchestration_exposes_only_the_closed_read_only_codex_tool() -> 
         tool for tool in captured["tools"] if tool.name == "invoke_codex_specialist"
     )
     assert tool.needs_approval is False
+    assert tool.timeout_seconds is None
     assert tool.params_json_schema["properties"]["operation"]["enum"] == [
         "inspect",
         "review",
@@ -542,7 +544,14 @@ def test_mcp_adapter_maps_only_the_frozen_envelope_to_the_codex_tool() -> None:
             self.calls = []
             self.interrupted = []
 
-        def call_tool(self, name: str, arguments: dict, *, deadline: float) -> dict:
+        def call_tool(
+            self,
+            name: str,
+            arguments: dict,
+            *,
+            deadline: float,
+            approval_callback,
+        ) -> dict:
             self.calls.append((name, arguments, deadline))
             return {
                 "structuredContent": {
@@ -564,7 +573,10 @@ def test_mcp_adapter_maps_only_the_frozen_envelope_to_the_codex_tool() -> None:
             return True
 
     client = _McpClient()
-    adapter = CodexMcpAdapter(client=client)
+    adapter = CodexMcpAdapter(
+        client=client,
+        approval_handler=lambda _envelope, _request: "deny",
+    )
     specialist, _adapter = _specialist(
         adapter=adapter,
         after=_snapshot(test_evidence=("12 passed",)),
@@ -602,7 +614,14 @@ def test_mcp_adapter_maps_only_the_frozen_envelope_to_the_codex_tool() -> None:
 
 def test_mcp_adapter_rejects_untyped_or_extended_structured_content() -> None:
     class _McpClient:
-        def call_tool(self, _name: str, _arguments: dict, *, deadline: float) -> dict:
+        def call_tool(
+            self,
+            _name: str,
+            _arguments: dict,
+            *,
+            deadline: float,
+            approval_callback,
+        ) -> dict:
             return {
                 "structuredContent": {
                     "threadId": "thread-mcp-001",
@@ -622,7 +641,12 @@ def test_mcp_adapter_rejects_untyped_or_extended_structured_content() -> None:
         def interrupt(self, request_id: str) -> bool:
             return True
 
-    specialist, _adapter = _specialist(adapter=CodexMcpAdapter(client=_McpClient()))
+    specialist, _adapter = _specialist(
+        adapter=CodexMcpAdapter(
+            client=_McpClient(),
+            approval_handler=lambda _envelope, _request: "deny",
+        )
+    )
 
     with pytest.raises(CodexVerificationError, match="structured result"):
         specialist.invoke(
@@ -633,3 +657,174 @@ def test_mcp_adapter_rejects_untyped_or_extended_structured_content() -> None:
                 task="Inspect the repository.",
             )
         )
+
+
+def test_mcp_adapter_surfaces_approval_context_and_denies_read_only_escalation() -> (
+    None
+):
+    callback_context = []
+    decisions = []
+
+    class _McpClient:
+        def call_tool(
+            self,
+            _name: str,
+            _arguments: dict,
+            *,
+            deadline: float,
+            approval_callback,
+        ) -> dict:
+            decisions.append(
+                approval_callback(
+                    CodexMcpApprovalRequest(
+                        thread_id="thread-mcp-approval",
+                        request_id="call-001",
+                        action="exec_command",
+                        details={
+                            "command": "git status",
+                            "cwd": "C:/work/Jarvis-v2",
+                        },
+                    )
+                )
+            )
+            return {
+                "structuredContent": {
+                    "threadId": "thread-mcp-approval",
+                    "content": json.dumps(
+                        {
+                            "status": "completed",
+                            "summary": "Review complete.",
+                            "changed_paths": [],
+                            "test_evidence": [],
+                            "unresolved_questions": [],
+                        }
+                    ),
+                }
+            }
+
+        def interrupt(self, _request_id: str) -> bool:
+            return True
+
+    def approval_handler(envelope, request):
+        callback_context.append((envelope, request))
+        return "allow"
+
+    specialist, _adapter = _specialist(
+        adapter=CodexMcpAdapter(
+            client=_McpClient(),
+            approval_handler=approval_handler,
+        )
+    )
+
+    specialist.invoke(
+        CodexInvocation(
+            request_id="request-mcp-approval",
+            workspace="jarvis",
+            operation="review",
+            task="Review the current diff.",
+        )
+    )
+
+    assert decisions == ["deny"]
+    envelope, request = callback_context[0]
+    assert envelope.request_id == "request-mcp-approval"
+    assert envelope.operation == "review"
+    assert request.thread_id == "thread-mcp-approval"
+    assert request.request_id == "call-001"
+    assert request.action == "exec_command"
+    assert request.details == {
+        "command": "git status",
+        "cwd": "C:/work/Jarvis-v2",
+    }
+
+
+def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None:
+    proposal = CodexWorkspaceProposal.create(
+        action_id="action-mcp-001",
+        request_id="request-mcp-write",
+        workspace="jarvis",
+        task="Prepare the requested source change.",
+        allowed_paths=("src/",),
+    )
+    approval = CodexWorkspaceApproval(
+        action_id=proposal.action_id,
+        request_id=proposal.request_id,
+        proposal_digest=proposal.digest,
+    )
+    decisions = []
+
+    class _McpClient:
+        def call_tool(
+            self,
+            _name: str,
+            _arguments: dict,
+            *,
+            deadline: float,
+            approval_callback,
+        ) -> dict:
+            decisions.append(
+                approval_callback(
+                    CodexMcpApprovalRequest(
+                        thread_id="thread-mcp-write",
+                        request_id="call-write-001",
+                        action="apply_patch",
+                        details={"fileChanges": [{"path": "src/feature.py"}]},
+                    )
+                )
+            )
+            return {
+                "structuredContent": {
+                    "threadId": "thread-mcp-write",
+                    "content": json.dumps(
+                        {
+                            "status": "completed",
+                            "summary": "Prepared and tested the change.",
+                            "changed_paths": ["src/feature.py"],
+                            "test_evidence": [],
+                            "unresolved_questions": [],
+                        }
+                    ),
+                }
+            }
+
+        def interrupt(self, _request_id: str) -> bool:
+            return True
+
+    def approval_handler(envelope, request):
+        assert envelope.request_id == proposal.request_id
+        assert envelope.operation == "workspace_prepare"
+        assert envelope.proposal_digest == proposal.digest
+        assert envelope.allowed_paths == ("src",)
+        assert request.thread_id == "thread-mcp-write"
+        assert request.request_id == "call-write-001"
+        assert request.action == "apply_patch"
+        assert request.details == {"fileChanges": [{"path": "src/feature.py"}]}
+        return "allow"
+
+    adapter = CodexMcpAdapter(
+        client=_McpClient(),
+        approval_handler=approval_handler,
+    )
+    specialist = CodexSpecialist(
+        config=_config(),
+        adapter=adapter,
+        inspector=_Inspector(
+            _snapshot(),
+            _snapshot(changed_paths=("src/feature.py",)),
+        ),
+        approval_verifier=_ApprovalVerifier(),
+    )
+
+    result = specialist.invoke(
+        CodexInvocation(
+            request_id=proposal.request_id,
+            workspace="jarvis",
+            operation="workspace_prepare",
+            task=proposal.task,
+            proposal=proposal,
+            approval=approval,
+        )
+    )
+
+    assert decisions == ["allow"]
+    assert result.changed_paths == ("src/feature.py",)

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
@@ -22,6 +22,8 @@ CodexHost = Literal["ubuntu", "windows"]
 CodexOperation = Literal["inspect", "review", "workspace_prepare"]
 CodexSandbox = Literal["read-only", "workspace-write"]
 CodexApprovalPolicy = Literal["on-request"]
+CodexApprovalDecision = Literal["allow", "deny"]
+CodexMcpApprovalAction = Literal["apply_patch", "exec_command"]
 CodexStatus = Literal["completed", "incomplete", "failed"]
 
 _READ_ONLY_OPERATIONS = frozenset({"inspect", "review"})
@@ -305,6 +307,38 @@ class CodexExecutionEnvelope:
 
 
 @dataclass(frozen=True, slots=True)
+class CodexMcpApprovalRequest:
+    """One server-to-client Codex approval request.
+
+    The managed MCP client translates the protocol's conversation/thread ID,
+    request/call ID, and action-specific payload into this typed value before
+    invoking Jarvis's approval callback.  ``details`` retains the exact
+    command or file-change context needed for the callback to compare the
+    request with the frozen Jarvis envelope and approval.
+    """
+
+    thread_id: str
+    request_id: str
+    action: CodexMcpApprovalAction
+    details: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        _canonical_text(self.thread_id, "Codex approval thread_id", max_chars=256)
+        _canonical_text(self.request_id, "Codex approval request_id", max_chars=256)
+        if self.action not in {"apply_patch", "exec_command"}:
+            raise ValueError("Codex approval action is not canonical")
+        if not isinstance(self.details, Mapping):
+            raise TypeError("Codex approval details must be a mapping")
+        object.__setattr__(self, "details", dict(self.details))
+
+
+CodexMcpApprovalCallback = Callable[[CodexMcpApprovalRequest], CodexApprovalDecision]
+CodexMcpApprovalHandler = Callable[
+    [CodexExecutionEnvelope, CodexMcpApprovalRequest], CodexApprovalDecision
+]
+
+
+@dataclass(frozen=True, slots=True)
 class CodexAdapterResult:
     """Bounded claims returned by a replaceable Codex adapter."""
 
@@ -407,7 +441,12 @@ class CodexApprovalVerifier(Protocol):
 
 
 class CodexMcpClient(Protocol):
-    """Minimal managed-client surface for the official Codex MCP server."""
+    """Managed-client surface for the official Codex MCP server.
+
+    A concrete client must dispatch every server-initiated approval request to
+    ``approval_callback`` and send its returned decision back over JSON-RPC.
+    It must not hide, auto-allow, or silently drop an approval request.
+    """
 
     def call_tool(
         self,
@@ -415,6 +454,7 @@ class CodexMcpClient(Protocol):
         arguments: Mapping[str, object],
         *,
         deadline: float,
+        approval_callback: CodexMcpApprovalCallback,
     ) -> Mapping[str, object]: ...
 
     def interrupt(self, request_id: str) -> bool: ...
@@ -423,8 +463,16 @@ class CodexMcpClient(Protocol):
 class CodexMcpAdapter:
     """Map a frozen envelope to the official ``codex`` MCP tool."""
 
-    def __init__(self, *, client: CodexMcpClient) -> None:
+    def __init__(
+        self,
+        *,
+        client: CodexMcpClient,
+        approval_handler: CodexMcpApprovalHandler,
+    ) -> None:
         self._client = client
+        if not callable(approval_handler):
+            raise TypeError("Codex MCP approval_handler must be callable")
+        self._approval_handler = approval_handler
 
     def invoke(
         self, envelope: CodexExecutionEnvelope, *, deadline: float
@@ -440,11 +488,34 @@ class CodexMcpAdapter:
             "config": {"model_reasoning_effort": envelope.reasoning},
             "developer-instructions": self._developer_instructions(envelope),
         }
-        raw_result = self._client.call_tool("codex", arguments, deadline=deadline)
+        raw_result = self._client.call_tool(
+            "codex",
+            arguments,
+            deadline=deadline,
+            approval_callback=lambda request: self._handle_approval(envelope, request),
+        )
         return self._parse_result(raw_result)
 
     def interrupt(self, request_id: str) -> bool:
         return self._client.interrupt(request_id)
+
+    def _handle_approval(
+        self,
+        envelope: CodexExecutionEnvelope,
+        request: CodexMcpApprovalRequest,
+    ) -> CodexApprovalDecision:
+        if not isinstance(request, CodexMcpApprovalRequest):
+            raise CodexVerificationError(
+                "Codex MCP approval callback received an untyped request"
+            )
+        decision = self._approval_handler(envelope, request)
+        if decision not in {"allow", "deny"}:
+            raise CodexVerificationError(
+                "Codex MCP approval callback returned an invalid decision"
+            )
+        if envelope.operation in _READ_ONLY_OPERATIONS:
+            return "deny"
+        return decision
 
     @staticmethod
     def _developer_instructions(envelope: CodexExecutionEnvelope) -> str:
@@ -531,7 +602,7 @@ class CodexSpecialist:
 
     @property
     def timeout_seconds(self) -> float:
-        """The immutable deadline exposed to the orchestration tool wrapper."""
+        """The specialist-owned hard deadline for one Codex turn."""
 
         return float(self._config.timeout_seconds)
 
