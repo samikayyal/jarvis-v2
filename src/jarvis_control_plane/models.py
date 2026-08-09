@@ -292,6 +292,36 @@ class OutboundAttemptStatus(str, Enum):
     NOT_STARTED = "not_started"
 
 
+OUTBOUND_TERMINAL_TRANSITIONS: Mapping[
+    OutboundAttemptStatus, frozenset[OutboundAttemptStatus]
+] = MappingProxyType(
+    {
+        OutboundAttemptStatus.UNATTEMPTED: frozenset(
+            {OutboundAttemptStatus.NOT_STARTED}
+        ),
+        OutboundAttemptStatus.ATTEMPTED: frozenset(
+            {OutboundAttemptStatus.UNKNOWN, OutboundAttemptStatus.CONFIRMED}
+        ),
+        OutboundAttemptStatus.CONFIRMED: frozenset({OutboundAttemptStatus.CONFIRMED}),
+        OutboundAttemptStatus.UNKNOWN: frozenset({OutboundAttemptStatus.UNKNOWN}),
+        OutboundAttemptStatus.NOT_STARTED: frozenset(
+            {OutboundAttemptStatus.NOT_STARTED}
+        ),
+    }
+)
+
+
+def is_outbound_terminal_transition_allowed(
+    current: OutboundAttemptStatus | str,
+    target: OutboundAttemptStatus | str,
+) -> bool:
+    """Return whether one terminal outbound transition preserves the state machine."""
+
+    current_status = OutboundAttemptStatus(current)
+    target_status = OutboundAttemptStatus(target)
+    return target_status in OUTBOUND_TERMINAL_TRANSITIONS[current_status]
+
+
 @dataclass(frozen=True, slots=True)
 class OutboundAttemptRecord:
     """Private outbox state that prevents automatic duplicate delivery."""
@@ -364,6 +394,18 @@ class OutboundAttemptRecoveryProjection:
     attempted_at: str | None = None
     terminal_at: str | None = None
     outbound_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryDegradedMarker:
+    """Durable evidence that restart recovery requires administrative repair."""
+
+    reason: str
+    marked_at: datetime
+
+    def __post_init__(self) -> None:
+        _non_empty_identifier(self.reason, "reason")
+        object.__setattr__(self, "marked_at", ensure_utc(self.marked_at))
 
 
 def _deletion_scope_datetime(

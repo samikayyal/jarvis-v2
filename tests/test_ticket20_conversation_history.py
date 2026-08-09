@@ -458,7 +458,7 @@ def test_failed_outbound_attempt_is_terminal_and_not_searchable() -> None:
     assert state.outbound_outbox == {}
     attempts = state.list_outbound_conversation_attempts()
     assert len(attempts) == 1
-    assert attempts[0].status is OutboundAttemptStatus.NOT_STARTED
+    assert attempts[0].status is OutboundAttemptStatus.UNKNOWN
     assert attempts[0].message is None
     assert attempts[0].terminal_at is not None
 

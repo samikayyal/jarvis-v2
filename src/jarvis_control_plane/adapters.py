@@ -43,9 +43,11 @@ from .models import (
     OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
+    RecoveryDegradedMarker,
     RequestState,
     _conversation_message_digest,
     ensure_utc,
+    is_outbound_terminal_transition_allowed,
 )
 from .ports import (
     ActionCancellationResult,
@@ -283,12 +285,29 @@ class InMemoryDurableStateStore:
         self.memories: dict[str, DurableMemory] = {}
         self.requests: dict[str, RequestState] = {}
         self._knowledge_vault_synchronized_at: datetime | None = None
+        self._recovery_degraded_marker: RecoveryDegradedMarker | None = None
         self.fail_claim = False
         self.fail_conversation = False
         self.fail_memory = False
         self.fail_save = False
         self.fail_update = False
         self._lock = threading.RLock()
+
+    def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None:
+        with self._lock:
+            return self._recovery_degraded_marker
+
+    def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None:
+        marker = RecoveryDegradedMarker(reason=reason, marked_at=marked_at)
+        with self._lock:
+            if self._recovery_degraded_marker is None:
+                self._recovery_degraded_marker = marker
+
+    def acknowledge_recovery_degraded(self) -> None:
+        """Clear the marker only when called by an explicit admin flow."""
+
+        with self._lock:
+            self._recovery_degraded_marker = None
 
     def admit_ingress(
         self,
@@ -518,15 +537,12 @@ class InMemoryDurableStateStore:
             record = self.outbound_attempts.get(key)
             if record is None:
                 raise StateStoreError("outbound attempt does not exist")
+            if not is_outbound_terminal_transition_allowed(record.status, status):
+                raise StateStoreError("outbound terminal transition is not allowed")
             if record.status not in {
                 OutboundAttemptStatus.UNATTEMPTED,
                 OutboundAttemptStatus.ATTEMPTED,
             }:
-                if record.status is OutboundAttemptStatus.CONFIRMED and status in {
-                    OutboundAttemptStatus.UNKNOWN,
-                    OutboundAttemptStatus.NOT_STARTED,
-                }:
-                    return
                 if record.status is status and (
                     outbound_id is None or outbound_id == record.outbound_id
                 ):
@@ -1141,6 +1157,11 @@ class SQLiteDurableStateStore:
                     slot INTEGER PRIMARY KEY CHECK (slot = 1),
                     synchronized_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS recovery_degraded_marker (
+                    marker_id INTEGER PRIMARY KEY CHECK (marker_id = 1),
+                    reason TEXT NOT NULL,
+                    marked_at TEXT NOT NULL
+                );
                 """
             )
             request_columns = {
@@ -1265,6 +1286,63 @@ class SQLiteDurableStateStore:
             raise StateStoreError(
                 "SQLite outbound state requires the manual Ticket 12 migration"
             )
+
+    def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None:
+        try:
+            row = self.connection.execute(
+                """
+                SELECT reason, marked_at
+                FROM recovery_degraded_marker
+                WHERE marker_id = 1
+                """
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StateStoreError(
+                "could not load the recovery-degraded marker"
+            ) from exc
+        if row is None:
+            return None
+        try:
+            return RecoveryDegradedMarker(
+                reason=row["reason"],
+                marked_at=datetime.fromisoformat(row["marked_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StateStoreError("stored recovery-degraded marker is invalid") from exc
+
+    def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None:
+        marker = RecoveryDegradedMarker(reason=reason, marked_at=marked_at)
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                INSERT INTO recovery_degraded_marker(marker_id, reason, marked_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(marker_id) DO NOTHING
+                """,
+                (marker.reason, marker.marked_at.isoformat()),
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "could not persist the recovery-degraded marker"
+            ) from exc
+
+    def acknowledge_recovery_degraded(self) -> None:
+        """Clear the marker only when called by an explicit admin flow."""
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                "DELETE FROM recovery_degraded_marker WHERE marker_id = 1"
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError(
+                "could not acknowledge the recovery-degraded marker"
+            ) from exc
 
     def admit_ingress(
         self,
@@ -1864,16 +1942,12 @@ class SQLiteDurableStateStore:
             if attempt is None:
                 raise StateStoreError("outbound attempt does not exist")
             current_status = OutboundAttemptStatus(attempt["status"])
+            if not is_outbound_terminal_transition_allowed(current_status, status):
+                raise StateStoreError("outbound terminal transition is not allowed")
             if current_status not in {
                 OutboundAttemptStatus.UNATTEMPTED,
                 OutboundAttemptStatus.ATTEMPTED,
             }:
-                if current_status is OutboundAttemptStatus.CONFIRMED and status in {
-                    OutboundAttemptStatus.UNKNOWN,
-                    OutboundAttemptStatus.NOT_STARTED,
-                }:
-                    self.connection.rollback()
-                    return
                 if current_status is status and (
                     outbound_id is None or outbound_id == attempt["outbound_id"]
                 ):

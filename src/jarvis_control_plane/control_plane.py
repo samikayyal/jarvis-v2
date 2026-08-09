@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -45,6 +45,7 @@ from .models import (
     OutboundDelivery,
     OutboundReply,
     ReceiveResult,
+    RecoveryDegradedMarker,
     RequestState,
     SignedInboundEvent,
 )
@@ -426,8 +427,13 @@ class DeterministicCapabilityBroker:
         ):
             raise TypeError("vault_write_proposal_preparer must provide propose")
         self.vault_write_proposal_preparer = vault_write_proposal_preparer
-        self._recovery_degraded = False
-        self._recovery_degraded_reason: str | None = None
+        recovery_marker: RecoveryDegradedMarker | None = (
+            self.state.load_recovery_degraded_marker()
+        )
+        self._recovery_degraded = recovery_marker is not None
+        self._recovery_degraded_reason = (
+            recovery_marker.reason if recovery_marker is not None else None
+        )
         existing_session = self.working_sessions.load()
         durable_requests = self.state.list_requests()
         durable_outbound_attempts = (
@@ -829,10 +835,17 @@ class DeterministicCapabilityBroker:
         )
         self._reserve_outbound_history(reply, message=message)
         outbound_id: str | None = None
+        outbound_attempt_started = False
+
+        def mark_outbound_attempt_started() -> None:
+            nonlocal outbound_attempt_started
+            outbound_attempt_started = True
 
         def send() -> dict[str, str]:
             nonlocal outbound_id
-            self._mark_outbound_attempted(reply)
+            self._mark_outbound_attempted(
+                reply, on_started=mark_outbound_attempt_started
+            )
             delivery = self.outbound.send(reply)
             outbound_id = self._accepted_outbound_id(delivery)
             self._accept_outbound_history(reply, outbound_id=outbound_id)
@@ -859,7 +872,7 @@ class DeterministicCapabilityBroker:
                 reply,
                 status=(
                     OutboundAttemptStatus.UNKNOWN
-                    if may_have_sent
+                    if outbound_attempt_started
                     else OutboundAttemptStatus.NOT_STARTED
                 ),
                 outbound_id=outbound_id,
@@ -2025,6 +2038,18 @@ class DeterministicCapabilityBroker:
             # outbound state is changed until both evidence paths succeed.
             if inconsistency_evidence:
                 self.audit.append_batch(inconsistency_evidence)
+        if inconsistency_counts:
+            reason = (
+                "restart found inconsistent durable outbound state; "
+                "administrative repair is required"
+            )
+            self.state.mark_recovery_degraded(
+                reason=reason,
+                marked_at=restart_at,
+            )
+            self._recovery_degraded = True
+            self._recovery_degraded_reason = reason
+        if session_transition is not None:
             self.working_sessions.compare_and_set_with_audit(
                 existing_session,
                 session_transition.state,
@@ -2045,12 +2070,6 @@ class DeterministicCapabilityBroker:
                 )
             )
         self.state.reconcile_outbound_conversation_attempts(interrupted_at=restart_at)
-        if inconsistency_counts:
-            self._recovery_degraded = True
-            self._recovery_degraded_reason = (
-                "restart found inconsistent durable outbound state; "
-                "administrative repair is required"
-            )
 
     def _admit_request(
         self,
@@ -2611,6 +2630,12 @@ class DeterministicCapabilityBroker:
 
         side_effect_may_have_happened = False
         outbound_reserved = False
+        outbound_attempt_started = False
+
+        def mark_outbound_attempt_started() -> None:
+            nonlocal outbound_attempt_started
+            outbound_attempt_started = True
+
         try:
             preflight = getattr(self.outbound, "preflight", None)
             if not callable(preflight):
@@ -2692,6 +2717,7 @@ class DeterministicCapabilityBroker:
                     cancellation_token,
                     outcome=result.outcome,
                     message=message,
+                    on_attempt_started=mark_outbound_attempt_started,
                 ),
                 result_limit_bytes=4_096,
                 error_limit_bytes=8_192,
@@ -2815,7 +2841,7 @@ class DeterministicCapabilityBroker:
                     reply,
                     status=(
                         OutboundAttemptStatus.UNKNOWN
-                        if may_have_sent
+                        if outbound_attempt_started
                         else OutboundAttemptStatus.NOT_STARTED
                     ),
                 )
@@ -4162,6 +4188,12 @@ class DeterministicCapabilityBroker:
             body=body,
         )
         outbound_reserved = False
+        outbound_attempt_started = False
+
+        def mark_outbound_attempt_started() -> None:
+            nonlocal outbound_attempt_started
+            outbound_attempt_started = True
+
         try:
             self.outbound.preflight(reply)
             self.audit.append_batch(
@@ -4216,7 +4248,11 @@ class DeterministicCapabilityBroker:
                 input_payload=reply,
                 arguments={"operation": "send", "channel": "controlled_outbound"},
                 telemetry={"phase": "control_reply"},
-                operation=lambda: self._send_and_confirm(reply, message=message),
+                operation=lambda: self._send_and_confirm(
+                    reply,
+                    message=message,
+                    on_attempt_started=mark_outbound_attempt_started,
+                ),
                 result_limit_bytes=4_096,
                 error_limit_bytes=8_192,
             )
@@ -4247,7 +4283,7 @@ class DeterministicCapabilityBroker:
                     reply,
                     status=(
                         OutboundAttemptStatus.UNKNOWN
-                        if may_have_sent
+                        if outbound_attempt_started
                         else OutboundAttemptStatus.NOT_STARTED
                     ),
                 )
@@ -4306,9 +4342,13 @@ class DeterministicCapabilityBroker:
         return False
 
     def _send_and_confirm(
-        self, reply: OutboundReply, *, message: InboundMessage
+        self,
+        reply: OutboundReply,
+        *,
+        message: InboundMessage,
+        on_attempt_started: Callable[[], None] | None = None,
     ) -> dict[str, str]:
-        self._mark_outbound_attempted(reply)
+        self._mark_outbound_attempted(reply, on_started=on_attempt_started)
         delivery = self.outbound.send(reply)
         outbound_id = self._accepted_outbound_id(delivery)
         self._accept_outbound_history(reply, outbound_id=outbound_id)
@@ -4370,6 +4410,7 @@ class DeterministicCapabilityBroker:
         *,
         outcome: str,
         message: InboundMessage,
+        on_attempt_started: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         """Linearize cancellation against the start of outbound dispatch."""
 
@@ -4380,7 +4421,7 @@ class DeterministicCapabilityBroker:
                 raise _CancelledBeforeDispatch(
                     "request was cancelled before outbound dispatch"
                 )
-            self._mark_outbound_attempted(reply)
+            self._mark_outbound_attempted(reply, on_started=on_attempt_started)
             delivery = self.outbound.send(reply)
             outbound_id = self._accepted_outbound_id(delivery)
             self._accept_outbound_history(reply, outbound_id=outbound_id)
@@ -4432,7 +4473,12 @@ class DeterministicCapabilityBroker:
             return exc
         return None
 
-    def _mark_outbound_attempted(self, reply: OutboundReply) -> None:
+    def _mark_outbound_attempted(
+        self,
+        reply: OutboundReply,
+        *,
+        on_started: Callable[[], None] | None = None,
+    ) -> None:
         """Persist the ambiguity boundary immediately before connector entry."""
 
         try:
@@ -4445,6 +4491,8 @@ class DeterministicCapabilityBroker:
             raise OutboundConnectorError(
                 "outbound attempt could not be persisted before dispatch"
             ) from exc
+        if on_started is not None:
+            on_started()
 
     def _late_result_result(
         self,

@@ -33,6 +33,7 @@ from .models import (
     OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
+    RecoveryDegradedMarker,
     RequestState,
 )
 
@@ -261,6 +262,12 @@ class DurableStateStore(Protocol):
     def list_outbound_conversation_attempt_recovery(
         self,
     ) -> tuple[OutboundAttemptRecoveryProjection, ...]: ...
+
+    def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None: ...
+
+    def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None: ...
+
+    def acknowledge_recovery_degraded(self) -> None: ...
 
     def reconcile_outbound_conversation_attempts(
         self, *, interrupted_at: datetime

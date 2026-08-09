@@ -200,7 +200,7 @@ def test_restart_audit_failure_does_not_create_missing_working_session() -> None
 @pytest.mark.parametrize(
     ("may_have_sent", "expected_status", "expected_disposition"),
     [
-        (False, OutboundAttemptStatus.NOT_STARTED, "failed"),
+        (False, OutboundAttemptStatus.UNKNOWN, "failed"),
         (True, OutboundAttemptStatus.UNKNOWN, "unknown"),
     ],
 )
@@ -611,6 +611,62 @@ def test_sqlite_restart_missing_open_outbox_is_audited_and_degraded(tmp_path) ->
     state.close()
 
 
+def test_sqlite_recovery_degraded_marker_survives_two_restarts_until_ack(
+    tmp_path,
+) -> None:
+    database, message = _sqlite_reserved_message(
+        tmp_path, "persistent-recovery-degraded"
+    )
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "DELETE FROM outbound_conversation_outbox WHERE message_id = ?",
+        (message.message_id,),
+    )
+    connection.commit()
+    connection.close()
+
+    first_state = SQLiteDurableStateStore(database)
+    first = _components(state=first_state)
+    first_marker = first_state.load_recovery_degraded_marker()
+    assert first.broker.recovery_degraded is True
+    assert first_marker is not None
+    first_state.close()
+
+    second_state = SQLiteDurableStateStore(database)
+    second = _components(state=second_state)
+    assert second.broker.recovery_degraded is True
+    assert second.broker.recovery_degraded_reason == first_marker.reason
+    result = second.receiver.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id=TRANSPORT_SESSION,
+                event_id="event-persistent-recovery-degraded",
+                message_id="message-persistent-recovery-degraded",
+                sender_id=OPERATOR,
+                chat_id=OPERATOR,
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text="do not start work while the marker remains",
+            ),
+            second.config.signing_secret,
+        )
+    )
+    assert result.status_code == 503
+    assert result.disposition == "recovery_degraded"
+    assert second_state.load_recovery_degraded_marker() is not None
+
+    second_state.acknowledge_recovery_degraded()
+    assert second_state.load_recovery_degraded_marker() is None
+    second_state.close()
+
+    third_state = SQLiteDurableStateStore(database)
+    third = _components(state=third_state)
+    assert third.broker.recovery_degraded is False
+    third_state.close()
+
+
 def test_sqlite_restart_orphan_outbox_is_removed_and_degraded(tmp_path) -> None:
     database, message = _sqlite_reserved_message(tmp_path, "orphan-outbox")
     connection = sqlite3.connect(database)
@@ -794,6 +850,67 @@ def test_outbound_attempt_store_contract_rejects_illegal_transitions(
                         status=OutboundAttemptStatus.CONFIRMED,
                         terminal_at=NOW + timedelta(seconds=2),
                     )
+    finally:
+        _close_contract_store(state)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    ("source_status", "target_status"),
+    [
+        (OutboundAttemptStatus.UNATTEMPTED, OutboundAttemptStatus.UNKNOWN),
+        (OutboundAttemptStatus.ATTEMPTED, OutboundAttemptStatus.NOT_STARTED),
+        (OutboundAttemptStatus.CONFIRMED, OutboundAttemptStatus.UNKNOWN),
+        (OutboundAttemptStatus.UNKNOWN, OutboundAttemptStatus.NOT_STARTED),
+        (OutboundAttemptStatus.NOT_STARTED, OutboundAttemptStatus.UNKNOWN),
+    ],
+)
+def test_outbound_attempt_store_rejects_forbidden_terminal_transitions(
+    store_kind: str,
+    source_status: OutboundAttemptStatus,
+    target_status: OutboundAttemptStatus,
+    tmp_path,
+) -> None:
+    state = _contract_store(store_kind, tmp_path)
+    message = _outbound_message(
+        message_id=f"matrix-{store_kind}-{source_status.value}-{target_status.value}"
+    )
+    try:
+        state.reserve_outbound_conversation_message(message)
+        if source_status in {
+            OutboundAttemptStatus.ATTEMPTED,
+            OutboundAttemptStatus.CONFIRMED,
+            OutboundAttemptStatus.UNKNOWN,
+        }:
+            state.mark_outbound_conversation_attempted(
+                transport_session_id=message.transport_session_id,
+                message_id=message.message_id,
+                attempted_at=NOW + timedelta(seconds=1),
+            )
+        if (
+            source_status
+            in {
+                OutboundAttemptStatus.CONFIRMED,
+                OutboundAttemptStatus.UNKNOWN,
+            }
+            or source_status is OutboundAttemptStatus.NOT_STARTED
+        ):
+            state.terminalize_outbound_conversation_attempt(
+                transport_session_id=message.transport_session_id,
+                message_id=message.message_id,
+                status=source_status,
+                terminal_at=NOW + timedelta(seconds=2),
+            )
+
+        with pytest.raises(StateStoreError, match="terminal transition"):
+            state.terminalize_outbound_conversation_attempt(
+                transport_session_id=message.transport_session_id,
+                message_id=message.message_id,
+                status=target_status,
+                terminal_at=NOW + timedelta(seconds=3),
+            )
+
+        assert state.list_outbound_conversation_attempts()[0].status is source_status
     finally:
         _close_contract_store(state)
 
