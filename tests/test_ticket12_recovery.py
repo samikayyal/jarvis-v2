@@ -18,6 +18,8 @@ from jarvis_control_plane import (
     RequestState,
     SignedInboundEvent,
     SQLiteDurableStateStore,
+    StateStoreError,
+    migrate_sqlite_outbound_conversation_attempts,
 )
 from jarvis_control_plane.models import OutboundDelivery
 from jarvis_control_plane.ports import OutboundConnectorError
@@ -405,7 +407,9 @@ def test_signed_request_records_gateway_confirmation_before_completion() -> None
     assert attempts[0].message is None
 
 
-def test_pre_ticket12_sqlite_outbox_is_migrated_unknown_without_delivery(
+@pytest.mark.parametrize("legacy_attempt_schema", [False, True])
+def test_pre_ticket12_sqlite_outbox_requires_manual_migration_without_mutation(
+    legacy_attempt_schema: bool,
     tmp_path,
 ) -> None:
     database = tmp_path / "legacy-ticket20-state.sqlite3"
@@ -427,6 +431,23 @@ def test_pre_ticket12_sqlite_outbox_is_migrated_unknown_without_delivery(
         );
         """
     )
+    if legacy_attempt_schema:
+        connection.executescript(
+            """
+            CREATE TABLE outbound_attempt_record (
+                transport_session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('unattempted', 'attempted', 'confirmed', 'unknown', 'not_started')
+                ),
+                reserved_at TEXT NOT NULL,
+                attempted_at TEXT,
+                terminal_at TEXT,
+                PRIMARY KEY (transport_session_id, message_id)
+            );
+            """
+        )
     connection.execute(
         """
         INSERT INTO outbound_conversation_outbox(
@@ -450,6 +471,39 @@ def test_pre_ticket12_sqlite_outbox_is_migrated_unknown_without_delivery(
     connection.commit()
     connection.close()
 
+    with pytest.raises(StateStoreError, match="manual Ticket 12 migration"):
+        SQLiteDurableStateStore(database)
+
+    unchanged = sqlite3.connect(database)
+    attempt_table = unchanged.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'outbound_attempt_record'
+        """
+    ).fetchone()
+    if legacy_attempt_schema:
+        assert attempt_table is not None
+        assert "outbound_id" not in {
+            row[1]
+            for row in unchanged.execute(
+                "PRAGMA table_info(outbound_attempt_record)"
+            ).fetchall()
+        }
+    else:
+        assert attempt_table is None
+    assert (
+        unchanged.execute(
+            "SELECT text FROM outbound_conversation_outbox WHERE message_id = ?",
+            ("legacy-reply",),
+        ).fetchone()[0]
+        == "legacy private outbound body"
+    )
+    unchanged.close()
+
+    assert migrate_sqlite_outbound_conversation_attempts(database, applied_at=NOW) == 1
+    assert migrate_sqlite_outbound_conversation_attempts(database, applied_at=NOW) == 1
+
     state = SQLiteDurableStateStore(database)
     restarted = _components(state=state)
 
@@ -459,6 +513,235 @@ def test_pre_ticket12_sqlite_outbox_is_migrated_unknown_without_delivery(
     assert attempts[0].message is None
     assert restarted.outbound.sent == []
     state.close()
+
+
+def test_sqlite_restart_missing_open_outbox_is_audited_and_degraded(tmp_path) -> None:
+    database, message = _sqlite_reserved_message(tmp_path, "missing-open-outbox")
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "DELETE FROM outbound_conversation_outbox WHERE message_id = ?",
+        (message.message_id,),
+    )
+    connection.commit()
+    connection.close()
+
+    state = SQLiteDurableStateStore(database)
+    restarted = _components(state=state)
+
+    attempt = state.list_outbound_conversation_attempts()[0]
+    assert attempt.status is OutboundAttemptStatus.NOT_STARTED
+    assert attempt.message is None
+    assert restarted.broker.recovery_degraded is True
+    assert restarted.broker.recovery_degraded_reason is not None
+    assert _restart_inconsistency_reasons(restarted) == {"open_attempt_without_outbox"}
+    result = restarted.receiver.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id=TRANSPORT_SESSION,
+                event_id="event-recovery-degraded",
+                message_id="message-recovery-degraded",
+                sender_id=OPERATOR,
+                chat_id=OPERATOR,
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text="do not start work while degraded",
+            ),
+            restarted.config.signing_secret,
+        )
+    )
+    assert result.status_code == 503
+    assert result.disposition == "recovery_degraded"
+    assert state.list_requests() == ()
+    state.close()
+
+
+def test_sqlite_restart_orphan_outbox_is_removed_and_degraded(tmp_path) -> None:
+    database, message = _sqlite_reserved_message(tmp_path, "orphan-outbox")
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "DELETE FROM outbound_attempt_record WHERE message_id = ?",
+        (message.message_id,),
+    )
+    connection.commit()
+    connection.close()
+
+    state = SQLiteDurableStateStore(database)
+    restarted = _components(state=state)
+
+    assert state.list_outbound_conversation_attempts() == ()
+    assert restarted.broker.recovery_degraded is True
+    assert _restart_inconsistency_reasons(restarted) == {"outbox_without_attempt"}
+    state.close()
+
+
+def test_sqlite_restart_terminal_attempt_with_payload_is_removed_and_degraded(
+    tmp_path,
+) -> None:
+    database = tmp_path / "terminal-outbox.sqlite3"
+    state = SQLiteDurableStateStore(database)
+    message = _outbound_message(message_id="terminal-with-payload")
+    state.reserve_outbound_conversation_message(message)
+    state.mark_outbound_conversation_attempted(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        attempted_at=NOW + timedelta(seconds=1),
+    )
+    state.terminalize_outbound_conversation_attempt(
+        transport_session_id=message.transport_session_id,
+        message_id=message.message_id,
+        status=OutboundAttemptStatus.CONFIRMED,
+        terminal_at=NOW + timedelta(seconds=2),
+        outbound_id="gateway-terminal-with-payload",
+    )
+    state.close()
+
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        INSERT INTO outbound_conversation_outbox(
+            transport_session_id, message_id, working_session_id, event_id,
+            chat_id, sender_id, text, occurred_at, request_id, credential_like
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message.transport_session_id,
+            message.message_id,
+            message.working_session_id,
+            message.event_id,
+            message.chat_id,
+            message.sender_id,
+            message.text,
+            message.occurred_at.isoformat(),
+            message.request_id,
+            int(message.credential_like),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = SQLiteDurableStateStore(database)
+    restarted = _components(state=reopened)
+
+    attempt = reopened.list_outbound_conversation_attempts()[0]
+    assert attempt.status is OutboundAttemptStatus.CONFIRMED
+    assert attempt.message is None
+    assert restarted.broker.recovery_degraded is True
+    assert _restart_inconsistency_reasons(restarted) == {"terminal_attempt_with_outbox"}
+    reopened.close()
+
+
+def test_sqlite_restart_mismatched_attempt_outbox_request_is_degraded(tmp_path) -> None:
+    database, message = _sqlite_reserved_message(tmp_path, "mismatched-request")
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        UPDATE outbound_conversation_outbox
+        SET request_id = ?
+        WHERE transport_session_id = ? AND message_id = ?
+        """,
+        ("different-request", message.transport_session_id, message.message_id),
+    )
+    connection.commit()
+    connection.close()
+
+    state = SQLiteDurableStateStore(database)
+    restarted = _components(state=state)
+
+    attempt = state.list_outbound_conversation_attempts()[0]
+    assert attempt.status is OutboundAttemptStatus.NOT_STARTED
+    assert attempt.message is None
+    assert restarted.broker.recovery_degraded is True
+    assert _restart_inconsistency_reasons(restarted) == {
+        "attempt_outbox_request_mismatch"
+    }
+    state.close()
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_outbound_attempt_identity_cannot_be_reserved_after_terminalization(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    state = _contract_store(store_kind, tmp_path)
+    message = _outbound_message(message_id=f"reuse-{store_kind}")
+    try:
+        state.reserve_outbound_conversation_message(message)
+        state.terminalize_outbound_conversation_attempt(
+            transport_session_id=message.transport_session_id,
+            message_id=message.message_id,
+            status=OutboundAttemptStatus.NOT_STARTED,
+            terminal_at=NOW + timedelta(seconds=1),
+        )
+
+        with pytest.raises(StateStoreError, match="identifier already exists"):
+            state.reserve_outbound_conversation_message(message)
+        assert len(state.list_outbound_conversation_attempts()) == 1
+    finally:
+        _close_contract_store(state)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "illegal_transition",
+    [
+        "mark_before_reserve",
+        "terminalize_before_reserve",
+        "confirm_unattempted",
+        "mark_after_terminalization",
+        "terminalize_after_terminalization",
+    ],
+)
+def test_outbound_attempt_store_contract_rejects_illegal_transitions(
+    store_kind: str,
+    illegal_transition: str,
+    tmp_path,
+) -> None:
+    state = _contract_store(store_kind, tmp_path)
+    message = _outbound_message(message_id=f"illegal-{store_kind}-{illegal_transition}")
+    try:
+        with pytest.raises(StateStoreError):
+            if illegal_transition == "mark_before_reserve":
+                state.mark_outbound_conversation_attempted(
+                    transport_session_id=message.transport_session_id,
+                    message_id=message.message_id,
+                    attempted_at=NOW,
+                )
+            elif illegal_transition == "terminalize_before_reserve":
+                state.terminalize_outbound_conversation_attempt(
+                    transport_session_id=message.transport_session_id,
+                    message_id=message.message_id,
+                    status=OutboundAttemptStatus.NOT_STARTED,
+                    terminal_at=NOW,
+                )
+            else:
+                state.reserve_outbound_conversation_message(message)
+                state.terminalize_outbound_conversation_attempt(
+                    transport_session_id=message.transport_session_id,
+                    message_id=message.message_id,
+                    status=(
+                        OutboundAttemptStatus.CONFIRMED
+                        if illegal_transition == "confirm_unattempted"
+                        else OutboundAttemptStatus.NOT_STARTED
+                    ),
+                    terminal_at=NOW + timedelta(seconds=1),
+                )
+                if illegal_transition == "mark_after_terminalization":
+                    state.mark_outbound_conversation_attempted(
+                        transport_session_id=message.transport_session_id,
+                        message_id=message.message_id,
+                        attempted_at=NOW + timedelta(seconds=2),
+                    )
+                else:
+                    state.terminalize_outbound_conversation_attempt(
+                        transport_session_id=message.transport_session_id,
+                        message_id=message.message_id,
+                        status=OutboundAttemptStatus.CONFIRMED,
+                        terminal_at=NOW + timedelta(seconds=2),
+                    )
+    finally:
+        _close_contract_store(state)
 
 
 def _components(
@@ -514,3 +797,32 @@ def _outbound_message(*, message_id: str) -> ConversationMessage:
         direction="outbound",
         request_id=f"request-{message_id}",
     )
+
+
+def _restart_inconsistency_reasons(components: object) -> set[str]:
+    return {
+        record.details["reason"]
+        for record in components.audit.records
+        if record.kind == "restart_inconsistency"
+    }
+
+
+def _sqlite_reserved_message(tmp_path, message_id: str):
+    database = tmp_path / f"{message_id}.sqlite3"
+    state = SQLiteDurableStateStore(database)
+    message = _outbound_message(message_id=message_id)
+    state.reserve_outbound_conversation_message(message)
+    state.close()
+    return database, message
+
+
+def _contract_store(store_kind: str, tmp_path):
+    if store_kind == "memory":
+        return InMemoryDurableStateStore()
+    return SQLiteDurableStateStore(tmp_path / "contract.sqlite3")
+
+
+def _close_contract_store(state: object) -> None:
+    close = getattr(state, "close", None)
+    if callable(close):
+        close()

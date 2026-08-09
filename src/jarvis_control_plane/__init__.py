@@ -14,6 +14,7 @@ from .adapters import (
     SQLiteDurableStateStore,
     SystemClock,
     UuidIdGenerator,
+    migrate_sqlite_outbound_conversation_attempts,
 )
 from .control_plane import (
     ControlPlane,
@@ -170,6 +171,7 @@ from .models import (
     OrchestrationRequest,
     OrchestrationResult,
     OutboundAttemptRecord,
+    OutboundAttemptRecoveryProjection,
     OutboundAttemptStatus,
     OutboundReply,
     ReceiveResult,
@@ -348,6 +350,7 @@ __all__ = [
     "OrchestrationRequest",
     "OrchestrationResult",
     "OutboundAttemptRecord",
+    "OutboundAttemptRecoveryProjection",
     "OutboundAttemptStatus",
     "OutboundConnectorError",
     "OutboundReply",
@@ -411,6 +414,7 @@ __all__ = [
     "gmail_proposal_payload",
     "gmail_proposal_preview",
     "gmail_write_request_from_proposal",
+    "migrate_sqlite_outbound_conversation_attempts",
     "parse_memory_command",
     "render_vault_unified_diff",
     "render_vault_write_preview",

@@ -342,6 +342,30 @@ class OutboundAttemptRecord:
             raise ValueError("attempted outbound records require attempted_at")
 
 
+@dataclass(frozen=True, slots=True)
+class OutboundAttemptRecoveryProjection:
+    """Body-free raw facts used before strict outbound-state validation.
+
+    Restart recovery must be able to describe a damaged attempt/outbox pair
+    without constructing :class:`OutboundAttemptRecord`, whose invariants are
+    intentionally strict for healthy state.  The projection therefore keeps
+    only bounded identity, status, timestamp, and row-presence facts; it never
+    carries the private outbound body.
+    """
+
+    transport_session_id: str
+    message_id: str
+    attempt_present: bool
+    outbox_present: bool
+    attempt_request_id: str | None = None
+    outbox_request_id: str | None = None
+    status: str | None = None
+    reserved_at: str | None = None
+    attempted_at: str | None = None
+    terminal_at: str | None = None
+    outbound_id: str | None = None
+
+
 def _deletion_scope_datetime(
     value: date | datetime, name: str, *, end: bool
 ) -> datetime:
@@ -1277,6 +1301,19 @@ _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
         "outbound_not_started": None,
         "outbound_unknown": None,
     },
+    "restart_inconsistency": {
+        "count": None,
+        "reason": frozenset(
+            {
+                "attempt_outbox_request_mismatch",
+                "open_attempt_without_outbox",
+                "outbox_without_attempt",
+                "terminal_attempt_with_outbox",
+                "unsupported_attempt_status",
+            }
+        ),
+        "state": frozenset({"administrative_degraded"}),
+    },
     "action_outcome": {
         "channel": frozenset({"controlled"}),
         "command": None,
@@ -1377,6 +1414,13 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
         "working_session",
         "control_plane",
         frozenset({"interrupted"}),
+        frozenset({"recorded"}),
+    ),
+    "restart_inconsistency": (
+        "state_recovery",
+        "durable_state",
+        "control_plane",
+        frozenset({"degraded"}),
         frozenset({"recorded"}),
     ),
     "inbound_admitted": (

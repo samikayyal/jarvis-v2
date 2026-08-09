@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import Counter
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -39,7 +40,7 @@ from .models import (
     OrchestrationProposalIntent,
     OrchestrationRequest,
     OrchestrationResult,
-    OutboundAttemptRecord,
+    OutboundAttemptRecoveryProjection,
     OutboundAttemptStatus,
     OutboundReply,
     ReceiveResult,
@@ -424,9 +425,13 @@ class DeterministicCapabilityBroker:
         ):
             raise TypeError("vault_write_proposal_preparer must provide propose")
         self.vault_write_proposal_preparer = vault_write_proposal_preparer
+        self._recovery_degraded = False
+        self._recovery_degraded_reason: str | None = None
         existing_session = self.working_sessions.load()
         durable_requests = self.state.list_requests()
-        durable_outbound_attempts = self.state.list_outbound_conversation_attempts()
+        durable_outbound_attempts = (
+            self.state.list_outbound_conversation_attempt_recovery()
+        )
         durable_restart_state = bool(durable_requests or durable_outbound_attempts)
         if existing_session is not None or durable_restart_state:
             self._reconcile_restart_state(
@@ -446,7 +451,9 @@ class DeterministicCapabilityBroker:
                     config=SessionConfig(operator_id=config.operator_id),
                 )
             )
-        if existing_session is not None or durable_restart_state:
+        if (
+            existing_session is not None or durable_restart_state
+        ) and not self._recovery_degraded:
             self._record_pending_session_migration()
         # The recorder is a write-only capability backed by an isolated writer.
         # Never retain a readable diagnostic store on the broker graph.
@@ -457,6 +464,12 @@ class DeterministicCapabilityBroker:
     def handle(self, message: InboundMessage) -> ReceiveResult:
         """Accept one already-admitted message and drive its named lifecycle stages."""
 
+        if self._recovery_degraded:
+            return ReceiveResult(
+                status_code=503,
+                disposition="recovery_degraded",
+                reason=self._recovery_degraded_reason,
+            )
         session = self._reconcile_inactivity()
         if session.pending_action is not None and session.pending_action.is_expired(
             self.clock
@@ -1909,7 +1922,7 @@ class DeterministicCapabilityBroker:
         *,
         existing_session: WorkingSession | None,
         requests: tuple[RequestState, ...],
-        outbound_attempts: tuple[OutboundAttemptRecord, ...],
+        outbound_attempts: tuple[OutboundAttemptRecoveryProjection, ...],
     ) -> None:
         """Admit restart evidence before closing any durable nonterminal edge."""
 
@@ -1925,14 +1938,36 @@ class DeterministicCapabilityBroker:
         interrupted = sum(
             request.status not in terminal_request_statuses for request in requests
         )
+        open_statuses = {
+            OutboundAttemptStatus.UNATTEMPTED.value,
+            OutboundAttemptStatus.ATTEMPTED.value,
+        }
+        terminal_statuses = {
+            OutboundAttemptStatus.CONFIRMED.value,
+            OutboundAttemptStatus.UNKNOWN.value,
+            OutboundAttemptStatus.NOT_STARTED.value,
+        }
+        inconsistency_counts: Counter[str] = Counter()
         not_started = sum(
-            record.status is OutboundAttemptStatus.UNATTEMPTED
+            record.status == OutboundAttemptStatus.UNATTEMPTED.value
             for record in outbound_attempts
         )
         unknown = sum(
-            record.status is OutboundAttemptStatus.ATTEMPTED
+            record.status == OutboundAttemptStatus.ATTEMPTED.value
             for record in outbound_attempts
         )
+        for record in outbound_attempts:
+            if not record.attempt_present:
+                inconsistency_counts["outbox_without_attempt"] += 1
+            elif record.status in open_statuses:
+                if not record.outbox_present:
+                    inconsistency_counts["open_attempt_without_outbox"] += 1
+                elif record.outbox_request_id != record.attempt_request_id:
+                    inconsistency_counts["attempt_outbox_request_mismatch"] += 1
+            elif record.status not in terminal_statuses:
+                inconsistency_counts["unsupported_attempt_status"] += 1
+            elif record.outbox_present:
+                inconsistency_counts["terminal_attempt_with_outbox"] += 1
         restart_at = self.clock.now()
         session_transition = (
             interrupt_for_restart(existing_session, now=restart_at)
@@ -1960,6 +1995,26 @@ class DeterministicCapabilityBroker:
                 "outbound_unknown": str(unknown),
             },
         )
+        inconsistency_evidence = tuple(
+            AuditEvidence(
+                evidence_id=f"restart-inconsistency-{uuid.uuid4()}-{reason}",
+                kind="restart_inconsistency",
+                occurred_at=restart_at,
+                event_id=None,
+                request_id=None,
+                outcome="degraded",
+                actor="control_plane",
+                operation_type="state_recovery",
+                target_category="durable_state",
+                execution_status="recorded",
+                details={
+                    "count": str(count),
+                    "reason": reason,
+                    "state": "administrative_degraded",
+                },
+            )
+            for reason, count in sorted(inconsistency_counts.items())
+        )
         # Admit the required restart evidence before closing any durable
         # nonterminal edge. When a working session exists, use its
         # state-plus-audit compare-and-set so the session cannot be changed
@@ -1967,8 +2022,13 @@ class DeterministicCapabilityBroker:
         # atomically join, so audit admission remains the gate before session
         # creation in the constructor.
         if session_transition is None:
-            self.audit.append(restart_evidence)
+            self.audit.append_batch((restart_evidence, *inconsistency_evidence))
         else:
+            # A session CAS can atomically carry one audit record.  Admit any
+            # additional bounded inconsistency evidence first; no request or
+            # outbound state is changed until both evidence paths succeed.
+            if inconsistency_evidence:
+                self.audit.append_batch(inconsistency_evidence)
             self.working_sessions.compare_and_set_with_audit(
                 existing_session,
                 session_transition.state,
@@ -1989,6 +2049,12 @@ class DeterministicCapabilityBroker:
                 )
             )
         self.state.reconcile_outbound_conversation_attempts(interrupted_at=restart_at)
+        if inconsistency_counts:
+            self._recovery_degraded = True
+            self._recovery_degraded_reason = (
+                "restart found inconsistent durable outbound state; "
+                "administrative repair is required"
+            )
 
     def _admit_request(
         self,
@@ -2905,6 +2971,18 @@ class DeterministicCapabilityBroker:
         """Expose only the current conversation boundary to ingress admission."""
 
         return self._reconcile_inactivity().session_id
+
+    @property
+    def recovery_degraded(self) -> bool:
+        """Whether restart found state requiring manual administrative repair."""
+
+        return self._recovery_degraded
+
+    @property
+    def recovery_degraded_reason(self) -> str | None:
+        """Return only the bounded administrative recovery reason code."""
+
+        return self._recovery_degraded_reason
 
     def _current_working_session(self) -> WorkingSession:
         session = self.working_sessions.load()
@@ -4610,6 +4688,13 @@ class SignedMessageReceiver:
                 status_code=204,
                 disposition="rejected",
                 reason=rejection,
+            )
+
+        if self.broker.recovery_degraded:
+            return ReceiveResult(
+                status_code=503,
+                disposition="recovery_degraded",
+                reason=self.broker.recovery_degraded_reason,
             )
 
         try:

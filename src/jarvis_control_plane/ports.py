@@ -29,6 +29,7 @@ from .models import (
     OrchestrationRequest,
     OrchestrationResult,
     OutboundAttemptRecord,
+    OutboundAttemptRecoveryProjection,
     OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
@@ -256,6 +257,10 @@ class DurableStateStore(Protocol):
     def list_outbound_conversation_attempts(
         self,
     ) -> tuple[OutboundAttemptRecord, ...]: ...
+
+    def list_outbound_conversation_attempt_recovery(
+        self,
+    ) -> tuple[OutboundAttemptRecoveryProjection, ...]: ...
 
     def reconcile_outbound_conversation_attempts(
         self, *, interrupted_at: datetime

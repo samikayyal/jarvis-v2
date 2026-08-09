@@ -39,6 +39,7 @@ from .models import (
     OrchestrationRequest,
     OrchestrationResult,
     OutboundAttemptRecord,
+    OutboundAttemptRecoveryProjection,
     OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
@@ -62,6 +63,149 @@ from .ports import (
     StateStoreError,
 )
 from .sessions import ModelAvailability
+
+SQLITE_OUTBOUND_ATTEMPT_MIGRATION_VERSION = 1
+_SQLITE_OUTBOUND_ATTEMPT_MIGRATION_NAME = "ticket12_outbound_attempt_state"
+_SQLITE_OUTBOUND_ATTEMPT_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS outbound_attempt_record (
+    transport_session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('unattempted', 'attempted', 'confirmed', 'unknown', 'not_started')
+    ),
+    outbound_id TEXT,
+    reserved_at TEXT NOT NULL,
+    attempted_at TEXT,
+    terminal_at TEXT,
+    PRIMARY KEY (transport_session_id, message_id)
+)
+"""
+
+
+def migrate_sqlite_outbound_conversation_attempts(
+    database: str | Path | sqlite3.Connection = ":memory:",
+    *,
+    applied_at: datetime | None = None,
+) -> int:
+    """Apply the versioned Ticket 12 outbound-state migration manually.
+
+    This is an administrative/offline operation.  Normal state-store startup
+    deliberately does not call it: a legacy outbound outbox remains untouched
+    until an operator has chosen to run the migration after taking the required
+    backup and completing the upgrade rehearsal.
+    """
+
+    owns_connection = not isinstance(database, sqlite3.Connection)
+    connection = (
+        database
+        if isinstance(database, sqlite3.Connection)
+        else sqlite3.connect(str(database))
+    )
+    connection.row_factory = sqlite3.Row
+    migration_version = SQLITE_OUTBOUND_ATTEMPT_MIGRATION_VERSION
+    try:
+        if not owns_connection and connection.in_transaction:
+            raise StateStoreError(
+                "manual outbound-state migration requires an idle SQLite connection"
+            )
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_state_migrations (
+                migration_name TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+            """
+        )
+        existing = connection.execute(
+            """
+            SELECT version
+            FROM jarvis_state_migrations
+            WHERE migration_name = ?
+            """,
+            (_SQLITE_OUTBOUND_ATTEMPT_MIGRATION_NAME,),
+        ).fetchone()
+        if existing is not None and int(existing["version"]) >= migration_version:
+            connection.commit()
+            return int(existing["version"])
+
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "outbound_conversation_outbox" not in tables:
+            raise StateStoreError(
+                "manual outbound-state migration requires the legacy outbox table"
+            )
+
+        connection.execute(_SQLITE_OUTBOUND_ATTEMPT_TABLE_SQL)
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(outbound_attempt_record)"
+            ).fetchall()
+        }
+        required_columns = {
+            "transport_session_id",
+            "message_id",
+            "request_id",
+            "status",
+            "reserved_at",
+            "attempted_at",
+            "terminal_at",
+        }
+        if not required_columns.issubset(columns):
+            raise StateStoreError(
+                "manual outbound-state migration found an unsupported attempt schema"
+            )
+        if "outbound_id" not in columns:
+            connection.execute(
+                "ALTER TABLE outbound_attempt_record ADD COLUMN outbound_id TEXT"
+            )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO outbound_attempt_record(
+                transport_session_id, message_id, request_id, status,
+                outbound_id, reserved_at, attempted_at, terminal_at
+            )
+            SELECT transport_session_id, message_id, request_id, 'attempted',
+                   NULL, occurred_at, occurred_at, NULL
+            FROM outbound_conversation_outbox
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO jarvis_state_migrations(migration_name, version, applied_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(migration_name) DO UPDATE SET
+                version = excluded.version,
+                applied_at = excluded.applied_at
+            """,
+            (
+                _SQLITE_OUTBOUND_ATTEMPT_MIGRATION_NAME,
+                migration_version,
+                ensure_utc(applied_at or datetime.now(UTC)).isoformat(),
+            ),
+        )
+        connection.commit()
+        return migration_version
+    except StateStoreError:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        if connection.in_transaction:
+            connection.rollback()
+        raise StateStoreError(
+            "could not apply manual outbound-state migration"
+        ) from exc
+    finally:
+        if owns_connection:
+            connection.close()
 
 
 class SystemClock:
@@ -315,7 +459,11 @@ class InMemoryDurableStateStore:
             if self.fail_conversation:
                 raise StateStoreError("controlled conversation write failure")
             key = (message.transport_session_id, message.message_id)
-            if key in self.conversation_messages or key in self.outbound_outbox:
+            if (
+                key in self.conversation_messages
+                or key in self.outbound_outbox
+                or key in self.outbound_attempts
+            ):
                 raise StateStoreError("conversation message identifier already exists")
             self.outbound_outbox[key] = message
             self.outbound_attempts[key] = OutboundAttemptRecord(
@@ -445,17 +593,59 @@ class InMemoryDurableStateStore:
                 )
             )
 
+    def list_outbound_conversation_attempt_recovery(
+        self,
+    ) -> tuple[OutboundAttemptRecoveryProjection, ...]:
+        with self._lock:
+            keys = set(self.outbound_attempts) | set(self.outbound_outbox)
+            projections: list[OutboundAttemptRecoveryProjection] = []
+            for transport_session_id, message_id in sorted(keys):
+                record = self.outbound_attempts.get((transport_session_id, message_id))
+                message = self.outbound_outbox.get((transport_session_id, message_id))
+                projections.append(
+                    OutboundAttemptRecoveryProjection(
+                        transport_session_id=transport_session_id,
+                        message_id=message_id,
+                        attempt_present=record is not None,
+                        outbox_present=message is not None,
+                        attempt_request_id=record.request_id if record else None,
+                        outbox_request_id=message.request_id if message else None,
+                        status=record.status.value if record else None,
+                        reserved_at=(
+                            record.reserved_at.isoformat() if record else None
+                        ),
+                        attempted_at=(
+                            record.attempted_at.isoformat()
+                            if record and record.attempted_at is not None
+                            else None
+                        ),
+                        terminal_at=(
+                            record.terminal_at.isoformat()
+                            if record and record.terminal_at is not None
+                            else None
+                        ),
+                        outbound_id=record.outbound_id if record else None,
+                    )
+                )
+            return tuple(projections)
+
     def reconcile_outbound_conversation_attempts(
         self, *, interrupted_at: datetime
     ) -> tuple[OutboundAttemptRecord, ...]:
         interrupted_at = ensure_utc(interrupted_at)
         with self._lock:
             reconciled: list[OutboundAttemptRecord] = []
-            for key, record in tuple(self.outbound_attempts.items()):
+            keys = set(self.outbound_attempts) | set(self.outbound_outbox)
+            for key in sorted(keys):
+                record = self.outbound_attempts.get(key)
+                if record is None:
+                    self.outbound_outbox.pop(key, None)
+                    continue
                 if record.status not in {
                     OutboundAttemptStatus.UNATTEMPTED,
                     OutboundAttemptStatus.ATTEMPTED,
                 }:
+                    self.outbound_outbox.pop(key, None)
                     continue
                 status = (
                     OutboundAttemptStatus.NOT_STARTED
@@ -847,8 +1037,9 @@ class SQLiteDurableStateStore:
         self._conversation_has_legacy_session = False
         self._deleted_archive = deleted_archive
         try:
+            self._assert_outbound_attempt_schema_is_current()
             self.connection.executescript(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS ingress_claims (
                     session_id TEXT NOT NULL,
                     message_id TEXT NOT NULL,
@@ -907,19 +1098,7 @@ class SQLiteDurableStateStore:
                     credential_like INTEGER NOT NULL CHECK (credential_like IN (0, 1)),
                     PRIMARY KEY (transport_session_id, message_id)
                 );
-                CREATE TABLE IF NOT EXISTS outbound_attempt_record (
-                    transport_session_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('unattempted', 'attempted', 'confirmed', 'unknown', 'not_started')
-                    ),
-                    outbound_id TEXT,
-                    reserved_at TEXT NOT NULL,
-                    attempted_at TEXT,
-                    terminal_at TEXT,
-                    PRIMARY KEY (transport_session_id, message_id)
-                );
+                {_SQLITE_OUTBOUND_ATTEMPT_TABLE_SQL};
                 CREATE INDEX IF NOT EXISTS conversation_history_by_working_session
                     ON conversation_history(working_session_id, occurred_at, transport_session_id, message_id);
                 CREATE INDEX IF NOT EXISTS conversation_history_by_request
@@ -964,33 +1143,6 @@ class SQLiteDurableStateStore:
                 );
                 """
             )
-            outbound_attempt_columns = {
-                row["name"]
-                for row in self.connection.execute(
-                    "PRAGMA table_info(outbound_attempt_record)"
-                ).fetchall()
-            }
-            if "outbound_id" not in outbound_attempt_columns:
-                self.connection.execute(
-                    "ALTER TABLE outbound_attempt_record ADD COLUMN outbound_id TEXT"
-                )
-            # Ticket 20 databases may already contain a reserved outbound body
-            # without the Ticket 12 attempt record.  Its connector boundary is
-            # unknowable after upgrade, so migrate it as attempted; broker
-            # startup will close it unknown and remove the private payload.
-            self.connection.execute(
-                """
-                INSERT OR IGNORE INTO outbound_attempt_record(
-                    transport_session_id, message_id, request_id, status,
-                    reserved_at, attempted_at, terminal_at
-                )
-                SELECT transport_session_id, message_id, request_id, 'attempted',
-                       occurred_at, occurred_at, NULL
-                FROM outbound_conversation_outbox
-                """
-            )
-            self.connection.commit()
-
             request_columns = {
                 row["name"]
                 for row in self.connection.execute(
@@ -1082,6 +1234,37 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             self.close()
             raise StateStoreError("could not initialize SQLite state") from exc
+        except StateStoreError:
+            self.close()
+            raise
+
+    def _assert_outbound_attempt_schema_is_current(self) -> None:
+        """Reject a Ticket 12-incompatible database without changing it."""
+
+        tables = {
+            row["name"]
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        has_outbox = "outbound_conversation_outbox" in tables
+        has_attempts = "outbound_attempt_record" in tables
+        if has_outbox != has_attempts:
+            raise StateStoreError(
+                "SQLite outbound state requires the manual Ticket 12 migration"
+            )
+        if not has_attempts:
+            return
+        columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(outbound_attempt_record)"
+            ).fetchall()
+        }
+        if "outbound_id" not in columns:
+            raise StateStoreError(
+                "SQLite outbound state requires the manual Ticket 12 migration"
+            )
 
     def admit_ingress(
         self,
@@ -1821,32 +2004,112 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not list outbound attempts") from exc
         return tuple(_outbound_attempt_from_row(row) for row in rows)
 
+    def list_outbound_conversation_attempt_recovery(
+        self,
+    ) -> tuple[OutboundAttemptRecoveryProjection, ...]:
+        """Load bounded attempt/outbox facts without constructing domain records."""
+
+        try:
+            attempt_rows = self.connection.execute(
+                """
+                SELECT a.transport_session_id, a.message_id, a.request_id,
+                       a.status, a.outbound_id, a.reserved_at, a.attempted_at,
+                       a.terminal_at, o.request_id AS outbox_request_id,
+                       CASE WHEN o.message_id IS NULL THEN 0 ELSE 1 END
+                           AS outbox_present
+                FROM outbound_attempt_record AS a
+                LEFT JOIN outbound_conversation_outbox AS o
+                  ON o.transport_session_id = a.transport_session_id
+                 AND o.message_id = a.message_id
+                ORDER BY a.reserved_at, a.transport_session_id, a.message_id
+                """
+            ).fetchall()
+            outbox_rows = self.connection.execute(
+                """
+                SELECT o.transport_session_id, o.message_id, o.request_id
+                FROM outbound_conversation_outbox AS o
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM outbound_attempt_record AS a
+                    WHERE a.transport_session_id = o.transport_session_id
+                      AND a.message_id = o.message_id
+                )
+                ORDER BY o.occurred_at, o.transport_session_id, o.message_id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StateStoreError(
+                "could not load outbound recovery projection"
+            ) from exc
+
+        projections: list[OutboundAttemptRecoveryProjection] = [
+            OutboundAttemptRecoveryProjection(
+                transport_session_id=row["transport_session_id"],
+                message_id=row["message_id"],
+                attempt_present=True,
+                outbox_present=bool(row["outbox_present"]),
+                attempt_request_id=row["request_id"],
+                outbox_request_id=row["outbox_request_id"],
+                status=row["status"],
+                reserved_at=row["reserved_at"],
+                attempted_at=row["attempted_at"],
+                terminal_at=row["terminal_at"],
+                outbound_id=row["outbound_id"],
+            )
+            for row in attempt_rows
+        ]
+        projections.extend(
+            OutboundAttemptRecoveryProjection(
+                transport_session_id=row["transport_session_id"],
+                message_id=row["message_id"],
+                attempt_present=False,
+                outbox_present=True,
+                outbox_request_id=row["request_id"],
+            )
+            for row in outbox_rows
+        )
+        return tuple(projections)
+
     def reconcile_outbound_conversation_attempts(
         self, *, interrupted_at: datetime
     ) -> tuple[OutboundAttemptRecord, ...]:
         interrupted_at = ensure_utc(interrupted_at)
         try:
             self.connection.execute("BEGIN IMMEDIATE")
-            rows = self.connection.execute(
-                """
-                SELECT a.transport_session_id, a.message_id, a.request_id, a.status,
-                       a.outbound_id, a.reserved_at, a.attempted_at, a.terminal_at,
-                       o.working_session_id, o.event_id, o.chat_id, o.sender_id,
-                       o.text, o.occurred_at, o.credential_like
-                FROM outbound_attempt_record AS a
-                LEFT JOIN outbound_conversation_outbox AS o
-                  ON o.transport_session_id = a.transport_session_id
-                 AND o.message_id = a.message_id
-                WHERE a.status IN ('unattempted', 'attempted')
-                ORDER BY a.reserved_at, a.transport_session_id, a.message_id
-                """,
-            ).fetchall()
+            projections = self.list_outbound_conversation_attempt_recovery()
             reconciled: list[OutboundAttemptRecord] = []
-            for row in rows:
-                current = _outbound_attempt_from_row(row)
+            for projection in projections:
+                if not projection.attempt_present:
+                    self.connection.execute(
+                        """
+                        DELETE FROM outbound_conversation_outbox
+                        WHERE transport_session_id = ? AND message_id = ?
+                        """,
+                        (
+                            projection.transport_session_id,
+                            projection.message_id,
+                        ),
+                    )
+                    continue
+                if projection.status not in {
+                    OutboundAttemptStatus.UNATTEMPTED.value,
+                    OutboundAttemptStatus.ATTEMPTED.value,
+                }:
+                    if projection.outbox_present:
+                        self.connection.execute(
+                            """
+                            DELETE FROM outbound_conversation_outbox
+                            WHERE transport_session_id = ? AND message_id = ?
+                            """,
+                            (
+                                projection.transport_session_id,
+                                projection.message_id,
+                            ),
+                        )
+                    continue
                 status = (
                     OutboundAttemptStatus.NOT_STARTED
-                    if current.status is OutboundAttemptStatus.UNATTEMPTED
+                    if projection.status == OutboundAttemptStatus.UNATTEMPTED.value
                     else OutboundAttemptStatus.UNKNOWN
                 )
                 self.connection.execute(
@@ -1858,9 +2121,9 @@ class SQLiteDurableStateStore:
                     (
                         status.value,
                         interrupted_at.isoformat(),
-                        current.transport_session_id,
-                        current.message_id,
-                        current.status.value,
+                        projection.transport_session_id,
+                        projection.message_id,
+                        projection.status,
                     ),
                 )
                 self.connection.execute(
@@ -1868,17 +2131,19 @@ class SQLiteDurableStateStore:
                     DELETE FROM outbound_conversation_outbox
                     WHERE transport_session_id = ? AND message_id = ?
                     """,
-                    (current.transport_session_id, current.message_id),
+                    (projection.transport_session_id, projection.message_id),
                 )
-                reconciled.append(
-                    replace(
-                        current,
-                        status=status,
-                        message=None,
-                        terminal_at=interrupted_at,
-                    )
+                recovered = _recovered_terminal_attempt_record(
+                    projection,
+                    status=status,
+                    terminal_at=interrupted_at,
                 )
+                if recovered is not None:
+                    reconciled.append(recovered)
             self.connection.commit()
+        except StateStoreError:
+            self.connection.rollback()
+            raise
         except sqlite3.Error as exc:
             self.connection.rollback()
             raise StateStoreError("could not reconcile outbound attempts") from exc
@@ -3129,6 +3394,41 @@ def _conversation_message_from_row(row: sqlite3.Row) -> ConversationMessage:
         request_id=row["request_id"],
         credential_like=bool(row["credential_like"]),
     )
+
+
+def _recovered_terminal_attempt_record(
+    projection: OutboundAttemptRecoveryProjection,
+    *,
+    status: OutboundAttemptStatus,
+    terminal_at: datetime,
+) -> OutboundAttemptRecord | None:
+    """Materialize only after recovery has removed the invalid open edge."""
+
+    if (
+        not isinstance(projection.attempt_request_id, str)
+        or not projection.attempt_request_id.strip()
+        or not isinstance(projection.reserved_at, str)
+    ):
+        return None
+    try:
+        attempted_at = (
+            datetime.fromisoformat(projection.attempted_at)
+            if projection.attempted_at is not None
+            else None
+        )
+        return OutboundAttemptRecord(
+            transport_session_id=projection.transport_session_id,
+            message_id=projection.message_id,
+            request_id=projection.attempt_request_id,
+            status=status,
+            reserved_at=datetime.fromisoformat(projection.reserved_at),
+            message=None,
+            attempted_at=attempted_at,
+            terminal_at=terminal_at,
+            outbound_id=None,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _outbound_attempt_from_row(row: sqlite3.Row) -> OutboundAttemptRecord:
