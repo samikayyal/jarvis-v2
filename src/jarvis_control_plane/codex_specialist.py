@@ -11,13 +11,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import shlex
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
+from itertools import pairwise
 from time import monotonic
 from typing import Literal, Protocol
+
+from .terminal_policy import (
+    TerminalAction,
+    TerminalDisposition,
+    authorize_terminal_action,
+)
 
 CodexHost = Literal["ubuntu", "windows"]
 CodexOperation = Literal["inspect", "review", "workspace_prepare"]
@@ -43,29 +50,7 @@ _MAX_SUMMARY_CHARS = 8_000
 _MAX_RESULT_ITEMS = 128
 _MAX_PROPOSAL_PATCH_CHARS = 256_000
 _CONTENT_DIGEST_LENGTH = 64
-_FORBIDDEN_COMMAND_PATTERNS = (
-    re.compile(
-        r"\bgit(?:\s+[^;&|]+)*?\s+(?:push|commit|reset|rebase|merge|"
-        r"cherry-pick|revert|clean|checkout|switch|branch|worktree)(?:\s|$)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:^|[\s;&|])(?:rm|rmdir|del|erase|remove-item|set-content|"
-        r"add-content|move-item|copy-item)(?:\s|$)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:>|>>|\btee\b|\bsudo\b|\bsu\b)", re.IGNORECASE),
-    re.compile(
-        r"\b(?:systemctl|service|kubectl\s+apply|docker\s+(?:compose\s+)?"
-        r"(?:up|run))\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b(?:danger-full-access|trust-critical)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:python(?:3)?|pwsh|powershell|bash|sh|node)\s+-(?:c|command)\b",
-        re.IGNORECASE,
-    ),
-)
+_MAX_INTERRUPT_GRACE_SECONDS = 5.0
 
 
 class CodexSpecialistError(RuntimeError):
@@ -158,6 +143,97 @@ def _canonical_patch(value: str, name: str = "workspace proposal patch") -> str:
     ):
         raise ValueError(f"{name} must be a bounded non-empty patch")
     return value
+
+
+def _patch_file_marker(value: str, prefix: str) -> str | None:
+    try:
+        tokens = shlex.split(value, posix=True)
+    except ValueError as exc:
+        raise ValueError("workspace proposal patch has an invalid file marker") from exc
+    if len(tokens) != 1:
+        raise ValueError("workspace proposal patch file markers must be canonical")
+    marker = tokens[0]
+    if marker == "/dev/null":
+        return None
+    if not marker.startswith(prefix):
+        raise ValueError("workspace proposal patch has an invalid file prefix")
+    return _relative_path(marker[len(prefix) :], "workspace proposal patch path")
+
+
+def _canonical_patch_changes(
+    patch: str,
+) -> tuple[tuple[str, bool, bool], ...]:
+    """Return exact text-file transitions from one strict canonical Git patch."""
+
+    patch = _canonical_patch(patch)
+    if not patch.endswith("\n"):
+        raise ValueError("workspace proposal patch must end with a newline")
+    lines = patch.splitlines()
+    starts = [
+        index for index, line in enumerate(lines) if line.startswith("diff --git ")
+    ]
+    if not starts or any(line for line in lines[: starts[0]]):
+        raise ValueError("workspace proposal patch requires canonical Git diff headers")
+    starts.append(len(lines))
+    transitions: list[tuple[str, bool, bool]] = []
+    for start, end in pairwise(starts):
+        segment = lines[start:end]
+        try:
+            header = shlex.split(segment[0][len("diff --git ") :], posix=True)
+        except ValueError as exc:
+            raise ValueError(
+                "workspace proposal patch has an invalid diff header"
+            ) from exc
+        if (
+            len(header) != 2
+            or not header[0].startswith("a/")
+            or not header[1].startswith("b/")
+        ):
+            raise ValueError("workspace proposal patch has an invalid diff header")
+        old_path = _relative_path(header[0][2:], "workspace proposal patch path")
+        new_path = _relative_path(header[1][2:], "workspace proposal patch path")
+        if old_path != new_path:
+            raise ValueError("workspace proposal patch cannot rename or copy files")
+        if any(
+            line.startswith(
+                (
+                    "rename from ",
+                    "rename to ",
+                    "copy from ",
+                    "copy to ",
+                    "Binary files ",
+                )
+            )
+            or line in {"GIT binary patch"}
+            for line in segment[1:]
+        ):
+            raise ValueError("workspace proposal patch supports text changes only")
+        try:
+            hunk_index = next(
+                index
+                for index, line in enumerate(segment[1:], start=1)
+                if line.startswith("@@ ")
+            )
+        except StopIteration as exc:
+            raise ValueError("workspace proposal patch requires a text hunk") from exc
+        old_markers = [
+            line[4:] for line in segment[1:hunk_index] if line.startswith("--- ")
+        ]
+        new_markers = [
+            line[4:] for line in segment[1:hunk_index] if line.startswith("+++ ")
+        ]
+        if len(old_markers) != 1 or len(new_markers) != 1:
+            raise ValueError("workspace proposal patch requires exact file markers")
+        marked_old = _patch_file_marker(old_markers[0], "a/")
+        marked_new = _patch_file_marker(new_markers[0], "b/")
+        if (marked_old is not None and marked_old != old_path) or (
+            marked_new is not None and marked_new != new_path
+        ):
+            raise ValueError("workspace proposal patch paths are inconsistent")
+        transitions.append((old_path, marked_old is not None, marked_new is not None))
+    if len({path for path, _before, _after in transitions}) != len(transitions):
+        raise ValueError("workspace proposal patch contains duplicate paths")
+    return tuple(sorted(transitions))
 
 
 def _canonical_remote_refs(
@@ -341,6 +417,21 @@ class CodexWorkspaceProposal:
         if any(not _path_is_allowed(change.path, paths) for change in changes):
             raise ValueError("workspace proposal change is outside its allowed paths")
         patch = _canonical_patch(self.patch)
+        patch_changes = _canonical_patch_changes(patch)
+        expected_patch_changes = tuple(
+            sorted(
+                (
+                    change.path,
+                    change.before_digest is not None,
+                    change.after_digest is not None,
+                )
+                for change in changes
+            )
+        )
+        if patch_changes != expected_patch_changes:
+            raise ValueError(
+                "workspace proposal patch paths do not match its exact file changes"
+            )
         object.__setattr__(self, "allowed_paths", paths)
         object.__setattr__(self, "base_remote_refs", remote_refs)
         object.__setattr__(self, "changes", changes)
@@ -524,6 +615,21 @@ class CodexAdapterResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CodexInterruption:
+    """Terminal adapter result issued only after complete process-scope quiescence."""
+
+    result: CodexAdapterResult
+    quiescent: Literal[True] = True
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.result, CodexAdapterResult)
+            or self.quiescent is not True
+        ):
+            raise TypeError("Codex interruption requires a quiescent typed result")
+
+
+@dataclass(frozen=True, slots=True)
 class CodexWorkspaceSnapshot:
     """Evidence captured by a Jarvis-controlled inspector, not by Codex."""
 
@@ -579,7 +685,10 @@ class CodexAdapter(Protocol):
         self, envelope: CodexExecutionEnvelope, *, deadline: float
     ) -> CodexAdapterResult: ...
 
-    def interrupt(self, request_id: str) -> bool: ...
+    def interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
+        """Stop the complete turn scope before deadline and return terminal evidence."""
+
+        ...
 
 
 class CodexWorkspaceInspector(Protocol):
@@ -613,7 +722,7 @@ class CodexMcpClient(Protocol):
         approval_callback: CodexMcpApprovalCallback,
     ) -> Mapping[str, object]: ...
 
-    def interrupt(self, request_id: str) -> bool: ...
+    def interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption: ...
 
 
 class CodexMcpAdapter:
@@ -652,8 +761,13 @@ class CodexMcpAdapter:
         )
         return self._parse_result(raw_result)
 
-    def interrupt(self, request_id: str) -> bool:
-        return self._client.interrupt(request_id)
+    def interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
+        interruption = self._client.interrupt(request_id, deadline=deadline)
+        if not isinstance(interruption, CodexInterruption):
+            raise CodexVerificationError(
+                "Codex MCP interrupt returned no typed quiescence evidence"
+            )
+        return interruption
 
     def _handle_approval(
         self,
@@ -752,40 +866,29 @@ class CodexMcpAdapter:
     ) -> bool:
         if envelope.operation != "workspace_prepare":
             return False
-        allowed_keys = {
-            "argv",
-            "affected_paths",
-            "command",
-            "cwd",
-            "operation",
-            "paths",
-        }
-        if set(details) - allowed_keys:
-            return False
-        if "command" in details and "argv" in details:
-            return False
-        if "paths" in details and "affected_paths" in details:
+        if set(details) != {"argv", "cwd"}:
             return False
         if cls._request_cwd(details) != envelope.cwd:
             return False
-        operation = details.get("operation", "read")
-        if operation != "read":
+        argv = details.get("argv")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(value, str) or not value for value in argv)
+        ):
             return False
-        command = details.get("command")
-        if command is None:
-            argv = details.get("argv")
-            if not isinstance(argv, list) or any(
-                not isinstance(value, str) for value in argv
-            ):
-                return False
-            command = " ".join(argv)
-        if not isinstance(command, str) or not command.strip():
+        try:
+            action = TerminalAction(
+                host=envelope.host,
+                executable=argv[0],
+                arguments=tuple(argv[1:]),
+                cwd=envelope.cwd,
+            )
+        except ValueError:
             return False
-        if any(pattern.search(command) for pattern in _FORBIDDEN_COMMAND_PATTERNS):
-            return False
-        paths = cls._request_paths(details)
-        return paths is not None and all(
-            _path_is_allowed(path, envelope.allowed_paths) for path in paths
+        return (
+            authorize_terminal_action(action).disposition
+            is TerminalDisposition.SAFE_READ
         )
 
     @staticmethod
@@ -883,44 +986,51 @@ class CodexSpecialist:
         envelope = self._freeze(invocation, workspace)
         before = self._inspector.snapshot(workspace)
         deadline = monotonic() + envelope.timeout_seconds
+        interrupt_grace = min(
+            _MAX_INTERRUPT_GRACE_SECONDS, envelope.timeout_seconds / 2
+        )
+        execution_timeout = envelope.timeout_seconds - interrupt_grace
         executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="codex-specialist"
         )
         future = executor.submit(self._adapter.invoke, envelope, deadline=deadline)
         try:
-            adapter_result = future.result(timeout=envelope.timeout_seconds)
+            adapter_result = future.result(timeout=execution_timeout)
         except FutureTimeout as exc:
-            interrupted = self._adapter.interrupt(invocation.request_id)
-            # A running Python thread cannot be cancelled.  Join it before
-            # inspecting the workspace or returning control to orchestration;
-            # otherwise a late Codex write can occur after this method returns.
-            try:
-                interrupted_result = future.result()
-            except Exception as error:  # noqa: BLE001 - normalize adapter failure after join
-                interrupted_result = None
-                worker_error = error
-            else:
-                worker_error = None
-            if interrupted is not True:
+            interruption = self._adapter.interrupt(
+                invocation.request_id, deadline=deadline
+            )
+            if not isinstance(interruption, CodexInterruption):
                 raise CodexVerificationError(
-                    "Codex interrupt could not be independently confirmed"
+                    "Codex interrupt provided no typed quiescence evidence"
                 ) from exc
-            if worker_error is not None:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise CodexVerificationError(
+                    "Codex process scope did not establish quiescence before its deadline"
+                ) from exc
+            try:
+                worker_result = future.result(timeout=remaining)
+            except FutureTimeout as error:
+                raise CodexVerificationError(
+                    "Codex process scope did not establish quiescence before its deadline"
+                ) from error
+            except Exception as error:
                 raise CodexVerificationError(
                     "Codex interrupt stopped without a typed result"
-                ) from worker_error
-            if not isinstance(interrupted_result, CodexAdapterResult):
+                ) from error
+            if worker_result != interruption.result:
                 raise CodexVerificationError(
-                    "Codex interrupt stopped without a typed result"
+                    "Codex interrupt result did not match the quiescent worker result"
                 ) from exc
             after = self._inspector.snapshot(workspace)
             changed_paths, test_evidence = self._verify(
-                envelope, interrupted_result, before, after
+                envelope, worker_result, before, after
             )
             unresolved_questions = tuple(
                 dict.fromkeys(
                     (
-                        *interrupted_result.unresolved_questions,
+                        *worker_result.unresolved_questions,
                         "Codex specialist did not complete before its frozen deadline.",
                     )
                 )
@@ -931,10 +1041,10 @@ class CodexSpecialist:
                 changed_paths=changed_paths,
                 test_evidence=test_evidence,
                 unresolved_questions=unresolved_questions[:_MAX_RESULT_ITEMS],
-                thread_id=interrupted_result.thread_id,
+                thread_id=worker_result.thread_id,
             )
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=future.done(), cancel_futures=True)
         if not isinstance(adapter_result, CodexAdapterResult):
             raise CodexVerificationError("Codex adapter returned an untyped result")
         after = self._inspector.snapshot(workspace)

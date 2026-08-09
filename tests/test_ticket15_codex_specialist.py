@@ -4,12 +4,15 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 
 from jarvis_control_plane.codex_specialist import (
     CodexAdapterResult,
+    CodexExecutionEnvelope,
+    CodexInterruption,
     CodexInvocation,
     CodexMcpAdapter,
     CodexMcpApprovalRequest,
@@ -36,6 +39,17 @@ TEST_BEFORE = "c" * 64
 TEST_AFTER = "d" * 64
 
 
+def _patch(path: str, *, before: str = "before", after: str = "after") -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1 +1 @@\n"
+        f"-{before}\n"
+        f"+{after}\n"
+    )
+
+
 def _change(
     path: str, before_digest: str = SRC_BEFORE, after_digest: str = SRC_AFTER
 ) -> CodexWorkspaceChange:
@@ -56,7 +70,7 @@ def _proposal(
     changes: tuple[CodexWorkspaceChange, ...] = (_change("src/feature.py"),),
     base_head: str = "abc123",
     base_remote_refs: tuple[tuple[str, str], ...] = (("origin/main", "abc123"),),
-    patch: str = "diff --git a/src/feature.py b/src/feature.py\n+approved\n",
+    patch: str = _patch("src/feature.py"),
 ) -> CodexWorkspaceProposal:
     return CodexWorkspaceProposal.create(
         action_id=action_id,
@@ -91,16 +105,22 @@ class _Adapter:
         self.interrupt_confirmed = interrupt_confirmed
         self.envelopes = []
         self.interrupted = []
+        self._interrupted = Event()
 
     def invoke(self, envelope, *, deadline: float) -> CodexAdapterResult:
         self.envelopes.append(envelope)
         if self.delay_seconds:
-            time.sleep(self.delay_seconds)
+            self._interrupted.wait(self.delay_seconds)
         return self.result
 
-    def interrupt(self, request_id: str) -> bool:
+    def interrupt(
+        self, request_id: str, *, deadline: float
+    ) -> CodexInterruption | bool:
         self.interrupted.append(request_id)
-        return self.interrupt_confirmed
+        if not self.interrupt_confirmed:
+            return False
+        self._interrupted.set()
+        return CodexInterruption(result=self.result)
 
 
 class _Inspector:
@@ -263,12 +283,14 @@ def test_workspace_proposal_digest_binds_base_patch_and_file_transition() -> Non
             "after_digest": SRC_AFTER,
         }
     ]
-    assert (
-        _proposal(
-            patch="diff --git a/src/feature.py b/src/feature.py\nchanged\n"
-        ).digest
-        != proposal.digest
+    assert _proposal(patch=_patch("src/feature.py", after="changed")).digest != (
+        proposal.digest
     )
+
+
+def test_workspace_proposal_rejects_patch_outside_declared_changes() -> None:
+    with pytest.raises(ValueError, match="patch paths"):
+        _proposal(patch=_patch("deployment/service.ini"))
 
 
 def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths() -> (
@@ -281,8 +303,8 @@ def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths(
             _change("tests/test_feature.py", TEST_BEFORE, TEST_AFTER),
         ),
         patch=(
-            "diff --git a/src/feature.py b/src/feature.py\n"
-            "diff --git a/tests/test_feature.py b/tests/test_feature.py\n"
+            _patch("src/feature.py")
+            + _patch("tests/test_feature.py", before="old test", after="new test")
         ),
     )
     approval = CodexWorkspaceApproval(
@@ -503,10 +525,10 @@ def test_independent_verification_rejects_forbidden_specialist_effects(
 
 
 def test_specialist_interrupts_the_adapter_at_the_frozen_deadline() -> None:
-    adapter = _Adapter(delay_seconds=0.05)
+    adapter = _Adapter(delay_seconds=0.2)
     specialist, _adapter = _specialist(
         adapter=adapter,
-        config=_config(timeout_seconds=0.01),
+        config=_config(timeout_seconds=0.1),
     )
 
     result = specialist.invoke(
@@ -524,10 +546,10 @@ def test_specialist_interrupts_the_adapter_at_the_frozen_deadline() -> None:
 
 
 def test_timeout_rejects_an_unconfirmed_interrupt_or_late_mutation() -> None:
-    unconfirmed = _Adapter(delay_seconds=0.05, interrupt_confirmed=False)
+    unconfirmed = _Adapter(delay_seconds=0.2, interrupt_confirmed=False)
     specialist, _adapter = _specialist(
         adapter=unconfirmed,
-        config=_config(timeout_seconds=0.01),
+        config=_config(timeout_seconds=0.1),
     )
     with pytest.raises(CodexVerificationError, match="interrupt"):
         specialist.invoke(
@@ -539,11 +561,11 @@ def test_timeout_rejects_an_unconfirmed_interrupt_or_late_mutation() -> None:
             )
         )
 
-    late_mutation = _Adapter(delay_seconds=0.05)
+    late_mutation = _Adapter(delay_seconds=0.2)
     specialist, _adapter = _specialist(
         adapter=late_mutation,
         after=_snapshot(changed_paths=("README.md",)),
-        config=_config(timeout_seconds=0.01),
+        config=_config(timeout_seconds=0.1),
     )
     with pytest.raises(CodexVerificationError, match="read-only"):
         specialist.invoke(
@@ -559,7 +581,7 @@ def test_timeout_rejects_an_unconfirmed_interrupt_or_late_mutation() -> None:
 def test_timeout_does_not_return_until_the_worker_is_quiescent() -> None:
     class _LateWorker(_Adapter):
         def __init__(self) -> None:
-            super().__init__(delay_seconds=0.05)
+            super().__init__(delay_seconds=0.2)
             self.finished = False
 
         def invoke(self, envelope, *, deadline: float) -> CodexAdapterResult:
@@ -570,7 +592,7 @@ def test_timeout_does_not_return_until_the_worker_is_quiescent() -> None:
     adapter = _LateWorker()
     specialist, _adapter = _specialist(
         adapter=adapter,
-        config=_config(timeout_seconds=0.01),
+        config=_config(timeout_seconds=0.1),
     )
 
     result = specialist.invoke(
@@ -584,6 +606,31 @@ def test_timeout_does_not_return_until_the_worker_is_quiescent() -> None:
 
     assert result.status == "incomplete"
     assert adapter.finished is True
+
+
+def test_timeout_rejects_non_quiescent_worker_within_the_frozen_deadline() -> None:
+    class _StuckAdapter(_Adapter):
+        def interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
+            self.interrupted.append(request_id)
+            return CodexInterruption(result=self.result)
+
+    adapter = _StuckAdapter(delay_seconds=0.3)
+    specialist, _adapter = _specialist(
+        adapter=adapter,
+        config=_config(timeout_seconds=0.05),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(CodexVerificationError, match="quiescence"):
+        specialist.invoke(
+            CodexInvocation(
+                request_id="request-stuck",
+                workspace="jarvis",
+                operation="inspect",
+                task="Inspect the repository.",
+            )
+        )
+    assert time.monotonic() - started < 0.15
 
 
 def test_agents_orchestration_exposes_only_the_closed_read_only_codex_tool() -> None:
@@ -663,8 +710,8 @@ def test_agents_orchestration_exposes_only_the_closed_read_only_codex_tool() -> 
 
 def test_agents_orchestration_preserves_a_typed_incomplete_codex_result() -> None:
     specialist, _codex_adapter = _specialist(
-        adapter=_Adapter(delay_seconds=0.05),
-        config=_config(timeout_seconds=0.01),
+        adapter=_Adapter(delay_seconds=0.2),
+        config=_config(timeout_seconds=0.1),
     )
     captured: dict[str, object] = {}
 
@@ -933,7 +980,7 @@ def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None
         action_id="action-mcp-001",
         request_id="request-mcp-write",
         changes=(_change("src/feature.py"),),
-        patch="diff --git a/src/feature.py b/src/feature.py\n+approved\n",
+        patch=_patch("src/feature.py"),
     )
     approval = CodexWorkspaceApproval(
         action_id=proposal.action_id,
@@ -1116,3 +1163,98 @@ def test_mcp_adapter_denies_forbidden_exec_command_before_operator_handler() -> 
     assert decisions == ["deny"]
     assert handler_calls == []
     assert result.changed_paths == ("src/feature.py",)
+
+
+def test_mcp_adapter_denies_project_code_labeled_as_read_before_handler() -> None:
+    proposal = _proposal(
+        action_id="action-mcp-project-code",
+        request_id="request-mcp-project-code",
+    )
+    envelope = CodexExecutionEnvelope(
+        request_id=proposal.request_id,
+        task=proposal.task,
+        host="windows",
+        cwd="C:/work/Jarvis-v2",
+        model="gpt-5.6-sol",
+        reasoning="high",
+        sandbox="workspace-write",
+        approval_policy="on-request",
+        timeout_seconds=300,
+        operation="workspace_prepare",
+        allowed_paths=("src",),
+        proposal_digest=proposal.digest,
+        proposal_base_head=proposal.base_head,
+        proposal_remote_refs=proposal.base_remote_refs,
+        proposal_changes=proposal.changes,
+        proposal_patch=proposal.patch,
+    )
+    handler_calls = []
+    adapter = CodexMcpAdapter(
+        client=SimpleNamespace(),
+        approval_handler=lambda _envelope, _request: (
+            handler_calls.append(True) or "allow"
+        ),
+    )
+
+    decision = adapter._handle_approval(
+        envelope,
+        CodexMcpApprovalRequest(
+            thread_id="thread-project-code",
+            request_id="call-project-code",
+            action="exec_command",
+            details={
+                "cwd": "C:/work/Jarvis-v2",
+                "command": "python scripts/activate.py",
+                "operation": "read",
+            },
+        ),
+    )
+
+    assert decision == "deny"
+    assert handler_calls == []
+
+
+def test_mcp_adapter_allows_only_structured_authoritative_safe_read() -> None:
+    proposal = _proposal()
+    envelope = CodexExecutionEnvelope(
+        request_id=proposal.request_id,
+        task=proposal.task,
+        host="ubuntu",
+        cwd="/work/Jarvis-v2",
+        model="gpt-5.6-sol",
+        reasoning="high",
+        sandbox="workspace-write",
+        approval_policy="on-request",
+        timeout_seconds=300,
+        operation="workspace_prepare",
+        allowed_paths=("src",),
+        proposal_digest=proposal.digest,
+        proposal_base_head=proposal.base_head,
+        proposal_remote_refs=proposal.base_remote_refs,
+        proposal_changes=proposal.changes,
+        proposal_patch=proposal.patch,
+    )
+    handler_calls = []
+    adapter = CodexMcpAdapter(
+        client=SimpleNamespace(),
+        approval_handler=lambda _envelope, request: (
+            handler_calls.append(request.details) or "allow"
+        ),
+    )
+    details = {
+        "cwd": "/work/Jarvis-v2",
+        "argv": ["/usr/bin/git", "status"],
+    }
+
+    decision = adapter._handle_approval(
+        envelope,
+        CodexMcpApprovalRequest(
+            thread_id="thread-safe-read",
+            request_id="call-safe-read",
+            action="exec_command",
+            details=details,
+        ),
+    )
+
+    assert decision == "allow"
+    assert handler_calls == [details]
