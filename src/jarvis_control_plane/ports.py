@@ -28,8 +28,12 @@ from .models import (
     MemorySelection,
     OrchestrationRequest,
     OrchestrationResult,
+    OutboundAttemptRecord,
+    OutboundAttemptRecoveryProjection,
+    OutboundAttemptStatus,
     OutboundDelivery,
     OutboundReply,
+    RecoveryDegradedMarker,
     RequestState,
 )
 
@@ -229,7 +233,45 @@ class DurableStateStore(Protocol):
         *,
         transport_session_id: str,
         message_id: str,
+        terminal_at: datetime | None = None,
+        outbound_id: str | None = None,
     ) -> None: ...
+
+    def terminalize_outbound_conversation_attempt(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        status: OutboundAttemptStatus | str,
+        terminal_at: datetime,
+        outbound_id: str | None = None,
+    ) -> None: ...
+
+    def mark_outbound_conversation_attempted(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        attempted_at: datetime,
+    ) -> None: ...
+
+    def list_outbound_conversation_attempts(
+        self,
+    ) -> tuple[OutboundAttemptRecord, ...]: ...
+
+    def list_outbound_conversation_attempt_recovery(
+        self,
+    ) -> tuple[OutboundAttemptRecoveryProjection, ...]: ...
+
+    def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None: ...
+
+    def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None: ...
+
+    def acknowledge_recovery_degraded(self) -> None: ...
+
+    def reconcile_outbound_conversation_attempts(
+        self, *, interrupted_at: datetime
+    ) -> tuple[OutboundAttemptRecord, ...]: ...
 
     def search_conversation_messages(
         self,

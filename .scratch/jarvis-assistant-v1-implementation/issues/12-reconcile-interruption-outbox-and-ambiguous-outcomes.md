@@ -4,9 +4,9 @@
 
 **Blocked by:** 03 — Enforce append-only audit admission and safe inspection; 04 — Retain complete diagnostic traces and enforce trace capacity; 07 — Freeze and execute one exact approval-gated action; 11 — Dispatch bounded work through a controlled worker gateway.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Restart marks active work interrupted, removes pending payloads, revokes session permissions, preserves persistent permissions, and clears request working data.
-- [ ] Durable outbox and dispatch records distinguish known-unattempted, attempted, confirmed, and unknown outcomes.
-- [ ] No interrupted model run, proposal, connector call, terminal process, or possibly successful side effect resumes or retries automatically.
+- [x] Restart marks active work interrupted, removes pending payloads, revokes session permissions, preserves persistent permissions, and clears request working data.
+- [x] Durable outbox and dispatch records distinguish known-unattempted, attempted, confirmed, and unknown outcomes.
+- [x] No interrupted model run, proposal, connector call, terminal process, or possibly successful side effect resumes or retries automatically.
 
