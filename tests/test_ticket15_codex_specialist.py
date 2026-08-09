@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from datetime import UTC, datetime
 from threading import Event
 from types import SimpleNamespace
@@ -106,12 +105,16 @@ class _Adapter:
         self.envelopes = []
         self.interrupted = []
         self._interrupted = Event()
+        self.invoke_finished = Event()
 
     def invoke(self, envelope, *, deadline: float) -> CodexAdapterResult:
         self.envelopes.append(envelope)
-        if self.delay_seconds:
-            self._interrupted.wait(self.delay_seconds)
-        return self.result
+        try:
+            if self.delay_seconds:
+                self._interrupted.wait(self.delay_seconds)
+            return self.result
+        finally:
+            self.invoke_finished.set()
 
     def interrupt(
         self, request_id: str, *, deadline: float
@@ -291,6 +294,22 @@ def test_workspace_proposal_digest_binds_base_patch_and_file_transition() -> Non
 def test_workspace_proposal_rejects_patch_outside_declared_changes() -> None:
     with pytest.raises(ValueError, match="patch paths"):
         _proposal(patch=_patch("deployment/service.ini"))
+
+
+def test_workspace_proposal_rejects_file_mode_changes() -> None:
+    patch = (
+        "diff --git a/src/feature.py b/src/feature.py\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "--- a/src/feature.py\n"
+        "+++ b/src/feature.py\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    )
+
+    with pytest.raises(ValueError, match="text changes only"):
+        _proposal(patch=patch)
 
 
 def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths() -> (
@@ -560,6 +579,7 @@ def test_timeout_rejects_an_unconfirmed_interrupt_or_late_mutation() -> None:
                 task="Inspect the repository.",
             )
         )
+    assert unconfirmed.invoke_finished.is_set()
 
     late_mutation = _Adapter(delay_seconds=0.2)
     specialist, _adapter = _specialist(
@@ -608,7 +628,7 @@ def test_timeout_does_not_return_until_the_worker_is_quiescent() -> None:
     assert adapter.finished is True
 
 
-def test_timeout_rejects_non_quiescent_worker_within_the_frozen_deadline() -> None:
+def test_timeout_retains_ownership_until_a_non_quiescent_worker_stops() -> None:
     class _StuckAdapter(_Adapter):
         def interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
             self.interrupted.append(request_id)
@@ -620,7 +640,6 @@ def test_timeout_rejects_non_quiescent_worker_within_the_frozen_deadline() -> No
         config=_config(timeout_seconds=0.05),
     )
 
-    started = time.monotonic()
     with pytest.raises(CodexVerificationError, match="quiescence"):
         specialist.invoke(
             CodexInvocation(
@@ -630,7 +649,7 @@ def test_timeout_rejects_non_quiescent_worker_within_the_frozen_deadline() -> No
                 task="Inspect the repository.",
             )
         )
-    assert time.monotonic() - started < 0.15
+    assert adapter.invoke_finished.is_set()
 
 
 def test_agents_orchestration_exposes_only_the_closed_read_only_codex_tool() -> None:

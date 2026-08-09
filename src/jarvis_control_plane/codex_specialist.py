@@ -202,6 +202,8 @@ def _canonical_patch_changes(
                     "copy from ",
                     "copy to ",
                     "Binary files ",
+                    "old mode ",
+                    "new mode ",
                 )
             )
             or line in {"GIT binary patch"}
@@ -1044,7 +1046,11 @@ class CodexSpecialist:
                 thread_id=worker_result.thread_id,
             )
         finally:
-            executor.shutdown(wait=future.done(), cancel_futures=True)
+            # A verification failure must not release request/workspace ownership
+            # while the adapter can still mutate it. A conforming adapter makes
+            # this wait bounded by establishing process-scope quiescence before
+            # its deadline; a violating adapter fails closed until it is terminal.
+            executor.shutdown(wait=True, cancel_futures=True)
         if not isinstance(adapter_result, CodexAdapterResult):
             raise CodexVerificationError("Codex adapter returned an untyped result")
         after = self._inspector.snapshot(workspace)
