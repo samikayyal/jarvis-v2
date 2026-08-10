@@ -372,6 +372,9 @@ class SubprocessWindowsJobObjectExecutor:
             raise ActionDispatcherError(
                 "Windows Job Object executor accepts one redirection target per component"
             )
+        for component in invocation.action.components:
+            for target in component.redirections:
+                self._verify_frozen_redirection_target(target)
         with self._lock:
             if self._running:
                 raise ActionDispatcherError(
@@ -514,7 +517,9 @@ class SubprocessWindowsJobObjectExecutor:
                 else:
                     pipeline_input = None
                     if component.redirections:
-                        Path(component.redirections[0]).write_bytes(component_output)
+                        target = component.redirections[0]
+                        self._verify_frozen_redirection_target(target)
+                        Path(target).write_bytes(component_output)
                     else:
                         stdout_parts.extend(component_stdout)
                         if component_stdout_truncated[0]:
@@ -664,6 +669,15 @@ class SubprocessWindowsJobObjectExecutor:
             pass
         finally:
             stream.close()  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _verify_frozen_redirection_target(target: str) -> None:
+        candidate = Path(target)
+        resolved = candidate.resolve(strict=False)
+        if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
+            raise ActionDispatcherError(
+                "Windows redirection target changed through a reparse path"
+            )
 
     def _create_job_object(self) -> int:
         import ctypes

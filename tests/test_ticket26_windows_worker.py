@@ -72,6 +72,23 @@ def _invocation(
     )
 
 
+def test_terminal_identity_rejects_a_relative_redirection_target() -> None:
+    with pytest.raises(ValueError, match="redirection target must be canonical"):
+        TerminalAction(
+            host="windows",
+            executable="C:\\Windows\\System32\\whoami.exe",
+            arguments=(),
+            cwd="C:\\Windows\\System32",
+            components=(
+                {
+                    "executable": "C:\\Windows\\System32\\whoami.exe",
+                    "arguments": [],
+                    "redirections": ["relative.txt"],
+                },
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "wrong_value"),
     [
@@ -391,6 +408,38 @@ def test_native_job_executor_preserves_pipeline_and_redirection_structure(
     assert result.completed_components == (0, 1)
     assert result.stdout == ""
     assert redirected.read_text() == "PIPE ME\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows reparse paths")
+def test_native_redirection_rechecks_the_frozen_reparse_target(tmp_path: Path) -> None:
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(actual, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    redirected = linked / "out.txt"
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=("-c", "print('blocked')"),
+        cwd=str(tmp_path),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "print('blocked')"],
+                "redirections": [str(redirected)],
+            },
+        ),
+    )
+
+    with pytest.raises(ActionDispatcherError, match="changed through a reparse path"):
+        SubprocessWindowsJobObjectExecutor().execute(
+            _invocation("reparse-redirection", action=action), lambda _event: None
+        )
+
+    assert not (actual / "out.txt").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
