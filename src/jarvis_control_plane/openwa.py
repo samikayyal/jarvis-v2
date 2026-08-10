@@ -128,6 +128,8 @@ class OpenWAIngressReceiver(Protocol):
 
     def dispatch_admitted_message(self, message: InboundMessage) -> ReceiveResult: ...
 
+    def reconcile_ingress_restart(self) -> int: ...
+
 
 class OpenWAWebhookAdapter:
     """Adapt one private OpenWA HTTP callback to the signed receiver seam."""
@@ -163,11 +165,12 @@ class OpenWAIngressWorker:
     ) -> None:
         self.receiver = receiver
         self.state = state
+        self.startup_interrupted_count = receiver.reconcile_ingress_restart()
 
     def interrupt_stranded_dispatches(self) -> int:
-        """Conservatively terminalize work whose prior process outcome is unknown."""
+        """Return the nonterminal ingress count reconciled during startup."""
 
-        return self.state.interrupt_ingress_dispatches()
+        return self.startup_interrupted_count
 
     def run_once(self) -> ReceiveResult | None:
         message = self.state.begin_next_ingress_dispatch()

@@ -12,6 +12,7 @@ from test_support import build_receiver_components
 
 from jarvis_control_plane import (
     ControlledOutboundConnector,
+    InMemoryAuditBoundary,
     OpenWAConfig,
     OpenWAHttpError,
     OpenWAHttpResponse,
@@ -25,7 +26,7 @@ from jarvis_control_plane import (
     sign_body,
 )
 from jarvis_control_plane.openwa import ControlledOpenWAHttpTransport
-from jarvis_control_plane.ports import OutboundConnectorError
+from jarvis_control_plane.ports import AuditWriteError, OutboundConnectorError
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 SECRET = b"ticket13-webhook-secret"
@@ -78,6 +79,10 @@ def test_pinned_signed_webhook_drives_reply_correlation() -> None:
     )
     raw_body = _raw_openwa_event()
     inbound = OpenWAWebhookAdapter(receiver=components.receiver)
+    worker = OpenWAIngressWorker(
+        receiver=components.receiver,
+        state=components.state,
+    )
     event_headers = {
         "Content-Type": "application/json",
         "X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}",
@@ -96,10 +101,7 @@ def test_pinned_signed_webhook_drives_reply_correlation() -> None:
         assert acknowledgement.disposition == "admitted"
         controlled_outbound = cast(ControlledOutboundConnector, components.outbound)
         assert controlled_outbound.sent == []
-        result = OpenWAIngressWorker(
-            receiver=components.receiver,
-            state=components.state,
-        ).run_once()
+        result = worker.run_once()
     finally:
         assert components.trace_store is not None
         components.trace_store._close_writer_service()
@@ -156,20 +158,20 @@ def test_admitted_webhook_work_survives_state_store_reconstruction(tmp_path) -> 
         audit=second_audit,
     )
     try:
-        result = OpenWAIngressWorker(
+        worker = OpenWAIngressWorker(
             receiver=second.receiver,
             state=second.state,
-        ).run_once()
-        assert result is not None
-        assert result.disposition == "completed"
-        assert (
-            OpenWAIngressWorker(
-                receiver=second.receiver,
-                state=second.state,
-            ).run_once()
-            is None
         )
-        assert second.state.list_ingress_claims()[0].disposition == "dispatched"
+        assert worker.startup_interrupted_count == 1
+        assert worker.run_once() is None
+        assert second.state.list_ingress_claims()[0].disposition == "interrupted"
+        restart_evidence = tuple(
+            record
+            for record in second.audit.records
+            if record.kind == "service_restart"
+            and record.details.get("interrupted_ingress") == "nonterminal"
+        )
+        assert len(restart_evidence) == 1
     finally:
         assert second.trace_store is not None
         second.trace_store._close_writer_service()
@@ -211,6 +213,36 @@ def test_restart_interrupts_claimed_dispatch_without_replaying_it() -> None:
     assert components.state.list_ingress_claims()[0].disposition == "interrupted"
     controlled_outbound = cast(ControlledOutboundConnector, components.outbound)
     assert controlled_outbound.sent == []
+
+
+def test_restart_reconciliation_fails_closed_when_audit_is_unavailable() -> None:
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=SESSION_ID,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket13-restart-audit-failure",
+    )
+    raw_body = _raw_openwa_event(body="retain until restart audit is durable")
+    acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
+        raw_body=raw_body,
+        headers={"X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"},
+    )
+    audit = cast(InMemoryAuditBoundary, components.audit)
+    audit.fail = True
+
+    try:
+        with pytest.raises(AuditWriteError, match="controlled audit append failure"):
+            OpenWAIngressWorker(
+                receiver=components.receiver,
+                state=components.state,
+            )
+    finally:
+        assert components.trace_store is not None
+        components.trace_store._close_writer_service()
+
+    assert acknowledgement.disposition == "admitted"
+    assert components.state.list_ingress_claims()[0].disposition == "admitted"
 
 
 def test_outbound_adapter_uses_pinned_reply_route_and_returned_message_id() -> None:
@@ -313,6 +345,10 @@ def test_openwa_readiness_is_reflected_in_status_after_async_admission() -> None
         id_prefix="ticket13-status",
         messaging_readiness_provider=probe,
     )
+    worker = OpenWAIngressWorker(
+        receiver=components.receiver,
+        state=components.state,
+    )
     raw_body = _raw_openwa_event(body="/status")
     acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
         raw_body=raw_body,
@@ -320,10 +356,7 @@ def test_openwa_readiness_is_reflected_in_status_after_async_admission() -> None
     )
 
     try:
-        result = OpenWAIngressWorker(
-            receiver=components.receiver,
-            state=components.state,
-        ).run_once()
+        result = worker.run_once()
     finally:
         assert components.trace_store is not None
         components.trace_store._close_writer_service()
@@ -382,6 +415,10 @@ def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None
         id_prefix="ticket13-ambiguous",
         outbound=connector,
     )
+    worker = OpenWAIngressWorker(
+        receiver=components.receiver,
+        state=components.state,
+    )
     raw_body = _raw_openwa_event(body="summarize the ambiguous result")
     try:
         acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
@@ -390,10 +427,7 @@ def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None
                 "X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"
             },
         )
-        result = OpenWAIngressWorker(
-            receiver=components.receiver,
-            state=components.state,
-        ).run_once()
+        result = worker.run_once()
     finally:
         assert components.trace_store is not None
         components.trace_store._close_writer_service()

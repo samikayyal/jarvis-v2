@@ -234,7 +234,12 @@ class DurableStateStore(Protocol):
         disposition: str,
     ) -> None: ...
 
-    def interrupt_ingress_dispatches(self) -> int: ...
+    def reconcile_ingress_restart(
+        self,
+        *,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+    ) -> int: ...
 
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]: ...
 

@@ -495,14 +495,26 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("ingress dispatch is not active")
             self.claims[key] = replace(claim, disposition=disposition)
 
-    def interrupt_ingress_dispatches(self) -> int:
+    def reconcile_ingress_restart(
+        self,
+        *,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+    ) -> int:
+        """Atomically audit and interrupt all nonterminal ingress work."""
+
         with self._lock:
-            interrupted = 0
-            for key, claim in tuple(self.claims.items()):
-                if claim.disposition == "dispatching":
-                    self.claims[key] = replace(claim, disposition="interrupted")
-                    interrupted += 1
-            return interrupted
+            nonterminal = tuple(
+                (key, claim)
+                for key, claim in self.claims.items()
+                if claim.disposition in {"admitted", "dispatching"}
+            )
+            if not nonterminal:
+                return 0
+            audit.append(audit_evidence)
+            for key, claim in nonterminal:
+                self.claims[key] = replace(claim, disposition="interrupted")
+            return len(nonterminal)
 
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]:
         with self._lock:
@@ -1765,20 +1777,42 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not finish ingress dispatch") from exc
 
-    def interrupt_ingress_dispatches(self) -> int:
+    def reconcile_ingress_restart(
+        self,
+        *,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+    ) -> int:
+        """Atomically audit and interrupt all nonterminal ingress work."""
+
         try:
+            self.connection.execute("BEGIN IMMEDIATE")
             cursor = self.connection.execute(
                 """
                 UPDATE ingress_claims
                 SET disposition = 'interrupted'
-                WHERE disposition = 'dispatching'
+                WHERE disposition IN ('admitted', 'dispatching')
                 """
             )
+            if cursor.rowcount == 0:
+                self.connection.commit()
+                return 0
+            shared_audit = (
+                isinstance(audit, SQLiteAuditBoundary)
+                and audit._connection is self.connection
+            )
+            if shared_audit:
+                audit._append_batch_in_transaction((audit_evidence,))
+            else:
+                audit.append(audit_evidence)
             self.connection.commit()
             return cursor.rowcount
+        except AuditWriteError:
+            self.connection.rollback()
+            raise
         except sqlite3.Error as exc:
             self.connection.rollback()
-            raise StateStoreError("could not interrupt ingress dispatches") from exc
+            raise StateStoreError("could not reconcile ingress restart") from exc
 
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         try:

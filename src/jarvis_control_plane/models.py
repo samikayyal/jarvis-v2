@@ -1280,6 +1280,7 @@ _ALLOWED_AUDIT_DETAIL_KEYS = frozenset(
         "state",
         "status",
         "interrupted_requests",
+        "interrupted_ingress",
         "target",
         "target_category",
         "tool_input",
@@ -1373,6 +1374,7 @@ _OUTBOUND_RESULTS = frozenset(
 _AUDIT_DETAIL_SCHEMAS: dict[str, dict[str, frozenset[str] | None]] = {
     "service_restart": {
         "interrupted_requests": None,
+        "interrupted_ingress": None,
         "outbound_not_started": None,
         "outbound_unknown": None,
     },

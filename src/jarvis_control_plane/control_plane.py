@@ -4741,6 +4741,22 @@ class SignedMessageReceiver:
 
         return self.broker.handle(message)
 
+    def reconcile_ingress_restart(self) -> int:
+        """Fail closed on nonterminal ingress left by a prior process."""
+
+        return self.state.reconcile_ingress_restart(
+            audit=self.audit,
+            audit_evidence=self._audit_evidence(
+                kind="service_restart",
+                outcome="interrupted",
+                actor="control_plane",
+                operation_type="working_session",
+                target_category="working_session",
+                execution_status="recorded",
+                details={"interrupted_ingress": "nonterminal"},
+            ),
+        )
+
     def _receive(
         self, event: SignedInboundEvent, *, dispatch: bool
     ) -> ReceiveResult:
