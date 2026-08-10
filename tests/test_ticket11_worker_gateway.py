@@ -345,6 +345,91 @@ def test_worker_gateway_retains_known_partial_compound_failure_without_retry() -
     assert exc.value.result.status is WorkerExecutionStatus.FAILED
 
 
+def test_worker_gateway_rejects_completed_progress_with_an_unfinished_component() -> (
+    None
+):
+    worker = ControlledWorkerTransport(
+        identities={"ubuntu": _worker_identity()},
+        result=WorkerExecutionResult(
+            status=WorkerExecutionStatus.COMPLETED,
+            started_components=(0, 1),
+            completed_components=(0,),
+            process_tree_stopped=True,
+        ),
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker},
+        registered_identities={"ubuntu": _worker_identity()},
+    )
+    proposal = FrozenActionProposal.create(
+        action_id="action-worker-impossible-completion",
+        request_id="request-worker-impossible-completion",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/true",
+            "arguments": [],
+            "cwd": "/workspace",
+            "components": [
+                {"executable": "/usr/bin/true", "arguments": []},
+                {
+                    "operator_before": "&&",
+                    "executable": "/usr/bin/true",
+                    "arguments": [],
+                },
+            ],
+        },
+    )
+
+    with pytest.raises(WorkerExecutionError) as exc:
+        gateway.dispatch(proposal)
+
+    assert exc.value.result.status is WorkerExecutionStatus.UNKNOWN
+
+
+def test_worker_gateway_accepts_completed_short_circuit_progress() -> None:
+    worker = ControlledWorkerTransport(
+        identities={"ubuntu": _worker_identity()},
+        result=WorkerExecutionResult(
+            status=WorkerExecutionStatus.COMPLETED,
+            started_components=(0,),
+            completed_components=(0,),
+            process_tree_stopped=True,
+        ),
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": worker},
+        registered_identities={"ubuntu": _worker_identity()},
+    )
+    proposal = FrozenActionProposal.create(
+        action_id="action-worker-short-circuit",
+        request_id="request-worker-short-circuit",
+        kind="terminal",
+        preview="Run the exact terminal action.",
+        payload={
+            "host": "ubuntu",
+            "executable": "/usr/bin/true",
+            "arguments": [],
+            "cwd": "/workspace",
+            "components": [
+                {"executable": "/usr/bin/true", "arguments": []},
+                {
+                    "operator_before": "||",
+                    "executable": "/usr/bin/printf",
+                    "arguments": ["not-run"],
+                },
+            ],
+        },
+    )
+
+    result = gateway.dispatch(proposal)
+
+    assert result.status is WorkerExecutionStatus.COMPLETED
+    assert result.started_components == (0,)
+    assert result.completed_components == (0,)
+
+
 def test_worker_gateway_enforces_deadline_then_cancels_the_process_scope() -> None:
     release_execution = Event()
 

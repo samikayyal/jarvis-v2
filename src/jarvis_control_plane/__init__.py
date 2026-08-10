@@ -257,6 +257,24 @@ from .traces import (
     SQLiteDiagnosticTraceStore,
     TraceReservation,
 )
+from .ubuntu_worker import (
+    ControlledUbuntuLocalAuthenticator,
+    ControlledUbuntuProcessScope,
+    SystemdUbuntuProcessScope,
+    UbuntuLocalAuthenticator,
+    UbuntuLocalPeerExpectation,
+    UbuntuLocalPeerIdentity,
+    UbuntuProcessScope,
+    UbuntuWorkerReadiness,
+    UbuntuWorkerService,
+    UnixSocketUbuntuLocalAuthenticator,
+)
+from .ubuntu_worker_ipc import (
+    UnixSocketUbuntuWorkerTransport,
+    serve_ubuntu_worker_connection,
+)
+
+UbuntuWorkerTransport = UnixSocketUbuntuWorkerTransport
 from .windows_worker import (
     ControlledOutboundWindowsWorkerTransport,
     ControlledWindowsWorkerSession,
@@ -360,6 +378,8 @@ __all__ = [
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
     "ControlledOutboundWindowsWorkerTransport",
+    "ControlledUbuntuLocalAuthenticator",
+    "ControlledUbuntuProcessScope",
     "ControlledVaultSynchronizer",
     "ControlledVaultWriteRepository",
     "ControlledWindowsWorkerSession",
@@ -472,9 +492,19 @@ __all__ = [
     "SubprocessVaultSynchronizer",
     "SubprocessWindowsJobObjectExecutor",
     "SystemClock",
+    "SystemdUbuntuProcessScope",
     "TraceCapacityError",
     "TraceReservation",
     "TraceWriteError",
+    "UbuntuLocalAuthenticator",
+    "UbuntuLocalPeerExpectation",
+    "UbuntuLocalPeerIdentity",
+    "UbuntuProcessScope",
+    "UbuntuWorkerReadiness",
+    "UbuntuWorkerService",
+    "UbuntuWorkerTransport",
+    "UnixSocketUbuntuLocalAuthenticator",
+    "UnixSocketUbuntuWorkerTransport",
     "UrllibGoogleHttpTransport",
     "UrllibGoogleReadHttpTransport",
     "UrllibOpenWAHttpTransport",
@@ -533,5 +563,6 @@ __all__ = [
     "render_vault_unified_diff",
     "render_vault_write_preview",
     "serve_sqlite_deleted_conversation_archive",
+    "serve_ubuntu_worker_connection",
     "sign_body",
 ]
