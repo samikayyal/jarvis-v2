@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "application": {
+    "name": "jarvis-v2",
+    "version": "0.1.0",
+    "git_revision": "27bb6efc5482c1a481bd894ed540800a2acda256"
+  },
+  "python_base_image": {
+    "reference": "python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f"
+  },
+  "requirements_lock": {
+    "path": "requirements.lock",
+    "sha256": "694df9bfd8835bdff02dd24cd6646028376d6b3fa815861f9e461fc86580b908"
+  }
+}

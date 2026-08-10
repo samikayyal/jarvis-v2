@@ -1,0 +1,180 @@
+name: jarvis-assistant-v1
+
+x-service-defaults: &service-defaults
+  build:
+    context: ..
+    dockerfile: deployment/Dockerfile
+  profiles: [manual-activation]
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  init: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+  healthcheck:
+    test: [CMD, python, -m, jarvis_control_plane.deployment, /opt/jarvis/deployment]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  inbound_receiver:
+    <<: *service-defaults
+    user: "10001:10001"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-inbound
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+    networks: [ingress_broker]
+    pids_limit: 32
+    deploy:
+      resources:
+        limits: {memory: 64M, cpus: "0.10"}
+
+  capability_broker:
+    <<: *service-defaults
+    user: "10002:10002"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-broker
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - state_data:/var/lib/jarvis/state
+      - trace_data:/var/lib/jarvis/traces
+      - deleted_conversations:/var/lib/jarvis/deleted-conversations
+      - ubuntu_worker_socket:/run/jarvis-worker
+    networks:
+      - ingress_broker
+      - broker_orchestration
+      - broker_audit
+      - broker_google
+      - broker_vault
+      - broker_openwa_outbound
+      - broker_worker
+    pids_limit: 64
+    deploy:
+      resources:
+        limits: {memory: 192M, cpus: "0.35"}
+
+  orchestration_agent:
+    <<: *service-defaults
+    user: "10003:10003"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-orchestration
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - ./credentials/openai:/run/credentials/openai:ro
+    networks: [broker_orchestration]
+    pids_limit: 128
+    deploy:
+      resources:
+        limits: {memory: 256M, cpus: "0.45"}
+
+  audit_service:
+    <<: *service-defaults
+    user: "10004:10004"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-audit
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - audit_data:/var/lib/jarvis/audit
+    networks: [broker_audit]
+    pids_limit: 32
+    deploy:
+      resources:
+        limits: {memory: 64M, cpus: "0.10"}
+
+  google_connector:
+    <<: *service-defaults
+    user: "10005:10005"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-google
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - ./credentials/google:/run/credentials/google
+    networks: [broker_google, oauth_google]
+    pids_limit: 64
+    deploy:
+      resources:
+        limits: {memory: 96M, cpus: "0.15"}
+
+  knowledge_vault_connector:
+    <<: *service-defaults
+    user: "10006:10006"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-vault
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - ./credentials/vault:/run/credentials/vault:ro
+      - vault_clone:/var/lib/jarvis/vault
+    networks: [broker_vault]
+    pids_limit: 64
+    deploy:
+      resources:
+        limits: {memory: 128M, cpus: "0.20"}
+
+  openwa_outbound_connector:
+    <<: *service-defaults
+    user: "10007:10007"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-openwa-outbound
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - ./credentials/openwa:/run/credentials/openwa:ro
+    networks: [broker_openwa_outbound]
+    pids_limit: 32
+    deploy:
+      resources:
+        limits: {memory: 64M, cpus: "0.10"}
+
+  worker_gateway:
+    <<: *service-defaults
+    user: "10008:10008"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-worker-gateway
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+      - ./credentials/windows-worker:/run/credentials/windows-worker:ro
+    networks: [broker_worker]
+    pids_limit: 64
+    deploy:
+      resources:
+        limits: {memory: 96M, cpus: "0.25"}
+
+  public_oauth_callback:
+    <<: *service-defaults
+    user: "10009:10009"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-oauth-callback
+    volumes:
+      - ./config.example.json:/run/jarvis/config.json:ro
+    networks: [oauth_google]
+    ports: ["127.0.0.1:8080:8080"]
+    pids_limit: 32
+    deploy:
+      resources:
+        limits: {memory: 48M, cpus: "0.10"}
+
+networks:
+  ingress_broker: {internal: true}
+  broker_orchestration: {internal: true}
+  broker_audit: {internal: true}
+  broker_google: {internal: true}
+  broker_vault: {internal: true}
+  broker_openwa_outbound: {internal: true}
+  broker_worker: {internal: true}
+  oauth_google: {internal: true}
+
+volumes:
+  state_data: {}
+  audit_data: {}
+  trace_data: {}
+  deleted_conversations: {}
+  vault_clone: {}
+  ubuntu_worker_socket: {}
