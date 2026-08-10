@@ -312,6 +312,33 @@ def test_workspace_proposal_rejects_file_mode_changes() -> None:
         _proposal(patch=patch)
 
 
+@pytest.mark.parametrize(
+    ("mode_header", "old_marker", "new_marker"),
+    [
+        ("new file mode 100755", "/dev/null", "b/src/feature.py"),
+        ("new file mode 120000", "/dev/null", "b/src/feature.py"),
+        ("deleted file mode 100755", "a/src/feature.py", "/dev/null"),
+    ],
+)
+def test_workspace_proposal_rejects_create_delete_mode_headers(
+    mode_header: str,
+    old_marker: str,
+    new_marker: str,
+) -> None:
+    patch = (
+        "diff --git a/src/feature.py b/src/feature.py\n"
+        f"{mode_header}\n"
+        f"--- {old_marker}\n"
+        f"+++ {new_marker}\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+after\n"
+    )
+
+    with pytest.raises(ValueError, match="text changes only"):
+        _proposal(patch=patch)
+
+
 def test_workspace_preparation_accepts_only_matching_approval_and_allowed_paths() -> (
     None
 ):
@@ -1233,6 +1260,61 @@ def test_mcp_adapter_denies_project_code_labeled_as_read_before_handler() -> Non
     assert handler_calls == []
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["/usr/bin/git", "status"],
+        ["/usr/bin/git", "diff"],
+        ["/usr/bin/git", "diff", "--ext-diff"],
+        ["/usr/bin/git", "diff", "--textconv"],
+        ["/usr/bin/git", "log", "-p"],
+        ["/usr/bin/git", "show"],
+    ],
+)
+def test_mcp_adapter_denies_git_commands_before_operator_handler(
+    argv: list[str],
+) -> None:
+    proposal = _proposal()
+    envelope = CodexExecutionEnvelope(
+        request_id=proposal.request_id,
+        task=proposal.task,
+        host="ubuntu",
+        cwd="/work/Jarvis-v2",
+        model="gpt-5.6-sol",
+        reasoning="high",
+        sandbox="workspace-write",
+        approval_policy="on-request",
+        timeout_seconds=300,
+        operation="workspace_prepare",
+        allowed_paths=("src",),
+        proposal_digest=proposal.digest,
+        proposal_base_head=proposal.base_head,
+        proposal_remote_refs=proposal.base_remote_refs,
+        proposal_changes=proposal.changes,
+        proposal_patch=proposal.patch,
+    )
+    handler_calls = []
+    adapter = CodexMcpAdapter(
+        client=SimpleNamespace(),
+        approval_handler=lambda _envelope, request: (
+            handler_calls.append(request.details) or "allow"
+        ),
+    )
+
+    decision = adapter._handle_approval(
+        envelope,
+        CodexMcpApprovalRequest(
+            thread_id="thread-git-read",
+            request_id="call-git-read",
+            action="exec_command",
+            details={"cwd": envelope.cwd, "argv": argv},
+        ),
+    )
+
+    assert decision == "deny"
+    assert handler_calls == []
+
+
 def test_mcp_adapter_allows_only_structured_authoritative_safe_read() -> None:
     proposal = _proposal()
     envelope = CodexExecutionEnvelope(
@@ -1262,7 +1344,7 @@ def test_mcp_adapter_allows_only_structured_authoritative_safe_read() -> None:
     )
     details = {
         "cwd": "/work/Jarvis-v2",
-        "argv": ["/usr/bin/git", "status"],
+        "argv": ["/usr/bin/ls", "-la"],
     }
 
     decision = adapter._handle_approval(

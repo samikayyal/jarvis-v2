@@ -204,6 +204,8 @@ def _canonical_patch_changes(
                     "Binary files ",
                     "old mode ",
                     "new mode ",
+                    "new file mode ",
+                    "deleted file mode ",
                 )
             )
             or line in {"GIT binary patch"}
@@ -878,6 +880,12 @@ class CodexMcpAdapter:
             or not argv
             or any(not isinstance(value, str) or not value for value in argv)
         ):
+            return False
+        executable_name = argv[0].replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+        if executable_name.casefold() in {"git", "git.exe"}:
+            # Repository and user Git configuration can make nominally read-only
+            # commands execute hooks, external diff drivers, or textconv filters.
+            # Jarvis's independent inspector owns Git state verification instead.
             return False
         try:
             action = TerminalAction(
