@@ -4,6 +4,7 @@ import os
 import socket
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 from typing import Protocol, cast
@@ -34,6 +35,7 @@ from jarvis_control_plane import (
     WorkerProgressKind,
     serve_ubuntu_worker_connection,
 )
+from jarvis_control_plane.terminal_policy import TerminalAction, TerminalComponent
 
 
 class _CancellableHandle(Protocol):
@@ -64,11 +66,14 @@ def _worker(
     peer: UbuntuLocalPeerIdentity | None = None,
     readiness: UbuntuWorkerReadiness = UbuntuWorkerReadiness.READY,
     process_scope: ControlledUbuntuProcessScope | None = None,
+    channel: socket.socket | None = None,
 ) -> UbuntuWorkerService:
     return UbuntuWorkerService(
         worker_id="ubuntu-01",
         expected_peer=_peer_expectation(),
-        authenticator=ControlledUbuntuLocalAuthenticator(peer or _local_peer()),
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            peer or _local_peer(), connection=channel
+        ),
         readiness=lambda: readiness,
         process_scope=process_scope or ControlledUbuntuProcessScope(),
     )
@@ -237,7 +242,7 @@ def test_gateway_dispatch_and_result_cross_the_authenticated_local_channel() -> 
             ),
         ),
     )
-    service = _worker(process_scope=process_scope)
+    service = _worker(process_scope=process_scope, channel=worker_connection)
     server = Thread(
         target=serve_ubuntu_worker_connection,
         args=(worker_connection, service),
@@ -273,6 +278,20 @@ def test_gateway_dispatch_and_result_cross_the_authenticated_local_channel() -> 
     assert not server.is_alive()
 
 
+def test_worker_server_rejects_an_authenticator_for_another_socket() -> None:
+    gateway_connection, worker_connection = socket.socketpair()
+    unrelated_gateway, unrelated_worker = socket.socketpair()
+    service = _worker(channel=unrelated_worker)
+    try:
+        with pytest.raises(ValueError, match="exact channel"):
+            serve_ubuntu_worker_connection(worker_connection, service)
+    finally:
+        gateway_connection.close()
+        worker_connection.close()
+        unrelated_gateway.close()
+        unrelated_worker.close()
+
+
 def test_gateway_cancellation_crosses_the_local_channel_and_stops_scope() -> None:
     started = Event()
     release = Event()
@@ -294,7 +313,7 @@ def test_gateway_cancellation_crosses_the_local_channel_and_stops_scope() -> Non
     process_scope = ControlledUbuntuProcessScope(
         execution_hook=execute, cancellation_hook=cancel
     )
-    service = _worker(process_scope=process_scope)
+    service = _worker(process_scope=process_scope, channel=worker_connection)
     server = Thread(
         target=serve_ubuntu_worker_connection,
         args=(worker_connection, service),
@@ -357,7 +376,6 @@ def test_systemd_scope_is_noninteractive_bounded_and_never_uses_a_shell() -> Non
             host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
         ),
     )
-
     command = scope.command_for(invocation)
 
     assert command[0] == "/usr/bin/systemd-run"
@@ -375,6 +393,50 @@ def test_systemd_scope_rejects_an_invalid_process_tree_bound(
 ) -> None:
     with pytest.raises((TypeError, ValueError), match="process limit"):
         SystemdUbuntuProcessScope(process_limit=process_limit)  # type: ignore[arg-type]
+
+
+def test_systemd_scope_releases_a_reservation_after_pre_dispatch_rejection() -> None:
+    scope = SystemdUbuntuProcessScope()
+    invocation = _invocation(
+        "action-ubuntu-preflight",
+        WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    invocation = replace(
+        invocation,
+        action=TerminalAction(
+            host="ubuntu",
+            executable="/usr/bin/printf",
+            arguments=("hello",),
+            cwd="/workspace",
+            components=(
+                TerminalComponent(
+                    executable="/usr/bin/printf",
+                    arguments=("hello",),
+                    redirections=("/workspace/out.txt",),
+                ),
+            ),
+        ),
+    )
+    scope.reserve(action_id=invocation.action_id)
+
+    with pytest.raises(ActionDispatcherError):
+        scope.execute(invocation, lambda _event: None)
+
+    scope.reserve(action_id=invocation.action_id)
+
+
+def test_systemd_scope_retires_a_pre_start_cancellation_tombstone() -> None:
+    scope = SystemdUbuntuProcessScope()
+    action_id = "action-ubuntu-retire"
+    scope.reserve(action_id=action_id)
+
+    result = scope.cancel(action_id=action_id, timeout_seconds=10)
+    scope.retire(action_id=action_id)
+    scope.reserve(action_id=action_id)
+
+    assert result.status is ActionCancellationStatus.NOT_STARTED
 
 
 def test_ubuntu_worker_cancellation_stops_the_active_process_scope() -> None:
@@ -439,6 +501,9 @@ def test_cancellation_wins_the_reserved_scope_before_process_start() -> None:
     class PausingProcessScope:
         def reserve(self, *, action_id: str) -> None:
             inner.reserve(action_id=action_id)
+
+        def retire(self, *, action_id: str) -> None:
+            inner.retire(action_id=action_id)
 
         def execute(self, invocation, progress):
             entered_execute.set()
@@ -562,6 +627,26 @@ def test_ubuntu_worker_bounds_each_terminal_output_independently() -> None:
     assert len(result.stderr.encode()) == 1024 * 1024
     assert result.stdout.endswith("[output truncated]")
     assert result.stderr.endswith("[output truncated]")
+
+
+def test_ubuntu_worker_rejects_limits_above_its_configured_contract() -> None:
+    process_scope = ControlledUbuntuProcessScope()
+    worker = _worker(process_scope=process_scope)
+    identity = worker.authenticate(selected_host="ubuntu", timeout_seconds=10)
+    invocation = replace(
+        _invocation("action-ubuntu-limit-bypass", identity),
+        deadline_seconds=121,
+    )
+    worker.register_execution(
+        action_id=invocation.action_id,
+        timeout_seconds=10,
+        retention_seconds=900,
+    )
+
+    with pytest.raises(ActionDispatcherError, match="limits are invalid"):
+        worker.execute(invocation, lambda _event: None)
+
+    assert process_scope.invocations == []
 
 
 def _invocation(action_id: str, identity: WorkerIdentity):

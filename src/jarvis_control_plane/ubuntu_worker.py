@@ -30,6 +30,7 @@ from .ports import (
 )
 from .terminal_policy import TerminalComponent
 from .worker_gateway import (
+    WorkerExecutionLimits,
     WorkerExecutionResult,
     WorkerExecutionStatus,
     WorkerIdentity,
@@ -219,6 +220,8 @@ class UbuntuProcessScope(Protocol):
 
     def reserve(self, *, action_id: str) -> None: ...
 
+    def retire(self, *, action_id: str) -> None: ...
+
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
     ) -> WorkerExecutionResult: ...
@@ -258,6 +261,11 @@ class ControlledUbuntuProcessScope:
                     f"Ubuntu process scope {action_id} is already reserved"
                 )
             self._reserved.add(action_id)
+
+    def retire(self, *, action_id: str) -> None:
+        with self._lock:
+            self._reserved.discard(action_id)
+            self._cancelled.discard(action_id)
 
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
@@ -301,6 +309,12 @@ class ControlledUbuntuProcessScope:
 
 
 @dataclass(slots=True)
+class _StartingSystemdScope:
+    cancel_requested: Event
+    resolved: Event
+
+
+@dataclass(slots=True)
 class _RunningSystemdScope:
     unit_name: str
     process: subprocess.Popen[bytes]
@@ -339,6 +353,7 @@ class SystemdUbuntuProcessScope:
         self._process_limit = process_limit
         self._lock = RLock()
         self._running: dict[str, _RunningSystemdScope] = {}
+        self._starting: dict[str, _StartingSystemdScope] = {}
         self._active_action_ids: set[str] = set()
         self._reserved_action_ids: set[str] = set()
         self._cancelled_action_ids: set[str] = set()
@@ -355,6 +370,11 @@ class SystemdUbuntuProcessScope:
                     f"Ubuntu process scope {action_id} is already reserved"
                 )
             self._reserved_action_ids.add(action_id)
+
+    def retire(self, *, action_id: str) -> None:
+        with self._lock:
+            self._reserved_action_ids.discard(action_id)
+            self._cancelled_action_ids.discard(action_id)
 
     def command_for(self, invocation: WorkerInvocation) -> tuple[str, ...]:
         """Return the exact argv used to create the bounded native scope."""
@@ -394,6 +414,16 @@ class SystemdUbuntuProcessScope:
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
     ) -> WorkerExecutionResult:
+        try:
+            if sys.platform != "linux":
+                raise ActionDispatcherError(
+                    "native Ubuntu process scope requires Linux"
+                )
+            command = self.command_for(invocation)
+        except ActionDispatcherError:
+            with self._lock:
+                self._reserved_action_ids.discard(invocation.action_id)
+            raise
         with self._lock:
             if invocation.action_id in self._cancelled_action_ids:
                 return WorkerExecutionResult(
@@ -404,11 +434,18 @@ class SystemdUbuntuProcessScope:
                 raise ActionDispatcherError("Ubuntu process scope was not reserved")
             self._reserved_action_ids.remove(invocation.action_id)
             self._active_action_ids.add(invocation.action_id)
-        if sys.platform != "linux":
+            starting = _StartingSystemdScope(cancel_requested=Event(), resolved=Event())
+            self._starting[invocation.action_id] = starting
+        if starting.cancel_requested.is_set():
             with self._lock:
+                self._starting.pop(invocation.action_id, None)
                 self._active_action_ids.discard(invocation.action_id)
-            raise ActionDispatcherError("native Ubuntu process scope requires Linux")
-        command = self.command_for(invocation)
+                self._cancelled_action_ids.add(invocation.action_id)
+                starting.resolved.set()
+            return WorkerExecutionResult(
+                status=WorkerExecutionStatus.CANCELLED,
+                process_tree_stopped=True,
+            )
         unit_name = self._unit_name(invocation.action_id)
         try:
             process = subprocess.Popen(
@@ -423,17 +460,23 @@ class SystemdUbuntuProcessScope:
         except OSError as exc:
             with self._lock:
                 self._active_action_ids.discard(invocation.action_id)
+                self._starting.pop(invocation.action_id, None)
+                if starting.cancel_requested.is_set():
+                    self._cancelled_action_ids.add(invocation.action_id)
+                starting.resolved.set()
             raise ActionDispatcherError(
                 "native Ubuntu process scope could not start"
             ) from exc
         running = _RunningSystemdScope(
             unit_name=unit_name,
             process=process,
-            cancel_requested=Event(),
+            cancel_requested=starting.cancel_requested,
             termination_lock=RLock(),
         )
         with self._lock:
             self._running[invocation.action_id] = running
+            self._starting.pop(invocation.action_id, None)
+            starting.resolved.set()
         try:
             return self._observe(running, invocation, progress)
         finally:
@@ -448,16 +491,31 @@ class SystemdUbuntuProcessScope:
     def cancel(
         self, *, action_id: str, timeout_seconds: int
     ) -> ActionCancellationResult:
+        deadline = monotonic() + timeout_seconds
         with self._lock:
             if action_id in self._reserved_action_ids:
                 self._reserved_action_ids.remove(action_id)
                 self._cancelled_action_ids.add(action_id)
                 return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+            starting = self._starting.get(action_id)
             running = self._running.get(action_id)
+        if starting is not None:
+            starting.cancel_requested.set()
+            if not starting.resolved.wait(timeout=max(deadline - monotonic(), 0)):
+                return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+            with self._lock:
+                if action_id in self._cancelled_action_ids:
+                    return ActionCancellationResult(
+                        ActionCancellationStatus.NOT_STARTED
+                    )
+                running = self._running.get(action_id)
         if running is None:
             return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         running.cancel_requested.set()
-        stopped = self._stop_scope(running, timeout_seconds)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+        stopped = self._stop_scope(running, remaining)
         if stopped:
             with self._lock:
                 if self._running.get(action_id) is running:
@@ -625,7 +683,9 @@ class SystemdUbuntuProcessScope:
             stderr=stderr,
         )
 
-    def _stop_scope(self, running: _RunningSystemdScope, timeout_seconds: int) -> bool:
+    def _stop_scope(
+        self, running: _RunningSystemdScope, timeout_seconds: float
+    ) -> bool:
         deadline = monotonic() + timeout_seconds
         with running.termination_lock:
             if running.process.poll() is None:
@@ -721,6 +781,7 @@ class UbuntuWorkerService:
         authenticator: UbuntuLocalAuthenticator,
         readiness: Callable[[], UbuntuWorkerReadiness],
         process_scope: UbuntuProcessScope,
+        limits: WorkerExecutionLimits | None = None,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         if not worker_id.strip():
@@ -730,11 +791,17 @@ class UbuntuWorkerService:
         self._authenticator = authenticator
         self._readiness = readiness
         self._process_scope = process_scope
+        self._limits = limits or WorkerExecutionLimits()
         self._clock = clock
         self._lock = RLock()
         self._actions: dict[str, _ActionRecord] = {}
         self._active_action_id: str | None = None
         self._authenticated_identity: WorkerIdentity | None = None
+
+    def binds(self, connection: socket.socket) -> bool:
+        """Return whether OS identity checks use this exact accepted channel."""
+
+        return self._authenticator.binds(connection)
 
     def register_execution(
         self,
@@ -895,12 +962,32 @@ class UbuntuWorkerService:
             else:
                 record.state = _ActionState.FINALIZED
             record.expires_at = self._clock() + record.retention_seconds
+            self._process_scope.retire(action_id=action_id)
 
     def _validate_invocation_locked(self, invocation: WorkerInvocation) -> None:
         if invocation.action.host != "ubuntu":
             raise ActionDispatcherError("native Ubuntu worker rejected another host")
         if invocation.interactive:
             raise ActionDispatcherError("native Ubuntu worker is non-interactive")
+        bounded_values = (
+            (invocation.deadline_seconds, self._limits.deadline_seconds),
+            (invocation.stdout_limit_bytes, self._limits.stdout_limit_bytes),
+            (invocation.stderr_limit_bytes, self._limits.stderr_limit_bytes),
+            (
+                invocation.cancellation_grace_seconds,
+                self._limits.cancellation_grace_seconds,
+            ),
+            (invocation.progress_event_limit, self._limits.progress_event_limit),
+            (invocation.milestone_limit_bytes, self._limits.milestone_limit_bytes),
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            or value > maximum
+            for value, maximum in bounded_values
+        ):
+            raise ActionDispatcherError("native Ubuntu worker limits are invalid")
         if self._readiness() is not UbuntuWorkerReadiness.READY:
             raise ActionDispatcherError("native Ubuntu worker is not ready")
         if invocation.worker_identity != self._authenticated_identity:
@@ -913,6 +1000,7 @@ class UbuntuWorkerService:
         for action_id, record in tuple(self._actions.items()):
             if record.expires_at is not None and record.expires_at <= now:
                 del self._actions[action_id]
+                self._process_scope.retire(action_id=action_id)
 
     @staticmethod
     def _validate_retention(retention_seconds: int) -> None:

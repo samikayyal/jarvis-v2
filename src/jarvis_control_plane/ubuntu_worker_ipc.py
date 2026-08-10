@@ -23,7 +23,11 @@ from .ports import (
     ActionDispatcherError,
 )
 from .terminal_policy import TerminalAction, TerminalComponent
-from .ubuntu_worker import UbuntuLocalAuthenticator, UbuntuLocalPeerExpectation
+from .ubuntu_worker import (
+    UbuntuLocalAuthenticator,
+    UbuntuLocalPeerExpectation,
+    UbuntuWorkerService,
+)
 from .worker_gateway import (
     WorkerExecutionResult,
     WorkerExecutionStatus,
@@ -33,10 +37,12 @@ from .worker_gateway import (
     WorkerProgressEvent,
     WorkerProgressKind,
     WorkerProgressSink,
-    WorkerTransport,
 )
 
-_MAX_FRAME_BYTES = 2 * 1024 * 1024 + 128 * 1024
+# Two independently capped 1-MiB streams can expand sixfold under JSON escaping
+# (for example, NUL bytes).  Keep that overhead bounded without rejecting a
+# valid maximum-size terminal result.
+_MAX_FRAME_BYTES = 13 * 1024 * 1024
 _MAX_PENDING_MESSAGES = 130
 
 
@@ -208,6 +214,7 @@ class UnixSocketUbuntuWorkerTransport:
                     },
                 )
                 if message_type == "progress":
+                    _require_keys(message, {"request_id", "type", "payload"})
                     if progress is None:
                         raise ActionDispatcherError(
                             "Ubuntu worker sent unexpected progress"
@@ -215,6 +222,15 @@ class UnixSocketUbuntuWorkerTransport:
                     progress(_progress_from_wire(_required_object(message, "payload")))
                     continue
                 if message_type == "error":
+                    _require_keys(
+                        message,
+                        {
+                            "request_id",
+                            "type",
+                            "message",
+                            "may_have_dispatched",
+                        },
+                    )
                     error_message = _required_text(message, "message")
                     may_have_dispatched = message.get("may_have_dispatched", False)
                     if not isinstance(may_have_dispatched, bool):
@@ -224,6 +240,7 @@ class UnixSocketUbuntuWorkerTransport:
                     )
                 if message_type != "result":
                     raise ActionDispatcherError("Ubuntu worker response was malformed")
+                _require_keys(message, {"request_id", "type", "payload"})
                 return _required_object(message, "payload")
         finally:
             with self._pending_lock:
@@ -262,12 +279,14 @@ class UnixSocketUbuntuWorkerTransport:
 
 def serve_ubuntu_worker_connection(
     connection: socket.socket,
-    worker: WorkerTransport,
+    worker: UbuntuWorkerService,
     *,
     stop: Event | None = None,
 ) -> None:
     """Serve one already-accepted local connection; no listener is created."""
 
+    if not worker.binds(connection):
+        raise ValueError("Ubuntu worker service must authenticate its exact channel")
     connection.setblocking(False)
     send_lock = RLock()
     active_lock = RLock()
@@ -393,13 +412,15 @@ def serve_ubuntu_worker_connection(
     finally:
         with active_lock:
             running = active_action_id
-        if running is not None:
-            worker.cancel(
-                action_id=running,
-                timeout_seconds=10,
-                retention_seconds=retention_by_action.get(running, 15 * 60),
-            )
-        connection.close()
+        try:
+            if running is not None:
+                worker.cancel(
+                    action_id=running,
+                    timeout_seconds=10,
+                    retention_seconds=retention_by_action.get(running, 15 * 60),
+                )
+        finally:
+            connection.close()
 
 
 def _send_frame(
@@ -495,6 +516,13 @@ def _required_text(
     item = value[key]
     if not isinstance(item, str) or not item:
         raise TypeError(f"{key} must be non-blank text")
+    return item
+
+
+def _required_text_allow_empty(value: Mapping[str, object], key: str) -> str:
+    item = value[key]
+    if not isinstance(item, str):
+        raise TypeError(f"{key} must be text")
     return item
 
 
@@ -638,7 +666,7 @@ def _progress_from_wire(value: Mapping[str, object]) -> WorkerProgressEvent:
     return WorkerProgressEvent(
         sequence=_required_int(value, "sequence"),
         kind=WorkerProgressKind(_required_text(value, "kind")),
-        text=_required_text(value, "text") if value["text"] else "",
+        text=_required_text_allow_empty(value, "text"),
         stream=WorkerOutputStream(stream) if stream is not None else None,
         truncated=_required_bool(value, "truncated"),
     )
@@ -676,8 +704,8 @@ def _result_from_wire(value: Mapping[str, object]) -> WorkerExecutionResult:
         started_components=tuple(started),
         completed_components=tuple(completed),
         process_tree_stopped=_required_bool(value, "process_tree_stopped"),
-        stdout=_required_text(value, "stdout") if value["stdout"] else "",
-        stderr=_required_text(value, "stderr") if value["stderr"] else "",
+        stdout=_required_text_allow_empty(value, "stdout"),
+        stderr=_required_text_allow_empty(value, "stderr"),
     )
 
 
