@@ -121,6 +121,7 @@ class WindowsWorkerRegistration:
     identity: WorkerIdentity
     certificate_identity: str
     application_identity: str
+    heartbeat_interval_seconds: int = 10
 
     def __post_init__(self) -> None:
         if self.identity.host != "windows":
@@ -133,6 +134,14 @@ class WindowsWorkerRegistration:
                 raise ValueError(
                     f"Windows worker {name.replace('_', ' ')} must be canonical"
                 )
+        if (
+            isinstance(self.heartbeat_interval_seconds, bool)
+            or not isinstance(self.heartbeat_interval_seconds, int)
+            or not 1 <= self.heartbeat_interval_seconds <= 15
+        ):
+            raise ValueError(
+                "Windows worker heartbeat interval must be between one and 15 seconds"
+            )
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -150,6 +159,7 @@ class WindowsWorkerSessionEvidence:
     connection_id: str
     certificate_identity: str
     application_identity: str
+    heartbeat_interval_seconds: int
     _authenticated: bool
 
     def __init__(
@@ -160,6 +170,7 @@ class WindowsWorkerSessionEvidence:
         connection_id: str,
         certificate_identity: str,
         application_identity: str,
+        heartbeat_interval_seconds: int = 10,
         _token: object | None = None,
     ) -> None:
         object.__setattr__(self, "host", host)
@@ -167,6 +178,9 @@ class WindowsWorkerSessionEvidence:
         object.__setattr__(self, "connection_id", connection_id)
         object.__setattr__(self, "certificate_identity", certificate_identity)
         object.__setattr__(self, "application_identity", application_identity)
+        object.__setattr__(
+            self, "heartbeat_interval_seconds", heartbeat_interval_seconds
+        )
         object.__setattr__(
             self, "_authenticated", _token is _AUTHENTICATED_EVIDENCE_TOKEN
         )
@@ -189,6 +203,14 @@ class WindowsWorkerSessionEvidence:
                 raise ValueError(
                     f"Windows session {name.replace('_', ' ')} must be canonical"
                 )
+        if (
+            isinstance(self.heartbeat_interval_seconds, bool)
+            or not isinstance(self.heartbeat_interval_seconds, int)
+            or not 1 <= self.heartbeat_interval_seconds <= 15
+        ):
+            raise ValueError(
+                "Windows session heartbeat interval must be between one and 15 seconds"
+            )
 
     @property
     def worker_identity(self) -> WorkerIdentity:
@@ -236,10 +258,23 @@ def authenticate_windows_worker_session(
         raise ActionDispatcherError(
             "Windows worker application hello is malformed"
         ) from exc
-    required = {"host", "worker_id", "connection_id", "application_identity"}
+    required = {
+        "host",
+        "worker_id",
+        "connection_id",
+        "application_identity",
+        "heartbeat_interval_seconds",
+    }
     if not isinstance(hello, dict) or set(hello) != required:
         raise ActionDispatcherError("Windows worker application hello schema mismatch")
-    if any(not isinstance(hello[key], str) for key in required):
+    string_fields = required - {"heartbeat_interval_seconds"}
+    heartbeat_interval = hello["heartbeat_interval_seconds"]
+    if (
+        any(not isinstance(hello[key], str) for key in string_fields)
+        or isinstance(heartbeat_interval, bool)
+        or not isinstance(heartbeat_interval, int)
+        or not 1 <= heartbeat_interval <= 15
+    ):
         raise ActionDispatcherError("Windows worker application hello schema mismatch")
     evidence = WindowsWorkerSessionEvidence(
         host=hello["host"],
@@ -247,11 +282,14 @@ def authenticate_windows_worker_session(
         connection_id=hello["connection_id"],
         certificate_identity=registration.certificate_identity,
         application_identity=hello["application_identity"],
+        heartbeat_interval_seconds=heartbeat_interval,
         _token=_AUTHENTICATED_EVIDENCE_TOKEN,
     )
     if (
         evidence.worker_identity != registration.identity
         or evidence.application_identity != registration.application_identity
+        or evidence.heartbeat_interval_seconds
+        != registration.heartbeat_interval_seconds
     ):
         raise ActionDispatcherError("Windows worker application identity mismatch")
     return evidence
@@ -860,6 +898,10 @@ class OutboundWindowsWorkerTransport:
                 "Windows worker readiness expiry must be between one and 45 seconds"
             )
         self.registration = registration
+        if readiness_expiry_seconds < 2 * registration.heartbeat_interval_seconds:
+            raise ValueError(
+                "Windows worker readiness expiry must cover two heartbeat intervals"
+            )
         self.readiness_expiry_seconds = readiness_expiry_seconds
         self._clock = clock or monotonic
         self._lock = RLock()

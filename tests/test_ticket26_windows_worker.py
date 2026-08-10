@@ -89,6 +89,23 @@ def test_terminal_identity_rejects_a_relative_redirection_target() -> None:
         )
 
 
+def test_heartbeat_interval_uses_ten_seconds_and_rejects_above_hard_maximum() -> None:
+    assert REGISTRATION.heartbeat_interval_seconds == 10
+
+    with pytest.raises(ValueError, match="between one and 15 seconds"):
+        WindowsWorkerRegistration(
+            identity=WINDOWS_IDENTITY,
+            certificate_identity="spiffe://jarvis/workers/windows-01",
+            application_identity="jarvis-windows-worker/windows-01",
+            heartbeat_interval_seconds=16,
+        )
+
+    with pytest.raises(ValueError, match="cover two heartbeat intervals"):
+        ControlledOutboundWindowsWorkerTransport(
+            registration=REGISTRATION, readiness_expiry_seconds=19
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "wrong_value"),
     [
@@ -159,7 +176,8 @@ def test_production_transport_accepts_only_certificate_bound_application_hello()
         application_hello=(
             b'{"host":"windows","worker_id":"windows-01",'
             b'"connection_id":"boot-01",'
-            b'"application_identity":"jarvis-windows-worker/windows-01"}'
+            b'"application_identity":"jarvis-windows-worker/windows-01",'
+            b'"heartbeat_interval_seconds":10}'
         ),
     )
     transport.attach(ControlledWindowsWorkerSession(evidence=evidence))
