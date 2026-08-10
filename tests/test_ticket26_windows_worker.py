@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 
@@ -352,6 +353,63 @@ def test_native_job_executor_preserves_structured_compound_component_progress() 
     assert result.started_components == (0, 1)
     assert result.completed_components == (0, 1)
     assert result.stdout.splitlines() == ["first", "second"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_native_job_executor_preserves_pipeline_and_redirection_structure(
+    tmp_path: Path,
+) -> None:
+    redirected = tmp_path / "redirected.txt"
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=("-c", "print('pipe me')"),
+        cwd=str(tmp_path),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "print('pipe me')"],
+            },
+            {
+                "executable": sys.executable,
+                "arguments": [
+                    "-c",
+                    "import sys; print(sys.stdin.read().upper(), end='')",
+                ],
+                "operator_before": "|",
+                "redirections": [str(redirected)],
+            },
+        ),
+    )
+
+    result = SubprocessWindowsJobObjectExecutor().execute(
+        _invocation("pipeline-redirection", action=action), lambda _event: None
+    )
+
+    assert result.status is WorkerExecutionStatus.COMPLETED
+    assert result.started_components == (0, 1)
+    assert result.completed_components == (0, 1)
+    assert result.stdout == ""
+    assert redirected.read_text() == "PIPE ME\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_native_output_overflow_is_visibly_marked_and_traceable() -> None:
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=("-c", "print('x' * 100)"),
+        cwd=str(Path.cwd()),
+    )
+    invocation = replace(_invocation("truncated", action=action), stdout_limit_bytes=32)
+    events = []
+
+    result = SubprocessWindowsJobObjectExecutor().execute(invocation, events.append)
+
+    assert len(result.stdout.encode()) <= 32
+    assert result.stdout.endswith("[truncated]")
+    assert result.stdout_truncated is True
+    assert events[0].truncated is True
 
 
 def test_disconnect_during_started_action_returns_unknown_after_reconnect() -> None:

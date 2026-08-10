@@ -41,6 +41,7 @@ from .worker_gateway import (
 _CREATE_SUSPENDED = 0x00000004
 _AUTHENTICATED_EVIDENCE_TOKEN = object()
 _APPLICATION_HELLO_LIMIT_BYTES = 4096
+_PIPELINE_BUFFER_LIMIT_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,11 +366,11 @@ class SubprocessWindowsJobObjectExecutor:
                 "Windows Job Object execution is non-interactive"
             )
         if any(
-            component.operator_before == "|" or component.redirections
+            len(component.redirections) > 1
             for component in invocation.action.components
         ):
             raise ActionDispatcherError(
-                "Windows Job Object executor cannot preserve pipeline or redirection semantics"
+                "Windows Job Object executor accepts one redirection target per component"
             )
         with self._lock:
             if self._running:
@@ -395,7 +396,9 @@ class SubprocessWindowsJobObjectExecutor:
         started_components: list[int] = []
         completed_components: list[int] = []
         timed_out = False
+        bounded_scope_failed = False
         return_code: int | None = None
+        pipeline_input: bytes | None = None
         deadline = monotonic() + invocation.deadline_seconds
         try:
             flags = (
@@ -419,7 +422,11 @@ class SubprocessWindowsJobObjectExecutor:
                 process = subprocess.Popen(
                     [component.executable, *component.arguments],
                     cwd=invocation.action.cwd,
-                    stdin=subprocess.DEVNULL,
+                    stdin=(
+                        subprocess.PIPE
+                        if pipeline_input is not None
+                        else subprocess.DEVNULL
+                    ),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     creationflags=flags,
@@ -432,17 +439,25 @@ class SubprocessWindowsJobObjectExecutor:
 
                 assert process.stdout is not None
                 assert process.stderr is not None
+                pipes_to_next = (
+                    index + 1 < len(invocation.action.components)
+                    and invocation.action.components[index + 1].operator_before == "|"
+                )
+                component_stdout: list[bytes] = []
+                component_stdout_truncated = [False]
                 stdout_reader = Thread(
                     target=self._read_bounded,
                     args=(
                         process.stdout,
-                        max(
+                        _PIPELINE_BUFFER_LIMIT_BYTES
+                        if pipes_to_next or component.redirections
+                        else max(
                             invocation.stdout_limit_bytes
                             - sum(len(part) for part in stdout_parts),
                             0,
                         ),
-                        stdout_parts,
-                        stdout_truncated,
+                        component_stdout,
+                        component_stdout_truncated,
                     ),
                     daemon=True,
                 )
@@ -462,6 +477,15 @@ class SubprocessWindowsJobObjectExecutor:
                 )
                 stdout_reader.start()
                 stderr_reader.start()
+                input_writer: Thread | None = None
+                if pipeline_input is not None:
+                    assert process.stdin is not None
+                    input_writer = Thread(
+                        target=self._write_pipeline_input,
+                        args=(process.stdin, pipeline_input),
+                        daemon=True,
+                    )
+                    input_writer.start()
                 try:
                     return_code = process.wait(timeout=max(deadline - monotonic(), 0))
                 except subprocess.TimeoutExpired:
@@ -472,11 +496,32 @@ class SubprocessWindowsJobObjectExecutor:
                     return_code = process.poll()
                 stdout_reader.join(timeout=invocation.cancellation_grace_seconds)
                 stderr_reader.join(timeout=invocation.cancellation_grace_seconds)
-                if stdout_reader.is_alive() or stderr_reader.is_alive():
+                if input_writer is not None:
+                    input_writer.join(timeout=invocation.cancellation_grace_seconds)
+                if (
+                    stdout_reader.is_alive()
+                    or stderr_reader.is_alive()
+                    or (input_writer is not None and input_writer.is_alive())
+                ):
                     timed_out = True
+                component_output = b"".join(component_stdout)
+                if component_stdout_truncated[0] and (
+                    pipes_to_next or component.redirections
+                ):
+                    bounded_scope_failed = True
+                elif pipes_to_next:
+                    pipeline_input = component_output
+                else:
+                    pipeline_input = None
+                    if component.redirections:
+                        Path(component.redirections[0]).write_bytes(component_output)
+                    else:
+                        stdout_parts.extend(component_stdout)
+                        if component_stdout_truncated[0]:
+                            stdout_truncated[0] = True
                 if return_code == 0:
                     completed_components.append(index)
-                if timed_out:
+                if timed_out or bounded_scope_failed:
                     break
 
             # A successful root process may have left descendants running.
@@ -485,8 +530,16 @@ class SubprocessWindowsJobObjectExecutor:
                 job_handle, invocation.cancellation_grace_seconds
             )
 
-            stdout = b"".join(stdout_parts).decode(errors="replace")
-            stderr = b"".join(stderr_parts).decode(errors="replace")
+            stdout = self._decode_bounded_output(
+                stdout_parts,
+                truncated=stdout_truncated[0],
+                limit=invocation.stdout_limit_bytes,
+            )
+            stderr = self._decode_bounded_output(
+                stderr_parts,
+                truncated=stderr_truncated[0],
+                limit=invocation.stderr_limit_bytes,
+            )
             sequence = 2
             if stdout or stdout_truncated[0]:
                 progress(
@@ -518,6 +571,8 @@ class SubprocessWindowsJobObjectExecutor:
                 status = WorkerExecutionStatus.CANCELLED
             elif timed_out:
                 status = WorkerExecutionStatus.TIMED_OUT
+            elif bounded_scope_failed:
+                status = WorkerExecutionStatus.FAILED
             elif return_code == 0:
                 status = WorkerExecutionStatus.COMPLETED
             else:
@@ -529,6 +584,8 @@ class SubprocessWindowsJobObjectExecutor:
                 process_tree_stopped=stopped,
                 stdout=stdout,
                 stderr=stderr,
+                stdout_truncated=stdout_truncated[0],
+                stderr_truncated=stderr_truncated[0],
             )
         except BaseException:
             if process is not None:
@@ -586,6 +643,27 @@ class SubprocessWindowsJobObjectExecutor:
                 retained += len(bounded)
             if len(chunk) > available:
                 truncated[0] = True
+
+    @staticmethod
+    def _decode_bounded_output(
+        parts: list[bytes], *, truncated: bool, limit: int
+    ) -> str:
+        encoded = b"".join(parts)
+        if truncated:
+            marker = b"\n[truncated]"
+            if limit >= len(marker):
+                encoded = encoded[: limit - len(marker)] + marker
+        return encoded[:limit].decode(errors="ignore")
+
+    @staticmethod
+    def _write_pipeline_input(stream: object, value: bytes) -> None:
+        try:
+            stream.write(value)  # type: ignore[attr-defined]
+            stream.flush()  # type: ignore[attr-defined]
+        except BrokenPipeError:
+            pass
+        finally:
+            stream.close()  # type: ignore[attr-defined]
 
     def _create_job_object(self) -> int:
         import ctypes
