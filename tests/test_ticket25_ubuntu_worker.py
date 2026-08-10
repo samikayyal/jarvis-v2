@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, RLock, Thread
+from time import monotonic
 from typing import Protocol, cast
 
 import pytest
 
+import jarvis_control_plane.ubuntu_worker as ubuntu_worker_module
 from jarvis_control_plane import (
     ActionCancellationResult,
     ActionCancellationStatus,
@@ -395,6 +398,89 @@ def test_systemd_scope_rejects_an_invalid_process_tree_bound(
         SystemdUbuntuProcessScope(process_limit=process_limit)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("return_code", "state", "expected"),
+    [
+        (1, "", False),
+        (3, "inactive\n", True),
+        (3, "failed\n", True),
+        (4, "unknown\n", True),
+    ],
+)
+def test_systemd_scope_requires_a_known_stopped_unit_state(
+    monkeypatch: pytest.MonkeyPatch,
+    return_code: int,
+    state: str,
+    expected: bool,
+) -> None:
+    scope = SystemdUbuntuProcessScope()
+
+    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], return_code, stdout=state)
+
+    monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
+
+    stopped = scope._unit_is_stopped(
+        "jarvis-action-test.service", timeout_seconds=1
+    )
+
+    assert stopped is expected
+
+
+def test_systemd_scope_deadline_applies_after_wrapper_exit_with_open_pipes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InheritedPipe:
+        def __init__(self) -> None:
+            self.closed = Event()
+
+        def read(self, _size: int) -> bytes:
+            assert self.closed.wait(timeout=5)
+            return b""
+
+        read1 = read
+
+        def close(self) -> None:
+            self.closed.set()
+
+    class ExitedWrapper:
+        def __init__(self) -> None:
+            self.stdout = InheritedPipe()
+            self.stderr = InheritedPipe()
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    scope = SystemdUbuntuProcessScope()
+    wrapper = ExitedWrapper()
+    running_type = ubuntu_worker_module._RunningSystemdScope
+    running = running_type(
+        unit_name="jarvis-action-test.service",
+        process=cast("subprocess.Popen[bytes]", wrapper),
+        cancel_requested=Event(),
+        termination_lock=RLock(),
+    )
+    monkeypatch.setattr(scope, "_stop_scope", lambda *_args: True)
+    invocation = replace(
+        _invocation(
+            "action-ubuntu-inherited-pipe",
+            WorkerIdentity(
+                host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+            ),
+        ),
+        deadline_seconds=1,
+        cancellation_grace_seconds=1,
+    )
+
+    started = monotonic()
+    result = scope._observe(running, invocation, lambda _event: None)
+
+    assert monotonic() - started < 3
+    assert result.status is WorkerExecutionStatus.TIMED_OUT
+    assert result.process_tree_stopped is True
+
+
 def test_systemd_scope_releases_a_reservation_after_pre_dispatch_rejection() -> None:
     scope = SystemdUbuntuProcessScope()
     invocation = _invocation(
@@ -437,6 +523,17 @@ def test_systemd_scope_retires_a_pre_start_cancellation_tombstone() -> None:
     scope.reserve(action_id=action_id)
 
     assert result.status is ActionCancellationStatus.NOT_STARTED
+
+
+def test_ubuntu_worker_rejects_retention_above_configured_maximum() -> None:
+    worker = _worker()
+
+    with pytest.raises(ValueError, match="configured maximum"):
+        worker.register_execution(
+            action_id="action-ubuntu-excess-retention",
+            timeout_seconds=10,
+            retention_seconds=901,
+        )
 
 
 def test_ubuntu_worker_cancellation_stops_the_active_process_scope() -> None:

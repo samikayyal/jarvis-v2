@@ -557,8 +557,15 @@ class SystemdUbuntuProcessScope:
                     if len(accepted) != len(chunk) and not truncation_reported:
                         output.put((tag, b""))
                         truncation_reported = True
+            except (OSError, ValueError):
+                # Deadline cleanup closes the pipes to release readers even if
+                # a descendant inherited the wrapper's file descriptors.
+                pass
             finally:
-                output.put((tag, None))
+                try:
+                    output.put((tag, None), timeout=1)
+                except queue.Full:
+                    pass
 
         assert running.process.stdout is not None
         assert running.process.stderr is not None
@@ -609,19 +616,13 @@ class SystemdUbuntuProcessScope:
         deadline = monotonic() + invocation.deadline_seconds
         timed_out = False
         cleanup_failed = False
-        while len(ended) < 2 or running.process.poll() is None:
-            if monotonic() >= deadline and running.process.poll() is None:
-                timed_out = True
-                if not self._stop_scope(running, invocation.cancellation_grace_seconds):
-                    cleanup_failed = True
-                    break
-            try:
-                stream, chunk = output.get(timeout=0.05)
-            except queue.Empty:
-                continue
+        deadline_cleanup_stopped: bool | None = None
+
+        def record_chunk(stream: WorkerOutputStream, chunk: bytes | None) -> None:
+            nonlocal emitted, sequence
             if chunk is None:
                 ended.add(stream)
-                continue
+                return
             available = max(limits[stream] - len(buffers[stream]), 0)
             accepted = chunk[:available]
             buffers[stream].extend(accepted)
@@ -639,13 +640,40 @@ class SystemdUbuntuProcessScope:
                 )
                 sequence += 1
                 emitted += 1
+
+        while len(ended) < 2 or running.process.poll() is None:
+            if monotonic() >= deadline:
+                timed_out = True
+                deadline_cleanup_stopped = self._stop_scope(
+                    running, invocation.cancellation_grace_seconds
+                )
+                cleanup_failed = not deadline_cleanup_stopped
+                break
+            try:
+                stream, chunk = output.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            record_chunk(stream, chunk)
+        if timed_out:
+            running.process.stdout.close()
+            running.process.stderr.close()
+        while True:
+            try:
+                stream, chunk = output.get_nowait()
+            except queue.Empty:
+                break
+            record_chunk(stream, chunk)
         for reader in readers:
             reader.join(timeout=1)
         return_code = running.process.poll()
         process_tree_stopped = (
-            not cleanup_failed
-            and return_code is not None
-            and self._unit_is_stopped(running.unit_name, timeout_seconds=2)
+            deadline_cleanup_stopped
+            if deadline_cleanup_stopped is not None
+            else (
+                not cleanup_failed
+                and return_code is not None
+                and self._unit_is_stopped(running.unit_name, timeout_seconds=2)
+            )
         )
         status = (
             WorkerExecutionStatus.UNKNOWN
@@ -753,18 +781,21 @@ class SystemdUbuntuProcessScope:
                     self._systemctl_path,
                     "--user",
                     "is-active",
-                    "--quiet",
                     unit_name,
                 ),
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=timeout_seconds,
+                text=True,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return check.returncode != 0
+        state = check.stdout.strip()
+        return (check.returncode == 3 and state in {"inactive", "failed"}) or (
+            check.returncode == 4 and state == "unknown"
+        )
 
     @staticmethod
     def _unit_name(action_id: str) -> str:
@@ -1020,14 +1051,17 @@ class UbuntuWorkerService:
                 del self._actions[action_id]
                 self._process_scope.retire(action_id=action_id)
 
-    @staticmethod
-    def _validate_retention(retention_seconds: int) -> None:
+    def _validate_retention(self, retention_seconds: int) -> None:
         if (
             isinstance(retention_seconds, bool)
             or not isinstance(retention_seconds, int)
             or retention_seconds < 1
+            or retention_seconds > self._limits.action_state_retention_seconds
         ):
-            raise ValueError("Ubuntu worker retention must be positive")
+            raise ValueError(
+                "Ubuntu worker retention must be between one second and the "
+                "configured maximum"
+            )
 
 
 def _bound_result(
