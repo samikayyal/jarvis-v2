@@ -1,0 +1,86 @@
+schema_version = 1
+release_id = "jarvis-assistant-v1"
+artifact_lock = "artifacts.lock.json"
+configuration_kind = "example"
+
+[identities]
+inbound_receiver = "jarvis-inbound"
+capability_broker = "jarvis-broker"
+orchestration_agent = "jarvis-orchestration"
+audit_service = "jarvis-audit"
+google_connector = "jarvis-google"
+knowledge_vault_connector = "jarvis-vault"
+openwa_outbound_connector = "jarvis-openwa-outbound"
+worker_gateway = "jarvis-worker-gateway"
+public_oauth_callback = "jarvis-oauth-callback"
+
+[deployment]
+operator_id = "example-operator-id"
+openwa_internal_session_id = "example-internal-session-id"
+openwa_named_session = "example-named-session"
+openwa_operator_conversation_id = "example-operator-conversation-id"
+google_subject = "example-google-subject"
+oauth_callback_url = "https://oauth.example.invalid/callback"
+windows_worker_identity = "example-windows-worker"
+ubuntu_worker_identity = "example-ubuntu-worker"
+vault_remote = "ssh://vault.example.invalid/notes.git"
+vault_note_directories = ["Notes"]
+
+[models]
+default_model = "gpt-5.6-terra"
+default_reasoning = "medium"
+allowed_models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+allowed_reasoning = ["none", "low", "medium", "high", "xhigh", "max"]
+
+[connector_allowlists]
+gmail = ["read", "search", "send", "reply"]
+calendar = ["read", "search", "create", "update"]
+drive = ["read", "search"]
+vault = ["read", "search", "write_markdown"]
+
+[egress]
+orchestration_hosts = ["api.openai.com"]
+google_hosts = ["accounts.google.com", "oauth2.googleapis.com", "gmail.googleapis.com", "www.googleapis.com"]
+vault_hosts = ["vault.example.invalid"]
+worker_overlay_network = "jarvis-worker-overlay"
+
+[paths]
+state = "/var/lib/jarvis/state"
+audit = "/var/lib/jarvis/audit"
+traces = "/var/lib/jarvis/traces"
+deleted_conversations = "/var/lib/jarvis/deleted-conversations"
+ubuntu_worker_socket = "/run/jarvis-worker/ubuntu.sock"
+
+[permissions]
+configuration = "0444"
+credential_directory = "0700"
+credential_file = "0600"
+ubuntu_worker_socket = "0660"
+
+[openwa_handoff]
+activation = "manual-only"
+members = ["openwa", "inbound_receiver"]
+
+[timeouts]
+model_turn_seconds = 90
+read_connector_seconds = 20
+side_effect_connector_seconds = 30
+codex_seconds = 300
+terminal_seconds = 120
+active_request_seconds = 480
+
+[retention]
+conversation_history = "indefinite"
+durable_memory = "until-explicit-forget"
+audit = "indefinite"
+diagnostic_traces = "indefinite"
+backup_snapshots = "indefinite"
+terminal_operational_days = 30
+
+[resource_bounds]
+aggregate_memory_mib_max = 1280
+aggregate_cpu_cores_max = 2.0
+aggregate_pids = 512
+minimum_free_disk_gib = 2
+terminal_stdout_bytes = 1048576
+terminal_stderr_bytes = 1048576

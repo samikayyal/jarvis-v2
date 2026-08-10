@@ -13,7 +13,7 @@ x-service-defaults: &service-defaults
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
   healthcheck:
-    test: [CMD, python, -m, jarvis_control_plane.deployment, /opt/jarvis/deployment]
+    test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.deployment, /opt/jarvis/deployment, --configuration, /run/jarvis/config.toml, --source-root, /opt/jarvis]
     interval: 30s
     timeout: 5s
     retries: 3
@@ -31,7 +31,7 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-inbound
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
     networks: [ingress_broker]
     pids_limit: 32
     deploy:
@@ -44,7 +44,7 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-broker
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - state_data:/var/lib/jarvis/state
       - trace_data:/var/lib/jarvis/traces
       - deleted_conversations:/var/lib/jarvis/deleted-conversations
@@ -68,9 +68,9 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-orchestration
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
-      - ./credentials/openai:/run/credentials/openai:ro
-    networks: [broker_orchestration]
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/credentials/openai:/run/credentials/openai:ro
+    networks: [broker_orchestration, orchestration_egress]
     pids_limit: 128
     deploy:
       resources:
@@ -82,7 +82,7 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-audit
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - audit_data:/var/lib/jarvis/audit
     networks: [broker_audit]
     pids_limit: 32
@@ -96,9 +96,9 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-google
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
-      - ./credentials/google:/run/credentials/google
-    networks: [broker_google, oauth_google]
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/credentials/google:/run/credentials/google
+    networks: [broker_google, oauth_google, google_egress]
     pids_limit: 64
     deploy:
       resources:
@@ -110,10 +110,10 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-vault
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
-      - ./credentials/vault:/run/credentials/vault:ro
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/credentials/vault:/run/credentials/vault:ro
       - vault_clone:/var/lib/jarvis/vault
-    networks: [broker_vault]
+    networks: [broker_vault, vault_egress]
     pids_limit: 64
     deploy:
       resources:
@@ -125,8 +125,8 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-openwa-outbound
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
-      - ./credentials/openwa:/run/credentials/openwa:ro
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/credentials/openwa:/run/credentials/openwa:ro
     networks: [broker_openwa_outbound]
     pids_limit: 32
     deploy:
@@ -139,9 +139,9 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-worker-gateway
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
-      - ./credentials/windows-worker:/run/credentials/windows-worker:ro
-    networks: [broker_worker]
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/credentials/windows-worker:/run/credentials/windows-worker:ro
+    networks: [broker_worker, worker_overlay]
     pids_limit: 64
     deploy:
       resources:
@@ -153,7 +153,7 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-oauth-callback
     volumes:
-      - ./config.example.json:/run/jarvis/config.json:ro
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
     networks: [oauth_google]
     ports: ["127.0.0.1:8080:8080"]
     pids_limit: 32
@@ -170,6 +170,10 @@ networks:
   broker_openwa_outbound: {internal: true}
   broker_worker: {internal: true}
   oauth_google: {internal: true}
+  orchestration_egress: {internal: false}
+  google_egress: {internal: false}
+  vault_egress: {internal: false}
+  worker_overlay: {external: true, name: jarvis-worker-overlay}
 
 volumes:
   state_data: {}

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
@@ -22,7 +21,7 @@ def _copy_bundle(tmp_path: Path) -> Path:
 
 
 def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
-    report = verify_bundle(SHIPPED_BUNDLE)
+    report = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT)
 
     assert report.release_id == "jarvis-assistant-v1"
     assert report.services == (
@@ -47,14 +46,15 @@ def test_bundle_rejects_unknown_configuration_and_identity_mismatch(
     tmp_path: Path,
 ) -> None:
     bundle = _copy_bundle(tmp_path)
-    config_path = bundle / "config.example.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["unexpected"] = True
-    config["identities"]["openwa_outbound_connector"] = "jarvis-inbound"
-    config_path.write_text(json.dumps(config), encoding="utf-8")
+    config_path = bundle / "config.example.toml"
+    config = config_path.read_text(encoding="utf-8").replace(
+        'openwa_outbound_connector = "jarvis-openwa-outbound"',
+        'openwa_outbound_connector = "jarvis-inbound"',
+    )
+    config_path.write_text(f"unexpected = true\n{config}", encoding="utf-8")
 
     with pytest.raises(BundleValidationError) as raised:
-        verify_bundle(bundle)
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
 
     assert "unknown configuration key: unexpected" in raised.value.errors
     assert (
@@ -74,7 +74,7 @@ def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:
     )
 
     with pytest.raises(BundleValidationError) as raised:
-        verify_bundle(bundle)
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
 
     assert (
         "Dockerfile base image must be pinned by sha256 digest" in raised.value.errors
@@ -95,7 +95,7 @@ def test_bundle_rejects_security_network_and_resource_regressions(
     compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
 
     with pytest.raises(BundleValidationError) as raised:
-        verify_bundle(bundle)
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
 
     assert "inbound_receiver must not use privileged mode" in raised.value.errors
     assert (
@@ -117,7 +117,7 @@ def test_bundle_rejects_credential_mount_leak_and_missing_health_logging(
     compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
 
     with pytest.raises(BundleValidationError) as raised:
-        verify_bundle(bundle)
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
 
     assert (
         "capability_broker has an unauthorized credential mount" in raised.value.errors
@@ -129,14 +129,14 @@ def test_bundle_rejects_credential_mount_leak_and_missing_health_logging(
 
 
 def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
-    report = verify_bundle(SHIPPED_BUNDLE)
+    report = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT)
 
     assert report.checked_files == (
         "Dockerfile",
         "README.md",
         "artifacts.lock.json",
         "compose.yaml",
-        "config.example.json",
+        "config.example.toml",
         "openwa-handoff.md",
         "requirements.lock",
     )

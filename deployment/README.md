@@ -15,12 +15,13 @@ docker compose --file deployment/compose.yaml config --quiet
 The second command parses Compose only. Do not pass `--profile
 manual-activation` or run `up` during isolated verification.
 
-`config.example.json` contains no real operator, Google, OpenWA, vault, or worker
+`config.example.toml` contains no real operator, Google, OpenWA, vault, or worker
 identity. Before a later supervised activation, a manual administrator must make
-a root-owned `0444` configuration from the reviewed schema, create only the
+a root-owned `/etc/jarvis/jarvis.toml` in mode `0444` from the reviewed schema, create only the
 service-specific credential directories described below, and independently
 review the resulting exact values. Credential material never belongs in this
-repository.
+repository; `deployment/credentials/` is explicitly ignored as a defense against
+accidental staging.
 
 | Service | Credential boundary |
 | --- | --- |

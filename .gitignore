@@ -2,6 +2,7 @@
 .venv
 .env
 uv.lock
+deployment/credentials/
 
 *.egg-info
 

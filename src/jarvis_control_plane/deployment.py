@@ -11,36 +11,46 @@ import argparse
 import hashlib
 import json
 import re
+import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceResourceLimits:
+    memory: str
+    cpus: Decimal
+    pids: int
+
 
 REQUIRED_FILES = (
     "Dockerfile",
     "README.md",
     "artifacts.lock.json",
     "compose.yaml",
-    "config.example.json",
+    "config.example.toml",
     "openwa-handoff.md",
     "requirements.lock",
 )
 
-RESOURCE_LIMITS: Mapping[str, tuple[str, Decimal, int]] = MappingProxyType(
+RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
     {
-        "inbound_receiver": ("64M", Decimal("0.10"), 32),
-        "capability_broker": ("192M", Decimal("0.35"), 64),
-        "orchestration_agent": ("256M", Decimal("0.45"), 128),
-        "audit_service": ("64M", Decimal("0.10"), 32),
-        "google_connector": ("96M", Decimal("0.15"), 64),
-        "knowledge_vault_connector": ("128M", Decimal("0.20"), 64),
-        "openwa_outbound_connector": ("64M", Decimal("0.10"), 32),
-        "worker_gateway": ("96M", Decimal("0.25"), 64),
-        "public_oauth_callback": ("48M", Decimal("0.10"), 32),
+        "inbound_receiver": ServiceResourceLimits("64M", Decimal("0.10"), 32),
+        "capability_broker": ServiceResourceLimits("192M", Decimal("0.35"), 64),
+        "orchestration_agent": ServiceResourceLimits("256M", Decimal("0.45"), 128),
+        "audit_service": ServiceResourceLimits("64M", Decimal("0.10"), 32),
+        "google_connector": ServiceResourceLimits("96M", Decimal("0.15"), 64),
+        "knowledge_vault_connector": ServiceResourceLimits("128M", Decimal("0.20"), 64),
+        "openwa_outbound_connector": ServiceResourceLimits("64M", Decimal("0.10"), 32),
+        "worker_gateway": ServiceResourceLimits("96M", Decimal("0.25"), 64),
+        "public_oauth_callback": ServiceResourceLimits("48M", Decimal("0.10"), 32),
     }
 )
 
@@ -77,10 +87,17 @@ CONFIG_KEYS = frozenset(
         "schema_version",
         "release_id",
         "artifact_lock",
+        "configuration_kind",
         "identities",
+        "deployment",
+        "models",
+        "connector_allowlists",
+        "egress",
         "paths",
         "permissions",
         "openwa_handoff",
+        "timeouts",
+        "retention",
         "resource_bounds",
     }
 )
@@ -106,7 +123,12 @@ class BundleVerificationReport:
     host_mutations: tuple[str, ...] = ()
 
 
-def verify_bundle(bundle: str | Path) -> BundleVerificationReport:
+def verify_bundle(
+    bundle: str | Path,
+    *,
+    configuration: str | Path | None = None,
+    source_root: str | Path | None = None,
+) -> BundleVerificationReport:
     """Validate one bundle without invoking any external program or service."""
 
     root = Path(bundle).resolve()
@@ -118,11 +140,25 @@ def verify_bundle(bundle: str | Path) -> BundleVerificationReport:
         raise BundleValidationError(errors)
 
     compose = _load_mapping(root / "compose.yaml", errors, "compose")
-    config = _load_mapping(root / "config.example.json", errors, "configuration")
+    config_path = (
+        Path(configuration).resolve()
+        if configuration is not None
+        else root / "config.example.toml"
+    )
+    config = _load_mapping(config_path, errors, "configuration")
     lock = _load_mapping(root / "artifacts.lock.json", errors, "artifact lock")
 
     _validate_configuration(config, errors)
-    _validate_artifacts(root, lock, errors)
+    _validate_artifacts(
+        root,
+        lock,
+        errors,
+        source_root=(
+            Path(source_root).resolve()
+            if source_root is not None
+            else root.parent.resolve()
+        ),
+    )
     handoff_active = _validate_compose(compose, config, errors)
     _validate_handoff_description(root / "openwa-handoff.md", errors)
 
@@ -133,9 +169,11 @@ def verify_bundle(bundle: str | Path) -> BundleVerificationReport:
     return BundleVerificationReport(
         release_id=str(config["release_id"]),
         services=services,
-        aggregate_memory_mib=sum(_memory_mib(v[0]) for v in RESOURCE_LIMITS.values()),
-        aggregate_cpus=float(sum(v[1] for v in RESOURCE_LIMITS.values())),
-        aggregate_pids=sum(v[2] for v in RESOURCE_LIMITS.values()),
+        aggregate_memory_mib=sum(
+            _memory_mib(limit.memory) for limit in RESOURCE_LIMITS.values()
+        ),
+        aggregate_cpus=float(sum(limit.cpus for limit in RESOURCE_LIMITS.values())),
+        aggregate_pids=sum(limit.pids for limit in RESOURCE_LIMITS.values()),
         openwa_handoff_activated=handoff_active,
         checked_files=REQUIRED_FILES,
     )
@@ -145,9 +183,17 @@ def _load_mapping(path: Path, errors: list[str], label: str) -> dict[str, Any]:
     try:
         if path.suffix == ".json":
             value = json.loads(path.read_text(encoding="utf-8"))
+        elif path.suffix == ".toml":
+            value = tomllib.loads(path.read_text(encoding="utf-8"))
         else:
             value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, yaml.YAMLError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        tomllib.TOMLDecodeError,
+        yaml.YAMLError,
+    ) as exc:
         errors.append(f"{label} cannot be parsed: {type(exc).__name__}")
         return {}
     if not isinstance(value, dict):
@@ -167,6 +213,8 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
         errors.append("release_id must be jarvis-assistant-v1")
     if config.get("artifact_lock") != "artifacts.lock.json":
         errors.append("artifact_lock must reference artifacts.lock.json")
+    if config.get("configuration_kind") not in {"example", "active"}:
+        errors.append("configuration_kind must be example or active")
 
     identities = config.get("identities")
     if not isinstance(identities, Mapping):
@@ -202,6 +250,113 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
     if paths != expected_paths:
         errors.append("deployment paths do not match the reviewed contract")
 
+    deployment = config.get("deployment")
+    deployment_keys = {
+        "operator_id",
+        "openwa_internal_session_id",
+        "openwa_named_session",
+        "openwa_operator_conversation_id",
+        "google_subject",
+        "oauth_callback_url",
+        "windows_worker_identity",
+        "ubuntu_worker_identity",
+        "vault_remote",
+        "vault_note_directories",
+    }
+    if not isinstance(deployment, Mapping) or set(deployment) != deployment_keys:
+        errors.append("deployment identity and endpoint configuration is incomplete")
+    else:
+        for key in deployment_keys - {"vault_note_directories"}:
+            value = deployment.get(key)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"deployment value {key} must be non-empty")
+        note_directories = deployment.get("vault_note_directories")
+        if not isinstance(note_directories, list) or not note_directories:
+            errors.append("vault_note_directories must contain at least one path")
+        if config.get("configuration_kind") == "active" and any(
+            "example" in str(value).lower() for value in deployment.values()
+        ):
+            errors.append("active configuration contains example deployment values")
+
+    models = config.get("models")
+    expected_models = {
+        "default_model": "gpt-5.6-terra",
+        "default_reasoning": "medium",
+        "allowed_models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        "allowed_reasoning": ["none", "low", "medium", "high", "xhigh", "max"],
+    }
+    if models != expected_models:
+        errors.append("model policy does not match the canonical V1 choices")
+
+    allowlists = config.get("connector_allowlists")
+    expected_allowlists = {
+        "gmail": ["read", "search", "send", "reply"],
+        "calendar": ["read", "search", "create", "update"],
+        "drive": ["read", "search"],
+        "vault": ["read", "search", "write_markdown"],
+    }
+    if allowlists != expected_allowlists:
+        errors.append("connector allowlists do not match the V1 capability surface")
+
+    egress = config.get("egress")
+    expected_egress = {
+        "orchestration_hosts": ["api.openai.com"],
+        "google_hosts": [
+            "accounts.google.com",
+            "oauth2.googleapis.com",
+            "gmail.googleapis.com",
+            "www.googleapis.com",
+        ],
+        "vault_hosts": ["vault.example.invalid"],
+        "worker_overlay_network": "jarvis-worker-overlay",
+    }
+    if config.get("configuration_kind") == "example":
+        if egress != expected_egress:
+            errors.append(
+                "egress policy does not match the reviewed connector boundaries"
+            )
+    elif not isinstance(egress, Mapping):
+        errors.append("egress policy must be configured")
+    else:
+        vault_remote = (
+            deployment.get("vault_remote") if isinstance(deployment, Mapping) else ""
+        )
+        vault_host = urlsplit(str(vault_remote)).hostname
+        if (
+            egress.get("orchestration_hosts") != ["api.openai.com"]
+            or egress.get("google_hosts") != expected_egress["google_hosts"]
+            or egress.get("vault_hosts") != [vault_host]
+            or not isinstance(egress.get("worker_overlay_network"), str)
+            or not egress.get("worker_overlay_network")
+        ):
+            errors.append(
+                "active egress policy is inconsistent with connector endpoints"
+            )
+
+    timeouts = config.get("timeouts")
+    expected_timeouts = {
+        "model_turn_seconds": 90,
+        "read_connector_seconds": 20,
+        "side_effect_connector_seconds": 30,
+        "codex_seconds": 300,
+        "terminal_seconds": 120,
+        "active_request_seconds": 480,
+    }
+    if timeouts != expected_timeouts:
+        errors.append("timeouts do not match the conservative V1 defaults")
+
+    retention = config.get("retention")
+    expected_retention = {
+        "conversation_history": "indefinite",
+        "durable_memory": "until-explicit-forget",
+        "audit": "indefinite",
+        "diagnostic_traces": "indefinite",
+        "backup_snapshots": "indefinite",
+        "terminal_operational_days": 30,
+    }
+    if retention != expected_retention:
+        errors.append("retention settings do not match the V1 contract")
+
     handoff = config.get("openwa_handoff")
     if not isinstance(handoff, Mapping) or handoff.get("activation") != "manual-only":
         errors.append("OpenWA handoff must be declared manual-only")
@@ -224,11 +379,18 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
             errors.append("resource_bounds do not match the reviewed V1 limits")
 
 
-def _validate_artifacts(root: Path, lock: Mapping[str, Any], errors: list[str]) -> None:
+def _validate_artifacts(
+    root: Path,
+    lock: Mapping[str, Any],
+    errors: list[str],
+    *,
+    source_root: Path,
+) -> None:
     if set(lock) != {
         "schema_version",
         "application",
         "python_base_image",
+        "uv_build_image",
         "requirements_lock",
     }:
         errors.append("artifact lock has missing or unknown keys")
@@ -243,23 +405,39 @@ def _validate_artifacts(root: Path, lock: Mapping[str, Any], errors: list[str]) 
         or not re.fullmatch(r"[0-9a-f]{40}", str(application.get("git_revision", "")))
     ):
         errors.append("application artifact must be pinned to a Git revision")
+    elif application.get("source_sha256") != _application_source_sha256(
+        source_root, errors
+    ):
+        errors.append("application source differs from the pinned artifact")
     base = lock.get("python_base_image")
     reference = base.get("reference") if isinstance(base, Mapping) else None
     if not isinstance(reference, str) or not re.fullmatch(
         r"python:3\.13\.13-slim-bookworm@sha256:[0-9a-f]{64}", reference
     ):
         errors.append("Python base image must be pinned by tag and sha256 digest")
+    uv_image = lock.get("uv_build_image")
+    uv_reference = uv_image.get("reference") if isinstance(uv_image, Mapping) else None
+    if not isinstance(uv_reference, str) or not re.fullmatch(
+        r"ghcr\.io/astral-sh/uv:0\.6\.14@sha256:[0-9a-f]{64}", uv_reference
+    ):
+        errors.append("uv build image must be pinned by tag and sha256 digest")
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
-    first_instruction = next(
-        (line.strip() for line in dockerfile.splitlines() if line.strip()), ""
+    from_instructions = tuple(
+        line.strip() for line in dockerfile.splitlines() if line.startswith("FROM ")
     )
-    if not re.fullmatch(
+    expected_from = (
+        f"FROM {uv_reference} AS uv",
+        f"FROM {reference}",
+    )
+    if len(from_instructions) != 2 or not re.fullmatch(
         r"FROM python:3\.13\.13-slim-bookworm@sha256:[0-9a-f]{64}",
-        first_instruction,
+        from_instructions[-1] if from_instructions else "",
     ):
         errors.append("Dockerfile base image must be pinned by sha256 digest")
-    elif reference is not None and first_instruction != f"FROM {reference}":
-        errors.append("Dockerfile base image differs from artifact lock")
+    elif from_instructions != expected_from:
+        errors.append("Dockerfile images differ from artifact lock")
+    if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
+        errors.append("Dockerfile dependency installation must use uv")
 
     requirement = lock.get("requirements_lock")
     expected_hash = (
@@ -289,9 +467,24 @@ def _validate_compose(
     handoff_active = isinstance(networks, Mapping) and "openwa-handoff" in networks
     if handoff_active:
         errors.append("production OpenWA handoff network must not be activated")
+    egress_networks = {"orchestration_egress", "google_egress", "vault_egress"}
     if isinstance(networks, Mapping):
         for name, network in networks.items():
-            if not isinstance(network, Mapping) or network.get("internal") is not True:
+            if not isinstance(network, Mapping):
+                errors.append(f"network {name} must be an object")
+            elif name in egress_networks and network != {"internal": False}:
+                errors.append(f"network {name} must be a dedicated egress segment")
+            elif name == "worker_overlay" and network != {
+                "external": True,
+                "name": "jarvis-worker-overlay",
+            }:
+                errors.append(
+                    "worker_overlay must reference the manual private overlay"
+                )
+            elif (
+                name not in egress_networks | {"worker_overlay"}
+                and network.get("internal") is not True
+            ):
                 errors.append(f"network {name} must be private and non-published")
 
     identities = config.get("identities", {})
@@ -373,14 +566,23 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
             continue
         target = parts[1]
         targets.add(target)
-        if target == "/run/jarvis/config.json" and parts[-1] == "ro":
+        if (
+            parts[0] == "/etc/jarvis/jarvis.toml"
+            and target == "/run/jarvis/config.toml"
+            and parts[-1] == "ro"
+        ):
             has_config = True
         if (
             target.startswith("/run/credentials/")
             and target not in ALLOWED_CREDENTIAL_MOUNTS[service]
         ):
             errors.append(f"{service} has an unauthorized credential mount")
-        if "/var/run/docker.sock" in volume or volume.startswith("/"):
+        allowed_host_source = parts[0] == "/etc/jarvis/jarvis.toml" or parts[
+            0
+        ].startswith("/etc/jarvis/credentials/")
+        if "/var/run/docker.sock" in volume or (
+            volume.startswith("/") and not allowed_host_source
+        ):
             errors.append(f"{service} has a prohibited broad host mount")
     if not has_config:
         errors.append(f"{service} must mount the validated configuration read-only")
@@ -392,10 +594,9 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
 def _validate_service_resources(
     service: str,
     raw: Mapping[str, Any],
-    expected: tuple[str, Decimal, int],
+    expected: ServiceResourceLimits,
     errors: list[str],
 ) -> None:
-    memory, cpus, pids = expected
     deploy = raw.get("deploy")
     resources = deploy.get("resources") if isinstance(deploy, Mapping) else None
     limits = resources.get("limits") if isinstance(resources, Mapping) else None
@@ -405,12 +606,12 @@ def _validate_service_resources(
         actual_cpu_decimal = Decimal(str(actual_cpus))
     except InvalidOperation:
         actual_cpu_decimal = Decimal(-1)
-    if actual_memory != memory:
-        errors.append(f"{service} memory limit must be {memory}")
-    if actual_cpu_decimal != cpus:
-        errors.append(f"{service} CPU limit must be {cpus}")
-    if raw.get("pids_limit") != pids:
-        errors.append(f"{service} PID limit must be {pids}")
+    if actual_memory != expected.memory:
+        errors.append(f"{service} memory limit must be {expected.memory}")
+    if actual_cpu_decimal != expected.cpus:
+        errors.append(f"{service} CPU limit must be {expected.cpus}")
+    if raw.get("pids_limit") != expected.pids:
+        errors.append(f"{service} PID limit must be {expected.pids}")
 
 
 def _validate_handoff_description(path: Path, errors: list[str]) -> None:
@@ -430,12 +631,36 @@ def _memory_mib(value: str) -> int:
     return int(value.removesuffix("M"))
 
 
+def _application_source_sha256(source_root: Path, errors: list[str]) -> str:
+    paths = [source_root / "pyproject.toml", source_root / "README.md"]
+    source_directory = source_root / "src"
+    if source_directory.is_dir():
+        paths.extend(sorted(source_directory.rglob("*.py")))
+    if any(not path.is_file() for path in paths) or len(paths) == 2:
+        errors.append("application source tree is incomplete")
+        return ""
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(source_root).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path, help="deployment bundle directory")
+    parser.add_argument("--configuration", type=Path)
+    parser.add_argument("--source-root", type=Path)
     args = parser.parse_args(argv)
     try:
-        report = verify_bundle(args.bundle)
+        report = verify_bundle(
+            args.bundle,
+            configuration=args.configuration,
+            source_root=args.source_root,
+        )
     except BundleValidationError as exc:
         for error in exc.errors:
             print(f"ERROR: {error}")
