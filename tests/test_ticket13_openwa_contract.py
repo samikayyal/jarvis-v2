@@ -200,7 +200,6 @@ def test_restart_interrupts_claimed_dispatch_without_replaying_it() -> None:
     )
 
     try:
-        interrupted = worker.interrupt_stranded_dispatches()
         replay = worker.run_once()
     finally:
         assert components.trace_store is not None
@@ -208,7 +207,7 @@ def test_restart_interrupts_claimed_dispatch_without_replaying_it() -> None:
 
     assert acknowledgement.disposition == "admitted"
     assert claimed is not None
-    assert interrupted == 1
+    assert worker.startup_interrupted_count == 1
     assert replay is None
     assert components.state.list_ingress_claims()[0].disposition == "interrupted"
     controlled_outbound = cast(ControlledOutboundConnector, components.outbound)

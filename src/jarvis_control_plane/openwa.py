@@ -167,11 +167,6 @@ class OpenWAIngressWorker:
         self.state = state
         self.startup_interrupted_count = receiver.reconcile_ingress_restart()
 
-    def interrupt_stranded_dispatches(self) -> int:
-        """Return the nonterminal ingress count reconciled during startup."""
-
-        return self.startup_interrupted_count
-
     def run_once(self) -> ReceiveResult | None:
         message = self.state.begin_next_ingress_dispatch()
         if message is None:
