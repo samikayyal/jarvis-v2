@@ -162,14 +162,44 @@ class SignedInboundEvent:
         ):
             return False
         expected = sign_body(self.raw_body, secret)
-        return hmac.compare_digest(expected, self.signature)
+        supplied = self.signature
+        if supplied.startswith("sha256="):
+            supplied = supplied.removeprefix("sha256=")
+        return hmac.compare_digest(expected, supplied)
 
     def decode(self) -> InboundMessage:
         try:
             payload = json.loads(self.raw_body.decode("utf-8"))
+            if isinstance(payload, Mapping) and "sessionId" in payload:
+                return _openwa_inbound_message(payload)
             return InboundMessage.from_mapping(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError("signed body is not valid JSON") from exc
+
+
+def _openwa_inbound_message(payload: Mapping[str, Any]) -> InboundMessage:
+    """Translate the pinned OpenWA webhook DTO after signature verification."""
+
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise TypeError("OpenWA event data must be an object")
+    is_group = data.get("isGroup")
+    chat_type = (
+        "group" if is_group is True else "direct" if is_group is False else None
+    )
+    sender_id = None if data.get("isLidSender") is True else data.get("from")
+    return InboundMessage(
+        event_type=payload.get("event"),  # type: ignore[arg-type]
+        session_id=payload.get("sessionId"),  # type: ignore[arg-type]
+        event_id=payload.get("idempotencyKey"),  # type: ignore[arg-type]
+        message_id=data.get("id"),  # type: ignore[arg-type]
+        sender_id=sender_id,
+        chat_id=data.get("chatId"),
+        chat_type=chat_type,
+        message_type=data.get("type"),
+        from_me=data.get("fromMe"),
+        text=data.get("body"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1133,12 +1163,15 @@ class OutboundReply:
     session_id: str
     recipient_id: str
     body: str
+    quoted_message_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("reply_id", "request_id", "session_id", "recipient_id"):
             _non_empty_identifier(getattr(self, name), name)
         if not isinstance(self.body, str) or not self.body.strip():
             raise ValueError("reply body must be non-blank")
+        if self.quoted_message_id is not None:
+            _non_empty_identifier(self.quoted_message_id, "quoted_message_id")
 
     @property
     def correlation_id(self) -> str:

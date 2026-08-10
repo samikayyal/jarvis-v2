@@ -24,6 +24,7 @@ from jarvis_control_plane import (
     ModelAvailability,
     SignedMessageReceiver,
 )
+from jarvis_control_plane.ports import OutboundConnector
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +38,7 @@ class ReceiverComponents:
     ids: DeterministicIdGenerator
     provider: FixedModelAvailabilityProvider
     orchestration: ControlledOrchestrationAdapter
-    outbound: ControlledOutboundConnector
+    outbound: OutboundConnector
     broker: DeterministicCapabilityBroker
     receiver: SignedMessageReceiver
     trace_store: InMemoryDiagnosticTraceStore | None
@@ -56,6 +57,7 @@ def build_receiver_components(
     state: Any | None = None,
     audit: Any | None = None,
     orchestration: ControlledOrchestrationAdapter | None = None,
+    outbound: OutboundConnector | None = None,
     availability: ModelAvailability | None = None,
     working_session_id: str | None = None,
     clock: FixedClock | None = None,
@@ -80,12 +82,16 @@ def build_receiver_components(
     audit = audit if audit is not None else InMemoryAuditBoundary()
     orchestration = orchestration or ControlledOrchestrationAdapter()
     provider = FixedModelAvailabilityProvider(availability or ModelAvailability())
-    outbound = ControlledOutboundConnector(
-        operator_id=operator_id,
-        session_id=transport_session_id,
-        audit=audit,
-        clock=clock,
-        ids=ids,
+    outbound = (
+        outbound
+        if outbound is not None
+        else ControlledOutboundConnector(
+            operator_id=operator_id,
+            session_id=transport_session_id,
+            audit=audit,
+            clock=clock,
+            ids=ids,
+        )
     )
     trace_store = None
     if trace is None:

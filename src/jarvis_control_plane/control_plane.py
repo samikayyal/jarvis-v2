@@ -740,6 +740,7 @@ class DeterministicCapabilityBroker:
                     request_id=action.request_id,
                     session_id=self.config.session_id,
                     recipient_id=message.chat_id,
+                    quoted_message_id=message.message_id,
                     body=(
                         f"Proposal {action.action_id} digest {action.digest} "
                         f"part {number}/{total} request_id={action.request_id}\n{fragment}"
@@ -759,6 +760,7 @@ class DeterministicCapabilityBroker:
                 request_id=action.request_id,
                 session_id=self.config.session_id,
                 recipient_id=message.chat_id,
+                quoted_message_id=message.message_id,
                 body=(
                     f"Proposal {action.action_id} digest {action.digest} "
                     "All proposal fragments were presented. "
@@ -2586,6 +2588,7 @@ class DeterministicCapabilityBroker:
             request_id=request.request_id,
             session_id=self.config.session_id,
             recipient_id=message.chat_id,
+            quoted_message_id=message.message_id,
             body=_bounded_informational_reply(
                 result.reply_text,
                 request_id=request.request_id,
@@ -4214,6 +4217,7 @@ class DeterministicCapabilityBroker:
             request_id=control_id,
             session_id=self.config.session_id,
             recipient_id=message.chat_id,
+            quoted_message_id=message.message_id,
             body=body,
         )
         outbound_reserved = False
