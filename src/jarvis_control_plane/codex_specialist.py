@@ -13,10 +13,11 @@ import hashlib
 import json
 import shlex
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from itertools import pairwise
+from threading import Lock
 from time import monotonic
 from typing import Literal, Protocol
 
@@ -25,6 +26,7 @@ from .terminal_policy import (
     TerminalDisposition,
     authorize_terminal_action,
 )
+from .traces import DiagnosticTraceRecorder
 
 CodexHost = Literal["ubuntu", "windows"]
 CodexOperation = Literal["inspect", "review", "workspace_prepare"]
@@ -49,6 +51,9 @@ _MAX_TASK_CHARS = 8_000
 _MAX_SUMMARY_CHARS = 8_000
 _MAX_RESULT_ITEMS = 128
 _MAX_PROPOSAL_PATCH_CHARS = 256_000
+_MAX_MCP_RESULT_BYTES = 512 * 1024
+_MAX_TRACE_RESULT_BYTES = 512 * 1024
+_MAX_TRACE_ERROR_BYTES = 16 * 1024
 _CONTENT_DIGEST_LENGTH = 64
 _MAX_INTERRUPT_GRACE_SECONDS = 5.0
 
@@ -921,7 +926,7 @@ class CodexMcpAdapter:
 
     @staticmethod
     def _prompt(envelope: CodexExecutionEnvelope) -> str:
-        return (
+        prompt = (
             f"Allowed operation: {envelope.operation}.\n"
             f"Task: {envelope.task}\n\n"
             "Return exactly one JSON object with these keys: status (completed, "
@@ -929,6 +934,18 @@ class CodexMcpAdapter:
             "workspace-relative strings), test_evidence (array of strings), and "
             "unresolved_questions (array of strings). Do not wrap the JSON in markdown."
         )
+        if envelope.operation == "workspace_prepare":
+            if envelope.proposal_patch is None:
+                raise CodexPolicyError(
+                    "workspace preparation lacks the frozen approved patch"
+                )
+            prompt += (
+                "\n\nApply exactly this frozen approved patch:\n"
+                "<approved_patch>\n"
+                f"{envelope.proposal_patch}"
+                "</approved_patch>"
+            )
+        return prompt
 
     @staticmethod
     def _parse_result(raw_result: Mapping[str, object]) -> CodexAdapterResult:
@@ -940,6 +957,11 @@ class CodexMcpAdapter:
             content = structured["content"]
             if not isinstance(thread_id, str) or not isinstance(content, str):
                 raise TypeError
+            if (
+                len(content) > _MAX_MCP_RESULT_BYTES
+                or len(content.encode("utf-8")) > _MAX_MCP_RESULT_BYTES
+            ):
+                raise ValueError("Codex MCP result content is too large")
             payload = json.loads(content)
             if not isinstance(payload, dict) or set(payload) != {
                 "status",
@@ -978,12 +1000,23 @@ class CodexSpecialist:
         config: CodexSpecialistConfig,
         adapter: CodexAdapter,
         inspector: CodexWorkspaceInspector,
+        trace: DiagnosticTraceRecorder,
         approval_verifier: CodexApprovalVerifier | None = None,
     ) -> None:
+        if not isinstance(trace, DiagnosticTraceRecorder):
+            raise TypeError(
+                "trace must be an explicitly configured DiagnosticTraceRecorder"
+            )
         self._config = config
         self._adapter = adapter
         self._inspector = inspector
+        self._trace = trace
         self._approval_verifier = approval_verifier
+        self._active_lock = Lock()
+        self._interrupt_lock = Lock()
+        self._active_deadlines: dict[str, float] = {}
+        self._active_futures: dict[str, Future[CodexAdapterResult]] = {}
+        self._interruptions: dict[str, CodexInterruption] = {}
 
     @property
     def timeout_seconds(self) -> float:
@@ -991,10 +1024,16 @@ class CodexSpecialist:
 
         return float(self._config.timeout_seconds)
 
-    def invoke(self, invocation: CodexInvocation) -> CodexSpecialistResult:
+    def invoke(
+        self,
+        invocation: CodexInvocation,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> CodexSpecialistResult:
         workspace = self._config.workspace(invocation.workspace)
         envelope = self._freeze(invocation, workspace)
         before = self._inspector.snapshot(workspace)
+        self._verify_proposal_base(envelope, before)
         deadline = monotonic() + envelope.timeout_seconds
         interrupt_grace = min(
             _MAX_INTERRUPT_GRACE_SECONDS, envelope.timeout_seconds / 2
@@ -1003,13 +1042,26 @@ class CodexSpecialist:
         executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="codex-specialist"
         )
-        future = executor.submit(self._adapter.invoke, envelope, deadline=deadline)
+        if is_cancelled is not None and is_cancelled():
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise CodexPolicyError("Codex specialist request was cancelled")
+        future = executor.submit(
+            self._invoke_adapter,
+            envelope,
+            invocation.approval,
+            deadline=deadline,
+        )
+        with self._active_lock:
+            self._active_deadlines[invocation.request_id] = deadline
+            self._active_futures[invocation.request_id] = future
         try:
+            if is_cancelled is not None and is_cancelled():
+                if future.cancel():
+                    raise CodexPolicyError("Codex specialist request was cancelled")
+                self._interrupt(invocation.request_id, deadline=deadline)
             adapter_result = future.result(timeout=execution_timeout)
         except FutureTimeout as exc:
-            interruption = self._adapter.interrupt(
-                invocation.request_id, deadline=deadline
-            )
+            interruption = self._interrupt(invocation.request_id, deadline=deadline)
             if not isinstance(interruption, CodexInterruption):
                 raise CodexVerificationError(
                     "Codex interrupt provided no typed quiescence evidence"
@@ -1059,6 +1111,11 @@ class CodexSpecialist:
             # this wait bounded by establishing process-scope quiescence before
             # its deadline; a violating adapter fails closed until it is terminal.
             executor.shutdown(wait=True, cancel_futures=True)
+            with self._active_lock:
+                self._active_deadlines.pop(invocation.request_id, None)
+                self._active_futures.pop(invocation.request_id, None)
+            with self._interrupt_lock:
+                self._interruptions.pop(invocation.request_id, None)
         if not isinstance(adapter_result, CodexAdapterResult):
             raise CodexVerificationError("Codex adapter returned an untyped result")
         after = self._inspector.snapshot(workspace)
@@ -1073,6 +1130,60 @@ class CodexSpecialist:
             unresolved_questions=adapter_result.unresolved_questions,
             thread_id=adapter_result.thread_id,
         )
+
+    def cancel(self, request_id: str) -> bool:
+        """Interrupt one active process scope after request cancellation wins."""
+
+        _canonical_text(request_id, "request_id", max_chars=128)
+        with self._active_lock:
+            active_deadline = self._active_deadlines.get(request_id)
+            future = self._active_futures.get(request_id)
+        if active_deadline is None or future is None:
+            return False
+        if future.cancel():
+            return True
+        deadline = min(active_deadline, monotonic() + _MAX_INTERRUPT_GRACE_SECONDS)
+        self._interrupt(request_id, deadline=deadline)
+        return True
+
+    def _invoke_adapter(
+        self,
+        envelope: CodexExecutionEnvelope,
+        approval: CodexWorkspaceApproval | None,
+        *,
+        deadline: float,
+    ) -> CodexAdapterResult:
+        return self._trace.execute(
+            request_id=envelope.request_id,
+            operation_id=f"{envelope.request_id}:codex",
+            operation_type="codex",
+            input_payload=envelope,
+            arguments={
+                "operation": "invoke",
+                "workspace_approval": approval,
+            },
+            telemetry={
+                "host": envelope.host,
+                "sandbox": envelope.sandbox,
+                "approval_policy": envelope.approval_policy,
+            },
+            operation=lambda: self._adapter.invoke(envelope, deadline=deadline),
+            result_limit_bytes=_MAX_TRACE_RESULT_BYTES,
+            error_limit_bytes=_MAX_TRACE_ERROR_BYTES,
+        )
+
+    def _interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
+        with self._interrupt_lock:
+            previous = self._interruptions.get(request_id)
+            if previous is not None:
+                return previous
+            interruption = self._adapter.interrupt(request_id, deadline=deadline)
+            if not isinstance(interruption, CodexInterruption):
+                raise CodexVerificationError(
+                    "Codex interrupt provided no typed quiescence evidence"
+                )
+            self._interruptions[request_id] = interruption
+            return interruption
 
     def _freeze(
         self, invocation: CodexInvocation, workspace: CodexWorkspace
@@ -1229,3 +1340,33 @@ class CodexSpecialist:
                     "independent verification found changes outside the approved paths"
                 )
         return changed_paths
+
+    @staticmethod
+    def _verify_proposal_base(
+        envelope: CodexExecutionEnvelope,
+        before: CodexWorkspaceSnapshot,
+    ) -> None:
+        """Reject stale approved mutations before the adapter can start."""
+
+        if envelope.operation != "workspace_prepare":
+            return
+        expected_changes = envelope.proposal_changes
+        expected_paths = tuple(change.path for change in expected_changes)
+        if (
+            envelope.proposal_base_head is None
+            or before.head != envelope.proposal_base_head
+            or dict(before.remote_refs) != dict(envelope.proposal_remote_refs)
+        ):
+            raise CodexVerificationError(
+                "workspace base changed before the approved proposal executed"
+            )
+        before_digests = dict(before.file_digests)
+        if set(before_digests) != set(expected_paths):
+            raise CodexVerificationError(
+                "independent verification lacks exact file-content evidence"
+            )
+        for change in expected_changes:
+            if before_digests[change.path] != change.before_digest:
+                raise CodexVerificationError(
+                    "workspace base content changed before the approved proposal"
+                )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +30,7 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
 )
+from jarvis_control_plane.traces import DiagnosticTraceRecorder
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 SRC_BEFORE = "a" * 64
@@ -105,10 +106,12 @@ class _Adapter:
         self.envelopes = []
         self.interrupted = []
         self._interrupted = Event()
+        self.invoke_started = Event()
         self.invoke_finished = Event()
 
     def invoke(self, envelope, *, deadline: float) -> CodexAdapterResult:
         self.envelopes.append(envelope)
+        self.invoke_started.set()
         try:
             if self.delay_seconds:
                 self._interrupted.wait(self.delay_seconds)
@@ -150,6 +153,22 @@ class _ApprovalVerifier:
     ) -> bool:
         self.checked.append((proposal, approval))
         return self.approved
+
+
+class _TraceRecorder(DiagnosticTraceRecorder):
+    """Small write-only recorder double that preserves the admission seam."""
+
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.failure = failure
+
+    def execute(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.failure is not None:
+            raise self.failure
+        result = kwargs["operation"]()
+        kwargs["captured_result"] = result
+        return result
 
 
 def _snapshot(
@@ -194,12 +213,14 @@ def _specialist(
     after: CodexWorkspaceSnapshot | None = None,
     config: CodexSpecialistConfig | None = None,
     approval_verifier: _ApprovalVerifier | None = None,
+    trace: _TraceRecorder | None = None,
 ) -> tuple[CodexSpecialist, _Adapter]:
     adapter = adapter or _Adapter()
     specialist = CodexSpecialist(
         config=config or _config(),
         adapter=adapter,
         inspector=_Inspector(before or _snapshot(), after or _snapshot()),
+        trace=trace or _TraceRecorder(),
         approval_verifier=approval_verifier or _ApprovalVerifier(),
     )
     return specialist, adapter
@@ -228,6 +249,85 @@ def test_read_only_invocation_freezes_the_complete_execution_envelope() -> None:
     assert envelope.operation == "review"
     assert result.verified is True
     assert result.changed_paths == ()
+
+
+def test_specialist_admits_the_frozen_envelope_and_raw_result_to_trace() -> None:
+    trace = _TraceRecorder()
+    specialist, adapter = _specialist(trace=trace)
+
+    specialist.invoke(
+        CodexInvocation(
+            request_id="request-traced",
+            workspace="jarvis",
+            operation="review",
+            task="Review the current diff.",
+        )
+    )
+
+    assert len(trace.calls) == 1
+    call = trace.calls[0]
+    assert call["operation_type"] == "codex"
+    assert call["input_payload"] == adapter.envelopes[0]
+    assert call["arguments"] == {
+        "operation": "invoke",
+        "workspace_approval": None,
+    }
+    assert call["captured_result"] == adapter.result
+
+
+def test_trace_admission_failure_prevents_the_codex_adapter_from_starting() -> None:
+    trace = _TraceRecorder(failure=RuntimeError("trace capacity unavailable"))
+    specialist, adapter = _specialist(trace=trace)
+
+    with pytest.raises(RuntimeError, match="trace capacity unavailable"):
+        specialist.invoke(
+            CodexInvocation(
+                request_id="request-trace-rejected",
+                workspace="jarvis",
+                operation="inspect",
+                task="Inspect the repository.",
+            )
+        )
+
+    assert adapter.envelopes == []
+
+
+@pytest.mark.parametrize(
+    "before,error",
+    [
+        (_snapshot(head="stale-head"), "workspace base changed"),
+        (_snapshot(remote_head="stale-remote"), "workspace base changed"),
+        (
+            _snapshot(file_digests=(("src/feature.py", TEST_BEFORE),)),
+            "workspace base content changed",
+        ),
+    ],
+)
+def test_stale_approved_base_is_rejected_before_codex_starts(
+    before: CodexWorkspaceSnapshot,
+    error: str,
+) -> None:
+    proposal = _proposal(request_id="request-stale-base")
+    approval = CodexWorkspaceApproval(
+        action_id=proposal.action_id,
+        request_id=proposal.request_id,
+        proposal_digest=proposal.digest,
+    )
+    specialist, adapter = _specialist(before=before)
+
+    with pytest.raises(CodexVerificationError, match=error):
+        specialist.invoke(
+            CodexInvocation(
+                request_id=proposal.request_id,
+                workspace=proposal.workspace,
+                operation="workspace_prepare",
+                task=proposal.task,
+                proposal=proposal,
+                approval=approval,
+            )
+        )
+
+    assert adapter.envelopes == []
 
 
 def test_danger_full_access_and_never_approve_are_not_configurable() -> None:
@@ -463,6 +563,7 @@ def test_independent_verification_rejects_a_read_only_head_change() -> None:
 def test_independent_verification_rejects_out_of_scope_workspace_changes() -> None:
     proposal = _proposal()
     specialist, _adapter = _specialist(
+        before=_snapshot(file_digests=(("src/feature.py", SRC_BEFORE),)),
         after=_snapshot(changed_paths=("deployment/service.ini",)),
     )
 
@@ -821,6 +922,64 @@ def test_agents_orchestration_preserves_a_typed_incomplete_codex_result() -> Non
     assert result.reply_text == "Inspection timed out safely."
 
 
+def test_agents_orchestration_propagates_request_cancellation_into_codex() -> None:
+    codex_adapter = _Adapter(delay_seconds=30)
+    specialist, _unused = _specialist(adapter=codex_adapter)
+    outcomes: list[object] = []
+
+    orchestration = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_values: object(),
+        run_sync=lambda *_args, **_kwargs: object(),
+        model_settings_factory=lambda **values: values,
+        reasoning_factory=lambda **values: values,
+        run_config_factory=lambda **values: values,
+        codex_specialist=specialist,
+    )
+    invocation = CodexInvocation(
+        request_id="request-agent-cancel",
+        workspace="jarvis",
+        operation="inspect",
+        task="Inspect the repository.",
+    )
+    runner = Thread(target=lambda: outcomes.append(specialist.invoke(invocation)))
+    runner.start()
+    assert codex_adapter.invoke_started.wait(timeout=5)
+
+    assert orchestration.cancel(request_id=invocation.request_id) is True
+
+    runner.join(timeout=5)
+    assert not runner.is_alive()
+    assert codex_adapter.interrupted == [invocation.request_id]
+    assert len(outcomes) == 1
+
+
+def test_agents_orchestration_cancellation_prevents_a_queued_codex_start() -> None:
+    specialist, codex_adapter = _specialist()
+    orchestration = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_values: object(),
+        run_sync=lambda *_args, **_kwargs: object(),
+        model_settings_factory=lambda **values: values,
+        reasoning_factory=lambda **values: values,
+        run_config_factory=lambda **values: values,
+        codex_specialist=specialist,
+    )
+    request_id = "request-agent-cancelled-before-start"
+
+    assert orchestration.cancel(request_id=request_id) is False
+    with pytest.raises(CodexPolicyError, match="cancelled"):
+        specialist.invoke(
+            CodexInvocation(
+                request_id=request_id,
+                workspace="jarvis",
+                operation="inspect",
+                task="Inspect the repository.",
+            ),
+            is_cancelled=lambda: orchestration._request_is_cancelled(request_id),
+        )
+
+    assert codex_adapter.envelopes == []
+
+
 def test_mcp_adapter_maps_only_the_frozen_envelope_to_the_codex_tool() -> None:
     class _McpClient:
         def __init__(self) -> None:
@@ -895,6 +1054,33 @@ def test_mcp_adapter_maps_only_the_frozen_envelope_to_the_codex_tool() -> None:
     assert result.test_evidence == ("12 passed",)
 
 
+def test_mcp_workspace_prompt_contains_the_frozen_approved_patch() -> None:
+    proposal = _proposal(request_id="request-prompt-patch")
+    envelope = CodexExecutionEnvelope(
+        request_id=proposal.request_id,
+        task=proposal.task,
+        host="windows",
+        cwd="C:/work/Jarvis-v2",
+        model="gpt-5.6-sol",
+        reasoning="high",
+        sandbox="workspace-write",
+        approval_policy="on-request",
+        timeout_seconds=300,
+        operation="workspace_prepare",
+        allowed_paths=proposal.allowed_paths,
+        proposal_digest=proposal.digest,
+        proposal_base_head=proposal.base_head,
+        proposal_remote_refs=proposal.base_remote_refs,
+        proposal_changes=proposal.changes,
+        proposal_patch=proposal.patch,
+    )
+
+    prompt = CodexMcpAdapter._prompt(envelope)
+
+    assert proposal.patch in prompt
+    assert "<approved_patch>" in prompt
+
+
 def test_mcp_adapter_rejects_untyped_or_extended_structured_content() -> None:
     class _McpClient:
         def call_tool(
@@ -940,6 +1126,31 @@ def test_mcp_adapter_rejects_untyped_or_extended_structured_content() -> None:
                 task="Inspect the repository.",
             )
         )
+
+
+def test_mcp_adapter_rejects_oversized_content_before_json_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parsed = []
+    monkeypatch.setattr(
+        json,
+        "loads",
+        lambda _content: (
+            parsed.append(True) or pytest.fail("oversized JSON was parsed")
+        ),
+    )
+
+    with pytest.raises(CodexVerificationError, match="structured result"):
+        CodexMcpAdapter._parse_result(
+            {
+                "structuredContent": {
+                    "threadId": "thread-oversized",
+                    "content": "x" * (512 * 1024 + 1),
+                }
+            }
+        )
+
+    assert parsed == []
 
 
 def test_mcp_adapter_surfaces_approval_context_and_denies_read_only_escalation() -> (
@@ -1105,6 +1316,7 @@ def test_mcp_adapter_delegates_workspace_approval_with_frozen_envelope() -> None
                 file_digests=(("src/feature.py", SRC_AFTER),),
             ),
         ),
+        trace=_TraceRecorder(),
         approval_verifier=_ApprovalVerifier(),
     )
 
@@ -1192,6 +1404,7 @@ def test_mcp_adapter_denies_forbidden_exec_command_before_operator_handler() -> 
                 file_digests=(("src/feature.py", SRC_AFTER),),
             ),
         ),
+        trace=_TraceRecorder(),
         approval_verifier=_ApprovalVerifier(),
     )
 

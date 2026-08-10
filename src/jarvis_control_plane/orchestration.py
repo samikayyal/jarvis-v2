@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from threading import Lock
 from time import monotonic
 from typing import Any, Literal
 
@@ -298,8 +299,17 @@ class AgentsSdkOrchestrationAdapter:
         self._read_tools = tuple(read_tools)
         self._vault_write_enabled = vault_write_enabled
         self._codex_specialist = codex_specialist
+        self._cancellation_lock = Lock()
+        self._cancelled_requests: set[str] = set()
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+        try:
+            return self._run(request)
+        finally:
+            with self._cancellation_lock:
+                self._cancelled_requests.discard(request.state.request_id)
+
+    def _run(self, request: OrchestrationRequest) -> OrchestrationResult:
         milestones = [
             OrchestrationMilestone(
                 stage="orchestration_started",
@@ -398,6 +408,19 @@ class AgentsSdkOrchestrationAdapter:
             milestones=tuple(milestones),
         )
 
+    def cancel(self, *, request_id: str) -> bool:
+        """Propagate a request cancellation into an active Codex process scope."""
+
+        with self._cancellation_lock:
+            self._cancelled_requests.add(request_id)
+        if self._codex_specialist is None:
+            return False
+        return self._codex_specialist.cancel(request_id)
+
+    def _request_is_cancelled(self, request_id: str) -> bool:
+        with self._cancellation_lock:
+            return request_id in self._cancelled_requests
+
     def _build_tools(
         self,
         request: OrchestrationRequest,
@@ -478,6 +501,9 @@ class AgentsSdkOrchestrationAdapter:
                             workspace=typed_input.workspace,
                             operation=typed_input.operation,
                             task=typed_input.task,
+                        ),
+                        is_cancelled=lambda: self._request_is_cancelled(
+                            request.state.request_id
                         ),
                     )
                     bounded_output = CodexToolOutput(

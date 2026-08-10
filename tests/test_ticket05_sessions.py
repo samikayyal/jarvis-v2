@@ -697,7 +697,17 @@ def test_cancel_wins_race_and_late_result_never_dispatches() -> None:
         assert release_orchestration.wait(timeout=5)
         return "This late result must not be sent."
 
-    orchestration = ControlledOrchestrationAdapter(response_factory=blocked_response)
+    class _CancellableOrchestration(ControlledOrchestrationAdapter):
+        def __init__(self) -> None:
+            super().__init__(response_factory=blocked_response)
+            self.cancelled_requests: list[str] = []
+
+        def cancel(self, *, request_id: str) -> bool:
+            self.cancelled_requests.append(request_id)
+            release_orchestration.set()
+            return True
+
+    orchestration = _CancellableOrchestration()
     _, audit, _, outbound, broker, receiver, trace_store = make_receiver_components(
         orchestration=orchestration
     )
@@ -733,6 +743,7 @@ def test_cancel_wins_race_and_late_result_never_dispatches() -> None:
             make_signed_event("/cancel", event_id="event-cancel", message_id="m-cancel")
         )
         assert cancelled.disposition == "cancelled"
+        assert orchestration.cancelled_requests == [active.active_request.request_id]
         current = broker.working_sessions.load()
         assert current is not None and current.active_request is None
 
