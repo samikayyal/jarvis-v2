@@ -441,6 +441,69 @@ class InMemoryDurableStateStore:
                 disposition=disposition,
             )
 
+    def begin_next_ingress_dispatch(self) -> ConversationMessage | None:
+        with self._lock:
+            pending = sorted(
+                (
+                    claim
+                    for claim in self.claims.values()
+                    if claim.disposition == "admitted"
+                ),
+                key=lambda claim: (
+                    claim.claimed_at,
+                    claim.session_id,
+                    claim.message_id,
+                ),
+            )
+            for claim in pending:
+                key = (claim.session_id, claim.message_id)
+                message = self.conversation_messages.get(key)
+                if message is None:
+                    continue
+                self.claims[key] = replace(claim, disposition="dispatching")
+                return message
+            return None
+
+    def begin_ingress_dispatch(
+        self, *, transport_session_id: str, message_id: str
+    ) -> bool:
+        with self._lock:
+            key = (transport_session_id, message_id)
+            claim = self.claims.get(key)
+            if (
+                claim is None
+                or claim.disposition != "admitted"
+                or key not in self.conversation_messages
+            ):
+                return False
+            self.claims[key] = replace(claim, disposition="dispatching")
+            return True
+
+    def finish_ingress_dispatch(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None:
+        if disposition not in {"dispatched", "interrupted"}:
+            raise StateStoreError("ingress dispatch disposition is invalid")
+        with self._lock:
+            key = (transport_session_id, message_id)
+            claim = self.claims.get(key)
+            if claim is None or claim.disposition != "dispatching":
+                raise StateStoreError("ingress dispatch is not active")
+            self.claims[key] = replace(claim, disposition=disposition)
+
+    def interrupt_ingress_dispatches(self) -> int:
+        with self._lock:
+            interrupted = 0
+            for key, claim in tuple(self.claims.items()):
+                if claim.disposition == "dispatching":
+                    self.claims[key] = replace(claim, disposition="interrupted")
+                    interrupted += 1
+            return interrupted
+
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]:
         with self._lock:
             return tuple(
@@ -1609,6 +1672,113 @@ class SQLiteDurableStateStore:
             raise
         except sqlite3.Error as exc:
             raise StateStoreError("could not update ingress disposition") from exc
+
+    def begin_next_ingress_dispatch(self) -> ConversationMessage | None:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self.connection.execute(
+                """
+                SELECT h.transport_session_id, h.working_session_id,
+                       h.message_id, h.event_id, h.chat_id, h.sender_id,
+                       h.text, h.occurred_at, h.direction, h.request_id,
+                       h.credential_like
+                FROM ingress_claims AS i
+                JOIN conversation_history AS h
+                  ON h.transport_session_id = i.session_id
+                 AND h.message_id = i.message_id
+                WHERE i.disposition = 'admitted'
+                ORDER BY i.claimed_at, i.session_id, i.message_id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                self.connection.commit()
+                return None
+            cursor = self.connection.execute(
+                """
+                UPDATE ingress_claims
+                SET disposition = 'dispatching'
+                WHERE session_id = ? AND message_id = ?
+                  AND disposition = 'admitted'
+                """,
+                (row["transport_session_id"], row["message_id"]),
+            )
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                return None
+            self.connection.commit()
+            return _conversation_message_from_row(row)
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError("could not begin ingress dispatch") from exc
+
+    def begin_ingress_dispatch(
+        self, *, transport_session_id: str, message_id: str
+    ) -> bool:
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE ingress_claims
+                SET disposition = 'dispatching'
+                WHERE session_id = ? AND message_id = ?
+                  AND disposition = 'admitted'
+                  AND EXISTS (
+                      SELECT 1 FROM conversation_history AS h
+                      WHERE h.transport_session_id = ingress_claims.session_id
+                        AND h.message_id = ingress_claims.message_id
+                  )
+                """,
+                (transport_session_id, message_id),
+            )
+            self.connection.commit()
+            return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError("could not begin ingress dispatch") from exc
+
+    def finish_ingress_dispatch(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None:
+        if disposition not in {"dispatched", "interrupted"}:
+            raise StateStoreError("ingress dispatch disposition is invalid")
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE ingress_claims
+                SET disposition = ?
+                WHERE session_id = ? AND message_id = ?
+                  AND disposition = 'dispatching'
+                """,
+                (disposition, transport_session_id, message_id),
+            )
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                raise StateStoreError("ingress dispatch is not active")
+            self.connection.commit()
+        except StateStoreError:
+            raise
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError("could not finish ingress dispatch") from exc
+
+    def interrupt_ingress_dispatches(self) -> int:
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE ingress_claims
+                SET disposition = 'interrupted'
+                WHERE disposition = 'dispatching'
+                """
+            )
+            self.connection.commit()
+            return cursor.rowcount
+        except sqlite3.Error as exc:
+            self.connection.rollback()
+            raise StateStoreError("could not interrupt ingress dispatches") from exc
 
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         try:

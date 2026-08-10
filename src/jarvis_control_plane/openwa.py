@@ -16,8 +16,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
-from .models import OutboundDelivery, OutboundReply, ReceiveResult, SignedInboundEvent
-from .ports import OutboundConnectorError
+from .models import (
+    InboundMessage,
+    OutboundDelivery,
+    OutboundReply,
+    ReceiveResult,
+    SignedInboundEvent,
+)
+from .ports import DurableStateStore, OutboundConnectorError
 
 OPENWA_HTTP_TIMEOUT_SECONDS = 5.0
 MAX_OPENWA_HTTP_RESPONSE_BYTES = 64 * 1024
@@ -34,7 +40,7 @@ def _canonical_text(value: object, name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class OpenWAConfig:
-    """Non-secret routing plus the one injected OpenWA operator credential."""
+    """Fixed routing plus the one injected OpenWA operator credential."""
 
     api_base_url: str
     api_key: str = field(repr=False)
@@ -115,14 +121,18 @@ class _ReadableResponse(Protocol):
     def read(self, n: int = -1) -> bytes: ...
 
 
-class SignedEventReceiver(Protocol):
+class OpenWAIngressReceiver(Protocol):
     def receive(self, event: SignedInboundEvent) -> ReceiveResult: ...
+
+    def admit(self, event: SignedInboundEvent) -> ReceiveResult: ...
+
+    def dispatch_admitted_message(self, message: InboundMessage) -> ReceiveResult: ...
 
 
 class OpenWAWebhookAdapter:
     """Adapt one private OpenWA HTTP callback to the signed receiver seam."""
 
-    def __init__(self, *, receiver: SignedEventReceiver) -> None:
+    def __init__(self, *, receiver: OpenWAIngressReceiver) -> None:
         self.receiver = receiver
 
     def receive(
@@ -137,9 +147,60 @@ class OpenWAWebhookAdapter:
             if name.lower() == "x-openwa-signature"
         )
         signature = signatures[0] if len(signatures) == 1 else None
-        return self.receiver.receive(
+        return self.receiver.admit(
             SignedInboundEvent(raw_body=raw_body, signature=signature)
         )
+
+
+class OpenWAIngressWorker:
+    """Drain the durable admitted-message handoff outside the webhook request."""
+
+    def __init__(
+        self,
+        *,
+        receiver: OpenWAIngressReceiver,
+        state: DurableStateStore,
+    ) -> None:
+        self.receiver = receiver
+        self.state = state
+
+    def interrupt_stranded_dispatches(self) -> int:
+        """Conservatively terminalize work whose prior process outcome is unknown."""
+
+        return self.state.interrupt_ingress_dispatches()
+
+    def run_once(self) -> ReceiveResult | None:
+        message = self.state.begin_next_ingress_dispatch()
+        if message is None:
+            return None
+        try:
+            result = self.receiver.dispatch_admitted_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id=message.transport_session_id,
+                    event_id=message.event_id,
+                    message_id=message.message_id,
+                    sender_id=message.sender_id,
+                    chat_id=message.chat_id,
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=message.text,
+                )
+            )
+        except Exception:
+            self.state.finish_ingress_dispatch(
+                transport_session_id=message.transport_session_id,
+                message_id=message.message_id,
+                disposition="interrupted",
+            )
+            raise
+        self.state.finish_ingress_dispatch(
+            transport_session_id=message.transport_session_id,
+            message_id=message.message_id,
+            disposition="dispatched",
+        )
+        return result
 
 
 class UrllibOpenWAHttpTransport:
@@ -212,7 +273,9 @@ class OpenWAReadinessProbe:
         transport: OpenWAHttpTransport | None = None,
     ) -> None:
         self.config = config
-        self.transport = transport or UrllibOpenWAHttpTransport()
+        self.transport = (
+            transport if transport is not None else UrllibOpenWAHttpTransport()
+        )
 
     def current(self) -> OpenWAReadiness:
         return OpenWAReadiness(
@@ -267,12 +330,23 @@ class OpenWAOutboundConnector:
         self,
         *,
         config: OpenWAConfig,
-        readiness: OpenWAReadinessProbe,
+        readiness: OpenWAReadinessProbe | None = None,
         transport: OpenWAHttpTransport | None = None,
     ) -> None:
         self.config = config
+        self.transport = (
+            transport if transport is not None else UrllibOpenWAHttpTransport()
+        )
+        if readiness is None:
+            readiness = OpenWAReadinessProbe(
+                config=config,
+                transport=self.transport,
+            )
+        elif readiness.config != config or readiness.transport is not self.transport:
+            raise ValueError(
+                "OpenWA readiness and outbound delivery must share one configuration and transport"
+            )
         self.readiness = readiness
-        self.transport = transport or UrllibOpenWAHttpTransport()
 
     def preflight(self, reply: OutboundReply) -> None:
         self._validate_reply(reply)

@@ -144,7 +144,7 @@ def test_admission_retains_authorized_text_and_replay_cannot_duplicate_it() -> N
     assert history[0].chat_id == OPERATOR
     assert history[0].text == "Retain this exact authorized text"
     assert len(state.list_ingress_claims()) == 1  # type: ignore[attr-defined]
-    assert state.list_ingress_claims()[0].disposition == "admitted"  # type: ignore[attr-defined]
+    assert state.list_ingress_claims()[0].disposition == "dispatched"  # type: ignore[attr-defined]
     assert len(state.list_requests()) == 1  # type: ignore[attr-defined]
     assert len(orchestration.calls) == 1
     assert len(outbound.sent) == 1
@@ -460,7 +460,7 @@ def test_ingress_claim_and_history_are_atomic_when_state_write_fails() -> None:
     assert retry.status_code == 202
     assert retry.disposition == "completed"
     assert len(state.list_ingress_claims()) == 1
-    assert state.list_ingress_claims()[0].disposition == "admitted"
+    assert state.list_ingress_claims()[0].disposition == "dispatched"
     assert len(state.list_conversation_messages()) == 2
     assert len(state.list_requests()) == 1
     assert len(orchestration.calls) == 1
@@ -589,7 +589,7 @@ def test_admitted_update_failure_keeps_claim_non_eligible() -> None:
     assert replay.status_code == 202
     assert replay.disposition == "completed"
     assert len(state.list_ingress_claims()) == 1
-    assert state.list_ingress_claims()[0].disposition == "admitted"
+    assert state.list_ingress_claims()[0].disposition == "dispatched"
     assert len(state.list_conversation_messages()) == 2
     assert len(state.list_requests()) == 1
     assert len(orchestration.calls) == 1
@@ -615,7 +615,7 @@ def test_claim_write_failure_returns_503_and_retry_processes_once() -> None:
     assert retry.status_code == 202
     assert retry.disposition == "completed"
     assert len(state.list_ingress_claims()) == 1
-    assert state.list_ingress_claims()[0].disposition == "admitted"
+    assert state.list_ingress_claims()[0].disposition == "dispatched"
     assert len(state.list_conversation_messages()) == 2
     assert len(state.list_requests()) == 1
     assert len(orchestration.calls) == 1

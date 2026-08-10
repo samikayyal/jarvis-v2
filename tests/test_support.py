@@ -24,7 +24,10 @@ from jarvis_control_plane import (
     ModelAvailability,
     SignedMessageReceiver,
 )
-from jarvis_control_plane.ports import OutboundConnector
+from jarvis_control_plane.ports import (
+    MessagingGatewayReadinessProvider,
+    OutboundConnector,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +61,7 @@ def build_receiver_components(
     audit: Any | None = None,
     orchestration: ControlledOrchestrationAdapter | None = None,
     outbound: OutboundConnector | None = None,
+    messaging_readiness_provider: MessagingGatewayReadinessProvider | None = None,
     availability: ModelAvailability | None = None,
     working_session_id: str | None = None,
     clock: FixedClock | None = None,
@@ -110,6 +114,7 @@ def build_receiver_components(
         ids=ids,
         trace=trace,
         model_availability_provider=provider,
+        messaging_readiness_provider=messaging_readiness_provider,
         action_dispatcher=action_dispatcher,
         action_lifecycle=action_lifecycle,
         vault_write_proposal_preparer=vault_write_proposal_preparer,

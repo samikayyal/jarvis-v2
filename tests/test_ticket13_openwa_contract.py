@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from typing import cast
 
@@ -14,10 +15,13 @@ from jarvis_control_plane import (
     OpenWAConfig,
     OpenWAHttpError,
     OpenWAHttpResponse,
+    OpenWAIngressWorker,
     OpenWAOutboundConnector,
     OpenWAReadinessProbe,
     OpenWAWebhookAdapter,
     OutboundReply,
+    SQLiteAuditBoundary,
+    SQLiteDurableStateStore,
     sign_body,
 )
 from jarvis_control_plane.openwa import ControlledOpenWAHttpTransport
@@ -81,7 +85,7 @@ def test_pinned_signed_webhook_drives_reply_correlation() -> None:
         "X-OpenWA-Delivery-Id": "delivery-001",
     }
 
-    result = inbound.receive(raw_body=raw_body, headers=event_headers)
+    acknowledgement = inbound.receive(raw_body=raw_body, headers=event_headers)
     unauthenticated = inbound.receive(
         raw_body=_raw_openwa_event(body="must not be admitted"),
         headers={"Content-Type": "application/json"},
@@ -89,12 +93,19 @@ def test_pinned_signed_webhook_drives_reply_correlation() -> None:
 
     try:
         assert unauthenticated.disposition == "unauthenticated"
+        assert acknowledgement.disposition == "admitted"
+        controlled_outbound = cast(ControlledOutboundConnector, components.outbound)
+        assert controlled_outbound.sent == []
+        result = OpenWAIngressWorker(
+            receiver=components.receiver,
+            state=components.state,
+        ).run_once()
     finally:
         assert components.trace_store is not None
         components.trace_store._close_writer_service()
 
+    assert result is not None
     assert result.disposition == "completed"
-    controlled_outbound = cast(ControlledOutboundConnector, components.outbound)
     assert len(controlled_outbound.sent) == 1
     reply = controlled_outbound.sent[0]
     assert reply.session_id == SESSION_ID
@@ -103,6 +114,103 @@ def test_pinned_signed_webhook_drives_reply_correlation() -> None:
     assert components.state.list_ingress_claims()[0].event_id == (
         "message.received:session:wa-inbound-001"
     )
+
+
+def test_admitted_webhook_work_survives_state_store_reconstruction(tmp_path) -> None:
+    database = tmp_path / "ticket13-ingress.sqlite3"
+    first_connection = sqlite3.connect(database)
+    first_state = SQLiteDurableStateStore(first_connection)
+    first_audit = SQLiteAuditBoundary(first_connection)
+    first = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=SESSION_ID,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket13-before-restart",
+        state=first_state,
+        audit=first_audit,
+    )
+    raw_body = _raw_openwa_event(body="finish after receiver reconstruction")
+    acknowledgement = OpenWAWebhookAdapter(receiver=first.receiver).receive(
+        raw_body=raw_body,
+        headers={"X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"},
+    )
+    assert acknowledgement.disposition == "admitted"
+    assert first.state.list_requests() == ()
+    assert first.trace_store is not None
+    first.trace_store._close_writer_service()
+    first_state.close()
+    first_audit.close()
+    first_connection.close()
+
+    second_connection = sqlite3.connect(database)
+    second_state = SQLiteDurableStateStore(second_connection)
+    second_audit = SQLiteAuditBoundary(second_connection)
+    second = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=SESSION_ID,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket13-after-restart",
+        state=second_state,
+        audit=second_audit,
+    )
+    try:
+        result = OpenWAIngressWorker(
+            receiver=second.receiver,
+            state=second.state,
+        ).run_once()
+        assert result is not None
+        assert result.disposition == "completed"
+        assert (
+            OpenWAIngressWorker(
+                receiver=second.receiver,
+                state=second.state,
+            ).run_once()
+            is None
+        )
+        assert second.state.list_ingress_claims()[0].disposition == "dispatched"
+    finally:
+        assert second.trace_store is not None
+        second.trace_store._close_writer_service()
+        second_state.close()
+        second_audit.close()
+        second_connection.close()
+
+
+def test_restart_interrupts_claimed_dispatch_without_replaying_it() -> None:
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=SESSION_ID,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket13-interrupted",
+    )
+    raw_body = _raw_openwa_event(body="do not replay an uncertain dispatch")
+    acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
+        raw_body=raw_body,
+        headers={"X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"},
+    )
+    claimed = components.state.begin_next_ingress_dispatch()
+    worker = OpenWAIngressWorker(
+        receiver=components.receiver,
+        state=components.state,
+    )
+
+    try:
+        interrupted = worker.interrupt_stranded_dispatches()
+        replay = worker.run_once()
+    finally:
+        assert components.trace_store is not None
+        components.trace_store._close_writer_service()
+
+    assert acknowledgement.disposition == "admitted"
+    assert claimed is not None
+    assert interrupted == 1
+    assert replay is None
+    assert components.state.list_ingress_claims()[0].disposition == "interrupted"
+    controlled_outbound = cast(ControlledOutboundConnector, components.outbound)
+    assert controlled_outbound.sent == []
 
 
 def test_outbound_adapter_uses_pinned_reply_route_and_returned_message_id() -> None:
@@ -183,6 +291,50 @@ def test_readiness_keeps_container_health_and_named_session_state_distinct() -> 
     assert transport.requests[1].headers == {"X-API-Key": "owa_k1_contract-test"}
 
 
+def test_openwa_readiness_is_reflected_in_status_after_async_admission() -> None:
+    transport = ControlledOpenWAHttpTransport(
+        responses=(
+            OpenWAHttpResponse(status_code=200, body=b'{"status":"ok"}'),
+            OpenWAHttpResponse(
+                status_code=200,
+                body=(
+                    b'{"id":"7316be1d-38d8-47c1-9d58-374f456b9629",'
+                    b'"name":"jarvis","status":"ready"}'
+                ),
+            ),
+        )
+    )
+    probe = OpenWAReadinessProbe(config=_config(), transport=transport)
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=SESSION_ID,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket13-status",
+        messaging_readiness_provider=probe,
+    )
+    raw_body = _raw_openwa_event(body="/status")
+    acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
+        raw_body=raw_body,
+        headers={"X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"},
+    )
+
+    try:
+        result = OpenWAIngressWorker(
+            receiver=components.receiver,
+            state=components.state,
+        ).run_once()
+    finally:
+        assert components.trace_store is not None
+        components.trace_store._close_writer_service()
+
+    assert acknowledgement.disposition == "admitted"
+    assert result is not None
+    assert result.disposition == "status"
+    controlled_outbound = cast(ControlledOutboundConnector, components.outbound)
+    assert "OpenWA=ready" in controlled_outbound.sent[0].body
+
+
 def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None:
     config = _config()
     transport = ControlledOpenWAHttpTransport(
@@ -232,16 +384,22 @@ def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None
     )
     raw_body = _raw_openwa_event(body="summarize the ambiguous result")
     try:
-        result = OpenWAWebhookAdapter(receiver=components.receiver).receive(
+        acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
             raw_body=raw_body,
             headers={
                 "X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"
             },
         )
+        result = OpenWAIngressWorker(
+            receiver=components.receiver,
+            state=components.state,
+        ).run_once()
     finally:
         assert components.trace_store is not None
         components.trace_store._close_writer_service()
 
+    assert acknowledgement.disposition == "admitted"
+    assert result is not None
     assert result.disposition == "unknown"
     assert components.state.list_outbound_conversation_attempts()[0].status.value == (
         "unknown"
