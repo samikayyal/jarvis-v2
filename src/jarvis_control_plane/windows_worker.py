@@ -20,7 +20,7 @@ from enum import Enum
 from pathlib import Path
 from threading import RLock, Thread
 from time import monotonic, sleep
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from .ports import (
     ActionCancellationResult,
@@ -41,7 +41,6 @@ from .worker_gateway import (
 _CREATE_SUSPENDED = 0x00000004
 _AUTHENTICATED_EVIDENCE_TOKEN = object()
 _APPLICATION_HELLO_LIMIT_BYTES = 4096
-_PIPELINE_BUFFER_LIMIT_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +392,7 @@ class SubprocessWindowsJobObjectExecutor:
         self.process_limit = process_limit
         self._lock = RLock()
         self._running: dict[str, _RunningWindowsJob] = {}
+        self._cancelled_actions: set[str] = set()
 
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
@@ -410,9 +410,6 @@ class SubprocessWindowsJobObjectExecutor:
             raise ActionDispatcherError(
                 "Windows Job Object executor accepts one redirection target per component"
             )
-        for component in invocation.action.components:
-            for target in component.redirections:
-                self._verify_frozen_redirection_target(target)
         with self._lock:
             if self._running:
                 raise ActionDispatcherError(
@@ -423,13 +420,16 @@ class SubprocessWindowsJobObjectExecutor:
                     f"Windows Job Object action {invocation.action_id} already started",
                     may_have_dispatched=True,
                 )
-
-        job_handle = self._create_job_object()
-        record = _RunningWindowsJob(process=None, job_handle=job_handle)
-        with self._lock:
+            if invocation.action_id in self._cancelled_actions:
+                return WorkerExecutionResult(
+                    status=WorkerExecutionStatus.CANCELLED,
+                    process_tree_stopped=True,
+                )
+            record = _RunningWindowsJob(process=None, job_handle=0)
             self._running[invocation.action_id] = record
-        process: subprocess.Popen[bytes] | None = None
-        assigned_to_job = False
+
+        job_handle = 0
+        unassigned_process: subprocess.Popen[bytes] | None = None
         stdout_parts: list[bytes] = []
         stderr_parts: list[bytes] = []
         stdout_truncated = [False]
@@ -437,134 +437,165 @@ class SubprocessWindowsJobObjectExecutor:
         started_components: list[int] = []
         completed_components: list[int] = []
         timed_out = False
-        bounded_scope_failed = False
         return_code: int | None = None
-        pipeline_input: bytes | None = None
         deadline = monotonic() + invocation.deadline_seconds
         try:
+            job_handle = self._create_job_object()
+            with self._lock:
+                record.job_handle = job_handle
+                if record.cancel_requested:
+                    return WorkerExecutionResult(
+                        status=WorkerExecutionStatus.CANCELLED,
+                        process_tree_stopped=True,
+                    )
             flags = (
                 subprocess.CREATE_NO_WINDOW
                 | subprocess.CREATE_NEW_PROCESS_GROUP
                 | _CREATE_SUSPENDED
             )
-            for index, component in enumerate(invocation.action.components):
-                if index and component.operator_before == "&&" and return_code != 0:
+            components = invocation.action.components
+            group_start = 0
+            while group_start < len(components):
+                group_end = group_start + 1
+                while (
+                    group_end < len(components)
+                    and components[group_end].operator_before == "|"
+                ):
+                    group_end += 1
+                group_operator = components[group_start].operator_before
+                if group_start and group_operator == "&&" and return_code != 0:
+                    group_start = group_end
                     continue
-                if index and component.operator_before == "||" and return_code == 0:
+                if group_start and group_operator == "||" and return_code == 0:
+                    group_start = group_end
                     continue
                 with self._lock:
                     if record.cancel_requested:
                         break
-                remaining = deadline - monotonic()
-                if remaining <= 0:
+                if deadline - monotonic() <= 0:
                     timed_out = True
                     break
-                assigned_to_job = False
-                process = subprocess.Popen(
-                    [component.executable, *component.arguments],
-                    cwd=invocation.action.cwd,
-                    stdin=(
-                        subprocess.PIPE
-                        if pipeline_input is not None
-                        else subprocess.DEVNULL
-                    ),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    creationflags=flags,
-                )
-                record.process = process
-                self._assign_process(job_handle, process)
-                assigned_to_job = True
-                self._resume_process(process)
-                started_components.append(index)
-
-                assert process.stdout is not None
-                assert process.stderr is not None
-                pipes_to_next = (
-                    index + 1 < len(invocation.action.components)
-                    and invocation.action.components[index + 1].operator_before == "|"
-                )
-                component_stdout: list[bytes] = []
-                component_stdout_truncated = [False]
-                stdout_reader = Thread(
-                    target=self._read_bounded,
-                    args=(
-                        process.stdout,
-                        _PIPELINE_BUFFER_LIMIT_BYTES
-                        if pipes_to_next or component.redirections
-                        else max(
-                            invocation.stdout_limit_bytes
-                            - sum(len(part) for part in stdout_parts),
-                            0,
-                        ),
-                        component_stdout,
-                        component_stdout_truncated,
-                    ),
-                    daemon=True,
-                )
-                stderr_reader = Thread(
-                    target=self._read_bounded,
-                    args=(
-                        process.stderr,
-                        max(
-                            invocation.stderr_limit_bytes
-                            - sum(len(part) for part in stderr_parts),
-                            0,
-                        ),
-                        stderr_parts,
-                        stderr_truncated,
-                    ),
-                    daemon=True,
-                )
-                stdout_reader.start()
-                stderr_reader.start()
-                input_writer: Thread | None = None
-                if pipeline_input is not None:
-                    assert process.stdin is not None
-                    input_writer = Thread(
-                        target=self._write_pipeline_input,
-                        args=(process.stdin, pipeline_input),
-                        daemon=True,
-                    )
-                    input_writer.start()
+                group_processes: list[subprocess.Popen[bytes]] = []
+                group_readers: list[Thread] = []
+                redirection_streams: list[BinaryIO] = []
+                previous_pipe: object | None = None
+                cancelled_during_launch = False
                 try:
-                    return_code = process.wait(timeout=max(deadline - monotonic(), 0))
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    self._terminate_and_wait(
-                        job_handle, invocation.cancellation_grace_seconds
-                    )
-                    return_code = process.poll()
-                stdout_reader.join(timeout=invocation.cancellation_grace_seconds)
-                stderr_reader.join(timeout=invocation.cancellation_grace_seconds)
-                if input_writer is not None:
-                    input_writer.join(timeout=invocation.cancellation_grace_seconds)
-                if (
-                    stdout_reader.is_alive()
-                    or stderr_reader.is_alive()
-                    or (input_writer is not None and input_writer.is_alive())
-                ):
-                    timed_out = True
-                component_output = b"".join(component_stdout)
-                if component_stdout_truncated[0] and (
-                    pipes_to_next or component.redirections
-                ):
-                    bounded_scope_failed = True
-                elif pipes_to_next:
-                    pipeline_input = component_output
-                else:
-                    pipeline_input = None
-                    if component.redirections:
-                        target = component.redirections[0]
-                        self._verify_frozen_redirection_target(target)
-                        Path(target).write_bytes(component_output)
-                    else:
-                        stdout_parts.extend(component_stdout)
-                        if component_stdout_truncated[0]:
-                            stdout_truncated[0] = True
-                if return_code == 0:
-                    completed_components.append(index)
-                if timed_out or bounded_scope_failed:
+                    for index in range(group_start, group_end):
+                        component = components[index]
+                        redirects_stdout = bool(component.redirections)
+                        pipes_to_next = index + 1 < group_end and not redirects_stdout
+                        stdout_target: int | BinaryIO = subprocess.PIPE
+                        # Serialize cancellation with every file open and suspended
+                        # process publication. Once terminate() acknowledges, this
+                        # block can no longer create a side effect or a new child.
+                        with self._lock:
+                            if record.cancel_requested:
+                                cancelled_during_launch = True
+                                break
+                            if redirects_stdout:
+                                stdout_target = self._open_frozen_redirection_target(
+                                    component.redirections[0]
+                                )
+                                redirection_streams.append(stdout_target)
+                            unassigned_process = subprocess.Popen(
+                                [component.executable, *component.arguments],
+                                cwd=invocation.action.cwd,
+                                stdin=(previous_pipe or subprocess.DEVNULL),
+                                stdout=stdout_target,
+                                stderr=subprocess.PIPE,
+                                creationflags=flags,
+                            )
+                            process = unassigned_process
+                            self._assign_process(job_handle, process)
+                            unassigned_process = None
+                            record.process = process
+                        group_processes.append(process)
+                        started_components.append(index)
+                        if previous_pipe is not None:
+                            previous_pipe.close()  # type: ignore[attr-defined]
+                        previous_pipe = process.stdout if pipes_to_next else None
+                    for stream in redirection_streams:
+                        stream.close()
+                    redirection_streams.clear()
+                    if cancelled_during_launch:
+                        for process in group_processes:
+                            process.wait(timeout=invocation.cancellation_grace_seconds)
+                        break
+
+                    endpoint = group_processes[-1]
+                    endpoint_stdout: list[bytes] = []
+                    endpoint_stdout_truncated = [False]
+                    if endpoint.stdout is not None:
+                        stdout_reader = Thread(
+                            target=self._read_bounded,
+                            args=(
+                                endpoint.stdout,
+                                max(
+                                    invocation.stdout_limit_bytes
+                                    - sum(len(part) for part in stdout_parts),
+                                    0,
+                                ),
+                                endpoint_stdout,
+                                endpoint_stdout_truncated,
+                            ),
+                            daemon=True,
+                        )
+                        stdout_reader.start()
+                        group_readers.append(stdout_reader)
+                    for process in group_processes:
+                        assert process.stderr is not None
+                        stderr_reader = Thread(
+                            target=self._read_bounded,
+                            args=(
+                                process.stderr,
+                                max(
+                                    invocation.stderr_limit_bytes
+                                    - sum(len(part) for part in stderr_parts),
+                                    0,
+                                ),
+                                stderr_parts,
+                                stderr_truncated,
+                            ),
+                            daemon=True,
+                        )
+                        stderr_reader.start()
+                        group_readers.append(stderr_reader)
+
+                    # Consumers must be able to drain pipes before producers run.
+                    # Cancellation and resume are mutually exclusive: after a
+                    # successful cancellation acknowledgement no child is resumed.
+                    with self._lock:
+                        if not record.cancel_requested:
+                            for process in reversed(group_processes):
+                                self._resume_process(process)
+                    for process in group_processes:
+                        try:
+                            process.wait(timeout=max(deadline - monotonic(), 0))
+                        except subprocess.TimeoutExpired:
+                            timed_out = True
+                            self._terminate_and_wait(
+                                job_handle, invocation.cancellation_grace_seconds
+                            )
+                            break
+                    for reader in group_readers:
+                        reader.join(timeout=invocation.cancellation_grace_seconds)
+                    if any(reader.is_alive() for reader in group_readers):
+                        timed_out = True
+                    return_code = endpoint.poll()
+                    stdout_parts.extend(endpoint_stdout)
+                    if endpoint_stdout_truncated[0]:
+                        stdout_truncated[0] = True
+                    for offset, process in enumerate(group_processes):
+                        if process.poll() == 0:
+                            completed_components.append(group_start + offset)
+                finally:
+                    if previous_pipe is not None:
+                        previous_pipe.close()  # type: ignore[attr-defined]
+                    for stream in redirection_streams:
+                        stream.close()
+                group_start = group_end
+                if timed_out:
                     break
 
             # A successful root process may have left descendants running.
@@ -614,8 +645,6 @@ class SubprocessWindowsJobObjectExecutor:
                 status = WorkerExecutionStatus.CANCELLED
             elif timed_out:
                 status = WorkerExecutionStatus.TIMED_OUT
-            elif bounded_scope_failed:
-                status = WorkerExecutionStatus.FAILED
             elif return_code == 0:
                 status = WorkerExecutionStatus.COMPLETED
             else:
@@ -631,31 +660,31 @@ class SubprocessWindowsJobObjectExecutor:
                 stderr_truncated=stderr_truncated[0],
             )
         except BaseException:
-            if process is not None:
-                if assigned_to_job:
-                    self._terminate_and_wait(
-                        job_handle, invocation.cancellation_grace_seconds
-                    )
-                else:
-                    self._terminate_unassigned_process(
-                        process, invocation.cancellation_grace_seconds
-                    )
-                    self._terminate_and_wait(
-                        job_handle, invocation.cancellation_grace_seconds
-                    )
+            if unassigned_process is not None:
+                self._terminate_unassigned_process(
+                    unassigned_process, invocation.cancellation_grace_seconds
+                )
+            if job_handle:
+                self._terminate_and_wait(
+                    job_handle, invocation.cancellation_grace_seconds
+                )
             raise
         finally:
             with self._lock:
                 self._running.pop(invocation.action_id, None)
-            self._close_handle(job_handle)
+            if job_handle:
+                self._close_handle(job_handle)
 
     def terminate(self, *, action_id: str, timeout_seconds: int) -> bool:
         with self._lock:
             record = self._running.get(action_id)
             if record is None:
-                return False
+                self._cancelled_actions.add(action_id)
+                return True
             record.cancel_requested = True
             job_handle = record.job_handle
+            if not job_handle:
+                return True
         return self._terminate_and_wait(job_handle, timeout_seconds)
 
     def finalize(self, *, action_id: str, timeout_seconds: int) -> None:
@@ -666,6 +695,7 @@ class SubprocessWindowsJobObjectExecutor:
                     "Windows Job Object action cannot be finalized while running",
                     may_have_dispatched=True,
                 )
+            self._cancelled_actions.discard(action_id)
 
     @staticmethod
     def _read_bounded(
@@ -699,23 +729,81 @@ class SubprocessWindowsJobObjectExecutor:
         return encoded[:limit].decode(errors="ignore")
 
     @staticmethod
-    def _write_pipeline_input(stream: object, value: bytes) -> None:
-        try:
-            stream.write(value)  # type: ignore[attr-defined]
-            stream.flush()  # type: ignore[attr-defined]
-        except BrokenPipeError:
-            pass
-        finally:
-            stream.close()  # type: ignore[attr-defined]
+    def _open_frozen_redirection_target(target: str) -> BinaryIO:
+        """Open once while preventing reparse substitution, then write by handle."""
 
-    @staticmethod
-    def _verify_frozen_redirection_target(target: str) -> None:
-        candidate = Path(target)
-        resolved = candidate.resolve(strict=False)
-        if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
-            raise ActionDispatcherError(
-                "Windows redirection target changed through a reparse path"
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        generic_write = 0x40000000
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        open_existing = 3
+        create_always = 2
+        file_attribute_reparse_point = 0x00000400
+        file_flag_backup_semantics = 0x02000000
+        file_flag_open_reparse_point = 0x00200000
+        invalid_handle_value = ctypes.c_void_p(-1).value
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        def open_handle(path: Path, *, directory: bool) -> int:
+            handle = kernel32.CreateFileW(
+                str(path),
+                0 if directory else generic_write,
+                file_share_read | file_share_write,
+                None,
+                open_existing if directory else create_always,
+                file_flag_open_reparse_point
+                | (file_flag_backup_semantics if directory else 0),
+                None,
             )
+            if int(handle) == invalid_handle_value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            info = ByHandleFileInformation()
+            if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                error = ctypes.get_last_error()
+                kernel32.CloseHandle(handle)
+                raise ctypes.WinError(error)
+            if info.dwFileAttributes & file_attribute_reparse_point:
+                kernel32.CloseHandle(handle)
+                raise ActionDispatcherError(
+                    "Windows redirection target changed through a reparse path"
+                )
+            return int(handle)
+
+        candidate = Path(target)
+        parent_handles: list[int] = []
+        target_handle = 0
+        try:
+            for parent in reversed(candidate.parents):
+                parent_handles.append(open_handle(parent, directory=True))
+            target_handle = open_handle(candidate, directory=False)
+            descriptor = msvcrt.open_osfhandle(target_handle, os.O_WRONLY | os.O_BINARY)
+            target_handle = 0  # descriptor owns the native handle now
+            return os.fdopen(descriptor, "wb", buffering=0)
+        finally:
+            if target_handle:
+                kernel32.CloseHandle(wintypes.HANDLE(target_handle))
+            for handle in reversed(parent_handles):
+                kernel32.CloseHandle(wintypes.HANDLE(handle))
 
     def _create_job_object(self) -> int:
         import ctypes

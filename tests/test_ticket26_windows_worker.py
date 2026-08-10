@@ -6,6 +6,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
+from time import monotonic, sleep
 
 import pytest
 
@@ -456,6 +457,177 @@ def test_native_job_executor_preserves_pipeline_and_redirection_structure(
     assert result.completed_components == (0, 1)
     assert result.stdout == ""
     assert redirected.read_text() == "PIPE ME\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_native_pipeline_streams_while_the_producer_is_running(tmp_path: Path) -> None:
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=(
+            "-c",
+            "while True: print('record', flush=True)",
+        ),
+        cwd=str(tmp_path),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "while True: print('record', flush=True)"],
+            },
+            {
+                "executable": sys.executable,
+                "arguments": [
+                    "-c",
+                    "import sys; print(sys.stdin.readline(), end='')",
+                ],
+                "operator_before": "|",
+            },
+        ),
+    )
+    started = monotonic()
+
+    result = SubprocessWindowsJobObjectExecutor().execute(
+        replace(_invocation("streaming-pipeline", action=action), deadline_seconds=5),
+        lambda _event: None,
+    )
+
+    assert monotonic() - started < 5
+    assert result.status is WorkerExecutionStatus.COMPLETED
+    assert result.stdout.splitlines() == ["record"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_false_conditional_skips_the_complete_pipeline(tmp_path: Path) -> None:
+    side_effect = tmp_path / "consumer-ran.txt"
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=("-c", "raise SystemExit(1)"),
+        cwd=str(tmp_path),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "raise SystemExit(1)"],
+            },
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "print('guarded')"],
+                "operator_before": "&&",
+            },
+            {
+                "executable": sys.executable,
+                "arguments": [
+                    "-c",
+                    f"from pathlib import Path; Path({str(side_effect)!r}).write_text('ran')",
+                ],
+                "operator_before": "|",
+            },
+        ),
+    )
+
+    result = SubprocessWindowsJobObjectExecutor().execute(
+        _invocation("guarded-pipeline", action=action), lambda _event: None
+    )
+
+    assert result.status is WorkerExecutionStatus.FAILED
+    assert result.started_components == (0,)
+    assert not side_effect.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_redirection_takes_precedence_over_a_following_pipe(tmp_path: Path) -> None:
+    redirected = tmp_path / "redirected.txt"
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=("-c", "print('redirected')"),
+        cwd=str(tmp_path),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "print('redirected')"],
+                "redirections": [str(redirected)],
+            },
+            {
+                "executable": sys.executable,
+                "arguments": [
+                    "-c",
+                    "import sys; print(repr(sys.stdin.read()))",
+                ],
+                "operator_before": "|",
+            },
+        ),
+    )
+
+    result = SubprocessWindowsJobObjectExecutor().execute(
+        _invocation("redirect-before-pipe", action=action), lambda _event: None
+    )
+
+    assert result.status is WorkerExecutionStatus.COMPLETED
+    assert redirected.read_text() == "redirected\n"
+    assert result.stdout.splitlines() == ["''"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_redirection_stops_mutating_when_the_action_deadline_expires(
+    tmp_path: Path,
+) -> None:
+    redirected = tmp_path / "bounded.txt"
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=(
+            "-c",
+            "import sys; chunk='x'*65536;\nwhile True: sys.stdout.write(chunk); sys.stdout.flush()",
+        ),
+        cwd=str(tmp_path),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": [
+                    "-c",
+                    "import sys; chunk='x'*65536;\nwhile True: sys.stdout.write(chunk); sys.stdout.flush()",
+                ],
+                "redirections": [str(redirected)],
+            },
+        ),
+    )
+
+    result = SubprocessWindowsJobObjectExecutor().execute(
+        replace(_invocation("deadline-redirection", action=action), deadline_seconds=1),
+        lambda _event: None,
+    )
+    size_after_result = redirected.stat().st_size
+    sleep(0.2)
+
+    assert result.status is WorkerExecutionStatus.TIMED_OUT
+    assert redirected.stat().st_size == size_after_result
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_executor_retains_cancellation_before_the_action_record_is_published(
+    tmp_path: Path,
+) -> None:
+    side_effect = tmp_path / "must-not-run.txt"
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=(
+            "-c",
+            f"from pathlib import Path; Path({str(side_effect)!r}).write_text('ran')",
+        ),
+        cwd=str(tmp_path),
+    )
+    executor = SubprocessWindowsJobObjectExecutor()
+
+    assert executor.terminate(action_id="handoff-cancel", timeout_seconds=1) is True
+    result = executor.execute(
+        _invocation("handoff-cancel", action=action), lambda _event: None
+    )
+
+    assert result.status is WorkerExecutionStatus.CANCELLED
+    assert result.process_tree_stopped is True
+    assert not side_effect.exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows reparse paths")
