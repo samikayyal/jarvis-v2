@@ -4,9 +4,9 @@
 
 **Blocked by:** 12 — Reconcile interruption, outbox state, and ambiguous outcomes.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] The worker verifies authenticated local identity and rejects actions bound to another host or an unavailable/degraded worker.
-- [ ] It runs a non-interactive bounded process scope, streams tagged bounded output, and cancels the complete process tree.
-- [ ] Contract verification uses controlled local inputs and does not install a service, activate credentials, expose a listener, or perform trust-critical changes.
+- [x] The worker verifies authenticated local identity and rejects actions bound to another host or an unavailable/degraded worker.
+- [x] It runs a non-interactive bounded process scope, streams tagged bounded output, and cancels the complete process tree.
+- [x] Contract verification uses controlled local inputs and does not install a service, activate credentials, expose a listener, or perform trust-critical changes.
 
