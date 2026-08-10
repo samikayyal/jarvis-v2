@@ -184,9 +184,7 @@ def _openwa_inbound_message(payload: Mapping[str, Any]) -> InboundMessage:
     if not isinstance(data, Mapping):
         raise TypeError("OpenWA event data must be an object")
     is_group = data.get("isGroup")
-    chat_type = (
-        "group" if is_group is True else "direct" if is_group is False else None
-    )
+    chat_type = "group" if is_group is True else "direct" if is_group is False else None
     sender_id = None if data.get("isLidSender") is True else data.get("from")
     return InboundMessage(
         event_type=payload.get("event"),  # type: ignore[arg-type]

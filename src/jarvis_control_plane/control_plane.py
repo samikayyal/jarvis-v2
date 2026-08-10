@@ -4757,9 +4757,7 @@ class SignedMessageReceiver:
             ),
         )
 
-    def _receive(
-        self, event: SignedInboundEvent, *, dispatch: bool
-    ) -> ReceiveResult:
+    def _receive(self, event: SignedInboundEvent, *, dispatch: bool) -> ReceiveResult:
         """Shared signed admission path for synchronous and HTTP boundaries."""
 
         if len(event.raw_body) > _MAX_RAW_INBOUND_BODY_BYTES:

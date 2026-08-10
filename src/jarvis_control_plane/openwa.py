@@ -285,9 +285,7 @@ class UrllibOpenWAHttpTransport:
             response.close()
 
 
-def _read_bounded_body(
-    response: _ReadableResponse, *, may_have_sent: bool
-) -> bytes:
+def _read_bounded_body(response: _ReadableResponse, *, may_have_sent: bool) -> bytes:
     body = response.read(MAX_OPENWA_HTTP_RESPONSE_BYTES + 1)
     if not isinstance(body, bytes):
         raise OpenWAHttpError("invalid_response", may_have_sent=may_have_sent)
@@ -399,9 +397,7 @@ class OpenWAOutboundConnector:
         if not readiness.container_healthy:
             raise OutboundConnectorError("OpenWA container is not healthy")
         if readiness.named_session_status != "ready":
-            raise OutboundConnectorError(
-                "configured OpenWA named session is not ready"
-            )
+            raise OutboundConnectorError("configured OpenWA named session is not ready")
 
     def send(self, reply: OutboundReply) -> OutboundDelivery:
         self._validate_reply(reply)

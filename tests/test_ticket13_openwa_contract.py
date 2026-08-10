@@ -42,7 +42,9 @@ OPERATOR = "962790000000@c.us"
 
 
 class _ControlledUrlOpener:
-    def __init__(self, *, response: object | None = None, error: Exception | None = None):
+    def __init__(
+        self, *, response: object | None = None, error: Exception | None = None
+    ):
         self.response = response
         self.error = error
         self.requests: list[object] = []
@@ -457,9 +459,7 @@ def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None
     try:
         acknowledgement = OpenWAWebhookAdapter(receiver=components.receiver).receive(
             raw_body=raw_body,
-            headers={
-                "X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"
-            },
+            headers={"X-OpenWA-Signature": f"sha256={sign_body(raw_body, SECRET)}"},
         )
         result = worker.run_once()
     finally:
@@ -472,7 +472,10 @@ def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None
     assert components.state.list_outbound_conversation_attempts()[0].status.value == (
         "unknown"
     )
-    assert len([request for request in transport.requests if request.method == "POST"]) == 1
+    assert (
+        len([request for request in transport.requests if request.method == "POST"])
+        == 1
+    )
 
     oversized = OutboundReply(
         reply_id="reply-oversized",
@@ -505,7 +508,9 @@ def test_urllib_transport_rejects_redirects_before_forwarding_credentials(
         installed_handlers.extend(handlers)
         return opener
 
-    monkeypatch.setattr(openwa_module, "build_opener", controlled_build_opener, raising=False)
+    monkeypatch.setattr(
+        openwa_module, "build_opener", controlled_build_opener, raising=False
+    )
 
     with pytest.raises(OpenWAHttpError) as raised:
         UrllibOpenWAHttpTransport().request(
