@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
-from typing import cast
+from email.message import Message
+from http.client import BadStatusLine, IncompleteRead
+from io import BytesIO
+from typing import Any, cast
+from urllib.error import HTTPError
 
 import pytest
 from test_support import build_receiver_components
 
+import jarvis_control_plane.openwa as openwa_module
 from jarvis_control_plane import (
     ControlledOutboundConnector,
     InMemoryAuditBoundary,
@@ -23,6 +28,7 @@ from jarvis_control_plane import (
     OutboundReply,
     SQLiteAuditBoundary,
     SQLiteDurableStateStore,
+    UrllibOpenWAHttpTransport,
     sign_body,
 )
 from jarvis_control_plane.openwa import ControlledOpenWAHttpTransport
@@ -33,6 +39,35 @@ SECRET = b"ticket13-webhook-secret"
 SESSION_ID = "7316be1d-38d8-47c1-9d58-374f456b9629"
 SESSION_NAME = "jarvis"
 OPERATOR = "962790000000@c.us"
+
+
+class _ControlledUrlOpener:
+    def __init__(self, *, response: object | None = None, error: Exception | None = None):
+        self.response = response
+        self.error = error
+        self.requests: list[object] = []
+
+    def open(self, request: object, *, timeout: float) -> object:
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        assert self.response is not None
+        return self.response
+
+
+class _BrokenHttpResponse:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.closed = False
+
+    def getcode(self) -> int:
+        return 201
+
+    def read(self, _limit: int = -1) -> bytes:
+        raise self.error
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _raw_openwa_event(*, body: str = "summarize the controlled result") -> bytes:
@@ -449,3 +484,76 @@ def test_outbound_envelope_is_fixed_and_ambiguous_send_is_not_definite() -> None
     )
     with pytest.raises(OutboundConnectorError, match="4,096"):
         connector.preflight(oversized)
+
+
+def test_urllib_transport_rejects_redirects_before_forwarding_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirect_headers = Message()
+    redirect_headers["Location"] = "https://attacker.test/collect"
+    redirect = HTTPError(
+        "http://openwa.test:2785/api/messages",
+        302,
+        "Found",
+        redirect_headers,
+        BytesIO(b"redirect rejected"),
+    )
+    opener = _ControlledUrlOpener(error=redirect)
+    installed_handlers: list[Any] = []
+
+    def controlled_build_opener(*handlers: object) -> _ControlledUrlOpener:
+        installed_handlers.extend(handlers)
+        return opener
+
+    monkeypatch.setattr(openwa_module, "build_opener", controlled_build_opener, raising=False)
+
+    with pytest.raises(OpenWAHttpError) as raised:
+        UrllibOpenWAHttpTransport().request(
+            method="POST",
+            url="http://openwa.test:2785/api/messages",
+            headers={"X-API-Key": "owa_k1_must-not-redirect"},
+            body=b"{}",
+            timeout_seconds=5.0,
+        )
+
+    assert raised.value.code == "redirect_rejected"
+    assert raised.value.may_have_sent is True
+    assert len(opener.requests) == 1
+    assert len(installed_handlers) == 1
+    assert installed_handlers[0].redirect_request(None, None, 302, "", {}, "") is None
+
+
+@pytest.mark.parametrize(
+    ("opener_error", "response_error"),
+    (
+        (BadStatusLine("broken status"), None),
+        (None, IncompleteRead(b"partial", 10)),
+    ),
+)
+def test_urllib_transport_maps_protocol_failures_to_ambiguous_post_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    opener_error: Exception | None,
+    response_error: Exception | None,
+) -> None:
+    response = None if response_error is None else _BrokenHttpResponse(response_error)
+    opener = _ControlledUrlOpener(response=response, error=opener_error)
+    monkeypatch.setattr(
+        openwa_module,
+        "build_opener",
+        lambda *_handlers: opener,
+        raising=False,
+    )
+
+    with pytest.raises(OpenWAHttpError) as raised:
+        UrllibOpenWAHttpTransport().request(
+            method="POST",
+            url="http://openwa.test:2785/api/messages",
+            headers={"X-API-Key": "owa_k1_protocol-failure"},
+            body=b"{}",
+            timeout_seconds=5.0,
+        )
+
+    assert raised.value.code == "invalid_response"
+    assert raised.value.may_have_sent is True
+    if response is not None:
+        assert response.closed is True

@@ -11,10 +11,11 @@ import json
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from typing import Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .models import (
     InboundMessage,
@@ -120,6 +121,17 @@ class OpenWAHttpTransport(Protocol):
 class _ReadableResponse(Protocol):
     def read(self, n: int = -1) -> bytes: ...
 
+    def getcode(self) -> int | None: ...
+
+    def close(self) -> None: ...
+
+
+class _RejectRedirectHandler(HTTPRedirectHandler):
+    """Return redirect responses without constructing a credentialed follow-up."""
+
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
 
 class OpenWAIngressReceiver(Protocol):
     def receive(self, event: SignedInboundEvent) -> ReceiveResult: ...
@@ -204,6 +216,9 @@ class OpenWAIngressWorker:
 class UrllibOpenWAHttpTransport:
     """Production HTTP transport for the future private two-member network."""
 
+    def __init__(self) -> None:
+        self._opener = build_opener(_RejectRedirectHandler())
+
     def request(
         self,
         *,
@@ -215,25 +230,57 @@ class UrllibOpenWAHttpTransport:
     ) -> OpenWAHttpResponse:
         request = Request(url, data=body, headers=dict(headers), method=method)
         try:
-            response = urlopen(request, timeout=timeout_seconds)
+            response = self._opener.open(request, timeout=timeout_seconds)
         except HTTPError as error:
             try:
-                return OpenWAHttpResponse(
-                    status_code=error.code,
-                    body=_read_bounded_body(error, may_have_sent=method == "POST"),
-                )
+                if 300 <= error.code < 400:
+                    raise OpenWAHttpError(
+                        "redirect_rejected",
+                        may_have_sent=method == "POST",
+                    ) from error
+                try:
+                    body = _read_bounded_body(
+                        error,
+                        may_have_sent=method == "POST",
+                    )
+                except HTTPException as protocol_error:
+                    raise OpenWAHttpError(
+                        "invalid_response",
+                        may_have_sent=method == "POST",
+                    ) from protocol_error
+                return OpenWAHttpResponse(status_code=error.code, body=body)
             finally:
                 error.close()
+        except HTTPException as error:
+            raise OpenWAHttpError(
+                "invalid_response",
+                may_have_sent=method == "POST",
+            ) from error
         except (TimeoutError, URLError, OSError) as error:
             raise OpenWAHttpError(
                 "timeout" if isinstance(error, TimeoutError) else "unavailable",
                 may_have_sent=method == "POST",
             ) from error
         try:
-            return OpenWAHttpResponse(
-                status_code=response.getcode(),
-                body=_read_bounded_body(response, may_have_sent=method == "POST"),
-            )
+            try:
+                status_code = response.getcode()
+                if status_code is None:
+                    raise OpenWAHttpError(
+                        "invalid_response",
+                        may_have_sent=method == "POST",
+                    )
+                return OpenWAHttpResponse(
+                    status_code=status_code,
+                    body=_read_bounded_body(
+                        response,
+                        may_have_sent=method == "POST",
+                    ),
+                )
+            except HTTPException as error:
+                raise OpenWAHttpError(
+                    "invalid_response",
+                    may_have_sent=method == "POST",
+                ) from error
         finally:
             response.close()
 
