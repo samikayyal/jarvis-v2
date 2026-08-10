@@ -65,6 +65,7 @@ from .ports import (
     IdGenerator,
     KnowledgeVaultWriteProposalPreparer,
     MemorySearchLimitExceeded,
+    MessagingGatewayReadinessProvider,
     ModelAvailabilityProvider,
     OrchestrationAdapter,
     OrchestrationAdapterError,
@@ -392,6 +393,7 @@ class DeterministicCapabilityBroker:
         ids: IdGenerator,
         trace: DiagnosticTraceRecorder,
         model_availability_provider: ModelAvailabilityProvider,
+        messaging_readiness_provider: MessagingGatewayReadinessProvider | None = None,
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
         action_lifecycle: BoundActionLifecycle | None = None,
@@ -410,6 +412,7 @@ class DeterministicCapabilityBroker:
         self.clock = clock
         self.ids = ids
         self.model_availability_provider = model_availability_provider
+        self.messaging_readiness_provider = messaging_readiness_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
         selected_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
         if not isinstance(selected_dispatcher, ActionDispatcher):
@@ -478,6 +481,10 @@ class DeterministicCapabilityBroker:
                 reason=self._recovery_degraded_reason,
             )
         session = self._reconcile_inactivity()
+        readiness_failure = self._refresh_messaging_readiness()
+        if readiness_failure is not None:
+            return readiness_failure
+        session = self._current_working_session()
         if session.pending_action is not None and session.pending_action.is_expired(
             self.clock
         ):
@@ -614,6 +621,33 @@ class DeterministicCapabilityBroker:
             result=result,
         )
 
+    def _refresh_messaging_readiness(self) -> ReceiveResult | None:
+        provider = self.messaging_readiness_provider
+        if provider is None:
+            return None
+        try:
+            observation = provider.current()
+            ready = observation.messaging_ready is True
+        except (RuntimeError, TypeError, ValueError):
+            ready = False
+        current = self._current_working_session()
+        level = "ready" if ready else "unavailable"
+        if current.readiness.openwa == level:
+            return None
+        updated = replace(
+            current,
+            readiness=replace(current.readiness, openwa=level),
+        )
+        try:
+            self.working_sessions.compare_and_set(current, updated)
+        except SessionStoreError:
+            return ReceiveResult(
+                status_code=503,
+                disposition="readiness_state_unavailable",
+                reason="messaging-gateway readiness could not be persisted",
+            )
+        return None
+
     @property
     def current_pending_action(self) -> PendingActionState | None:
         """Expose the current frozen action without exposing its payload in status."""
@@ -740,6 +774,7 @@ class DeterministicCapabilityBroker:
                     request_id=action.request_id,
                     session_id=self.config.session_id,
                     recipient_id=message.chat_id,
+                    quoted_message_id=message.message_id,
                     body=(
                         f"Proposal {action.action_id} digest {action.digest} "
                         f"part {number}/{total} request_id={action.request_id}\n{fragment}"
@@ -759,6 +794,7 @@ class DeterministicCapabilityBroker:
                 request_id=action.request_id,
                 session_id=self.config.session_id,
                 recipient_id=message.chat_id,
+                quoted_message_id=message.message_id,
                 body=(
                     f"Proposal {action.action_id} digest {action.digest} "
                     "All proposal fragments were presented. "
@@ -2586,6 +2622,7 @@ class DeterministicCapabilityBroker:
             request_id=request.request_id,
             session_id=self.config.session_id,
             recipient_id=message.chat_id,
+            quoted_message_id=message.message_id,
             body=_bounded_informational_reply(
                 result.reply_text,
                 request_id=request.request_id,
@@ -4214,6 +4251,7 @@ class DeterministicCapabilityBroker:
             request_id=control_id,
             session_id=self.config.session_id,
             recipient_id=message.chat_id,
+            quoted_message_id=message.message_id,
             body=body,
         )
         outbound_reserved = False
@@ -4691,6 +4729,39 @@ class SignedMessageReceiver:
     def receive(self, event: SignedInboundEvent) -> ReceiveResult:
         """Verify, admit, claim, and dispatch one signed event."""
 
+        return self._receive(event, dispatch=True)
+
+    def admit(self, event: SignedInboundEvent) -> ReceiveResult:
+        """Durably admit a webhook event without running assistant work inline."""
+
+        return self._receive(event, dispatch=False)
+
+    def dispatch_admitted_message(self, message: InboundMessage) -> ReceiveResult:
+        """Run one message already claimed by the durable ingress worker."""
+
+        return self.broker.handle(message)
+
+    def reconcile_ingress_restart(self) -> int:
+        """Fail closed on nonterminal ingress left by a prior process."""
+
+        return self.state.reconcile_ingress_restart(
+            audit=self.audit,
+            audit_evidence=self._audit_evidence(
+                kind="service_restart",
+                outcome="interrupted",
+                actor="control_plane",
+                operation_type="working_session",
+                target_category="working_session",
+                execution_status="recorded",
+                details={"interrupted_ingress": "nonterminal"},
+            ),
+        )
+
+    def _receive(
+        self, event: SignedInboundEvent, *, dispatch: bool
+    ) -> ReceiveResult:
+        """Shared signed admission path for synchronous and HTTP boundaries."""
+
         if len(event.raw_body) > _MAX_RAW_INBOUND_BODY_BYTES:
             return ReceiveResult(
                 status_code=413,
@@ -4814,7 +4885,40 @@ class SignedMessageReceiver:
                 disposition="audit_blocked",
                 reason="required audit evidence was unavailable",
             )
-        return self.broker.handle(message)
+        if dispatch:
+            try:
+                began = self.state.begin_ingress_dispatch(
+                    transport_session_id=message.session_id,
+                    message_id=message.message_id,
+                )
+            except StateStoreError:
+                return ReceiveResult(
+                    status_code=503,
+                    disposition="state_unavailable",
+                    reason="durable ingress dispatch state was unavailable",
+                )
+            if not began:
+                return ReceiveResult(
+                    status_code=503,
+                    disposition="dispatch_unavailable",
+                    reason="admitted ingress work could not be claimed",
+                )
+            try:
+                result = self.broker.handle(message)
+            except Exception:
+                self.state.finish_ingress_dispatch(
+                    transport_session_id=message.session_id,
+                    message_id=message.message_id,
+                    disposition="interrupted",
+                )
+                raise
+            self.state.finish_ingress_dispatch(
+                transport_session_id=message.session_id,
+                message_id=message.message_id,
+                disposition="dispatched",
+            )
+            return result
+        return ReceiveResult(status_code=202, disposition="admitted")
 
     def _admission_rejection(self, message: InboundMessage) -> str | None:
         if message.event_type != "message.received":

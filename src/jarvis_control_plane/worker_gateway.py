@@ -211,6 +211,8 @@ class WorkerExecutionResult:
     process_tree_stopped: bool = False
     stdout: str = ""
     stderr: str = ""
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
     progress_events: tuple[WorkerProgressEvent, ...] = ()
 
     def __post_init__(self) -> None:
@@ -237,6 +239,10 @@ class WorkerExecutionResult:
         object.__setattr__(self, "status", status)
         if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
             raise TypeError("worker output must be text")
+        if not isinstance(self.stdout_truncated, bool) or not isinstance(
+            self.stderr_truncated, bool
+        ):
+            raise TypeError("worker output truncation facts must be boolean")
         progress_events = tuple(self.progress_events)
         if any(not isinstance(event, WorkerProgressEvent) for event in progress_events):
             raise TypeError("worker progress must contain WorkerProgressEvent values")
@@ -1059,10 +1065,14 @@ def _bounded_result(
             for index, component in enumerate(components)
         ):
             raise ActionDispatcherError("worker reported a partial pipeline")
+    stdout_overflow = len(result.stdout.encode()) > limits.stdout_limit_bytes
+    stderr_overflow = len(result.stderr.encode()) > limits.stderr_limit_bytes
     return replace(
         result,
         stdout=_truncate_output(result.stdout, limits.stdout_limit_bytes),
         stderr=_truncate_output(result.stderr, limits.stderr_limit_bytes),
+        stdout_truncated=result.stdout_truncated or stdout_overflow,
+        stderr_truncated=result.stderr_truncated or stderr_overflow,
     )
 
 
