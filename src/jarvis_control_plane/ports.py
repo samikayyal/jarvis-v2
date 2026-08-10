@@ -220,6 +220,27 @@ class DurableStateStore(Protocol):
         disposition: str,
     ) -> None: ...
 
+    def begin_next_ingress_dispatch(self) -> ConversationMessage | None: ...
+
+    def begin_ingress_dispatch(
+        self, *, transport_session_id: str, message_id: str
+    ) -> bool: ...
+
+    def finish_ingress_dispatch(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None: ...
+
+    def reconcile_ingress_restart(
+        self,
+        *,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+    ) -> int: ...
+
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]: ...
 
     def append_conversation_message(self, message: ConversationMessage) -> None: ...
@@ -432,6 +453,17 @@ class ModelAvailabilityProvider(Protocol):
     """Authoritative provider access/availability check for exact runtime choices."""
 
     def current(self) -> ModelAvailability: ...
+
+
+class MessagingGatewayReadiness(Protocol):
+    """Safe aggregate derived from separate gateway/session observations."""
+
+    @property
+    def messaging_ready(self) -> bool: ...
+
+
+class MessagingGatewayReadinessProvider(Protocol):
+    def current(self) -> MessagingGatewayReadiness: ...
 
 
 class OutboundConnector(Protocol):
