@@ -549,7 +549,7 @@ def test_systemd_scope_rejects_an_invalid_process_tree_bound(
 
 
 @pytest.mark.parametrize(
-    ("return_code", "state", "allow_missing", "expected"),
+    ("return_code", "state", "wrapper_completed", "expected"),
     [
         (1, "", False, False),
         (3, "inactive\n", False, True),
@@ -562,7 +562,7 @@ def test_systemd_scope_requires_a_known_stopped_unit_state(
     monkeypatch: pytest.MonkeyPatch,
     return_code: int,
     state: str,
-    allow_missing: bool,
+    wrapper_completed: bool,
     expected: bool,
 ) -> None:
     scope = SystemdUbuntuProcessScope()
@@ -572,8 +572,6 @@ def test_systemd_scope_requires_a_known_stopped_unit_state(
 
     monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
     observed = Event()
-    if allow_missing:
-        observed.set()
     running = ubuntu_worker_module._RunningSystemdScope(
         unit_name="jarvis-action-test.service",
         process=cast("subprocess.Popen[bytes]", object()),
@@ -585,10 +583,48 @@ def test_systemd_scope_requires_a_known_stopped_unit_state(
     stopped = scope._unit_is_stopped(
         running,
         timeout_seconds=1,
-        allow_missing=allow_missing,
+        wrapper_completed=wrapper_completed,
     )
 
     assert stopped is expected
+
+
+def test_systemd_scope_accepts_a_collected_unit_after_wait_wrapper_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedWrapper:
+        def __init__(self) -> None:
+            self.stdout = BytesIO()
+            self.stderr = BytesIO()
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 4, stdout="unknown\n")
+
+    scope = SystemdUbuntuProcessScope()
+    monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
+    running = ubuntu_worker_module._RunningSystemdScope(
+        unit_name="jarvis-action-collected.service",
+        process=cast("subprocess.Popen[bytes]", ExitedWrapper()),
+        cancel_requested=Event(),
+        termination_lock=RLock(),
+        unit_observed=Event(),
+    )
+    invocation = _invocation(
+        "action-ubuntu-collected",
+        WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+
+    result = scope._observe(running, invocation, lambda _event: None)
+
+    assert result.status is WorkerExecutionStatus.COMPLETED
+    assert result.process_tree_stopped is True
+    assert not running.unit_observed.is_set()
 
 
 def test_systemd_scope_runs_structured_compounds_inside_the_same_unit() -> None:
@@ -894,6 +930,69 @@ def test_reserved_action_expires_and_retires_its_process_scope() -> None:
     )
 
     process_scope.reserve(action_id="action-ubuntu-expiring")
+
+
+def test_running_action_disables_reservation_expiry_until_it_finishes() -> None:
+    now = 0.0
+    started = Event()
+    release = Event()
+
+    def execute(_invocation: object) -> WorkerExecutionResult:
+        started.set()
+        assert release.wait(timeout=10)
+        return WorkerExecutionResult(
+            status=WorkerExecutionStatus.CANCELLED,
+            process_tree_stopped=True,
+        )
+
+    def cancel(_action_id: str, _timeout_seconds: int) -> ActionCancellationResult:
+        release.set()
+        return ActionCancellationResult(ActionCancellationStatus.STOPPED)
+
+    process_scope = ControlledUbuntuProcessScope(
+        execution_hook=execute,
+        cancellation_hook=cancel,
+    )
+    worker = UbuntuWorkerService(
+        worker_id="ubuntu-01",
+        expected_peer=_peer_expectation(),
+        authenticator=ControlledUbuntuLocalAuthenticator(_local_peer()),
+        readiness=lambda: UbuntuWorkerReadiness.READY,
+        process_scope=process_scope,
+        clock=lambda: now,
+    )
+    identity = worker.authenticate(selected_host="ubuntu", timeout_seconds=10)
+    invocation = _invocation("action-ubuntu-running-expiry", identity)
+    worker.register_execution(
+        action_id=invocation.action_id,
+        timeout_seconds=10,
+        retention_seconds=1,
+    )
+    results: list[WorkerExecutionResult] = []
+    thread = Thread(
+        target=lambda: results.append(worker.execute(invocation, lambda _event: None))
+    )
+    thread.start()
+    assert started.wait(timeout=10)
+    now = 2
+    worker.finalize_execution(
+        action_id=invocation.action_id,
+        timeout_seconds=10,
+        retention_seconds=1,
+    )
+    now = 4
+
+    cancellation = worker.cancel(
+        action_id=invocation.action_id,
+        timeout_seconds=10,
+        retention_seconds=1,
+    )
+    thread.join(timeout=10)
+
+    assert cancellation.status is ActionCancellationStatus.STOPPED
+    assert not thread.is_alive()
+    assert results[0].status is WorkerExecutionStatus.CANCELLED
+    assert process_scope.cancellations == [(invocation.action_id, 10)]
 
 
 def test_observation_failure_stops_and_releases_the_process_scope(

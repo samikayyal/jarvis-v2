@@ -744,7 +744,7 @@ class SystemdUbuntuProcessScope:
                 self._unit_is_stopped(
                     running,
                     timeout_seconds=min(0.25, max(deadline - now, 0.001)),
-                    allow_missing=False,
+                    wrapper_completed=False,
                 )
                 next_unit_probe = monotonic() + 0.25
             try:
@@ -777,7 +777,7 @@ class SystemdUbuntuProcessScope:
                 not cleanup_failed
                 and return_code is not None
                 and self._unit_is_stopped(
-                    running, timeout_seconds=2, allow_missing=True
+                    running, timeout_seconds=2, wrapper_completed=True
                 )
             )
         )
@@ -858,7 +858,7 @@ class SystemdUbuntuProcessScope:
             if self._unit_is_stopped(
                 running,
                 timeout_seconds=min(remaining, 1),
-                allow_missing=running.process.poll() is not None,
+                wrapper_completed=running.process.poll() is not None,
             ):
                 return True
             self._signal_unit(running.unit_name, "TERM", deadline)
@@ -874,7 +874,7 @@ class SystemdUbuntuProcessScope:
             if self._unit_is_stopped(
                 running,
                 timeout_seconds=min(remaining, 1),
-                allow_missing=running.process.poll() is not None,
+                wrapper_completed=running.process.poll() is not None,
             ):
                 return True
             self._signal_unit(running.unit_name, "KILL", deadline)
@@ -890,7 +890,7 @@ class SystemdUbuntuProcessScope:
             return self._unit_is_stopped(
                 running,
                 timeout_seconds=remaining,
-                allow_missing=running.process.poll() is not None,
+                wrapper_completed=running.process.poll() is not None,
             )
 
     def _signal_unit(self, unit_name: str, signal: str, deadline: float) -> None:
@@ -919,7 +919,7 @@ class SystemdUbuntuProcessScope:
         running: _RunningSystemdScope,
         *,
         timeout_seconds: float,
-        allow_missing: bool = False,
+        wrapper_completed: bool = False,
     ) -> bool:
         if timeout_seconds <= 0:
             return False
@@ -944,10 +944,7 @@ class SystemdUbuntuProcessScope:
         if state in {"active", "activating", "deactivating", "inactive", "failed"}:
             running.unit_observed.set()
         return (check.returncode == 3 and state in {"inactive", "failed"}) or (
-            allow_missing
-            and running.unit_observed.is_set()
-            and check.returncode == 4
-            and state == "unknown"
+            wrapper_completed and check.returncode == 4 and state == "unknown"
         )
 
     @staticmethod
@@ -1122,6 +1119,7 @@ class UbuntuWorkerService:
                 )
             assert record is not None
             record.state = _ActionState.RUNNING
+            record.expires_at = None
             self._active_action_id = invocation.action_id
         try:
             result = self._process_scope.execute(invocation, progress)
@@ -1203,7 +1201,7 @@ class UbuntuWorkerService:
                 record.finalize_requested = True
             else:
                 record.state = _ActionState.FINALIZED
-            record.expires_at = self._clock() + record.retention_seconds
+                record.expires_at = self._clock() + record.retention_seconds
             self._process_scope.retire(action_id=action_id)
 
     def _validate_invocation_locked(self, invocation: WorkerInvocation) -> None:
