@@ -360,6 +360,8 @@ class SystemdUbuntuProcessScope:
 
     def reserve(self, *, action_id: str) -> None:
         with self._lock:
+            if self._active_action_ids:
+                raise ActionDispatcherError("native Ubuntu process scope is busy")
             known = (
                 self._reserved_action_ids
                 | self._active_action_ids
@@ -477,14 +479,14 @@ class SystemdUbuntuProcessScope:
             self._running[invocation.action_id] = running
             self._starting.pop(invocation.action_id, None)
             starting.resolved.set()
+        release_scope = False
         try:
-            return self._observe(running, invocation, progress)
+            result = self._observe(running, invocation, progress)
+            release_scope = result.process_tree_stopped
+            return result
         finally:
             with self._lock:
-                if (
-                    self._running.get(invocation.action_id) is running
-                    and running.process.poll() is not None
-                ):
+                if self._running.get(invocation.action_id) is running and release_scope:
                     del self._running[invocation.action_id]
                     self._active_action_ids.discard(invocation.action_id)
 
@@ -688,18 +690,34 @@ class SystemdUbuntuProcessScope:
     ) -> bool:
         deadline = monotonic() + timeout_seconds
         with running.termination_lock:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            if self._unit_is_stopped(
+                running.unit_name, timeout_seconds=min(remaining, 1)
+            ):
+                return True
+            self._signal_unit(running.unit_name, "TERM", deadline)
             if running.process.poll() is None:
-                self._signal_unit(running.unit_name, "TERM", deadline)
                 remaining = max(deadline - monotonic(), 0.001)
                 try:
-                    running.process.wait(timeout=remaining)
+                    running.process.wait(timeout=max(remaining / 2, 0.001))
                 except subprocess.TimeoutExpired:
-                    self._signal_unit(running.unit_name, "KILL", deadline)
-                    remaining = max(deadline - monotonic(), 0.001)
-                    try:
-                        running.process.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
-                        return False
+                    pass
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            if self._unit_is_stopped(
+                running.unit_name, timeout_seconds=min(remaining, 1)
+            ):
+                return True
+            self._signal_unit(running.unit_name, "KILL", deadline)
+            if running.process.poll() is None:
+                remaining = max(deadline - monotonic(), 0.001)
+                try:
+                    running.process.wait(timeout=max(remaining / 2, 0.001))
+                except subprocess.TimeoutExpired:
+                    return False
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return False
