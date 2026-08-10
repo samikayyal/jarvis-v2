@@ -4,9 +4,9 @@
 
 **Blocked by:** 11 — Dispatch bounded work through a controlled worker gateway; 14 — Orchestrate natural-language requests through the Agents SDK.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Every Codex request fixes the host, canonical working directory, model, reasoning, sandbox, approval policy, timeout, and allowed operation.
-- [ ] Read-only is the default, and workspace preparation requires an already approved exact proposal in an allowlisted workspace.
-- [ ] Independent verification rejects out-of-scope changes, push, history rewriting, hidden approval bypass, trust-critical activation, and `danger-full-access`.
+- [x] Every Codex request fixes the host, canonical working directory, model, reasoning, sandbox, approval policy, timeout, and allowed operation.
+- [x] Read-only is the default, and workspace preparation requires an already approved exact proposal in an allowlisted workspace.
+- [x] Independent verification rejects out-of-scope changes, push, history rewriting, hidden approval bypass, trust-critical activation, and `danger-full-access`.
 

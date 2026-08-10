@@ -4001,6 +4001,35 @@ class DeterministicCapabilityBroker:
             ControlTransitionKind.CANCELLED,
             ControlTransitionKind.NEW_SESSION,
         }:
+            cancelled_request_id = (
+                expected.active_request.request_id
+                if expected.active_request is not None
+                else None
+            )
+            cancel_orchestration = getattr(self.orchestration, "cancel", None)
+            if cancelled_request_id is not None and callable(cancel_orchestration):
+                try:
+                    cancel_orchestration(request_id=cancelled_request_id)
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    self._best_effort_audit(
+                        kind="orchestration_cancellation_failed",
+                        event_id=message.event_id,
+                        request_id=cancelled_request_id,
+                        message_id=message.message_id,
+                        outcome="unknown",
+                        actor="control_plane",
+                        operation_type="orchestration_cancellation",
+                        target_category="model",
+                        details={"reason": type(exc).__name__},
+                    )
+                    return ReceiveResult(
+                        status_code=202,
+                        disposition="cancellation_unknown",
+                        reason=(
+                            "cancellation was recorded but the active orchestration "
+                            "process did not establish quiescence"
+                        ),
+                    )
             cancellation_outcomes = self._cancel_dispatches(dispatches_to_cancel)
             if transition.kind in {
                 ControlTransitionKind.CANCELLED,

@@ -57,6 +57,17 @@
   {
     "date": "2026-08-09",
     "mode": "PR Review",
+    "score": 95,
+    "findings": {
+      "critical": 0,
+      "warning": 1,
+      "suggestion": 0
+    },
+    "scope": "Ticket 15 bounded Codex specialist interface, MCP adapter, orchestration tool, and tests"
+  },
+  {
+    "date": "2026-08-09",
+    "mode": "PR Review",
     "score": 100,
     "findings": {
       "critical": 0,
@@ -64,5 +75,16 @@
       "suggestion": 0
     },
     "scope": "Ticket 12 restart reconciliation and outbound attempt durability"
+  },
+  {
+    "date": "2026-08-10",
+    "mode": "PR Review",
+    "score": 70,
+    "findings": {
+      "critical": 2,
+      "warning": 0,
+      "suggestion": 0
+    },
+    "scope": "Ticket 15 PR 11 timeout ownership and exact text-patch invariants before repair"
   }
 ]
