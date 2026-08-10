@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import socket
 import sys
+from collections.abc import Callable
+from pathlib import Path
 from threading import Event, Thread
+from typing import Protocol, cast
 
 import pytest
 
@@ -15,8 +18,10 @@ from jarvis_control_plane import (
     ControlledUbuntuProcessScope,
     FrozenActionProposal,
     SystemdUbuntuProcessScope,
+    UbuntuLocalPeerExpectation,
     UbuntuLocalPeerIdentity,
     UbuntuWorkerReadiness,
+    UbuntuWorkerService,
     UbuntuWorkerTransport,
     UnixSocketUbuntuLocalAuthenticator,
     WorkerExecutionError,
@@ -27,7 +32,14 @@ from jarvis_control_plane import (
     WorkerOutputStream,
     WorkerProgressEvent,
     WorkerProgressKind,
+    serve_ubuntu_worker_connection,
 )
+
+
+class _CancellableHandle(Protocol):
+    def run(self) -> object | None: ...
+
+    def cancel(self) -> ActionCancellationResult: ...
 
 
 def _local_peer(
@@ -52,15 +64,21 @@ def _worker(
     peer: UbuntuLocalPeerIdentity | None = None,
     readiness: UbuntuWorkerReadiness = UbuntuWorkerReadiness.READY,
     process_scope: ControlledUbuntuProcessScope | None = None,
-) -> UbuntuWorkerTransport:
-    return UbuntuWorkerTransport(
+) -> UbuntuWorkerService:
+    return UbuntuWorkerService(
         worker_id="ubuntu-01",
-        expected_peer_uid=1100,
-        expected_socket_owner_uid=1200,
-        expected_socket_path="/run/jarvis/ubuntu-worker.sock",
+        expected_peer=_peer_expectation(),
         authenticator=ControlledUbuntuLocalAuthenticator(peer or _local_peer()),
         readiness=lambda: readiness,
         process_scope=process_scope or ControlledUbuntuProcessScope(),
+    )
+
+
+def _peer_expectation() -> UbuntuLocalPeerExpectation:
+    return UbuntuLocalPeerExpectation(
+        peer_uid=1100,
+        socket_owner_uid=1200,
+        socket_path="/run/jarvis/ubuntu-worker.sock",
     )
 
 
@@ -112,7 +130,7 @@ def test_ubuntu_worker_authenticates_one_ready_local_host_identity() -> None:
     ],
 )
 def test_ubuntu_worker_rejects_wrong_host_peer_or_readiness(
-    worker: UbuntuWorkerTransport, selected_host: str, error: str
+    worker: UbuntuWorkerService, selected_host: str, error: str
 ) -> None:
     with pytest.raises(ActionDispatcherError, match=error):
         worker.authenticate(selected_host=selected_host, timeout_seconds=10)
@@ -120,11 +138,12 @@ def test_ubuntu_worker_rejects_wrong_host_peer_or_readiness(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="SO_PEERCRED is Linux-specific")
 def test_local_authenticator_uses_peer_credentials_and_restricted_socket(
-    tmp_path: object,
+    tmp_path: Path,
 ) -> None:
     path = os.fspath(tmp_path) + "/ubuntu-worker.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_family = socket.AF_UNIX  # type: ignore[attr-defined]
+    listener = socket.socket(unix_family, socket.SOCK_STREAM)
+    client = socket.socket(unix_family, socket.SOCK_STREAM)
     try:
         listener.bind(path)
         os.chmod(path, 0o600)
@@ -139,9 +158,16 @@ def test_local_authenticator_uses_peer_credentials_and_restricted_socket(
             )
 
             identity = authenticator.authenticate(timeout_seconds=10)
+            client_identity = UnixSocketUbuntuLocalAuthenticator(
+                connection=client,
+                socket_path=path,
+                connection_id="local-socket-01",
+            ).authenticate(timeout_seconds=10)
 
-            assert identity.peer_uid == os.getuid()
-            assert identity.socket_owner_uid == os.getuid()
+            current_uid = os.getuid()  # type: ignore[attr-defined]
+            assert identity.peer_uid == current_uid
+            assert client_identity.peer_uid == current_uid
+            assert identity.socket_owner_uid == current_uid
             assert identity.socket_mode == 0o600
         finally:
             connection.close()
@@ -196,6 +222,127 @@ def test_ubuntu_worker_runs_one_bounded_noninteractive_scope_with_tagged_output(
     assert invocation.deadline_seconds == 120
     assert invocation.stdout_limit_bytes == 1024 * 1024
     assert invocation.stderr_limit_bytes == 1024 * 1024
+
+
+def test_gateway_dispatch_and_result_cross_the_authenticated_local_channel() -> None:
+    gateway_connection, worker_connection = socket.socketpair()
+    process_scope = ControlledUbuntuProcessScope(
+        result=WorkerExecutionResult.completed(stdout="over-local-channel"),
+        progress_events=(
+            WorkerProgressEvent(
+                sequence=2,
+                kind=WorkerProgressKind.OUTPUT,
+                stream=WorkerOutputStream.STDOUT,
+                text="over-local-channel",
+            ),
+        ),
+    )
+    service = _worker(process_scope=process_scope)
+    server = Thread(
+        target=serve_ubuntu_worker_connection,
+        args=(worker_connection, service),
+        daemon=True,
+    )
+    server.start()
+    identity = WorkerIdentity(
+        host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+    )
+    authenticator = ControlledUbuntuLocalAuthenticator(
+        _local_peer(), connection=gateway_connection
+    )
+    transport = UbuntuWorkerTransport(
+        connection=gateway_connection,
+        authenticator=authenticator,
+        expected_peer=_peer_expectation(),
+        registered_identity=identity,
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": transport}, registered_identities={"ubuntu": identity}
+    )
+    try:
+        result = gateway.dispatch(_proposal("action-ubuntu-ipc"))
+
+        assert result.stdout == "over-local-channel"
+        assert result.progress_events[-1].text == "over-local-channel"
+        assert [item.action_id for item in process_scope.invocations] == [
+            "action-ubuntu-ipc"
+        ]
+    finally:
+        transport.close()
+        server.join(timeout=10)
+    assert not server.is_alive()
+
+
+def test_gateway_cancellation_crosses_the_local_channel_and_stops_scope() -> None:
+    started = Event()
+    release = Event()
+
+    def execute(_invocation: object) -> WorkerExecutionResult:
+        started.set()
+        assert release.wait(timeout=10)
+        return WorkerExecutionResult(
+            status=WorkerExecutionStatus.CANCELLED,
+            started_components=(0,),
+            process_tree_stopped=True,
+        )
+
+    def cancel(_action_id: str, _timeout_seconds: int) -> ActionCancellationResult:
+        release.set()
+        return ActionCancellationResult(ActionCancellationStatus.STOPPED)
+
+    gateway_connection, worker_connection = socket.socketpair()
+    process_scope = ControlledUbuntuProcessScope(
+        execution_hook=execute, cancellation_hook=cancel
+    )
+    service = _worker(process_scope=process_scope)
+    server = Thread(
+        target=serve_ubuntu_worker_connection,
+        args=(worker_connection, service),
+        daemon=True,
+    )
+    server.start()
+    identity = WorkerIdentity(
+        host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+    )
+    transport = UbuntuWorkerTransport(
+        connection=gateway_connection,
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=gateway_connection
+        ),
+        expected_peer=_peer_expectation(),
+        registered_identity=identity,
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": transport}, registered_identities={"ubuntu": identity}
+    )
+    handle = cast(
+        _CancellableHandle,
+        gateway.prepare(_proposal("action-ubuntu-ipc-cancel")),
+    )
+    failures: list[BaseException] = []
+    run = Thread(target=lambda: _capture_failure(handle.run, failures))
+    run.start()
+    assert started.wait(timeout=10)
+
+    cancellation = handle.cancel()
+    run.join(timeout=10)
+
+    assert cancellation.status is ActionCancellationStatus.STOPPED
+    assert not run.is_alive()
+    assert isinstance(failures[0], WorkerExecutionError)
+    assert failures[0].result.process_tree_stopped is True
+    transport.close()
+    server.join(timeout=10)
+    assert not server.is_alive()
+
+
+def _capture_failure(
+    operation: Callable[[], object], failures: list[BaseException]
+) -> None:
+    try:
+        operation()
+    except BaseException as exc:  # noqa: BLE001 - test observes worker boundary
+        failures.append(exc)
 
 
 def test_systemd_scope_is_noninteractive_bounded_and_never_uses_a_shell() -> None:
@@ -257,7 +404,10 @@ def test_ubuntu_worker_cancellation_stops_the_active_process_scope() -> None:
     gateway = WorkerGateway(
         workers={"ubuntu": worker}, registered_identities={"ubuntu": identity}
     )
-    handle = gateway.prepare(_proposal("action-ubuntu-cancel"))
+    handle = cast(
+        _CancellableHandle,
+        gateway.prepare(_proposal("action-ubuntu-cancel")),
+    )
     failures: list[BaseException] = []
 
     def run() -> None:
@@ -279,6 +429,57 @@ def test_ubuntu_worker_cancellation_stops_the_active_process_scope() -> None:
     assert failures
     assert isinstance(failures[0], WorkerExecutionError)
     assert failures[0].result.process_tree_stopped is True
+
+
+def test_cancellation_wins_the_reserved_scope_before_process_start() -> None:
+    entered_execute = Event()
+    release_execute = Event()
+    inner = ControlledUbuntuProcessScope()
+
+    class PausingProcessScope:
+        def reserve(self, *, action_id: str) -> None:
+            inner.reserve(action_id=action_id)
+
+        def execute(self, invocation, progress):
+            entered_execute.set()
+            assert release_execute.wait(timeout=10)
+            return inner.execute(invocation, progress)
+
+        def cancel(self, *, action_id: str, timeout_seconds: int):
+            return inner.cancel(action_id=action_id, timeout_seconds=timeout_seconds)
+
+    worker = UbuntuWorkerService(
+        worker_id="ubuntu-01",
+        expected_peer=_peer_expectation(),
+        authenticator=ControlledUbuntuLocalAuthenticator(_local_peer()),
+        readiness=lambda: UbuntuWorkerReadiness.READY,
+        process_scope=PausingProcessScope(),
+    )
+    identity = worker.authenticate(selected_host="ubuntu", timeout_seconds=10)
+    invocation = _invocation("action-ubuntu-cancel-before-start", identity)
+    worker.register_execution(
+        action_id=invocation.action_id,
+        timeout_seconds=10,
+        retention_seconds=900,
+    )
+    results: list[WorkerExecutionResult] = []
+    thread = Thread(
+        target=lambda: results.append(worker.execute(invocation, lambda _event: None))
+    )
+    thread.start()
+    assert entered_execute.wait(timeout=10)
+
+    cancellation = worker.cancel(
+        action_id=invocation.action_id,
+        timeout_seconds=10,
+        retention_seconds=900,
+    )
+    release_execute.set()
+    thread.join(timeout=10)
+
+    assert cancellation.status is ActionCancellationStatus.NOT_STARTED
+    assert results[0].status is WorkerExecutionStatus.CANCELLED
+    assert inner.invocations == []
 
 
 def test_ubuntu_worker_rejects_a_second_action_while_its_scope_is_active() -> None:
@@ -319,11 +520,9 @@ def test_ubuntu_worker_rejects_a_second_action_while_its_scope_is_active() -> No
 def test_ubuntu_worker_rechecks_the_local_connection_before_process_start() -> None:
     authenticator = ControlledUbuntuLocalAuthenticator(_local_peer())
     process_scope = ControlledUbuntuProcessScope()
-    worker = UbuntuWorkerTransport(
+    worker = UbuntuWorkerService(
         worker_id="ubuntu-01",
-        expected_peer_uid=1100,
-        expected_socket_owner_uid=1200,
-        expected_socket_path="/run/jarvis/ubuntu-worker.sock",
+        expected_peer=_peer_expectation(),
         authenticator=authenticator,
         readiness=lambda: UbuntuWorkerReadiness.READY,
         process_scope=process_scope,

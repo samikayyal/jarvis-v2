@@ -245,12 +245,19 @@ from .ubuntu_worker import (
     ControlledUbuntuProcessScope,
     SystemdUbuntuProcessScope,
     UbuntuLocalAuthenticator,
+    UbuntuLocalPeerExpectation,
     UbuntuLocalPeerIdentity,
     UbuntuProcessScope,
     UbuntuWorkerReadiness,
-    UbuntuWorkerTransport,
+    UbuntuWorkerService,
     UnixSocketUbuntuLocalAuthenticator,
 )
+from .ubuntu_worker_ipc import (
+    UnixSocketUbuntuWorkerTransport,
+    serve_ubuntu_worker_connection,
+)
+
+UbuntuWorkerTransport = UnixSocketUbuntuWorkerTransport
 from .worker_gateway import (
     ControlledWorkerTransport,
     WorkerExecutionError,
@@ -441,11 +448,14 @@ __all__ = [
     "TraceReservation",
     "TraceWriteError",
     "UbuntuLocalAuthenticator",
+    "UbuntuLocalPeerExpectation",
     "UbuntuLocalPeerIdentity",
     "UbuntuProcessScope",
     "UbuntuWorkerReadiness",
+    "UbuntuWorkerService",
     "UbuntuWorkerTransport",
     "UnixSocketUbuntuLocalAuthenticator",
+    "UnixSocketUbuntuWorkerTransport",
     "UrllibGoogleHttpTransport",
     "UrllibGoogleReadHttpTransport",
     "UuidIdGenerator",
@@ -495,5 +505,6 @@ __all__ = [
     "render_vault_unified_diff",
     "render_vault_write_preview",
     "serve_sqlite_deleted_conversation_archive",
+    "serve_ubuntu_worker_connection",
     "sign_body",
 ]

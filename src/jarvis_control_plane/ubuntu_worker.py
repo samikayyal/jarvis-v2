@@ -21,13 +21,14 @@ from enum import Enum
 from pathlib import PurePosixPath
 from threading import Event, RLock, Thread
 from time import monotonic
-from typing import Protocol
+from typing import BinaryIO, Protocol, cast
 
 from .ports import (
     ActionCancellationResult,
     ActionCancellationStatus,
     ActionDispatcherError,
 )
+from .terminal_policy import TerminalComponent
 from .worker_gateway import (
     WorkerExecutionResult,
     WorkerExecutionStatus,
@@ -46,6 +47,36 @@ class UbuntuWorkerReadiness(str, Enum):
     READY = "ready"
     DEGRADED = "degraded"
     UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class UbuntuLocalPeerExpectation:
+    """Exact OS identity and socket boundary trusted for one local peer."""
+
+    peer_uid: int
+    socket_owner_uid: int
+    socket_path: str
+    socket_mode: int = 0o600
+
+    def __post_init__(self) -> None:
+        for name in ("peer_uid", "socket_owner_uid"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"expected Ubuntu {name} is invalid")
+        if not PurePosixPath(self.socket_path).is_absolute():
+            raise ValueError("expected Ubuntu worker socket path must be absolute")
+        if str(PurePosixPath(self.socket_path)) != self.socket_path:
+            raise ValueError("expected Ubuntu worker socket path must be canonical")
+        if self.socket_mode != 0o600:
+            raise ValueError("expected Ubuntu worker socket mode must be 0600")
+
+    def matches(self, peer: UbuntuLocalPeerIdentity) -> bool:
+        return (
+            peer.peer_uid == self.peer_uid
+            and peer.socket_owner_uid == self.socket_owner_uid
+            and peer.socket_path == self.socket_path
+            and peer.socket_mode == self.socket_mode
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,17 +111,28 @@ class UbuntuLocalAuthenticator(Protocol):
 
     def authenticate(self, *, timeout_seconds: int) -> UbuntuLocalPeerIdentity: ...
 
+    def binds(self, connection: socket.socket) -> bool: ...
+
 
 class ControlledUbuntuLocalAuthenticator:
     """Deterministic local-channel identity provider for contract tests."""
 
-    def __init__(self, identity: UbuntuLocalPeerIdentity) -> None:
+    def __init__(
+        self,
+        identity: UbuntuLocalPeerIdentity,
+        *,
+        connection: socket.socket | None = None,
+    ) -> None:
         self.identity = identity
+        self._connection = connection
 
     def authenticate(self, *, timeout_seconds: int) -> UbuntuLocalPeerIdentity:
         if isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 30:
             raise ValueError("Ubuntu local authentication timeout is invalid")
         return self.identity
+
+    def binds(self, connection: socket.socket) -> bool:
+        return self._connection is connection
 
 
 class UnixSocketUbuntuLocalAuthenticator:
@@ -109,7 +151,8 @@ class UnixSocketUbuntuLocalAuthenticator:
         socket_path: str,
         connection_id: str,
     ) -> None:
-        if connection.family != socket.AF_UNIX:
+        unix_family = getattr(socket, "AF_UNIX", None)
+        if unix_family is None or connection.family != unix_family:
             raise ValueError("Ubuntu local channel must be a Unix socket")
         if not os.path.isabs(socket_path):
             raise ValueError("Ubuntu worker socket path must be absolute")
@@ -121,10 +164,14 @@ class UnixSocketUbuntuLocalAuthenticator:
         self._socket_path = socket_path
         self._connection_id = connection_id.strip()
 
+    def binds(self, connection: socket.socket) -> bool:
+        return self._connection is connection
+
     def authenticate(self, *, timeout_seconds: int) -> UbuntuLocalPeerIdentity:
         if isinstance(timeout_seconds, bool) or not 1 <= timeout_seconds <= 30:
             raise ValueError("Ubuntu local authentication timeout is invalid")
-        if not hasattr(socket, "SO_PEERCRED"):
+        peer_credentials_option = getattr(socket, "SO_PEERCRED", None)
+        if not isinstance(peer_credentials_option, int):
             raise ActionDispatcherError("Linux peer credentials are unavailable")
         try:
             socket_info = os.lstat(self._socket_path)
@@ -135,13 +182,19 @@ class UnixSocketUbuntuLocalAuthenticator:
                 raise ActionDispatcherError(
                     "Ubuntu worker socket permissions are not restricted"
                 )
-            local_path = self._connection.getsockname()
-            if not isinstance(local_path, str) or not os.path.samefile(
-                local_path, self._socket_path
+            channel_paths = (
+                self._connection.getsockname(),
+                self._connection.getpeername(),
+            )
+            if not any(
+                isinstance(channel_path, str)
+                and channel_path
+                and os.path.samefile(channel_path, self._socket_path)
+                for channel_path in channel_paths
             ):
                 raise ActionDispatcherError("Ubuntu worker socket identity changed")
             raw = self._connection.getsockopt(
-                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                socket.SOL_SOCKET, peer_credentials_option, struct.calcsize("3i")
             )
             peer_pid, peer_uid, peer_gid = struct.unpack("3i", raw)
         except ActionDispatcherError:
@@ -163,6 +216,8 @@ class UnixSocketUbuntuLocalAuthenticator:
 
 class UbuntuProcessScope(Protocol):
     """Least-privileged process-scope boundary owned by the native worker."""
+
+    def reserve(self, *, action_id: str) -> None: ...
 
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
@@ -191,21 +246,55 @@ class ControlledUbuntuProcessScope:
         self.cancellation_hook = cancellation_hook
         self.invocations: list[WorkerInvocation] = []
         self.cancellations: list[tuple[str, int]] = []
+        self._lock = RLock()
+        self._reserved: set[str] = set()
+        self._running: set[str] = set()
+        self._cancelled: set[str] = set()
+
+    def reserve(self, *, action_id: str) -> None:
+        with self._lock:
+            if action_id in self._reserved | self._running | self._cancelled:
+                raise ActionDispatcherError(
+                    f"Ubuntu process scope {action_id} is already reserved"
+                )
+            self._reserved.add(action_id)
 
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
     ) -> WorkerExecutionResult:
-        self.invocations.append(invocation)
-        for event in self.progress_events:
-            progress(event)
-        if self.execution_hook is not None:
-            return self.execution_hook(invocation)
-        return self.result
+        with self._lock:
+            if invocation.action_id in self._cancelled:
+                return WorkerExecutionResult(
+                    status=WorkerExecutionStatus.CANCELLED,
+                    process_tree_stopped=True,
+                )
+            if invocation.action_id not in self._reserved:
+                raise ActionDispatcherError("Ubuntu process scope was not reserved")
+            self._reserved.remove(invocation.action_id)
+            self._running.add(invocation.action_id)
+            self.invocations.append(invocation)
+        try:
+            for event in self.progress_events:
+                progress(event)
+            if self.execution_hook is not None:
+                return self.execution_hook(invocation)
+            return self.result
+        finally:
+            with self._lock:
+                self._running.discard(invocation.action_id)
 
     def cancel(
         self, *, action_id: str, timeout_seconds: int
     ) -> ActionCancellationResult:
         self.cancellations.append((action_id, timeout_seconds))
+        with self._lock:
+            if action_id in self._reserved:
+                self._reserved.remove(action_id)
+                self._cancelled.add(action_id)
+                return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
+            running = action_id in self._running
+        if not running:
+            return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         if self.cancellation_hook is not None:
             return self.cancellation_hook(action_id, timeout_seconds)
         return ActionCancellationResult(ActionCancellationStatus.STOPPED)
@@ -251,6 +340,21 @@ class SystemdUbuntuProcessScope:
         self._lock = RLock()
         self._running: dict[str, _RunningSystemdScope] = {}
         self._active_action_ids: set[str] = set()
+        self._reserved_action_ids: set[str] = set()
+        self._cancelled_action_ids: set[str] = set()
+
+    def reserve(self, *, action_id: str) -> None:
+        with self._lock:
+            known = (
+                self._reserved_action_ids
+                | self._active_action_ids
+                | self._cancelled_action_ids
+            )
+            if action_id in known:
+                raise ActionDispatcherError(
+                    f"Ubuntu process scope {action_id} is already reserved"
+                )
+            self._reserved_action_ids.add(action_id)
 
     def command_for(self, invocation: WorkerInvocation) -> tuple[str, ...]:
         """Return the exact argv used to create the bounded native scope."""
@@ -263,7 +367,7 @@ class SystemdUbuntuProcessScope:
             raise ActionDispatcherError(
                 "Ubuntu process scope accepts one process component"
             )
-        component = invocation.action.components[0]
+        component = cast(TerminalComponent, invocation.action.components[0])
         if component.redirections:
             raise ActionDispatcherError(
                 "Ubuntu process scope does not interpret shell redirections"
@@ -290,17 +394,22 @@ class SystemdUbuntuProcessScope:
     def execute(
         self, invocation: WorkerInvocation, progress: WorkerProgressSink
     ) -> WorkerExecutionResult:
+        with self._lock:
+            if invocation.action_id in self._cancelled_action_ids:
+                return WorkerExecutionResult(
+                    status=WorkerExecutionStatus.CANCELLED,
+                    process_tree_stopped=True,
+                )
+            if invocation.action_id not in self._reserved_action_ids:
+                raise ActionDispatcherError("Ubuntu process scope was not reserved")
+            self._reserved_action_ids.remove(invocation.action_id)
+            self._active_action_ids.add(invocation.action_id)
         if sys.platform != "linux":
+            with self._lock:
+                self._active_action_ids.discard(invocation.action_id)
             raise ActionDispatcherError("native Ubuntu process scope requires Linux")
         command = self.command_for(invocation)
         unit_name = self._unit_name(invocation.action_id)
-        with self._lock:
-            if invocation.action_id in self._active_action_ids:
-                raise ActionDispatcherError(
-                    f"Ubuntu process scope {invocation.action_id} is already active",
-                    may_have_dispatched=True,
-                )
-            self._active_action_ids.add(invocation.action_id)
         try:
             process = subprocess.Popen(
                 command,
@@ -340,6 +449,10 @@ class SystemdUbuntuProcessScope:
         self, *, action_id: str, timeout_seconds: int
     ) -> ActionCancellationResult:
         with self._lock:
+            if action_id in self._reserved_action_ids:
+                self._reserved_action_ids.remove(action_id)
+                self._cancelled_action_ids.add(action_id)
+                return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
             running = self._running.get(action_id)
         if running is None:
             return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
@@ -362,14 +475,28 @@ class SystemdUbuntuProcessScope:
         invocation: WorkerInvocation,
         progress: WorkerProgressSink,
     ) -> WorkerExecutionResult:
-        output: queue.Queue[tuple[WorkerOutputStream, bytes | None]] = queue.Queue()
+        # A small bounded queue applies backpressure to the pipe readers.  Each
+        # reader also discards bytes beyond its own stream cap before enqueueing,
+        # so fast child output can never accumulate unbounded Python memory.
+        output: queue.Queue[tuple[WorkerOutputStream, bytes | None]] = queue.Queue(
+            maxsize=8
+        )
 
-        def read_stream(stream: object, tag: WorkerOutputStream) -> None:
-            assert hasattr(stream, "read")
+        def read_stream(
+            stream: BinaryIO, tag: WorkerOutputStream, byte_limit: int
+        ) -> None:
             read = getattr(stream, "read1", stream.read)
+            remaining = byte_limit
+            truncation_reported = False
             try:
                 while chunk := read(16 * 1024):
-                    output.put((tag, chunk))
+                    accepted = chunk[:remaining]
+                    if accepted:
+                        output.put((tag, accepted))
+                        remaining -= len(accepted)
+                    if len(accepted) != len(chunk) and not truncation_reported:
+                        output.put((tag, b""))
+                        truncation_reported = True
             finally:
                 output.put((tag, None))
 
@@ -378,12 +505,20 @@ class SystemdUbuntuProcessScope:
         readers = (
             Thread(
                 target=read_stream,
-                args=(running.process.stdout, WorkerOutputStream.STDOUT),
+                args=(
+                    running.process.stdout,
+                    WorkerOutputStream.STDOUT,
+                    invocation.stdout_limit_bytes,
+                ),
                 daemon=True,
             ),
             Thread(
                 target=read_stream,
-                args=(running.process.stderr, WorkerOutputStream.STDERR),
+                args=(
+                    running.process.stderr,
+                    WorkerOutputStream.STDERR,
+                    invocation.stderr_limit_bytes,
+                ),
                 daemon=True,
             ),
         )
@@ -430,7 +565,7 @@ class SystemdUbuntuProcessScope:
             available = max(limits[stream] - len(buffers[stream]), 0)
             accepted = chunk[:available]
             buffers[stream].extend(accepted)
-            chunk_truncated = len(accepted) != len(chunk)
+            chunk_truncated = not chunk or len(accepted) != len(chunk)
             truncated[stream] = truncated[stream] or chunk_truncated
             if accepted and emitted < invocation.progress_event_limit - 1:
                 progress(
@@ -575,16 +710,14 @@ class _ActionRecord:
     finalize_requested: bool = False
 
 
-class UbuntuWorkerTransport:
-    """Host-bound native Ubuntu worker implementing the shared transport seam."""
+class UbuntuWorkerService:
+    """Worker-side service core reached only through the local wire adapter."""
 
     def __init__(
         self,
         *,
         worker_id: str,
-        expected_peer_uid: int,
-        expected_socket_owner_uid: int,
-        expected_socket_path: str,
+        expected_peer: UbuntuLocalPeerExpectation,
         authenticator: UbuntuLocalAuthenticator,
         readiness: Callable[[], UbuntuWorkerReadiness],
         process_scope: UbuntuProcessScope,
@@ -592,20 +725,8 @@ class UbuntuWorkerTransport:
     ) -> None:
         if not worker_id.strip():
             raise ValueError("Ubuntu worker identifier must be non-blank")
-        for name, value in (
-            ("peer", expected_peer_uid),
-            ("socket owner", expected_socket_owner_uid),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"expected Ubuntu {name} UID is invalid")
         self._worker_id = worker_id.strip()
-        self._expected_peer_uid = expected_peer_uid
-        self._expected_socket_owner_uid = expected_socket_owner_uid
-        if not PurePosixPath(expected_socket_path).is_absolute():
-            raise ValueError("expected Ubuntu worker socket path must be absolute")
-        if str(PurePosixPath(expected_socket_path)) != expected_socket_path:
-            raise ValueError("expected Ubuntu worker socket path must be canonical")
-        self._expected_socket_path = expected_socket_path
+        self._expected_peer = expected_peer
         self._authenticator = authenticator
         self._readiness = readiness
         self._process_scope = process_scope
@@ -624,6 +745,7 @@ class UbuntuWorkerTransport:
     ) -> None:
         del timeout_seconds  # There is no remote registration hop.
         self._validate_retention(retention_seconds)
+        self._process_scope.reserve(action_id=action_id)
         with self._lock:
             self._prune_expired_locked()
             if action_id in self._actions:
@@ -651,12 +773,7 @@ class UbuntuWorkerTransport:
 
     def _authenticate_local_identity(self, *, timeout_seconds: int) -> WorkerIdentity:
         peer = self._authenticator.authenticate(timeout_seconds=timeout_seconds)
-        if (
-            peer.peer_uid != self._expected_peer_uid
-            or peer.socket_owner_uid != self._expected_socket_owner_uid
-            or peer.socket_mode != 0o600
-            or peer.socket_path != self._expected_socket_path
-        ):
+        if not self._expected_peer.matches(peer):
             raise ActionDispatcherError(
                 "native Ubuntu worker local peer identity failed"
             )
@@ -735,6 +852,16 @@ class UbuntuWorkerTransport:
                 else:
                     record.state = _ActionState.CANCELLED
                 record.expires_at = self._clock() + record.retention_seconds
+                scope_result = self._process_scope.cancel(
+                    action_id=action_id, timeout_seconds=timeout_seconds
+                )
+                if scope_result.status not in {
+                    ActionCancellationStatus.NOT_STARTED,
+                    ActionCancellationStatus.UNKNOWN,
+                }:
+                    raise ActionDispatcherError(
+                        "Ubuntu process scope returned invalid pre-start cancellation"
+                    )
                 return ActionCancellationResult(ActionCancellationStatus.NOT_STARTED)
             if state in {_ActionState.TERMINAL, _ActionState.FINALIZED}:
                 return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
