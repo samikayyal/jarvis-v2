@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 from threading import Event, Thread
 
@@ -8,8 +11,10 @@ import pytest
 from jarvis_control_plane import (
     ActionCancellationStatus,
     ActionDispatcherError,
+    ControlledOutboundWindowsWorkerTransport,
     ControlledWindowsWorkerSession,
     OutboundWindowsWorkerTransport,
+    SubprocessWindowsJobObjectExecutor,
     WindowsMtlsClientConfig,
     WindowsWorkerRegistration,
     WindowsWorkerSessionEvidence,
@@ -17,6 +22,7 @@ from jarvis_control_plane import (
     WorkerExecutionStatus,
     WorkerIdentity,
     WorkerInvocation,
+    authenticate_windows_worker_session,
 )
 from jarvis_control_plane.terminal_policy import TerminalAction
 
@@ -42,10 +48,13 @@ def _evidence(**changes: str) -> WindowsWorkerSessionEvidence:
     return WindowsWorkerSessionEvidence(**values)
 
 
-def _invocation(action_id: str = "action-001") -> WorkerInvocation:
+def _invocation(
+    action_id: str = "action-001", *, action: TerminalAction | None = None
+) -> WorkerInvocation:
     return WorkerInvocation(
         action_id=action_id,
-        action=TerminalAction(
+        action=action
+        or TerminalAction(
             host="windows",
             executable="C:\\Windows\\System32\\whoami.exe",
             arguments=(),
@@ -75,7 +84,7 @@ def _invocation(action_id: str = "action-001") -> WorkerInvocation:
 def test_session_requires_matching_certificate_and_application_identity(
     field: str, wrong_value: str
 ) -> None:
-    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+    transport = ControlledOutboundWindowsWorkerTransport(registration=REGISTRATION)
     session = ControlledWindowsWorkerSession(evidence=_evidence(**{field: wrong_value}))
 
     with pytest.raises(ActionDispatcherError, match="identity mismatch"):
@@ -111,11 +120,58 @@ def test_mtls_configuration_requires_absolute_credentials_and_bounded_endpoint()
         )
 
 
+def test_production_transport_accepts_only_certificate_bound_application_hello() -> (
+    None
+):
+    class FakeTlsSocket:
+        def version(self) -> str:
+            return "TLSv1.3"
+
+        def getpeercert(self) -> dict[str, object]:
+            return {"subjectAltName": (("URI", "spiffe://jarvis/workers/windows-01"),)}
+
+    self_asserted = ControlledWindowsWorkerSession(evidence=_evidence())
+    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+    with pytest.raises(ActionDispatcherError, match="not mTLS authenticated"):
+        transport.attach(self_asserted)
+
+    evidence = authenticate_windows_worker_session(
+        registration=REGISTRATION,
+        tls_socket=FakeTlsSocket(),  # type: ignore[arg-type]
+        application_hello=(
+            b'{"host":"windows","worker_id":"windows-01",'
+            b'"connection_id":"boot-01",'
+            b'"application_identity":"jarvis-windows-worker/windows-01"}'
+        ),
+    )
+    transport.attach(ControlledWindowsWorkerSession(evidence=evidence))
+
+    assert transport.authenticate(selected_host="windows", timeout_seconds=1) == (
+        WINDOWS_IDENTITY
+    )
+
+
+def test_authenticated_session_rejects_certificate_or_closed_hello_mismatch() -> None:
+    class WrongCertificateTlsSocket:
+        def version(self) -> str:
+            return "TLSv1.3"
+
+        def getpeercert(self) -> dict[str, object]:
+            return {"subjectAltName": (("URI", "spiffe://jarvis/workers/other"),)}
+
+    with pytest.raises(ActionDispatcherError, match="certificate identity mismatch"):
+        authenticate_windows_worker_session(
+            registration=REGISTRATION,
+            tls_socket=WrongCertificateTlsSocket(),  # type: ignore[arg-type]
+            application_hello=b"{}",
+        )
+
+
 def test_offline_disconnect_and_heartbeat_expiry_are_unavailable_without_queueing() -> (
     None
 ):
     now = [100.0]
-    transport = OutboundWindowsWorkerTransport(
+    transport = ControlledOutboundWindowsWorkerTransport(
         registration=REGISTRATION,
         readiness_expiry_seconds=30,
         clock=lambda: now[0],
@@ -147,7 +203,7 @@ def test_offline_disconnect_and_heartbeat_expiry_are_unavailable_without_queuein
 
 
 def test_reconnect_never_runs_an_action_reserved_on_the_disconnected_session() -> None:
-    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+    transport = ControlledOutboundWindowsWorkerTransport(registration=REGISTRATION)
     first = ControlledWindowsWorkerSession(evidence=_evidence())
     transport.attach(first)
     transport.register_execution(
@@ -177,7 +233,7 @@ def test_windows_worker_runs_one_noninteractive_job_object_action_at_a_time() ->
     session = ControlledWindowsWorkerSession(
         evidence=_evidence(), execution_hook=execute
     )
-    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+    transport = ControlledOutboundWindowsWorkerTransport(registration=REGISTRATION)
     transport.attach(session)
     transport.register_execution(
         action_id="running", timeout_seconds=1, retention_seconds=60
@@ -220,7 +276,7 @@ def test_cancellation_reports_stopped_only_after_job_object_tree_termination() -
     session = ControlledWindowsWorkerSession(
         evidence=_evidence(), execution_hook=execute
     )
-    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+    transport = ControlledOutboundWindowsWorkerTransport(registration=REGISTRATION)
     transport.attach(session)
     transport.register_execution(
         action_id="cancel", timeout_seconds=1, retention_seconds=60
@@ -247,6 +303,57 @@ def test_cancellation_reports_stopped_only_after_job_object_tree_termination() -
     assert not worker.is_alive()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_failed_job_assignment_terminates_and_reaps_the_suspended_child() -> None:
+    class FailingAssignmentExecutor(SubprocessWindowsJobObjectExecutor):
+        spawned: subprocess.Popen[bytes] | None = None
+
+        def _assign_process(
+            self, job_handle: int, process: subprocess.Popen[bytes]
+        ) -> None:
+            del job_handle
+            self.spawned = process
+            raise OSError("controlled assignment failure")
+
+    executor = FailingAssignmentExecutor()
+
+    with pytest.raises(OSError, match="controlled assignment failure"):
+        executor.execute(_invocation("assignment-failure"), lambda _event: None)
+
+    assert executor.spawned is not None
+    assert executor.spawned.poll() is not None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+def test_native_job_executor_preserves_structured_compound_component_progress() -> None:
+    action = TerminalAction(
+        host="windows",
+        executable=sys.executable,
+        arguments=("-c", "print('first')"),
+        cwd=str(Path.cwd()),
+        components=(
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "print('first')"],
+            },
+            {
+                "executable": sys.executable,
+                "arguments": ["-c", "print('second')"],
+                "operator_before": "&&",
+            },
+        ),
+    )
+
+    result = SubprocessWindowsJobObjectExecutor().execute(
+        _invocation("compound", action=action), lambda _event: None
+    )
+
+    assert result.status is WorkerExecutionStatus.COMPLETED
+    assert result.started_components == (0, 1)
+    assert result.completed_components == (0, 1)
+    assert result.stdout.splitlines() == ["first", "second"]
+
+
 def test_disconnect_during_started_action_returns_unknown_after_reconnect() -> None:
     started = Event()
     release = Event()
@@ -257,7 +364,7 @@ def test_disconnect_during_started_action_returns_unknown_after_reconnect() -> N
         return WorkerExecutionResult.completed(stdout="may have completed")
 
     first = ControlledWindowsWorkerSession(evidence=_evidence(), execution_hook=execute)
-    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+    transport = ControlledOutboundWindowsWorkerTransport(registration=REGISTRATION)
     transport.attach(first)
     transport.register_execution(
         action_id="ambiguous", timeout_seconds=1, retention_seconds=60

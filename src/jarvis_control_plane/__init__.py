@@ -241,6 +241,7 @@ from .traces import (
     TraceReservation,
 )
 from .windows_worker import (
+    ControlledOutboundWindowsWorkerTransport,
     ControlledWindowsWorkerSession,
     OutboundWindowsWorkerTransport,
     SubprocessWindowsJobObjectExecutor,
@@ -250,6 +251,7 @@ from .windows_worker import (
     WindowsWorkerRegistration,
     WindowsWorkerSession,
     WindowsWorkerSessionEvidence,
+    authenticate_windows_worker_session,
     open_windows_worker_mtls_session,
 )
 from .worker_gateway import (
@@ -336,6 +338,7 @@ __all__ = [
     "ControlledGoogleReadProvider",
     "ControlledOrchestrationAdapter",
     "ControlledOutboundConnector",
+    "ControlledOutboundWindowsWorkerTransport",
     "ControlledVaultSynchronizer",
     "ControlledVaultWriteRepository",
     "ControlledWindowsWorkerSession",
@@ -483,6 +486,7 @@ __all__ = [
     "WorkerProgressKind",
     "WorkerProgressSink",
     "WorkerTransport",
+    "authenticate_windows_worker_session",
     "build_live_calendar_action_dispatcher",
     "build_live_gmail_write_connector",
     "build_live_google_read_connector",

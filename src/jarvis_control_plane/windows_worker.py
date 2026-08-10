@@ -9,6 +9,7 @@ queued for, failed over to, or inherited by a replacement connection.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import ssl
@@ -38,6 +39,8 @@ from .worker_gateway import (
 )
 
 _CREATE_SUSPENDED = 0x00000004
+_AUTHENTICATED_EVIDENCE_TOKEN = object()
+_APPLICATION_HELLO_LIMIT_BYTES = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +134,7 @@ class WindowsWorkerRegistration:
                 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class WindowsWorkerSessionEvidence:
     """Identity evidence from one authenticated outbound mTLS session.
 
@@ -146,6 +149,27 @@ class WindowsWorkerSessionEvidence:
     connection_id: str
     certificate_identity: str
     application_identity: str
+    _authenticated: bool
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        worker_id: str,
+        connection_id: str,
+        certificate_identity: str,
+        application_identity: str,
+        _token: object | None = None,
+    ) -> None:
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "worker_id", worker_id)
+        object.__setattr__(self, "connection_id", connection_id)
+        object.__setattr__(self, "certificate_identity", certificate_identity)
+        object.__setattr__(self, "application_identity", application_identity)
+        object.__setattr__(
+            self, "_authenticated", _token is _AUTHENTICATED_EVIDENCE_TOKEN
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         for name in (
@@ -172,6 +196,64 @@ class WindowsWorkerSessionEvidence:
             worker_id=self.worker_id,
             connection_id=self.connection_id,
         )
+
+    @property
+    def authenticated(self) -> bool:
+        """Whether evidence came from the mTLS and closed-handshake factory."""
+
+        return self._authenticated
+
+
+def authenticate_windows_worker_session(
+    *,
+    registration: WindowsWorkerRegistration,
+    tls_socket: ssl.SSLSocket,
+    application_hello: bytes,
+) -> WindowsWorkerSessionEvidence:
+    """Bind TLS peer-certificate evidence to one closed application hello."""
+
+    if tls_socket.version() != "TLSv1.3":
+        raise ActionDispatcherError("Windows worker session did not negotiate TLS 1.3")
+    peer = tls_socket.getpeercert()
+    if not isinstance(peer, dict):
+        raise ActionDispatcherError("Windows worker peer certificate is unavailable")
+    subject_alt_names = peer.get("subjectAltName", ())
+    certificate_identities = {
+        value
+        for kind, value in subject_alt_names
+        if kind == "URI" and isinstance(value, str)
+    }
+    if certificate_identities != {registration.certificate_identity}:
+        raise ActionDispatcherError("Windows worker certificate identity mismatch")
+    if not isinstance(application_hello, bytes) or not application_hello:
+        raise ActionDispatcherError("Windows worker application hello is invalid")
+    if len(application_hello) > _APPLICATION_HELLO_LIMIT_BYTES:
+        raise ActionDispatcherError("Windows worker application hello is oversized")
+    try:
+        hello = json.loads(application_hello.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ActionDispatcherError(
+            "Windows worker application hello is malformed"
+        ) from exc
+    required = {"host", "worker_id", "connection_id", "application_identity"}
+    if not isinstance(hello, dict) or set(hello) != required:
+        raise ActionDispatcherError("Windows worker application hello schema mismatch")
+    if any(not isinstance(hello[key], str) for key in required):
+        raise ActionDispatcherError("Windows worker application hello schema mismatch")
+    evidence = WindowsWorkerSessionEvidence(
+        host=hello["host"],
+        worker_id=hello["worker_id"],
+        connection_id=hello["connection_id"],
+        certificate_identity=registration.certificate_identity,
+        application_identity=hello["application_identity"],
+        _token=_AUTHENTICATED_EVIDENCE_TOKEN,
+    )
+    if (
+        evidence.worker_identity != registration.identity
+        or evidence.application_identity != registration.application_identity
+    ):
+        raise ActionDispatcherError("Windows worker application identity mismatch")
+    return evidence
 
 
 class WindowsWorkerSession(Protocol):
@@ -243,7 +325,7 @@ class WindowsJobObjectWorkerSession:
 
 @dataclass(slots=True)
 class _RunningWindowsJob:
-    process: subprocess.Popen[bytes]
+    process: subprocess.Popen[bytes] | None
     job_handle: int
     cancel_requested: bool = False
 
@@ -282,9 +364,12 @@ class SubprocessWindowsJobObjectExecutor:
             raise ActionDispatcherError(
                 "Windows Job Object execution is non-interactive"
             )
-        if len(invocation.action.components) != 1:
+        if any(
+            component.operator_before == "|" or component.redirections
+            for component in invocation.action.components
+        ):
             raise ActionDispatcherError(
-                "Windows Job Object executor does not accept compound actions"
+                "Windows Job Object executor cannot preserve pipeline or redirection semantics"
             )
         with self._lock:
             if self._running:
@@ -298,76 +383,107 @@ class SubprocessWindowsJobObjectExecutor:
                 )
 
         job_handle = self._create_job_object()
+        record = _RunningWindowsJob(process=None, job_handle=job_handle)
+        with self._lock:
+            self._running[invocation.action_id] = record
         process: subprocess.Popen[bytes] | None = None
+        assigned_to_job = False
         stdout_parts: list[bytes] = []
         stderr_parts: list[bytes] = []
         stdout_truncated = [False]
         stderr_truncated = [False]
+        started_components: list[int] = []
+        completed_components: list[int] = []
+        timed_out = False
+        return_code: int | None = None
+        deadline = monotonic() + invocation.deadline_seconds
         try:
             flags = (
                 subprocess.CREATE_NO_WINDOW
                 | subprocess.CREATE_NEW_PROCESS_GROUP
                 | _CREATE_SUSPENDED
             )
-            process = subprocess.Popen(
-                [invocation.action.executable, *invocation.action.arguments],
-                cwd=invocation.action.cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=flags,
-            )
-            self._assign_process(job_handle, process)
-            record = _RunningWindowsJob(process=process, job_handle=job_handle)
-            with self._lock:
-                self._running[invocation.action_id] = record
-            self._resume_process(process)
-
-            assert process.stdout is not None
-            assert process.stderr is not None
-            stdout_reader = Thread(
-                target=self._read_bounded,
-                args=(
-                    process.stdout,
-                    invocation.stdout_limit_bytes,
-                    stdout_parts,
-                    stdout_truncated,
-                ),
-                daemon=True,
-            )
-            stderr_reader = Thread(
-                target=self._read_bounded,
-                args=(
-                    process.stderr,
-                    invocation.stderr_limit_bytes,
-                    stderr_parts,
-                    stderr_truncated,
-                ),
-                daemon=True,
-            )
-            stdout_reader.start()
-            stderr_reader.start()
-
-            timed_out = False
-            try:
-                return_code = process.wait(timeout=invocation.deadline_seconds)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                stopped = self._terminate_and_wait(
-                    job_handle, invocation.cancellation_grace_seconds
+            for index, component in enumerate(invocation.action.components):
+                if index and component.operator_before == "&&" and return_code != 0:
+                    continue
+                if index and component.operator_before == "||" and return_code == 0:
+                    continue
+                with self._lock:
+                    if record.cancel_requested:
+                        break
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                assigned_to_job = False
+                process = subprocess.Popen(
+                    [component.executable, *component.arguments],
+                    cwd=invocation.action.cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=flags,
                 )
-                return_code = process.poll()
-            else:
-                # A successful root process may have left descendants running.
-                # Terminating the Job Object closes that ambiguity before result.
-                stopped = self._terminate_and_wait(
-                    job_handle, invocation.cancellation_grace_seconds
-                )
+                record.process = process
+                self._assign_process(job_handle, process)
+                assigned_to_job = True
+                self._resume_process(process)
+                started_components.append(index)
 
-            stdout_reader.join(timeout=invocation.cancellation_grace_seconds)
-            stderr_reader.join(timeout=invocation.cancellation_grace_seconds)
-            if stdout_reader.is_alive() or stderr_reader.is_alive():
-                stopped = False
+                assert process.stdout is not None
+                assert process.stderr is not None
+                stdout_reader = Thread(
+                    target=self._read_bounded,
+                    args=(
+                        process.stdout,
+                        max(
+                            invocation.stdout_limit_bytes
+                            - sum(len(part) for part in stdout_parts),
+                            0,
+                        ),
+                        stdout_parts,
+                        stdout_truncated,
+                    ),
+                    daemon=True,
+                )
+                stderr_reader = Thread(
+                    target=self._read_bounded,
+                    args=(
+                        process.stderr,
+                        max(
+                            invocation.stderr_limit_bytes
+                            - sum(len(part) for part in stderr_parts),
+                            0,
+                        ),
+                        stderr_parts,
+                        stderr_truncated,
+                    ),
+                    daemon=True,
+                )
+                stdout_reader.start()
+                stderr_reader.start()
+                try:
+                    return_code = process.wait(timeout=max(deadline - monotonic(), 0))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    self._terminate_and_wait(
+                        job_handle, invocation.cancellation_grace_seconds
+                    )
+                    return_code = process.poll()
+                stdout_reader.join(timeout=invocation.cancellation_grace_seconds)
+                stderr_reader.join(timeout=invocation.cancellation_grace_seconds)
+                if stdout_reader.is_alive() or stderr_reader.is_alive():
+                    timed_out = True
+                if return_code == 0:
+                    completed_components.append(index)
+                if timed_out:
+                    break
+
+            # A successful root process may have left descendants running.
+            # Terminating the Job Object closes that ambiguity before result.
+            stopped = self._terminate_and_wait(
+                job_handle, invocation.cancellation_grace_seconds
+            )
 
             stdout = b"".join(stdout_parts).decode(errors="replace")
             stderr = b"".join(stderr_parts).decode(errors="replace")
@@ -408,19 +524,25 @@ class SubprocessWindowsJobObjectExecutor:
                 status = WorkerExecutionStatus.FAILED
             return WorkerExecutionResult(
                 status=status,
-                started_components=(0,),
-                completed_components=(0,)
-                if status is WorkerExecutionStatus.COMPLETED
-                else (),
+                started_components=tuple(started_components),
+                completed_components=tuple(completed_components),
                 process_tree_stopped=stopped,
                 stdout=stdout,
                 stderr=stderr,
             )
         except BaseException:
             if process is not None:
-                self._terminate_and_wait(
-                    job_handle, invocation.cancellation_grace_seconds
-                )
+                if assigned_to_job:
+                    self._terminate_and_wait(
+                        job_handle, invocation.cancellation_grace_seconds
+                    )
+                else:
+                    self._terminate_unassigned_process(
+                        process, invocation.cancellation_grace_seconds
+                    )
+                    self._terminate_and_wait(
+                        job_handle, invocation.cancellation_grace_seconds
+                    )
             raise
         finally:
             with self._lock:
@@ -542,6 +664,26 @@ class SubprocessWindowsJobObjectExecutor:
             raise OSError(f"NtResumeProcess failed with status {status:#x}")
 
     @staticmethod
+    def _terminate_unassigned_process(
+        process: subprocess.Popen[bytes], timeout_seconds: int
+    ) -> None:
+        """Kill and reap a suspended child that never entered the Job Object."""
+
+        try:
+            process.kill()
+            process.wait(timeout=timeout_seconds)
+        except BaseException as exc:
+            raise ActionDispatcherError(
+                "unassigned suspended Windows child could not be stopped",
+                may_have_dispatched=True,
+            ) from exc
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    @staticmethod
     def _terminate_and_wait(job_handle: int, timeout_seconds: int) -> bool:
         import ctypes
         from ctypes import wintypes
@@ -640,6 +782,10 @@ class OutboundWindowsWorkerTransport:
         evidence = getattr(session, "evidence", None)
         if not isinstance(evidence, WindowsWorkerSessionEvidence):
             raise ActionDispatcherError("Windows worker session evidence is invalid")
+        if not self._evidence_is_authenticated(evidence):
+            raise ActionDispatcherError(
+                "Windows worker session evidence is not mTLS authenticated"
+            )
         expected = self.registration
         if (
             evidence.worker_identity != expected.identity
@@ -655,6 +801,10 @@ class OutboundWindowsWorkerTransport:
             self._session_epoch += 1
             self._session = session
             self._last_heartbeat = self._clock()
+
+    @staticmethod
+    def _evidence_is_authenticated(evidence: WindowsWorkerSessionEvidence) -> bool:
+        return evidence.authenticated
 
     def heartbeat(self, session: WindowsWorkerSession) -> None:
         """Refresh readiness only for the exact attached session object."""
@@ -885,6 +1035,15 @@ class OutboundWindowsWorkerTransport:
             or retention_seconds < 1
         ):
             raise ValueError("Windows worker action-state retention must be positive")
+
+
+class ControlledOutboundWindowsWorkerTransport(OutboundWindowsWorkerTransport):
+    """Test-only transport that accepts explicitly controlled identity evidence."""
+
+    @staticmethod
+    def _evidence_is_authenticated(evidence: WindowsWorkerSessionEvidence) -> bool:
+        del evidence
+        return True
 
 
 class ControlledWindowsWorkerSession:
