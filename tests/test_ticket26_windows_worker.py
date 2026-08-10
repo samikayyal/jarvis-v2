@@ -203,6 +203,36 @@ def test_authenticated_session_rejects_certificate_or_closed_hello_mismatch() ->
         )
 
 
+def test_attachment_rechecks_the_authenticated_heartbeat_registration() -> None:
+    class FakeTlsSocket:
+        def version(self) -> str:
+            return "TLSv1.3"
+
+        def getpeercert(self) -> dict[str, object]:
+            return {"subjectAltName": (("URI", "spiffe://jarvis/workers/windows-01"),)}
+
+    fifteen_second_registration = WindowsWorkerRegistration(
+        identity=WINDOWS_IDENTITY,
+        certificate_identity=REGISTRATION.certificate_identity,
+        application_identity=REGISTRATION.application_identity,
+        heartbeat_interval_seconds=15,
+    )
+    evidence = authenticate_windows_worker_session(
+        registration=fifteen_second_registration,
+        tls_socket=FakeTlsSocket(),  # type: ignore[arg-type]
+        application_hello=(
+            b'{"host":"windows","worker_id":"windows-01",'
+            b'"connection_id":"boot-01",'
+            b'"application_identity":"jarvis-windows-worker/windows-01",'
+            b'"heartbeat_interval_seconds":15}'
+        ),
+    )
+    transport = OutboundWindowsWorkerTransport(registration=REGISTRATION)
+
+    with pytest.raises(ActionDispatcherError, match="session identity mismatch"):
+        transport.attach(ControlledWindowsWorkerSession(evidence=evidence))
+
+
 def test_offline_disconnect_and_heartbeat_expiry_are_unavailable_without_queueing() -> (
     None
 ):

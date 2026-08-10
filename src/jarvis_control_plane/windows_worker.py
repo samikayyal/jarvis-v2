@@ -925,6 +925,8 @@ class OutboundWindowsWorkerTransport:
             evidence.worker_identity != expected.identity
             or evidence.certificate_identity != expected.certificate_identity
             or evidence.application_identity != expected.application_identity
+            or evidence.heartbeat_interval_seconds
+            != expected.heartbeat_interval_seconds
         ):
             raise ActionDispatcherError("Windows worker session identity mismatch")
         with self._lock:
