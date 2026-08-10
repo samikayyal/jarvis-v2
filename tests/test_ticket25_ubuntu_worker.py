@@ -6,6 +6,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from threading import Event, RLock, Thread
 from time import monotonic
@@ -37,6 +38,7 @@ from jarvis_control_plane import (
     WorkerProgressEvent,
     WorkerProgressKind,
     serve_ubuntu_worker_connection,
+    ubuntu_worker_runner,
 )
 from jarvis_control_plane.terminal_policy import TerminalAction, TerminalComponent
 
@@ -295,6 +297,145 @@ def test_worker_server_rejects_an_authenticator_for_another_socket() -> None:
         unrelated_worker.close()
 
 
+def test_worker_server_authenticates_before_accepting_registration() -> None:
+    gateway_connection, worker_connection = socket.socketpair()
+    service = _worker(
+        peer=_local_peer(peer_uid=9999),
+        channel=worker_connection,
+    )
+    server = Thread(
+        target=lambda: _capture_failure(
+            lambda: serve_ubuntu_worker_connection(worker_connection, service), []
+        ),
+        daemon=True,
+    )
+    server.start()
+    transport = UbuntuWorkerTransport(
+        connection=gateway_connection,
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=gateway_connection
+        ),
+        expected_peer=_peer_expectation(),
+        registered_identity=WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    try:
+        with pytest.raises(ActionDispatcherError, match="channel"):
+            transport.register_execution(
+                action_id="action-unauthenticated-register",
+                timeout_seconds=2,
+                retention_seconds=900,
+            )
+    finally:
+        transport.close()
+        server.join(timeout=2)
+    assert not server.is_alive()
+
+
+def test_worker_server_stop_event_wakes_an_idle_connection() -> None:
+    gateway_connection, worker_connection = socket.socketpair()
+    authenticated = Event()
+    stop = Event()
+
+    def readiness() -> UbuntuWorkerReadiness:
+        authenticated.set()
+        return UbuntuWorkerReadiness.READY
+
+    service = UbuntuWorkerService(
+        worker_id="ubuntu-01",
+        expected_peer=_peer_expectation(),
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=worker_connection
+        ),
+        readiness=readiness,
+        process_scope=ControlledUbuntuProcessScope(),
+    )
+    server = Thread(
+        target=serve_ubuntu_worker_connection,
+        args=(worker_connection, service),
+        kwargs={"stop": stop},
+        daemon=True,
+    )
+    server.start()
+    assert authenticated.wait(timeout=2)
+
+    stop.set()
+    server.join(timeout=2)
+
+    gateway_connection.close()
+    assert not server.is_alive()
+
+
+def test_transport_disconnect_returns_a_typed_ambiguous_error() -> None:
+    gateway_connection, worker_connection = socket.socketpair()
+    transport = UbuntuWorkerTransport(
+        connection=gateway_connection,
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=gateway_connection
+        ),
+        expected_peer=_peer_expectation(),
+        registered_identity=WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    failures: list[BaseException] = []
+    call = Thread(
+        target=lambda: _capture_failure(
+            lambda: transport.register_execution(
+                action_id="action-disconnected-register",
+                timeout_seconds=5,
+                retention_seconds=900,
+            ),
+            failures,
+        )
+    )
+    call.start()
+    assert worker_connection.recv(4096)
+
+    worker_connection.close()
+    call.join(timeout=2)
+
+    transport.close()
+    assert not call.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], ActionDispatcherError)
+    assert failures[0].may_have_dispatched is True
+
+
+def test_disconnect_retires_a_connection_owned_reservation() -> None:
+    gateway_connection, worker_connection = socket.socketpair()
+    process_scope = ControlledUbuntuProcessScope()
+    service = _worker(process_scope=process_scope, channel=worker_connection)
+    server = Thread(
+        target=serve_ubuntu_worker_connection,
+        args=(worker_connection, service),
+        daemon=True,
+    )
+    server.start()
+    transport = UbuntuWorkerTransport(
+        connection=gateway_connection,
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=gateway_connection
+        ),
+        expected_peer=_peer_expectation(),
+        registered_identity=WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    transport.register_execution(
+        action_id="action-abandoned-register",
+        timeout_seconds=10,
+        retention_seconds=900,
+    )
+
+    transport.close()
+    server.join(timeout=2)
+
+    assert not server.is_alive()
+    assert process_scope.cancellations == [("action-abandoned-register", 10)]
+
+
 def test_gateway_cancellation_crosses_the_local_channel_and_stops_scope() -> None:
     started = Event()
     release = Event()
@@ -384,6 +525,15 @@ def test_systemd_scope_is_noninteractive_bounded_and_never_uses_a_shell() -> Non
     assert command[0] == "/usr/bin/systemd-run"
     assert "--property=TasksMax=32" in command
     assert "--property=NoNewPrivileges=yes" in command
+    assert "--property=RestrictNamespaces=yes" in command
+    assert "--property=RuntimeMaxSec=120s" in command
+    inaccessible = next(
+        argument
+        for argument in command
+        if argument.startswith("--property=InaccessiblePaths=")
+    )
+    assert "%t/systemd/private" in inaccessible
+    assert "%t/bus" in inaccessible
     assert "--pipe" in command
     assert "--wait" in command
     assert command[-3:] == ("--", "/usr/bin/printf", "hello")
@@ -399,18 +549,20 @@ def test_systemd_scope_rejects_an_invalid_process_tree_bound(
 
 
 @pytest.mark.parametrize(
-    ("return_code", "state", "expected"),
+    ("return_code", "state", "allow_missing", "expected"),
     [
-        (1, "", False),
-        (3, "inactive\n", True),
-        (3, "failed\n", True),
-        (4, "unknown\n", True),
+        (1, "", False, False),
+        (3, "inactive\n", False, True),
+        (3, "failed\n", False, True),
+        (4, "unknown\n", False, False),
+        (4, "unknown\n", True, True),
     ],
 )
 def test_systemd_scope_requires_a_known_stopped_unit_state(
     monkeypatch: pytest.MonkeyPatch,
     return_code: int,
     state: str,
+    allow_missing: bool,
     expected: bool,
 ) -> None:
     scope = SystemdUbuntuProcessScope()
@@ -419,12 +571,103 @@ def test_systemd_scope_requires_a_known_stopped_unit_state(
         return subprocess.CompletedProcess([], return_code, stdout=state)
 
     monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
+    observed = Event()
+    if allow_missing:
+        observed.set()
+    running = ubuntu_worker_module._RunningSystemdScope(
+        unit_name="jarvis-action-test.service",
+        process=cast("subprocess.Popen[bytes]", object()),
+        cancel_requested=Event(),
+        termination_lock=RLock(),
+        unit_observed=observed,
+    )
 
     stopped = scope._unit_is_stopped(
-        "jarvis-action-test.service", timeout_seconds=1
+        running,
+        timeout_seconds=1,
+        allow_missing=allow_missing,
     )
 
     assert stopped is expected
+
+
+def test_systemd_scope_runs_structured_compounds_inside_the_same_unit() -> None:
+    scope = SystemdUbuntuProcessScope()
+    invocation = replace(
+        _invocation(
+            "action-ubuntu-compound",
+            WorkerIdentity(
+                host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+            ),
+        ),
+        action=TerminalAction(
+            host="ubuntu",
+            executable="/usr/bin/printf",
+            arguments=("hello",),
+            cwd="/workspace",
+            components=(
+                TerminalComponent("/usr/bin/printf", ("hello",)),
+                TerminalComponent("/usr/bin/tr", ("a-z", "A-Z"), "|"),
+                TerminalComponent("/usr/bin/printf", ("done",), "&&"),
+            ),
+        ),
+    )
+
+    command = scope.command_for(invocation)
+    separator = command.index("--")
+    action_command = command[separator + 1 :]
+
+    assert action_command[:3] == (
+        sys.executable,
+        "-m",
+        "jarvis_control_plane.ubuntu_worker_runner",
+    )
+    assert all(
+        cast(TerminalComponent, component).executable not in command
+        for component in invocation.action.components
+    )
+
+
+def test_compound_runner_preserves_control_flow_without_a_shell(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    plan = (
+        (sys.executable, ("-c", "raise SystemExit(1)"), ""),
+        (sys.executable, ("-c", "print('wrong')"), "&&"),
+        (sys.executable, ("-c", "print('recovered')"), "||"),
+    )
+
+    status = ubuntu_worker_runner._run_plan(plan)
+    captured = capfd.readouterr()
+
+    assert status == 0
+    assert captured.out.splitlines() == ["recovered"]
+    assert '"started":[0,2]' in captured.err
+    assert '"completed":[0,2]' in captured.err
+
+
+def test_compound_runner_connects_a_structured_pipeline(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    plan = (
+        (sys.executable, ("-c", "import sys; sys.stdout.write('hello')"), ""),
+        (
+            sys.executable,
+            (
+                "-c",
+                "import sys; sys.stdout.write(sys.stdin.read().upper())",
+            ),
+            "|",
+        ),
+    )
+
+    status = ubuntu_worker_runner._run_plan(plan)
+    captured = capfd.readouterr()
+
+    assert status == 0
+    assert captured.out == "HELLO"
+    assert '"started":[0,1]' in captured.err
+    assert '"completed":[0,1]' in captured.err
 
 
 def test_systemd_scope_deadline_applies_after_wrapper_exit_with_open_pipes(
@@ -460,6 +703,7 @@ def test_systemd_scope_deadline_applies_after_wrapper_exit_with_open_pipes(
         process=cast("subprocess.Popen[bytes]", wrapper),
         cancel_requested=Event(),
         termination_lock=RLock(),
+        unit_observed=Event(),
     )
     monkeypatch.setattr(scope, "_stop_scope", lambda *_args: True)
     invocation = replace(
@@ -525,6 +769,71 @@ def test_systemd_scope_retires_a_pre_start_cancellation_tombstone() -> None:
     assert result.status is ActionCancellationStatus.NOT_STARTED
 
 
+def test_systemd_scope_honors_cancellation_that_arrives_during_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered_start = Event()
+    release_start = Event()
+
+    class StartedProcess:
+        def __init__(self) -> None:
+            self.stdout = BytesIO()
+            self.stderr = BytesIO()
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    process = StartedProcess()
+
+    def start(*_args: object, **_kwargs: object) -> StartedProcess:
+        entered_start.set()
+        assert release_start.wait(timeout=5)
+        return process
+
+    scope = SystemdUbuntuProcessScope()
+    monkeypatch.setattr(ubuntu_worker_module.sys, "platform", "linux")
+    monkeypatch.setattr(ubuntu_worker_module.subprocess, "Popen", start)
+    monkeypatch.setattr(scope, "_stop_scope", lambda *_args: True)
+    monkeypatch.setattr(
+        scope,
+        "_observe",
+        lambda *_args: pytest.fail("cancelled startup must not enter observation"),
+    )
+    invocation = _invocation(
+        "action-ubuntu-cancel-during-start",
+        WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    scope.reserve(action_id=invocation.action_id)
+    results: list[WorkerExecutionResult] = []
+    execution = Thread(
+        target=lambda: results.append(scope.execute(invocation, lambda _event: None))
+    )
+    execution.start()
+    assert entered_start.wait(timeout=2)
+    cancellations: list[ActionCancellationResult] = []
+    cancellation = Thread(
+        target=lambda: cancellations.append(
+            scope.cancel(action_id=invocation.action_id, timeout_seconds=5)
+        )
+    )
+    cancellation.start()
+    starting = scope._starting[invocation.action_id]
+    assert starting.cancel_requested.wait(timeout=2)
+
+    release_start.set()
+    execution.join(timeout=2)
+    cancellation.join(timeout=2)
+
+    assert results[0].status is WorkerExecutionStatus.CANCELLED
+    assert results[0].process_tree_stopped is True
+    assert cancellations[0].status is ActionCancellationStatus.STOPPED
+    assert process.stdout.closed
+    assert process.stderr.closed
+
+
 def test_ubuntu_worker_rejects_retention_above_configured_maximum() -> None:
     worker = _worker()
 
@@ -534,6 +843,101 @@ def test_ubuntu_worker_rejects_retention_above_configured_maximum() -> None:
             timeout_seconds=10,
             retention_seconds=901,
         )
+
+
+def test_duplicate_registration_does_not_leak_a_process_reservation() -> None:
+    process_scope = ControlledUbuntuProcessScope()
+    worker = _worker(process_scope=process_scope)
+    worker.register_execution(
+        action_id="action-ubuntu-duplicate",
+        timeout_seconds=10,
+        retention_seconds=900,
+    )
+    worker.finalize_execution(
+        action_id="action-ubuntu-duplicate",
+        timeout_seconds=10,
+        retention_seconds=900,
+    )
+
+    with pytest.raises(ActionDispatcherError, match="already registered"):
+        worker.register_execution(
+            action_id="action-ubuntu-duplicate",
+            timeout_seconds=10,
+            retention_seconds=900,
+        )
+
+    process_scope.reserve(action_id="action-ubuntu-duplicate")
+
+
+def test_reserved_action_expires_and_retires_its_process_scope() -> None:
+    now = 0.0
+    process_scope = ControlledUbuntuProcessScope()
+    worker = UbuntuWorkerService(
+        worker_id="ubuntu-01",
+        expected_peer=_peer_expectation(),
+        authenticator=ControlledUbuntuLocalAuthenticator(_local_peer()),
+        readiness=lambda: UbuntuWorkerReadiness.READY,
+        process_scope=process_scope,
+        clock=lambda: now,
+    )
+    worker.register_execution(
+        action_id="action-ubuntu-expiring",
+        timeout_seconds=10,
+        retention_seconds=10,
+    )
+    now = 11
+
+    worker.register_execution(
+        action_id="action-ubuntu-after-expiry",
+        timeout_seconds=10,
+        retention_seconds=10,
+    )
+
+    process_scope.reserve(action_id="action-ubuntu-expiring")
+
+
+def test_observation_failure_stops_and_releases_the_process_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        def __init__(self) -> None:
+            self.stdout = BytesIO()
+            self.stderr = BytesIO()
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    process = ExitedProcess()
+    stopped: list[object] = []
+    scope = SystemdUbuntuProcessScope()
+    monkeypatch.setattr(ubuntu_worker_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        ubuntu_worker_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(
+        scope,
+        "_stop_scope",
+        lambda running, _timeout: stopped.append(running) is None or True,
+    )
+    invocation = _invocation(
+        "action-ubuntu-progress-failure",
+        WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    scope.reserve(action_id=invocation.action_id)
+
+    with pytest.raises(RuntimeError, match="progress send failed"):
+        scope.execute(
+            invocation,
+            lambda _event: (_ for _ in ()).throw(RuntimeError("progress send failed")),
+        )
+
+    assert len(stopped) == 1
+    scope.reserve(action_id="action-ubuntu-after-progress-failure")
 
 
 def test_ubuntu_worker_cancellation_stops_the_active_process_scope() -> None:

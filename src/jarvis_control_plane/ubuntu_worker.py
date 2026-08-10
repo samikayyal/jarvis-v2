@@ -7,7 +7,9 @@ authenticated, permission-restricted local Unix-socket channel.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import queue
 import socket
@@ -29,6 +31,7 @@ from .ports import (
     ActionDispatcherError,
 )
 from .terminal_policy import TerminalComponent
+from .ubuntu_worker_runner import COMPOUND_RESULT_MARKER
 from .worker_gateway import (
     WorkerExecutionLimits,
     WorkerExecutionResult,
@@ -40,6 +43,8 @@ from .worker_gateway import (
     WorkerProgressKind,
     WorkerProgressSink,
 )
+
+_COMPOUND_METADATA_LIMIT_BYTES = 4096
 
 
 class UbuntuWorkerReadiness(str, Enum):
@@ -320,6 +325,7 @@ class _RunningSystemdScope:
     process: subprocess.Popen[bytes]
     cancel_requested: Event
     termination_lock: RLock
+    unit_observed: Event
 
 
 class SystemdUbuntuProcessScope:
@@ -357,6 +363,7 @@ class SystemdUbuntuProcessScope:
         self._active_action_ids: set[str] = set()
         self._reserved_action_ids: set[str] = set()
         self._cancelled_action_ids: set[str] = set()
+        self._stopped_action_ids: set[str] = set()
 
     def reserve(self, *, action_id: str) -> None:
         with self._lock:
@@ -366,6 +373,7 @@ class SystemdUbuntuProcessScope:
                 self._reserved_action_ids
                 | self._active_action_ids
                 | self._cancelled_action_ids
+                | self._stopped_action_ids
             )
             if action_id in known:
                 raise ActionDispatcherError(
@@ -377,6 +385,7 @@ class SystemdUbuntuProcessScope:
         with self._lock:
             self._reserved_action_ids.discard(action_id)
             self._cancelled_action_ids.discard(action_id)
+            self._stopped_action_ids.discard(action_id)
 
     def command_for(self, invocation: WorkerInvocation) -> tuple[str, ...]:
         """Return the exact argv used to create the bounded native scope."""
@@ -385,16 +394,16 @@ class SystemdUbuntuProcessScope:
             raise ActionDispatcherError("Ubuntu process scopes are non-interactive")
         if invocation.action.host != "ubuntu":
             raise ActionDispatcherError("Ubuntu process scope rejected another host")
-        if len(invocation.action.components) != 1:
+        components = tuple(
+            cast(TerminalComponent, component)
+            for component in invocation.action.components
+        )
+        if any(component.redirections for component in components):
             raise ActionDispatcherError(
-                "Ubuntu process scope accepts one process component"
-            )
-        component = cast(TerminalComponent, invocation.action.components[0])
-        if component.redirections:
-            raise ActionDispatcherError(
-                "Ubuntu process scope does not interpret shell redirections"
+                "Ubuntu process scope cannot execute directionless redirections"
             )
         unit_name = self._unit_name(invocation.action_id)
+        action_command = self._action_command(components)
         return (
             self._systemd_run_path,
             "--user",
@@ -406,11 +415,41 @@ class SystemdUbuntuProcessScope:
             f"--unit={unit_name}",
             f"--property=TasksMax={self._process_limit}",
             "--property=NoNewPrivileges=yes",
+            "--property=RestrictNamespaces=yes",
+            (
+                "--property=InaccessiblePaths=/run/systemd/private "
+                "/run/dbus/system_bus_socket %t/systemd/private %t/bus"
+            ),
+            f"--property=RuntimeMaxSec={invocation.deadline_seconds}s",
             f"--property=TimeoutStopSec={invocation.cancellation_grace_seconds}s",
             f"--working-directory={invocation.action.cwd}",
             "--",
-            component.executable,
-            *component.arguments,
+            *action_command,
+        )
+
+    @staticmethod
+    def _action_command(
+        components: tuple[TerminalComponent, ...],
+    ) -> tuple[str, ...]:
+        if len(components) == 1:
+            component = components[0]
+            return (component.executable, *component.arguments)
+        plan = [
+            {
+                "executable": component.executable,
+                "arguments": list(component.arguments),
+                "operator_before": component.operator_before,
+            }
+            for component in components
+        ]
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(plan, separators=(",", ":")).encode()
+        ).decode()
+        return (
+            sys.executable,
+            "-m",
+            "jarvis_control_plane.ubuntu_worker_runner",
+            encoded,
         )
 
     def execute(
@@ -474,14 +513,41 @@ class SystemdUbuntuProcessScope:
             process=process,
             cancel_requested=starting.cancel_requested,
             termination_lock=RLock(),
+            unit_observed=Event(),
         )
         with self._lock:
             self._running[invocation.action_id] = running
             self._starting.pop(invocation.action_id, None)
             starting.resolved.set()
+        if running.cancel_requested.is_set():
+            stopped = self._stop_scope(running, invocation.cancellation_grace_seconds)
+            process.stdout.close()
+            process.stderr.close()
+            if stopped:
+                with self._lock:
+                    if self._running.get(invocation.action_id) is running:
+                        del self._running[invocation.action_id]
+                    self._active_action_ids.discard(invocation.action_id)
+                    self._stopped_action_ids.add(invocation.action_id)
+            return WorkerExecutionResult(
+                status=(
+                    WorkerExecutionStatus.CANCELLED
+                    if stopped
+                    else WorkerExecutionStatus.UNKNOWN
+                ),
+                process_tree_stopped=stopped,
+            )
         release_scope = False
         try:
-            result = self._observe(running, invocation, progress)
+            try:
+                result = self._observe(running, invocation, progress)
+            except BaseException:
+                release_scope = self._stop_scope(
+                    running, invocation.cancellation_grace_seconds
+                )
+                process.stdout.close()
+                process.stderr.close()
+                raise
             release_scope = result.process_tree_stopped
             return result
         finally:
@@ -506,6 +572,8 @@ class SystemdUbuntuProcessScope:
             if not starting.resolved.wait(timeout=max(deadline - monotonic(), 0)):
                 return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
             with self._lock:
+                if action_id in self._stopped_action_ids:
+                    return ActionCancellationResult(ActionCancellationStatus.STOPPED)
                 if action_id in self._cancelled_action_ids:
                     return ActionCancellationResult(
                         ActionCancellationStatus.NOT_STARTED
@@ -523,6 +591,7 @@ class SystemdUbuntuProcessScope:
                 if self._running.get(action_id) is running:
                     del self._running[action_id]
                 self._active_action_ids.discard(action_id)
+                self._stopped_action_ids.add(action_id)
         return ActionCancellationResult(
             ActionCancellationStatus.STOPPED
             if stopped
@@ -543,10 +612,14 @@ class SystemdUbuntuProcessScope:
         )
 
         def read_stream(
-            stream: BinaryIO, tag: WorkerOutputStream, byte_limit: int
+            stream: BinaryIO,
+            tag: WorkerOutputStream,
+            byte_limit: int,
+            tail_limit: int = 0,
         ) -> None:
             read = getattr(stream, "read1", stream.read)
-            remaining = byte_limit
+            remaining = byte_limit - tail_limit
+            tail = bytearray()
             truncation_reported = False
             try:
                 while chunk := read(16 * 1024):
@@ -554,21 +627,32 @@ class SystemdUbuntuProcessScope:
                     if accepted:
                         output.put((tag, accepted))
                         remaining -= len(accepted)
-                    if len(accepted) != len(chunk) and not truncation_reported:
-                        output.put((tag, b""))
-                        truncation_reported = True
+                    excess = chunk[len(accepted) :]
+                    if excess:
+                        if tail_limit:
+                            tail.extend(excess)
+                            del tail[:-tail_limit]
+                        if not truncation_reported:
+                            output.put((tag, b""))
+                            truncation_reported = True
             except (OSError, ValueError):
                 # Deadline cleanup closes the pipes to release readers even if
                 # a descendant inherited the wrapper's file descriptors.
                 pass
             finally:
                 try:
+                    if tail:
+                        output.put((tag, bytes(tail)), timeout=1)
                     output.put((tag, None), timeout=1)
                 except queue.Full:
                     pass
 
         assert running.process.stdout is not None
         assert running.process.stderr is not None
+        compound = len(invocation.action.components) > 1
+        stderr_capture_limit = invocation.stderr_limit_bytes + (
+            _COMPOUND_METADATA_LIMIT_BYTES if compound else 0
+        )
         readers = (
             Thread(
                 target=read_stream,
@@ -584,7 +668,8 @@ class SystemdUbuntuProcessScope:
                 args=(
                     running.process.stderr,
                     WorkerOutputStream.STDERR,
-                    invocation.stderr_limit_bytes,
+                    stderr_capture_limit,
+                    _COMPOUND_METADATA_LIMIT_BYTES if compound else 0,
                 ),
                 daemon=True,
             ),
@@ -609,7 +694,7 @@ class SystemdUbuntuProcessScope:
         }
         limits = {
             WorkerOutputStream.STDOUT: invocation.stdout_limit_bytes,
-            WorkerOutputStream.STDERR: invocation.stderr_limit_bytes,
+            WorkerOutputStream.STDERR: stderr_capture_limit,
         }
         truncated = {stream: False for stream in buffers}
         ended: set[WorkerOutputStream] = set()
@@ -617,6 +702,7 @@ class SystemdUbuntuProcessScope:
         timed_out = False
         cleanup_failed = False
         deadline_cleanup_stopped: bool | None = None
+        next_unit_probe = monotonic()
 
         def record_chunk(stream: WorkerOutputStream, chunk: bytes | None) -> None:
             nonlocal emitted, sequence
@@ -628,7 +714,11 @@ class SystemdUbuntuProcessScope:
             buffers[stream].extend(accepted)
             chunk_truncated = not chunk or len(accepted) != len(chunk)
             truncated[stream] = truncated[stream] or chunk_truncated
-            if accepted and emitted < invocation.progress_event_limit - 1:
+            if (
+                accepted
+                and not (compound and stream is WorkerOutputStream.STDERR)
+                and emitted < invocation.progress_event_limit - 1
+            ):
                 progress(
                     WorkerProgressEvent(
                         sequence=sequence,
@@ -642,13 +732,21 @@ class SystemdUbuntuProcessScope:
                 emitted += 1
 
         while len(ended) < 2 or running.process.poll() is None:
-            if monotonic() >= deadline:
+            now = monotonic()
+            if now >= deadline:
                 timed_out = True
                 deadline_cleanup_stopped = self._stop_scope(
                     running, invocation.cancellation_grace_seconds
                 )
                 cleanup_failed = not deadline_cleanup_stopped
                 break
+            if not running.unit_observed.is_set() and now >= next_unit_probe:
+                self._unit_is_stopped(
+                    running,
+                    timeout_seconds=min(0.25, max(deadline - now, 0.001)),
+                    allow_missing=False,
+                )
+                next_unit_probe = monotonic() + 0.25
             try:
                 stream, chunk = output.get(timeout=0.05)
             except queue.Empty:
@@ -665,6 +763,12 @@ class SystemdUbuntuProcessScope:
             record_chunk(stream, chunk)
         for reader in readers:
             reader.join(timeout=1)
+        while True:
+            try:
+                stream, chunk = output.get_nowait()
+            except queue.Empty:
+                break
+            record_chunk(stream, chunk)
         return_code = running.process.poll()
         process_tree_stopped = (
             deadline_cleanup_stopped
@@ -672,7 +776,9 @@ class SystemdUbuntuProcessScope:
             else (
                 not cleanup_failed
                 and return_code is not None
-                and self._unit_is_stopped(running.unit_name, timeout_seconds=2)
+                and self._unit_is_stopped(
+                    running, timeout_seconds=2, allow_missing=True
+                )
             )
         )
         status = (
@@ -692,22 +798,50 @@ class SystemdUbuntuProcessScope:
                 )
             )
         )
+        started_components = (0,)
+        completed_components = (0,) if status is WorkerExecutionStatus.COMPLETED else ()
+        raw_stderr = bytes(buffers[WorkerOutputStream.STDERR])
+        if compound:
+            compound_result = _extract_compound_result(raw_stderr)
+            if compound_result is None:
+                if status in {
+                    WorkerExecutionStatus.COMPLETED,
+                    WorkerExecutionStatus.FAILED,
+                }:
+                    status = WorkerExecutionStatus.UNKNOWN
+                raw_stderr = raw_stderr[: invocation.stderr_limit_bytes]
+                started_components = ()
+                completed_components = ()
+            else:
+                raw_stderr, started_components, completed_components = compound_result
+            if raw_stderr and emitted < invocation.progress_event_limit - 1:
+                progress(
+                    WorkerProgressEvent(
+                        sequence=sequence,
+                        kind=WorkerProgressKind.OUTPUT,
+                        stream=WorkerOutputStream.STDERR,
+                        text=_render_captured(
+                            raw_stderr,
+                            truncated[WorkerOutputStream.STDERR],
+                            invocation.stderr_limit_bytes,
+                        ),
+                        truncated=truncated[WorkerOutputStream.STDERR],
+                    )
+                )
         stdout = _render_captured(
             buffers[WorkerOutputStream.STDOUT],
             truncated[WorkerOutputStream.STDOUT],
             invocation.stdout_limit_bytes,
         )
         stderr = _render_captured(
-            buffers[WorkerOutputStream.STDERR],
+            raw_stderr,
             truncated[WorkerOutputStream.STDERR],
             invocation.stderr_limit_bytes,
         )
         return WorkerExecutionResult(
             status=status,
-            started_components=(0,),
-            completed_components=(0,)
-            if status is WorkerExecutionStatus.COMPLETED
-            else (),
+            started_components=started_components,
+            completed_components=completed_components,
             process_tree_stopped=process_tree_stopped,
             stdout=stdout,
             stderr=stderr,
@@ -722,7 +856,9 @@ class SystemdUbuntuProcessScope:
             if remaining <= 0:
                 return False
             if self._unit_is_stopped(
-                running.unit_name, timeout_seconds=min(remaining, 1)
+                running,
+                timeout_seconds=min(remaining, 1),
+                allow_missing=running.process.poll() is not None,
             ):
                 return True
             self._signal_unit(running.unit_name, "TERM", deadline)
@@ -736,7 +872,9 @@ class SystemdUbuntuProcessScope:
             if remaining <= 0:
                 return False
             if self._unit_is_stopped(
-                running.unit_name, timeout_seconds=min(remaining, 1)
+                running,
+                timeout_seconds=min(remaining, 1),
+                allow_missing=running.process.poll() is not None,
             ):
                 return True
             self._signal_unit(running.unit_name, "KILL", deadline)
@@ -749,7 +887,11 @@ class SystemdUbuntuProcessScope:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return False
-            return self._unit_is_stopped(running.unit_name, timeout_seconds=remaining)
+            return self._unit_is_stopped(
+                running,
+                timeout_seconds=remaining,
+                allow_missing=running.process.poll() is not None,
+            )
 
     def _signal_unit(self, unit_name: str, signal: str, deadline: float) -> None:
         remaining = max(deadline - monotonic(), 0.001)
@@ -772,7 +914,13 @@ class SystemdUbuntuProcessScope:
         except (OSError, subprocess.TimeoutExpired):
             return
 
-    def _unit_is_stopped(self, unit_name: str, *, timeout_seconds: float) -> bool:
+    def _unit_is_stopped(
+        self,
+        running: _RunningSystemdScope,
+        *,
+        timeout_seconds: float,
+        allow_missing: bool = False,
+    ) -> bool:
         if timeout_seconds <= 0:
             return False
         try:
@@ -781,7 +929,7 @@ class SystemdUbuntuProcessScope:
                     self._systemctl_path,
                     "--user",
                     "is-active",
-                    unit_name,
+                    running.unit_name,
                 ),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -793,8 +941,13 @@ class SystemdUbuntuProcessScope:
         except (OSError, subprocess.TimeoutExpired):
             return False
         state = check.stdout.strip()
+        if state in {"active", "activating", "deactivating", "inactive", "failed"}:
+            running.unit_observed.set()
         return (check.returncode == 3 and state in {"inactive", "failed"}) or (
-            check.returncode == 4 and state == "unknown"
+            allow_missing
+            and running.unit_observed.is_set()
+            and check.returncode == 4
+            and state == "unknown"
         )
 
     @staticmethod
@@ -809,6 +962,41 @@ class _ActionState(str, Enum):
     CANCELLED = "cancelled"
     TERMINAL = "terminal"
     FINALIZED = "finalized"
+
+
+def _extract_compound_result(
+    captured: bytes,
+) -> tuple[bytes, tuple[int, ...], tuple[int, ...]] | None:
+    user_output, marker, suffix = captured.rpartition(COMPOUND_RESULT_MARKER)
+    if not marker:
+        return None
+    metadata, separator, trailing = suffix.partition(b"\n")
+    if not separator or trailing:
+        return None
+    try:
+        value = json.loads(metadata)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"started", "completed"}:
+        return None
+    started = value["started"]
+    completed = value["completed"]
+    if not isinstance(started, list) or not isinstance(completed, list):
+        return None
+    if any(
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+        for index in (*started, *completed)
+    ):
+        return None
+    started_tuple = tuple(started)
+    completed_tuple = tuple(completed)
+    if (
+        tuple(sorted(set(started_tuple))) != started_tuple
+        or tuple(sorted(set(completed_tuple))) != completed_tuple
+        or not set(completed_tuple) <= set(started_tuple)
+    ):
+        return None
+    return user_output, started_tuple, completed_tuple
 
 
 @dataclass(slots=True)
@@ -861,7 +1049,6 @@ class UbuntuWorkerService:
     ) -> None:
         del timeout_seconds  # There is no remote registration hop.
         self._validate_retention(retention_seconds)
-        self._process_scope.reserve(action_id=action_id)
         with self._lock:
             self._prune_expired_locked()
             if action_id in self._actions:
@@ -869,10 +1056,16 @@ class UbuntuWorkerService:
                     f"Ubuntu worker action {action_id} is already registered",
                     may_have_dispatched=True,
                 )
-            self._actions[action_id] = _ActionRecord(
-                state=_ActionState.RESERVED,
-                retention_seconds=retention_seconds,
-            )
+            self._process_scope.reserve(action_id=action_id)
+            try:
+                self._actions[action_id] = _ActionRecord(
+                    state=_ActionState.RESERVED,
+                    retention_seconds=retention_seconds,
+                    expires_at=self._clock() + retention_seconds,
+                )
+            except BaseException:
+                self._process_scope.retire(action_id=action_id)
+                raise
 
     def authenticate(
         self, *, selected_host: str, timeout_seconds: int
@@ -1096,6 +1289,6 @@ def _truncate_utf8(value: str, limit: int) -> str:
     return marker.encode()[:limit].decode(errors="ignore")
 
 
-def _render_captured(value: bytearray, truncated: bool, limit: int) -> str:
+def _render_captured(value: bytes | bytearray, truncated: bool, limit: int) -> str:
     text = bytes(value).decode(errors="replace")
     return _truncate_utf8(f"{text}\n[output truncated]", limit) if truncated else text

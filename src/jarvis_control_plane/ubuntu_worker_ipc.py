@@ -263,16 +263,18 @@ class UnixSocketUbuntuWorkerTransport:
             self._fail_pending("Ubuntu worker channel disconnected")
 
     def _fail_pending(self, message: str) -> None:
-        failure = {
-            "type": "error",
-            "message": message,
-            "may_have_dispatched": True,
-        }
         with self._pending_lock:
-            pending = tuple(self._pending.values())
-        for responses in pending:
+            pending = tuple(self._pending.items())
+        for request_id, responses in pending:
             try:
-                responses.put_nowait(failure)
+                responses.put_nowait(
+                    {
+                        "request_id": request_id,
+                        "type": "error",
+                        "message": message,
+                        "may_have_dispatched": True,
+                    }
+                )
             except queue.Full:
                 pass
 
@@ -288,10 +290,16 @@ def serve_ubuntu_worker_connection(
     if not worker.binds(connection):
         raise ValueError("Ubuntu worker service must authenticate its exact channel")
     connection.setblocking(False)
+    try:
+        worker.authenticate(selected_host="ubuntu", timeout_seconds=10)
+    except BaseException:
+        connection.close()
+        raise
     send_lock = RLock()
     active_lock = RLock()
     active_action_id: str | None = None
     retention_by_action: dict[str, int] = {}
+    receiver = _PollingFrameReceiver()
 
     def send(request_id: str, message: Mapping[str, object]) -> None:
         _send_frame(
@@ -330,7 +338,13 @@ def serve_ubuntu_worker_connection(
 
     try:
         while stop is None or not stop.is_set():
-            request = _recv_frame(connection, deadline=None)
+            try:
+                request = receiver.receive(
+                    connection,
+                    deadline=(monotonic() + 0.25 if stop is not None else None),
+                )
+            except TimeoutError:
+                continue
             _require_keys(request, {"request_id", "operation", "payload"})
             request_id = _required_text(request, "request_id")
             operation = _required_text(request, "operation")
@@ -410,17 +424,55 @@ def serve_ubuntu_worker_connection(
     except (ActionDispatcherError, OSError, EOFError):
         pass
     finally:
-        with active_lock:
-            running = active_action_id
         try:
-            if running is not None:
-                worker.cancel(
-                    action_id=running,
-                    timeout_seconds=10,
-                    retention_seconds=retention_by_action.get(running, 15 * 60),
-                )
+            for action_id, retention in tuple(retention_by_action.items()):
+                try:
+                    worker.cancel(
+                        action_id=action_id,
+                        timeout_seconds=10,
+                        retention_seconds=retention,
+                    )
+                except (ActionDispatcherError, TypeError, ValueError):
+                    pass
         finally:
             connection.close()
+
+
+class _PollingFrameReceiver:
+    """Retain partial frame bytes while periodically yielding to a stop event."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._body_length: int | None = None
+
+    def receive(
+        self, connection: socket.socket, *, deadline: float | None
+    ) -> Mapping[str, object]:
+        while True:
+            if self._body_length is None and len(self._buffer) >= 4:
+                body_length = struct.unpack("!I", self._buffer[:4])[0]
+                if not 2 <= body_length <= _MAX_FRAME_BYTES:
+                    raise ActionDispatcherError("Ubuntu worker frame length is invalid")
+                self._body_length = body_length
+            if (
+                self._body_length is not None
+                and len(self._buffer) >= 4 + self._body_length
+            ):
+                end = 4 + self._body_length
+                body = bytes(self._buffer[4:end])
+                del self._buffer[:end]
+                self._body_length = None
+                return _decode_frame_body(body)
+            timeout = None if deadline is None else max(deadline - monotonic(), 0)
+            if timeout == 0:
+                raise TimeoutError("Ubuntu worker receive timed out")
+            readable, _, _ = select.select([connection], [], [], timeout)
+            if not readable:
+                raise TimeoutError("Ubuntu worker receive timed out")
+            chunk = connection.recv(64 * 1024)
+            if not chunk:
+                raise EOFError("Ubuntu worker channel closed")
+            self._buffer.extend(chunk)
 
 
 def _send_frame(
@@ -456,6 +508,10 @@ def _recv_frame(
     if length < 2 or length > _MAX_FRAME_BYTES:
         raise ActionDispatcherError("Ubuntu worker frame length is invalid")
     raw = _recv_exact(connection, length, deadline=deadline)
+    return _decode_frame_body(raw)
+
+
+def _decode_frame_body(raw: bytes) -> Mapping[str, object]:
     try:
         value = json.loads(
             raw,

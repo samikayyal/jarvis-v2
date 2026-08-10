@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from threading import Event, RLock, Thread
 from time import monotonic
-from typing import Protocol
+from typing import Protocol, cast
 
 from .models import FrozenActionProposal
 from .ports import (
@@ -21,7 +21,11 @@ from .ports import (
     ActionDispatcherError,
     ActionDispatchHandle,
 )
-from .terminal_policy import TerminalAction, terminal_action_from_proposal
+from .terminal_policy import (
+    TerminalAction,
+    TerminalComponent,
+    terminal_action_from_proposal,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,7 +447,10 @@ class _WorkerDispatchHandle:
             result = _bounded_result(
                 self._result,
                 limits=self.limits,
-                component_count=len(self.terminal.components),
+                components=tuple(
+                    cast(TerminalComponent, component)
+                    for component in self.terminal.components
+                ),
             )
         except ActionDispatcherError as exc:
             raise WorkerExecutionError(self._unknown_result()) from exc
@@ -913,6 +920,7 @@ class ControlledWorkerTransport:
                 return result
             if state is _WorkerTransportActionState.FINALIZED:
                 result = ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
+                assert record is not None
                 self._retain_cancellation_locked(action_id, result, record)
                 self.cancelled.append(action_id)
                 return result
@@ -1029,18 +1037,28 @@ def _bounded_result(
     result: WorkerExecutionResult,
     *,
     limits: WorkerExecutionLimits,
-    component_count: int,
+    components: tuple[TerminalComponent, ...],
 ) -> WorkerExecutionResult:
     if not isinstance(result, WorkerExecutionResult):
         raise ActionDispatcherError("worker returned an invalid execution result")
-    all_components = tuple(range(component_count))
-    if result.status is WorkerExecutionStatus.COMPLETED and (
-        result.started_components not in {(), all_components}
-        or result.completed_components not in {(), all_components}
-    ):
-        raise ActionDispatcherError("worker reported incomplete progress as completed")
+    component_count = len(components)
     if any(index >= component_count for index in result.started_components):
         raise ActionDispatcherError("worker reported an unknown command component")
+    if result.status is WorkerExecutionStatus.COMPLETED and result.started_components:
+        started = set(result.started_components)
+        if result.completed_components != result.started_components:
+            raise ActionDispatcherError("worker reported incomplete completed progress")
+        if 0 not in started or any(
+            component.operator_before == ";" and index not in started
+            for index, component in enumerate(components)
+        ):
+            raise ActionDispatcherError("worker reported impossible compound progress")
+        if any(
+            component.operator_before == "|"
+            and ((index in started) != (index - 1 in started))
+            for index, component in enumerate(components)
+        ):
+            raise ActionDispatcherError("worker reported a partial pipeline")
     return replace(
         result,
         stdout=_truncate_output(result.stdout, limits.stdout_limit_bytes),
