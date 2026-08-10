@@ -118,6 +118,14 @@ class TerminalAction:
             raise ValueError(
                 "terminal component executable must be canonical and absolute"
             )
+        if any(
+            not _is_canonical_path(redirection)
+            for component in components
+            for redirection in component.redirections
+        ):
+            raise ValueError(
+                "terminal redirection target must be canonical and absolute"
+            )
         object.__setattr__(self, "host", self.host.strip())
         object.__setattr__(self, "cwd", self.cwd.strip())
         object.__setattr__(self, "arguments", root.arguments)
