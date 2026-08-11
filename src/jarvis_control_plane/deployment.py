@@ -47,11 +47,11 @@ REQUIRED_FILES = (
 RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
     {
         "inbound_receiver": ServiceResourceLimits("64M", Decimal("0.10"), 32),
-        "capability_broker": ServiceResourceLimits("192M", Decimal("0.35"), 64),
-        "orchestration_agent": ServiceResourceLimits("256M", Decimal("0.45"), 64),
+        "capability_broker": ServiceResourceLimits("144M", Decimal("0.25"), 32),
+        "orchestration_agent": ServiceResourceLimits("224M", Decimal("0.42"), 112),
         "audit_service": ServiceResourceLimits("64M", Decimal("0.10"), 32),
-        "google_connector": ServiceResourceLimits("96M", Decimal("0.15"), 48),
-        "knowledge_vault_connector": ServiceResourceLimits("128M", Decimal("0.20"), 64),
+        "google_connector": ServiceResourceLimits("64M", Decimal("0.12"), 48),
+        "knowledge_vault_connector": ServiceResourceLimits("96M", Decimal("0.17"), 48),
         "openwa_outbound_connector": ServiceResourceLimits("64M", Decimal("0.10"), 32),
         "worker_gateway": ServiceResourceLimits("96M", Decimal("0.25"), 64),
         "public_oauth_callback": ServiceResourceLimits("48M", Decimal("0.10"), 32),
@@ -380,6 +380,22 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
             value = deployment.get(key)
             if not isinstance(value, str) or not value.strip():
                 errors.append(f"deployment value {key} must be non-empty")
+        callback = deployment.get("oauth_callback_url")
+        try:
+            parsed_callback = urlsplit(str(callback))
+        except ValueError:
+            parsed_callback = None
+        if (
+            parsed_callback is None
+            or parsed_callback.scheme != "https"
+            or parsed_callback.hostname is None
+            or parsed_callback.username is not None
+            or parsed_callback.password is not None
+            or parsed_callback.path != "/callback"
+            or parsed_callback.query
+            or parsed_callback.fragment
+        ):
+            errors.append("oauth_callback_url must be a registered HTTPS /callback URL")
         note_directories = deployment.get("vault_note_directories")
         try:
             canonical_allowed_note_directories(note_directories)  # type: ignore[arg-type]
@@ -455,8 +471,15 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
         "terminal_seconds": 120,
         "active_request_seconds": 480,
     }
-    if timeouts != expected_timeouts:
-        errors.append("timeouts do not match the conservative V1 defaults")
+    if not isinstance(timeouts, Mapping) or set(timeouts) != set(expected_timeouts):
+        errors.append("timeouts must define every conservative V1 bound")
+    elif any(
+        isinstance(timeouts[key], bool)
+        or not isinstance(timeouts[key], int)
+        or not 0 < timeouts[key] <= maximum
+        for key, maximum in expected_timeouts.items()
+    ):
+        errors.append("timeouts must be positive and no greater than V1 maxima")
 
     retention = config.get("retention")
     expected_retention = {
@@ -480,16 +503,37 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
     if not isinstance(bounds, Mapping):
         errors.append("resource_bounds must be an object")
     else:
-        expected = {
-            "aggregate_memory_mib_max": 1280,
-            "aggregate_cpu_cores_max": 2.0,
+        expected_keys = {
+            "aggregate_memory_mib_max",
+            "aggregate_cpu_cores_max",
+            "aggregate_pids",
+            "minimum_free_disk_gib",
+            "terminal_stdout_bytes",
+            "terminal_stderr_bytes",
+        }
+        fixed = {
             "aggregate_pids": 512,
             "minimum_free_disk_gib": 2,
             "terminal_stdout_bytes": 1_048_576,
             "terminal_stderr_bytes": 1_048_576,
         }
-        if bounds != expected:
-            errors.append("resource_bounds do not match the reviewed V1 limits")
+        memory = bounds.get("aggregate_memory_mib_max")
+        cpu = bounds.get("aggregate_cpu_cores_max")
+        if set(bounds) != expected_keys or any(
+            bounds.get(key) != value for key, value in fixed.items()
+        ):
+            errors.append("resource_bounds do not match the fixed V1 limits")
+        if (
+            isinstance(memory, bool)
+            or not isinstance(memory, int)
+            or not 0 < memory <= 1280
+            or isinstance(cpu, bool)
+            or not isinstance(cpu, (int, float))
+            or not 0 < cpu <= 2.0
+        ):
+            errors.append(
+                "aggregate resource bounds must be positive and no greater than V1 maxima"
+            )
 
 
 def validate_configuration(config: Mapping[str, Any]) -> None:

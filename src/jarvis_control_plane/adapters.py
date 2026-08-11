@@ -269,7 +269,7 @@ class DeterministicIdGenerator:
         return f"{self.prefix}-{namespace}-{next_value:04d}"
 
 
-def _locked_sqlite_state(method: Callable[..., Any]) -> Callable[..., Any]:
+def _locked_durable_state(method: Callable[..., Any]) -> Callable[..., Any]:
     """Serialize one durable-state transaction on its shared state boundary."""
 
     @wraps(method)
@@ -278,6 +278,9 @@ def _locked_sqlite_state(method: Callable[..., Any]) -> Callable[..., Any]:
             return method(self, *args, **kwargs)
 
     return locked
+
+
+_locked_sqlite_state = _locked_durable_state
 
 
 class InMemoryDurableStateStore:
@@ -305,26 +308,26 @@ class InMemoryDurableStateStore:
         self.fail_update = False
         self._lock = threading.RLock()
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None:
         with self._lock:
             return self._recovery_degraded_marker
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None:
         marker = RecoveryDegradedMarker(reason=reason, marked_at=marked_at)
         with self._lock:
             if self._recovery_degraded_marker is None:
                 self._recovery_degraded_marker = marker
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def acknowledge_recovery_degraded(self) -> None:
         """Clear the marker only when called by an explicit admin flow."""
 
         with self._lock:
             self._recovery_degraded_marker = None
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def admit_ingress(
         self,
         *,
@@ -395,7 +398,7 @@ class InMemoryDurableStateStore:
                 disposition=disposition,
             )
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def claim_ingress(
         self,
         *,
@@ -434,7 +437,7 @@ class InMemoryDurableStateStore:
             )
             return True
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def update_ingress_disposition(
         self,
         *,
@@ -459,7 +462,7 @@ class InMemoryDurableStateStore:
                 disposition=disposition,
             )
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def begin_next_ingress_dispatch(self) -> ConversationMessage | None:
         with self._lock:
             pending = sorted(
@@ -483,7 +486,7 @@ class InMemoryDurableStateStore:
                 return message
             return None
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def begin_ingress_dispatch(
         self, *, transport_session_id: str, message_id: str
     ) -> bool:
@@ -499,7 +502,7 @@ class InMemoryDurableStateStore:
             self.claims[key] = replace(claim, disposition="dispatching")
             return True
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def finish_ingress_dispatch(
         self,
         *,
@@ -516,7 +519,7 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("ingress dispatch is not active")
             self.claims[key] = replace(claim, disposition=disposition)
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def reconcile_ingress_restart(
         self,
         *,
@@ -1077,14 +1080,14 @@ class InMemoryDurableStateStore:
             self.memories[memory_id] = forgotten
             return forgotten
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
             if self.fail_claim:
                 raise StateStoreError("controlled ingress claim failure")
             return (session_id, message_id) in self.claims
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
             key = (session_id, message_id)
@@ -1092,7 +1095,7 @@ class InMemoryDurableStateStore:
             self.conversation_messages.pop(key, None)
             return released
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def save_request(self, request: RequestState) -> None:
         with self._lock:
             if self.fail_save:
@@ -1101,7 +1104,7 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("request identifier already exists")
             self.requests[request.request_id] = request
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def update_request(self, request: RequestState) -> None:
         with self._lock:
             if self.fail_update:
@@ -1110,32 +1113,32 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("request identifier does not exist")
             self.requests[request.request_id] = request
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def delete_request(self, request_id: str) -> bool:
         with self._lock:
             return self.requests.pop(request_id, None) is not None
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def get_request(self, request_id: str) -> RequestState | None:
         with self._lock:
             return self.requests.get(request_id)
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def list_requests(self) -> tuple[RequestState, ...]:
         with self._lock:
             return tuple(self.requests.values())
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def list_ingress_claims(self) -> tuple[IngressClaim, ...]:
         with self._lock:
             return tuple(self.claims.values())
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def load_knowledge_vault_synchronized_at(self) -> datetime | None:
         with self._lock:
             return self._knowledge_vault_synchronized_at
 
-    @_locked_sqlite_state
+    @_locked_durable_state
     def save_knowledge_vault_synchronized_at(self, synchronized_at: datetime) -> None:
         with self._lock:
             self._knowledge_vault_synchronized_at = ensure_utc(synchronized_at)

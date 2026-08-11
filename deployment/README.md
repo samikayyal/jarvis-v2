@@ -15,6 +15,11 @@ docker compose --file deployment/compose.yaml config --quiet
 The second command parses Compose only. Do not pass `--profile
 manual-activation` or run `up` during isolated verification.
 
+The broker plus isolated deleted archive and each credentialed connector plus
+its uncredentialed egress sidecar share the corresponding fixed V1 component
+budget. The complete Compose project therefore retains the specified aggregate
+limits of 1,008 MiB RAM, 1.80 CPU cores, and 512 PIDs.
+
 The image entry point is the role-specific runtime, not the offline verifier.
 Each Compose service selects exactly one composition root and exposes only its
 closed operation set. Owned-service calls use bounded JSON frames authenticated

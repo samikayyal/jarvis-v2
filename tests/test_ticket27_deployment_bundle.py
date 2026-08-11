@@ -88,8 +88,8 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "vault_egress_proxy",
         "worker_gateway",
     )
-    assert report.aggregate_memory_mib == 1152
-    assert report.aggregate_cpus == pytest.approx(1.99)
+    assert report.aggregate_memory_mib == 1008
+    assert report.aggregate_cpus == pytest.approx(1.80)
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
     assert report.host_mutations == ()
@@ -592,6 +592,26 @@ def test_configuration_rejects_noncanonical_vault_note_directories(
 
     assert (
         "vault_note_directories must contain canonical unique paths"
+        in raised.value.errors
+    )
+
+
+def test_configuration_allows_lower_bounds_and_requires_https_callback() -> None:
+    config = tomllib.loads(
+        (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
+    )
+    config["timeouts"]["model_turn_seconds"] = 60
+    config["resource_bounds"]["aggregate_memory_mib_max"] = 1024
+    config["resource_bounds"]["aggregate_cpu_cores_max"] = 1.5
+
+    validate_configuration(config)
+
+    config["deployment"]["oauth_callback_url"] = "http://oauth.example.invalid/callback"
+    with pytest.raises(BundleValidationError) as raised:
+        validate_configuration(config)
+
+    assert (
+        "oauth_callback_url must be a registered HTTPS /callback URL"
         in raised.value.errors
     )
 

@@ -69,10 +69,10 @@ services:
       - broker_vault
       - broker_openwa_outbound
       - broker_worker
-    pids_limit: 64
+    pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 192M, cpus: "0.35"}
+        limits: {memory: 144M, cpus: "0.25"}
 
   orchestration_agent:
     <<: *service-defaults
@@ -92,10 +92,10 @@ services:
       - /var/lib/jarvis/codex-traces:/var/lib/jarvis/codex-traces
       - /srv/jarvis-workspace:/srv/jarvis-workspace:ro
     networks: [broker_orchestration, broker_google, broker_vault, orchestration_egress]
-    pids_limit: 64
+    pids_limit: 112
     deploy:
       resources:
-        limits: {memory: 256M, cpus: "0.45"}
+        limits: {memory: 224M, cpus: "0.42"}
 
   audit_service:
     <<: *service-defaults
@@ -135,7 +135,7 @@ services:
     pids_limit: 48
     deploy:
       resources:
-        limits: {memory: 96M, cpus: "0.15"}
+        limits: {memory: 64M, cpus: "0.12"}
 
   knowledge_vault_connector:
     <<: *service-defaults
@@ -150,10 +150,10 @@ services:
       - /etc/jarvis/protocol/orchestration_agent--knowledge_vault_connector.key:/run/protocol/orchestration_agent--knowledge_vault_connector.key:ro
       - /var/lib/jarvis/vault:/var/lib/jarvis/vault
     networks: [broker_vault, vault_egress]
-    pids_limit: 64
+    pids_limit: 48
     deploy:
       resources:
-        limits: {memory: 128M, cpus: "0.20"}
+        limits: {memory: 96M, cpus: "0.17"}
 
   openwa_outbound_connector:
     <<: *service-defaults
