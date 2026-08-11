@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event, Thread
 from time import monotonic
 from types import SimpleNamespace
+from typing import Self
 
 import pytest
 import yaml
@@ -21,7 +22,8 @@ from jarvis_control_plane.deployment import (
     verify_bundle,
 )
 from jarvis_control_plane.models import SignedInboundEvent
-from jarvis_control_plane.ports import TraceCapacityError
+from jarvis_control_plane.openwa import OpenWAReadiness
+from jarvis_control_plane.ports import TraceCapacityError, WorkerReadiness
 from jarvis_control_plane.service_runtime import (
     SERVICE_ROLES,
     CompositionError,
@@ -32,6 +34,7 @@ from jarvis_control_plane.service_runtime import (
     _orchestration_operations,
     _service_access,
     _verified_inbound_event,
+    administrative_status,
 )
 from jarvis_control_plane.sessions import SQLiteWorkingSessionStore
 from jarvis_control_plane.traces import SQLiteDiagnosticTraceStore
@@ -601,8 +604,6 @@ def test_configuration_allows_lower_bounds_and_requires_https_callback() -> None
         (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
     )
     config["timeouts"]["model_turn_seconds"] = 60
-    config["resource_bounds"]["aggregate_memory_mib_max"] = 1024
-    config["resource_bounds"]["aggregate_cpu_cores_max"] = 1.5
 
     validate_configuration(config)
 
@@ -614,6 +615,70 @@ def test_configuration_allows_lower_bounds_and_requires_https_callback() -> None
         "oauth_callback_url must be a registered HTTPS /callback URL"
         in raised.value.errors
     )
+
+
+def test_administrative_status_reports_safe_operational_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tomllib.loads(
+        (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
+    )
+
+    class Client:
+        def __init__(self, role: str) -> None:
+            self.role = role
+
+        def call(self, operation: str) -> object:
+            assert operation == "current"
+            if self.role == "openwa_outbound_connector":
+                return OpenWAReadiness(True, "ready")
+            return WorkerReadiness(ubuntu="ready", windows="unavailable")
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            return b"ok"
+
+    monkeypatch.setattr(
+        "jarvis_control_plane.service_runtime._client",
+        lambda _config, *, client_identity, server_role: Client(server_role),
+    )
+    monkeypatch.setattr(
+        "jarvis_control_plane.service_runtime.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    monkeypatch.setattr(
+        "jarvis_control_plane.service_runtime.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=3 * 1024**3),
+    )
+
+    status = administrative_status(
+        config,
+        artifact_lock_path=SHIPPED_BUNDLE / "artifacts.lock.json",
+    )
+
+    assert set(status) == {
+        "components",
+        "messaging_ready",
+        "audit_writable",
+        "backup_freshness",
+        "hosts",
+        "release",
+        "resource_pressure",
+    }
+    assert set(status["components"].values()) == {"ready"}
+    assert status["messaging_ready"] is True
+    assert status["hosts"] == {"ubuntu": "ready", "windows": "unavailable"}
+    assert status["audit_writable"] is True
+    assert status["backup_freshness"] == "not-configured"
+    assert status["resource_pressure"] == "ok"
 
 
 def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:

@@ -503,37 +503,16 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
     if not isinstance(bounds, Mapping):
         errors.append("resource_bounds must be an object")
     else:
-        expected_keys = {
-            "aggregate_memory_mib_max",
-            "aggregate_cpu_cores_max",
-            "aggregate_pids",
-            "minimum_free_disk_gib",
-            "terminal_stdout_bytes",
-            "terminal_stderr_bytes",
-        }
-        fixed = {
+        expected = {
+            "aggregate_memory_mib_max": 1280,
+            "aggregate_cpu_cores_max": 2.0,
             "aggregate_pids": 512,
             "minimum_free_disk_gib": 2,
             "terminal_stdout_bytes": 1_048_576,
             "terminal_stderr_bytes": 1_048_576,
         }
-        memory = bounds.get("aggregate_memory_mib_max")
-        cpu = bounds.get("aggregate_cpu_cores_max")
-        if set(bounds) != expected_keys or any(
-            bounds.get(key) != value for key, value in fixed.items()
-        ):
+        if bounds != expected:
             errors.append("resource_bounds do not match the fixed V1 limits")
-        if (
-            isinstance(memory, bool)
-            or not isinstance(memory, int)
-            or not 0 < memory <= 1280
-            or isinstance(cpu, bool)
-            or not isinstance(cpu, (int, float))
-            or not 0 < cpu <= 2.0
-        ):
-            errors.append(
-                "aggregate resource bounds must be positive and no greater than V1 maxima"
-            )
 
 
 def validate_configuration(config: Mapping[str, Any]) -> None:
@@ -828,6 +807,7 @@ def _validate_compose(
             "broker_vault",
             "broker_openwa_outbound",
             "broker_worker",
+            "oauth_google",
         },
         "orchestration_agent": {
             "broker_orchestration",

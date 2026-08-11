@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import stat
 import tomllib
@@ -1310,6 +1311,79 @@ def health() -> None:
         raise CompositionError("service is not healthy") from exc
 
 
+def administrative_status(
+    config: Mapping[str, Any],
+    *,
+    artifact_lock_path: Path = Path("/opt/jarvis/deployment/artifacts.lock.json"),
+) -> dict[str, object]:
+    """Return the local administrator's bounded, content-free status view."""
+
+    primary_roles = tuple(
+        name for name in SERVICE_ROLES if name != "deleted_conversation_archive"
+    )
+    components: dict[str, str] = {}
+    for name in primary_roles:
+        role = SERVICE_ROLES[name]
+        try:
+            with urlopen(f"http://{name}:{role.port}/health", timeout=2) as response:
+                ready = response.status == 200 and response.read(3) == b"ok"
+        except (OSError, URLError):
+            ready = False
+        components[name] = "ready" if ready else "unavailable"
+
+    try:
+        messaging = _client(
+            config,
+            client_identity="jarvis-broker",
+            server_role="openwa_outbound_connector",
+        ).call("current")
+        messaging_ready = bool(getattr(messaging, "messaging_ready", False))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        messaging_ready = False
+    try:
+        workers = _client(
+            config,
+            client_identity="jarvis-broker",
+            server_role="worker_gateway",
+        ).call("current")
+        hosts = {
+            "ubuntu": getattr(workers, "ubuntu", "unavailable"),
+            "windows": getattr(workers, "windows", "unavailable"),
+        }
+    except (OSError, RuntimeError, TypeError, ValueError):
+        hosts = {"ubuntu": "unavailable", "windows": "unavailable"}
+
+    paths = config.get("paths")
+    bounds = config.get("resource_bounds")
+    try:
+        free = shutil.disk_usage(str(paths["state"])).free  # type: ignore[index]
+        minimum = int(bounds["minimum_free_disk_gib"]) * 1024**3  # type: ignore[index]
+        resource_pressure = "ok" if free >= minimum else "degraded"
+    except (KeyError, OSError, TypeError, ValueError):
+        resource_pressure = "unknown"
+
+    try:
+        lock = json.loads(artifact_lock_path.read_text(encoding="utf-8"))
+        application = lock["application"]
+        release = {
+            "id": config.get("release_id"),
+            "version": application["version"],
+            "revision": application["git_revision"],
+        }
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        release = {"id": config.get("release_id"), "version": None, "revision": None}
+
+    return {
+        "components": components,
+        "messaging_ready": messaging_ready,
+        "audit_writable": components.get("audit_service") == "ready",
+        "backup_freshness": "not-configured",
+        "hosts": hosts,
+        "release": release,
+        "resource_pressure": resource_pressure,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -1354,6 +1428,15 @@ def _parser() -> argparse.ArgumentParser:
         audit_parser.add_argument(
             "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
         )
+    status_parser = subcommands.add_parser("admin-status")
+    status_parser.add_argument(
+        "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
+    )
+    status_parser.add_argument(
+        "--artifact-lock",
+        type=Path,
+        default=Path("/opt/jarvis/deployment/artifacts.lock.json"),
+    )
     return parser
 
 
@@ -1438,6 +1521,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             client.call("disconnect")
             print("Google connection disconnected.")
+    elif arguments.command == "admin-status":
+        if os.environ.get("JARVIS_SERVICE_IDENTITY") != "jarvis-broker":
+            raise CompositionError("administrative status requires the broker identity")
+        configuration = _load_configuration(arguments.configuration)
+        print(
+            json.dumps(
+                administrative_status(
+                    configuration, artifact_lock_path=arguments.artifact_lock
+                ),
+                sort_keys=True,
+            )
+        )
     else:
         serve(
             arguments.role,

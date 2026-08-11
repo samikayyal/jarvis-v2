@@ -4,7 +4,7 @@
     "name": "jarvis-v2",
     "version": "0.1.0",
     "git_revision": "9529147822b1b794a04ba56a7fc92db060ed969a",
-    "source_sha256": "38ee45fb4f56cee4917472f6db6246ae14a795660ada1f14f0607f9006ed482b"
+    "source_sha256": "58c871d7e0a7d6a9a8f5d6eda9a5fd8549653cc5e49791d7007d42e79c79b343"
   },
   "python_base_image": {
     "reference": "python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f"

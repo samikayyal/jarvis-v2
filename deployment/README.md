@@ -129,6 +129,13 @@ administrator can run `audit-view` or `audit-export` as a one-off
 `audit_service` command and capture stdout; neither command is available through
 the broker protocol.
 
+For a content-free aggregate view after activation, a local administrator can
+run `docker compose --file deployment/compose.yaml run --rm capability_broker
+admin-status`. It reports component and messaging readiness, audit writability,
+backup freshness, execution-host availability, release identity, and resource
+pressure without credentials or personal identifiers. Backup freshness remains
+`not-configured` until Ticket 28 is completed.
+
 Orchestration, Google, and vault services have no direct Internet-routed
 network. Each reaches only its dedicated CONNECT proxy on a private segment;
 only the three uncredentialed proxies join `external_egress`, and each proxy
