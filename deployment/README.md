@@ -134,8 +134,8 @@ run `uv run python -m jarvis_control_plane.deployment deployment
 --administrative-status`. The host-side command reads Compose health locally and
 uses a one-off broker-identity process only for authenticated messaging, audit,
 and worker readiness. It reports no credentials or personal identifiers. Backup
-freshness remains `not-configured` until the activated host wires its backup
-schedule into administrative status.
+freshness is calculated on the host as `missing`, `current`, `stale`, or `invalid`
+from the local snapshot manifests without exposing backup contents.
 
 ## Administrative backup and isolated restore
 

@@ -49,6 +49,7 @@ PROTECTED_ADMIN_ROOTS = tuple(DEFAULT_ROOTS.values()) + (
     Path("/etc/jarvis"),
     Path("/run/credentials"),
     Path("/run/protocol"),
+    Path("/run/jarvis/deleted-archive-ipc"),
 )
 
 
