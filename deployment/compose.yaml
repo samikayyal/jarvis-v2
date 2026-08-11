@@ -12,7 +12,7 @@ x-service-defaults: &service-defaults
   init: true
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
-  healthcheck:
+  healthcheck: &healthcheck
     test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, health]
     interval: 30s
     timeout: 5s
@@ -232,6 +232,7 @@ services:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
     networks: [orchestration_egress, external_egress]
     healthcheck:
+      <<: *healthcheck
       test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
     pids_limit: 16
     deploy:
@@ -248,6 +249,7 @@ services:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
     networks: [google_egress, external_egress]
     healthcheck:
+      <<: *healthcheck
       test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
     pids_limit: 16
     deploy:
@@ -264,6 +266,7 @@ services:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
     networks: [vault_egress, external_egress]
     healthcheck:
+      <<: *healthcheck
       test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
     pids_limit: 16
     deploy:

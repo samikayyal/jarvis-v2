@@ -586,6 +586,9 @@ def _validate_artifacts(
             "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
             "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
         ),
+        "package_lock_sha256": (
+            "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
+        ),
     }:
         errors.append("Codex CLI artifact differs from the reviewed pin")
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
@@ -626,6 +629,15 @@ def _validate_artifacts(
         ),
     }:
         errors.append("Codex npm lock does not match the reviewed artifact")
+    codex_artifact = lock.get("codex_cli")
+    if (
+        codex_artifact.get("package_lock_sha256")
+        if isinstance(codex_artifact, Mapping)
+        else None
+    ) != hashlib.sha256(
+        (root / "codex/package-lock.json").read_bytes().replace(b"\r\n", b"\n")
+    ).hexdigest():
+        errors.append("Codex npm lock digest differs from artifact lock")
     if "RUN npm ci --omit=dev --ignore-scripts" not in dockerfile:
         errors.append("Dockerfile must install Codex from the npm lock")
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
@@ -766,8 +778,27 @@ def _validate_compose(
             or environment.get("JARVIS_SERVICE_IDENTITY") != expected_identity
         ):
             errors.append(f"compose identity mismatch for {service}")
-        if "healthcheck" not in raw:
+        healthcheck = raw.get("healthcheck")
+        expected_healthcheck = {
+            "test": [
+                "CMD",
+                "uv",
+                "run",
+                "--no-project",
+                "python",
+                "-m",
+                "jarvis_control_plane.service_runtime",
+                "proxy-health" if service.endswith("_egress_proxy") else "health",
+            ],
+            "interval": "30s",
+            "timeout": "5s",
+            "retries": 3,
+            "start_period": "10s",
+        }
+        if healthcheck is None:
             errors.append(f"{service} must define a healthcheck")
+        elif healthcheck != expected_healthcheck:
+            errors.append(f"{service} healthcheck differs from the reviewed probe")
         logging = raw.get("logging")
         options = logging.get("options", {}) if isinstance(logging, Mapping) else {}
         if not (
@@ -941,6 +972,31 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
     }
     if actual_state != ALLOWED_STATE_MOUNTS[service]:
         errors.append(f"{service} state mounts differ from the reviewed boundary")
+    reviewed = {"/etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro"}
+    reviewed.update(
+        f"/etc/jarvis/credentials/{target.rsplit('/', 1)[-1]}:{target}"
+        + ("" if target == "/run/credentials/google" else ":ro")
+        for target in ALLOWED_CREDENTIAL_MOUNTS[service]
+    )
+    reviewed.update(
+        f"/etc/jarvis/protocol/{target.rsplit('/', 1)[-1]}:{target}:ro"
+        for target in ALLOWED_PROTOCOL_MOUNTS[service]
+    )
+    reviewed.update(
+        (
+            f"/run/jarvis/deleted-archive-ipc:{target}"
+            if target == "/run/jarvis-deleted"
+            else f"{target}:{target}"
+        )
+        for target in ALLOWED_STATE_MOUNTS[service]
+    )
+    if service == "worker_gateway":
+        reviewed.add("/run/jarvis-worker/ubuntu.sock:/run/jarvis-worker/ubuntu.sock:ro")
+    if service == "orchestration_agent":
+        reviewed.add("/srv/jarvis-workspace:/srv/jarvis-workspace:ro")
+    actual = {volume for volume in volumes if isinstance(volume, str)}
+    if actual != reviewed or len(actual) != len(volumes):
+        errors.append(f"{service} volumes differ from the reviewed boundary")
 
 
 def _validate_service_resources(

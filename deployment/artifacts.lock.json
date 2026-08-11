@@ -18,7 +18,8 @@
   "codex_cli": {
     "package": "@openai/codex",
     "version": "0.147.0",
-    "integrity": "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
+    "integrity": "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w==",
+    "package_lock_sha256": "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
   },
   "os_packages": {
     "git": "1:2.39.5-0+deb12u3",

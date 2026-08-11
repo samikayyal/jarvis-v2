@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import stat
 import tomllib
 from io import BytesIO
 from pathlib import Path
@@ -153,6 +154,9 @@ def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
         "integrity": (
             "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
             "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
+        ),
+        "package_lock_sha256": (
+            "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
         ),
     }
     config = (SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8")
@@ -572,6 +576,36 @@ def test_protocol_keys_require_root_ownership_on_posix(
         _read_secret(path)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("mode", "uid"),
+    [
+        (stat.S_IFREG | 0o640, 10008),
+        (stat.S_IFREG | 0o600, 10009),
+        (stat.S_IFLNK | 0o600, 10008),
+    ],
+)
+def test_worker_private_key_requires_service_ownership_and_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: int, uid: int
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    path = SimpleNamespace(
+        lstat=lambda: SimpleNamespace(st_mode=mode, st_uid=uid),
+    )
+    monkeypatch.setattr(runtime.os, "name", "posix")
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: 10008, raising=False)
+
+    with pytest.raises(CompositionError, match="private key"):
+        runtime._private_key_path(path)
+
+
+def test_worker_runtime_requires_the_reviewed_overlay_port() -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    with pytest.raises(CompositionError, match="9443"):
+        runtime._reviewed_windows_overlay_port(9444)
+
+
 def test_broker_state_uses_only_the_write_only_deleted_archive_client(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -958,6 +992,19 @@ def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:
     )
 
 
+def test_bundle_binds_the_complete_codex_npm_lock(tmp_path: Path) -> None:
+    bundle = _copy_bundle(tmp_path)
+    lock_path = bundle / "codex/package-lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["packages"]["node_modules/@openai/codex-linux-x64"]["integrity"] = "changed"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    assert "Codex npm lock digest differs from artifact lock" in raised.value.errors
+
+
 def test_bundle_rejects_security_network_and_resource_regressions(
     tmp_path: Path,
 ) -> None:
@@ -1109,6 +1156,42 @@ def test_bundle_rejects_credential_mount_leak_and_missing_health_logging(
     assert "capability_broker must define a healthcheck" in raised.value.errors
     assert (
         "capability_broker must define bounded rotated logging" in raised.value.errors
+    )
+
+
+def test_bundle_rejects_unreviewed_volume_tuple(tmp_path: Path) -> None:
+    bundle = _copy_bundle(tmp_path)
+    compose_path = bundle / "compose.yaml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    compose["services"]["orchestration_agent"]["volumes"].append(
+        "./payload:/opt/jarvis/src"
+    )
+    compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    assert (
+        "orchestration_agent volumes differ from the reviewed boundary"
+        in raised.value.errors
+    )
+
+
+def test_bundle_rejects_modified_healthcheck(tmp_path: Path) -> None:
+    bundle = _copy_bundle(tmp_path)
+    compose_path = bundle / "compose.yaml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    compose["services"]["capability_broker"]["healthcheck"]["test"] = [
+        "CMD",
+        "true",
+    ]
+    compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    assert "capability_broker healthcheck differs from the reviewed probe" in (
+        raised.value.errors
     )
 
 

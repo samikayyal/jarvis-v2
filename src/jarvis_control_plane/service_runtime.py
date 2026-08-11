@@ -268,6 +268,27 @@ def _credential_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _private_key_path(path: Path) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise CompositionError("worker gateway private key is unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or (
+        os.name == "posix"
+        and (stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid())
+    ):
+        raise CompositionError(
+            "worker gateway private key ownership or mode is invalid"
+        )
+    return path
+
+
+def _reviewed_windows_overlay_port(value: object) -> int:
+    if value != 9443:
+        raise CompositionError("windows_overlay_bind_port must be 9443")
+    return 9443
+
+
 def _require_text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise CompositionError(f"{name} must be a non-empty canonical string")
@@ -1018,13 +1039,15 @@ def _worker_operations(
                 credentials.get("windows_overlay_bind_host"),
                 "windows_overlay_bind_host",
             ),
-            bind_port=int(credentials.get("windows_overlay_bind_port")),
+            bind_port=_reviewed_windows_overlay_port(
+                credentials.get("windows_overlay_bind_port")
+            ),
             ca_file=Path("/run/credentials/windows-worker/worker-ca.pem"),
             certificate_file=Path(
                 "/run/credentials/windows-worker/gateway-certificate.pem"
             ),
-            private_key_file=Path(
-                "/run/credentials/windows-worker/gateway-private-key.pem"
+            private_key_file=_private_key_path(
+                Path("/run/credentials/windows-worker/gateway-private-key.pem")
             ),
         ),
         registration=registration,

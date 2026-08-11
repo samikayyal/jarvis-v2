@@ -126,7 +126,9 @@ class SocketWindowsWorkerSession:
         payload = self._call(
             "execute",
             {"invocation": _encode(invocation)},
-            timeout_seconds=invocation.deadline_seconds,
+            timeout_seconds=(
+                invocation.deadline_seconds + invocation.cancellation_grace_seconds
+            ),
         )
         if not isinstance(payload, dict):
             raise ActionDispatcherError("Windows worker execution response is invalid")
