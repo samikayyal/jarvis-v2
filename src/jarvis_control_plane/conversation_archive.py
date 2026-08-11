@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import stat
 import tempfile
@@ -21,7 +22,7 @@ from datetime import UTC, datetime
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
-from threading import RLock, Thread
+from threading import RLock, Thread, current_thread, main_thread
 from time import monotonic
 from typing import Any, NoReturn
 
@@ -46,6 +47,12 @@ _ARCHIVE_MESSAGE_FIELDS = frozenset(
         "working_session_id",
     }
 )
+
+
+def _terminate_archive_service(_signum: int, _frame: object) -> NoReturn:
+    raise SystemExit
+
+
 _ARCHIVE_REQUEST_FIELDS = frozenset(
     {"operation", "messages", "deletion_id", "deleted_at"}
 )
@@ -1499,6 +1506,11 @@ def serve_sqlite_deleted_conversation_archive(
     """
 
     listener = _create_archive_listener(endpoint, authkey)
+    previous_sigterm = (
+        signal.signal(signal.SIGTERM, _terminate_archive_service)
+        if current_thread() is main_thread()
+        else None
+    )
     try:
         while True:
             connection = listener.accept()
@@ -1510,6 +1522,8 @@ def serve_sqlite_deleted_conversation_archive(
     finally:
         listener.close()
         _remove_archive_endpoint(endpoint)
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _archive_service_process_main(

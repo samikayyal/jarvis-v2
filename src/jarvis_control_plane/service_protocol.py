@@ -794,7 +794,7 @@ class RemoteActionDispatcher(ActionDispatcher, BoundActionLifecycle, ActionFinal
             return action
         try:
             result = self._client.call("action_bind", action)
-        except RemoteServiceError as exc:
+        except ServiceProtocolError as exc:
             raise ActionDispatcherError(str(exc)) from exc
         if not isinstance(result, models.FrozenActionProposal):
             raise ActionDispatcherError("action owner returned an invalid binding")
@@ -805,7 +805,7 @@ class RemoteActionDispatcher(ActionDispatcher, BoundActionLifecycle, ActionFinal
             return
         try:
             self._client.call("action_validate", action)
-        except RemoteServiceError as exc:
+        except ServiceProtocolError as exc:
             raise ActionDispatcherError(str(exc)) from exc
 
 

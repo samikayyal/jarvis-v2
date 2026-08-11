@@ -242,6 +242,32 @@ def test_agents_adapter_cancels_the_async_model_turn_at_its_deadline() -> None:
     assert cancelled.is_set()
 
 
+def test_agents_adapter_bounds_cancellation_quiescence_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jarvis_control_plane import orchestration
+
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        try:
+            await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.02)
+            raise
+
+    monkeypatch.setattr(orchestration, "_MODEL_CANCELLATION_GRACE_SECONDS", 0.01)
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="establish quiescence"):
+        adapter.run(_request("delay cancellation"))
+
+
 def test_agents_adapter_cancels_an_active_async_model_turn_and_waits_for_quiescence() -> (
     None
 ):
@@ -410,7 +436,7 @@ def test_model_failure_and_malformed_output_are_adapter_errors() -> None:
         malformed.run(_request("read the repository"))
 
 
-def test_calendar_insert_is_frozen_as_an_exact_typed_proposal() -> None:
+def test_calendar_insert_gets_an_internal_generation_placeholder() -> None:
     complete_event = {
         "summary": "Design review",
         "start": {"dateTime": "2026-08-10T10:00:00Z"},
@@ -432,7 +458,6 @@ def test_calendar_insert_is_frozen_as_an_exact_typed_proposal() -> None:
                         "calendar_id": "primary",
                         "complete_event": complete_event,
                         "notification": "all",
-                        "connection_generation": 3,
                     },
                 ),
             )
@@ -447,7 +472,7 @@ def test_calendar_insert_is_frozen_as_an_exact_typed_proposal() -> None:
     assert result.proposal is not None
     assert result.proposal.kind == "calendar_insert"
     assert '"summary":"Design review"' in result.proposal.payload
-    assert '"connection_generation":3' in result.proposal.payload
+    assert '"connection_generation":0' in result.proposal.payload
 
 
 def test_model_proposed_authority_fields_fail_closed_before_freezing() -> None:

@@ -487,7 +487,14 @@ class AgentsSdkOrchestrationAdapter:
                 )
                 if task not in done:
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    done, _pending = await asyncio.wait(
+                        (task,), timeout=_MODEL_CANCELLATION_GRACE_SECONDS
+                    )
+                    if task not in done:
+                        task.cancel()
+                        raise OrchestrationAdapterError(
+                            "Agents SDK model turn did not establish quiescence"
+                        )
                     raise _ModelTurnDeadlineExceeded
                 return await task
             except asyncio.CancelledError as exc:
@@ -498,7 +505,8 @@ class AgentsSdkOrchestrationAdapter:
                 with self._cancellation_lock:
                     if self._active_model_turns.get(request_id) is active:
                         self._active_model_turns.pop(request_id, None)
-                active.quiesced.set()
+                if task.done():
+                    active.quiesced.set()
 
         try:
             return asyncio.run(run_bounded())
@@ -718,12 +726,21 @@ class AgentsSdkOrchestrationAdapter:
                     **payload,
                 )
             elif plan.proposal.kind == "calendar_insert":
+                if "connection_generation" in payload:
+                    raise OrchestrationAdapterError(
+                        "model proposed connector-owned Calendar state"
+                    )
                 candidate = CalendarWriteProposal.insert(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
+                    connection_generation=0,
                     **payload,
                 )
             elif plan.proposal.kind in {"calendar_update", "calendar_patch"}:
+                if "connection_generation" in payload:
+                    raise OrchestrationAdapterError(
+                        "model proposed connector-owned Calendar state"
+                    )
                 snapshot_payload = payload.get("snapshot")
                 if not isinstance(snapshot_payload, Mapping):
                     raise OrchestrationAdapterError(
@@ -745,6 +762,7 @@ class AgentsSdkOrchestrationAdapter:
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
                     snapshot=snapshot,
+                    connection_generation=0,
                     **calendar_payload,
                 )
             elif plan.proposal.kind == "knowledge_vault_write":

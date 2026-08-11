@@ -1328,6 +1328,52 @@ def test_sqlite_deleted_area_and_tombstones_survive_restart(tmp_path) -> None:
         reopened_service.close()
 
 
+def test_production_archive_service_cleans_endpoint_on_sigterm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    endpoint = tmp_path / "writer.sock"
+    calls: list[str] = []
+    installed_handler: list[object] = []
+
+    class Listener:
+        def accept(self) -> object:
+            handler = installed_handler[0]
+            assert callable(handler)
+            handler(conversation_archive.signal.SIGTERM, None)
+            raise AssertionError("SIGTERM handler must stop the service")
+
+        def close(self) -> None:
+            calls.append("closed")
+
+    def create_listener(_endpoint: object, _authkey: bytes) -> Listener:
+        endpoint.touch()
+        return Listener()
+
+    def install_handler(_signal: object, handler: object) -> object:
+        installed_handler.append(handler)
+        return conversation_archive.signal.SIG_DFL
+
+    def remove_endpoint(_endpoint: object) -> None:
+        endpoint.unlink(missing_ok=True)
+        calls.append("removed")
+
+    monkeypatch.setattr(
+        conversation_archive, "_create_archive_listener", create_listener
+    )
+    monkeypatch.setattr(
+        conversation_archive, "_remove_archive_endpoint", remove_endpoint
+    )
+    monkeypatch.setattr(conversation_archive.signal, "signal", install_handler)
+
+    with pytest.raises(SystemExit):
+        conversation_archive.serve_sqlite_deleted_conversation_archive(
+            tmp_path / "archive.sqlite3", endpoint, authkey=b"a" * 32
+        )
+
+    assert calls == ["closed", "removed"]
+    assert not endpoint.exists()
+
+
 def test_sqlite_deletion_adopts_archive_after_live_commit_failure(tmp_path) -> None:
     database = tmp_path / "jarvis.sqlite3"
     deleted_database = tmp_path / "admin-only" / "deleted.sqlite3"

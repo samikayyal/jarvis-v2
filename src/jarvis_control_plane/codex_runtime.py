@@ -84,7 +84,8 @@ class CodexCliAdapter:
         try:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise TimeoutError
+                self._stop(process)
+                raise TimeoutError("Codex CLI exceeded its frozen deadline")
             stdout, stderr = process.communicate(
                 self._prompt(envelope), timeout=remaining
             )

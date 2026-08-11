@@ -273,6 +273,59 @@ def test_deployed_codex_cli_preserves_only_the_reviewed_proxy_environment(
     assert "UNREVIEWED_SECRET" not in environment
 
 
+def test_deployed_codex_cli_stops_a_process_after_an_expired_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import jarvis_control_plane.codex_runtime as runtime
+
+    executable = tmp_path / "codex"
+    executable.write_text("pinned", encoding="utf-8")
+
+    class Process:
+        returncode: int | None = None
+        pid = 1
+        stopped = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.stopped = True
+
+        def wait(self, *, timeout: float) -> int:
+            self.returncode = -15
+            return self.returncode
+
+        def communicate(self, _prompt: str, *, timeout: float) -> tuple[str, str]:
+            raise AssertionError("expired work must not be sent to Codex")
+
+    process = Process()
+    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(runtime, "monotonic", lambda: 2.0)
+    adapter = CodexCliAdapter(executable=executable, api_key="api-key")
+
+    with pytest.raises(TimeoutError, match="frozen deadline"):
+        adapter.invoke(
+            CodexExecutionEnvelope(
+                request_id="expired-request",
+                task="Review the workspace.",
+                host="ubuntu",
+                cwd="/srv/jarvis-workspace",
+                model="gpt-5.6-terra",
+                reasoning="medium",
+                sandbox="read-only",
+                approval_policy="on-request",
+                timeout_seconds=300,
+                operation="review",
+                allowed_paths=(),
+                proposal_digest=None,
+            ),
+            deadline=1.0,
+        )
+
+    assert process.stopped is True
+
+
 def test_working_session_store_is_usable_from_service_handler_threads(
     tmp_path: Path,
 ) -> None:

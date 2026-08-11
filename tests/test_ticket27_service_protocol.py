@@ -34,6 +34,7 @@ from jarvis_control_plane.service_protocol import (
     RemoteAuditBoundary,
     RemoteOrchestrationAdapter,
     ServiceAuthenticationError,
+    ServiceProtocolError,
     _decode,
     _encode,
     find_available_port,
@@ -205,6 +206,17 @@ def test_remote_action_keeps_prepared_handle_inside_owner() -> None:
     # The public adapter itself is exercised through the same client interface in
     # broker tests; this assertion protects the intended production adapter type.
     assert RemoteActionDispatcher
+
+
+def test_remote_action_binding_translates_transport_failures() -> None:
+    class Client:
+        def call(self, _operation: str, _action: object) -> object:
+            raise ServiceProtocolError("connector unavailable")
+
+    dispatcher = RemoteActionDispatcher(Client(), bound=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ActionDispatcherError, match="connector unavailable"):
+        dispatcher.bind_proposal(object())  # type: ignore[arg-type]
 
 
 def test_protocol_round_trips_enums_and_valid_large_terminal_envelopes() -> None:
