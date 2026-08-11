@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from multiprocessing import Process
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Event, Thread
 from time import monotonic, sleep
 
 import pytest
@@ -25,12 +25,16 @@ from jarvis_control_plane.ports import (
     ActionDispatcherError,
 )
 from jarvis_control_plane.service_protocol import (
+    MAX_FRAME_BYTES,
+    MAX_REQUEST_FRAME_BYTES,
     AuthenticatedServiceClient,
     AuthenticatedServiceServer,
     OwnedActionService,
     RemoteActionDispatcher,
     RemoteAuditBoundary,
     ServiceAuthenticationError,
+    _decode,
+    _encode,
     find_available_port,
     wait_until_ready,
 )
@@ -194,6 +198,102 @@ def test_remote_action_keeps_prepared_handle_inside_owner() -> None:
     # The public adapter itself is exercised through the same client interface in
     # broker tests; this assertion protects the intended production adapter type.
     assert RemoteActionDispatcher
+
+
+def test_protocol_round_trips_enums_and_valid_large_terminal_envelopes() -> None:
+    assert _decode(_encode(ActionCancellationStatus.NOT_STARTED)) is (
+        ActionCancellationStatus.NOT_STARTED
+    )
+    assert MAX_REQUEST_FRAME_BYTES < MAX_FRAME_BYTES
+
+    port = find_available_port()
+    result = "x" * (2 * 1024 * 1024)
+    server = AuthenticatedServiceServer(
+        identity="jarvis-worker-gateway",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        operations={"result": lambda: result},
+    )
+    Thread(target=server.serve_forever, daemon=True).start()
+    wait_until_ready("127.0.0.1", port)
+    client = AuthenticatedServiceClient(
+        identity="jarvis-broker",
+        expected_server_identity="jarvis-worker-gateway",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+    )
+    try:
+        assert client.call("result") == result
+    finally:
+        server.shutdown()
+
+
+def test_service_controls_remain_responsive_during_an_active_request() -> None:
+    started = Event()
+    release = Event()
+
+    def slow() -> str:
+        started.set()
+        assert release.wait(timeout=5)
+        return "slow"
+
+    port = find_available_port()
+    server = AuthenticatedServiceServer(
+        identity="jarvis-broker",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        operations={"slow": slow, "status": lambda: "ready"},
+    )
+    Thread(target=server.serve_forever, daemon=True).start()
+    wait_until_ready("127.0.0.1", port)
+    client = AuthenticatedServiceClient(
+        identity="jarvis-broker",
+        expected_server_identity="jarvis-broker",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        operation_timeouts={"slow": 5},
+    )
+    slow_result: list[object] = []
+    slow_thread = Thread(target=lambda: slow_result.append(client.call("slow")))
+    slow_thread.start()
+    assert started.wait(timeout=2)
+    try:
+        assert client.call("status") == "ready"
+    finally:
+        release.set()
+        slow_thread.join(timeout=5)
+        server.shutdown()
+    assert slow_result == ["slow"]
+
+
+def test_operation_specific_timeout_overrides_short_transport_default() -> None:
+    port = find_available_port()
+    server = AuthenticatedServiceServer(
+        identity="jarvis-orchestration",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        operations={"run": lambda: (sleep(0.1), "done")[1]},
+    )
+    Thread(target=server.serve_forever, daemon=True).start()
+    wait_until_ready("127.0.0.1", port)
+    client = AuthenticatedServiceClient(
+        identity="jarvis-broker",
+        expected_server_identity="jarvis-orchestration",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        timeout_seconds=0.01,
+        operation_timeouts={"run": 1},
+    )
+    try:
+        assert client.call("run") == "done"
+    finally:
+        server.shutdown()
 
 
 def test_per_link_key_cannot_impersonate_a_more_privileged_client() -> None:

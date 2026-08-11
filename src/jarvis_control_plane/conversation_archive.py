@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from time import monotonic
 from typing import Any, NoReturn
 
@@ -1502,10 +1502,11 @@ def serve_sqlite_deleted_conversation_archive(
     try:
         while True:
             connection = listener.accept()
-            try:
-                _serve_archive_connection(connection, database)
-            finally:
-                connection.close()
+            Thread(
+                target=_serve_archive_connection,
+                args=(connection, database),
+                daemon=True,
+            ).start()
     finally:
         listener.close()
         _remove_archive_endpoint(endpoint)
@@ -1524,10 +1525,11 @@ def _archive_service_process_main(
         startup_connection.close()
         while True:
             connection = listener.accept()
-            try:
-                _serve_archive_connection(connection, database)
-            finally:
-                connection.close()
+            Thread(
+                target=_serve_archive_connection,
+                args=(connection, database),
+                daemon=True,
+            ).start()
     except Exception as exc:  # noqa: BLE001 - startup boundary reports typed errors
         try:
             _send_archive_response(startup_connection, ok=False, message=str(exc))

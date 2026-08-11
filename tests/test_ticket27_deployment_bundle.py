@@ -3,23 +3,31 @@
 from __future__ import annotations
 
 import shutil
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from jarvis_control_plane.deployment import BundleValidationError, verify_bundle
+from jarvis_control_plane.deployment import (
+    BundleValidationError,
+    validate_configuration,
+    verify_bundle,
+)
 from jarvis_control_plane.models import SignedInboundEvent
+from jarvis_control_plane.ports import TraceCapacityError
 from jarvis_control_plane.service_runtime import (
     SERVICE_ROLES,
     CompositionError,
     _broker_state_store,
     _load_configuration,
+    _operation_timeouts,
     _orchestration_operations,
     _service_access,
     _verified_inbound_event,
 )
+from jarvis_control_plane.traces import SQLiteDiagnosticTraceStore
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SHIPPED_BUNDLE = REPOSITORY_ROOT / "deployment"
@@ -63,15 +71,18 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "capability_broker",
         "deleted_conversation_archive",
         "google_connector",
+        "google_egress_proxy",
         "inbound_receiver",
         "knowledge_vault_connector",
         "openwa_outbound_connector",
         "orchestration_agent",
+        "orchestration_egress_proxy",
         "public_oauth_callback",
+        "vault_egress_proxy",
         "worker_gateway",
     )
-    assert report.aggregate_memory_mib == 1056
-    assert report.aggregate_cpus == pytest.approx(1.9)
+    assert report.aggregate_memory_mib == 1152
+    assert report.aggregate_cpus == pytest.approx(1.99)
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
     assert report.host_mutations == ()
@@ -79,7 +90,14 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     commands = {
         name: tuple(service["command"]) for name, service in compose["services"].items()
     }
-    assert commands == {name: ("serve", name) for name in report.services}
+    assert commands == {
+        name: (
+            ("serve-egress-proxy", name.removesuffix("_egress_proxy"))
+            if name.endswith("_egress_proxy")
+            else ("serve", name)
+        )
+        for name in report.services
+    }
 
 
 def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
@@ -112,6 +130,13 @@ def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
     }
     config = (SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8")
     assert "openidconnect.googleapis.com" in config
+    npm_lock = yaml.safe_load(
+        (SHIPPED_BUNDLE / "codex/package-lock.json").read_text("utf-8")
+    )
+    assert (
+        npm_lock["packages"]["node_modules/@openai/codex"]["integrity"]
+        == (lock["codex_cli"]["integrity"])
+    )
 
 
 def test_orchestration_composition_includes_the_codex_specialist(
@@ -122,7 +147,7 @@ def test_orchestration_composition_includes_the_codex_specialist(
     captured: dict[str, object] = {}
     specialist = object()
     monkeypatch.setattr(runtime, "_credential_json", lambda _path: {"api_key": "key"})
-    monkeypatch.setattr(runtime, "_client", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime, "_client", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         runtime, "_service_trace", lambda *_args, **_kwargs: (None, None, object())
     )
@@ -194,6 +219,114 @@ def test_google_administration_is_authenticated_and_not_model_accessible() -> No
     assert allowlists["jarvis-oauth-callback"] == ("oauth_callback",)
 
 
+def test_google_startup_does_not_revive_a_persisted_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    class StateStore:
+        def __init__(self, _database: str) -> None:
+            self.set_calls: list[object] = []
+
+        def get_connection(self) -> object:
+            return SimpleNamespace(connected=False)
+
+        def set_connection(self, **kwargs: object) -> None:
+            self.set_calls.append(kwargs)
+
+    state = StateStore("unused")
+    credential_store = SimpleNamespace(
+        current=SimpleNamespace(granted_scopes=frozenset({"scope"})),
+        delete_calls=0,
+    )
+
+    def delete_credential() -> None:
+        credential_store.delete_calls += 1
+
+    credential_store.delete = delete_credential
+    monkeypatch.setattr(
+        runtime,
+        "_credential_json",
+        lambda _path: {"client_id": "id", "client_secret": "secret"},
+    )
+    monkeypatch.setattr(
+        runtime,
+        "FileGoogleCredentialStore",
+        lambda _path: credential_store,
+    )
+    monkeypatch.setattr(runtime, "SQLiteGoogleOAuthStateStore", lambda _path: state)
+    monkeypatch.setattr(
+        runtime,
+        "_service_trace",
+        lambda *_args, **_kwargs: (object(), object(), object()),
+    )
+    monkeypatch.setattr(runtime, "_client", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runtime, "RemoteAuditBoundary", lambda _client: object())
+    monkeypatch.setattr(
+        runtime,
+        "GoogleLiveOAuthProvider",
+        lambda **_kwargs: SimpleNamespace(authorization_url=lambda _value: "url"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "GoogleOAuthLifecycle",
+        lambda **_kwargs: SimpleNamespace(
+            connection_binding=object(),
+            start_authorization=lambda **_kwargs: object(),
+            handle_callback=lambda **_kwargs: object(),
+            disconnect=lambda: object(),
+            handle_refresh_failure=lambda *_args, **_kwargs: object(),
+        ),
+    )
+
+    class Reads:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __getattr__(self, _name: str):
+            return lambda **_kwargs: object()
+
+    monkeypatch.setattr(runtime, "GoogleReadConnector", Reads)
+    monkeypatch.setattr(runtime, "GoogleApiReadProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime, "GmailWriteConnector", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime, "GmailApiWriteProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime, "CalendarActionDispatcher", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        runtime, "GoogleApiCalendarWriteProvider", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        runtime,
+        "OwnedActionService",
+        lambda _owner: SimpleNamespace(
+            operations=lambda: {
+                name: (lambda: None)
+                for name in SERVICE_ROLES["google_connector"].operations
+                if name.startswith("action_")
+            }
+        ),
+    )
+
+    operations = runtime._google_operations(
+        {
+            "deployment": {
+                "google_subject": "subject-01",
+                "oauth_callback_url": "https://oauth.jarvis.invalid/callback",
+            },
+            "resource_bounds": {"minimum_free_disk_gib": 2},
+            "timeouts": {
+                "read_connector_seconds": 20,
+                "side_effect_connector_seconds": 30,
+                "terminal_seconds": 120,
+                "active_request_seconds": 480,
+            },
+        }
+    )
+
+    assert set(operations) == set(SERVICE_ROLES["google_connector"].operations)
+    assert state.set_calls == []
+    assert credential_store.delete_calls == 1
+
+
 def test_bundle_rejects_unknown_configuration_and_identity_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -256,6 +389,84 @@ def test_bundle_rejects_security_network_and_resource_regressions(
     assert "inbound_receiver memory limit must be 64M" in raised.value.errors
 
 
+def test_bundle_routes_credentialed_egress_only_through_allowlisted_proxies(
+    tmp_path: Path,
+) -> None:
+    compose = yaml.safe_load((SHIPPED_BUNDLE / "compose.yaml").read_text("utf-8"))
+    services = compose["services"]
+    for connector, proxy, segment in (
+        ("orchestration_agent", "orchestration_egress_proxy", "orchestration_egress"),
+        ("google_connector", "google_egress_proxy", "google_egress"),
+        ("knowledge_vault_connector", "vault_egress_proxy", "vault_egress"),
+    ):
+        assert segment in services[connector]["networks"]
+        assert "external_egress" not in services[connector]["networks"]
+        assert set(services[proxy]["networks"]) == {segment, "external_egress"}
+    assert compose["networks"]["orchestration_egress"] == {"internal": True}
+    assert compose["networks"]["google_egress"] == {"internal": True}
+    assert compose["networks"]["vault_egress"] == {"internal": True}
+
+    bundle = _copy_bundle(tmp_path)
+    compose_path = bundle / "compose.yaml"
+    mutated = yaml.safe_load(compose_path.read_text("utf-8"))
+    mutated["services"]["google_connector"]["networks"].append("external_egress")
+    compose_path.write_text(yaml.safe_dump(mutated), encoding="utf-8")
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+    assert "google_connector must not bypass its egress proxy" in raised.value.errors
+
+
+def test_openwa_route_worker_overlay_and_docker_context_are_reviewed() -> None:
+    compose = yaml.safe_load((SHIPPED_BUNDLE / "compose.yaml").read_text("utf-8"))
+    assert set(compose["services"]["openwa_outbound_connector"]["networks"]) == {
+        "broker_openwa_outbound",
+        "openwa_api",
+    }
+    assert compose["networks"]["openwa_api"] == {
+        "external": True,
+        "name": "jarvis-openwa-api",
+    }
+    dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text("utf-8").splitlines()
+    assert "deployment/credentials" in dockerignore
+    assert "deployment/credentials/**" in dockerignore
+    assert "RUN npm ci --omit=dev --ignore-scripts" in (
+        SHIPPED_BUNDLE / "Dockerfile"
+    ).read_text("utf-8")
+
+    active = tomllib.loads((SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8"))
+    active["configuration_kind"] = "active"
+    active["egress"]["worker_overlay_network"] = "wrong-overlay"
+    with pytest.raises(BundleValidationError, match="active egress policy"):
+        validate_configuration(active)
+
+
+def test_service_transport_timeouts_cover_configured_operation_deadlines() -> None:
+    config = tomllib.loads((SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8"))
+    assert _operation_timeouts(config, server_role="capability_broker")["receive"] > 480
+    assert _operation_timeouts(config, server_role="orchestration_agent")["run"] > 480
+    worker = _operation_timeouts(config, server_role="worker_gateway")
+    assert set(worker.values()) == {125.0}
+
+
+def test_trace_admission_preserves_the_configured_free_disk_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "jarvis_control_plane.traces.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=150),
+    )
+    store = SQLiteDiagnosticTraceStore(
+        tmp_path / "traces.sqlite3",
+        capacity_bytes=1000,
+        reservation_bytes=100,
+        hard_max_bytes=100,
+        minimum_free_bytes=100,
+    )
+    with pytest.raises(TraceCapacityError) as raised:
+        store.reserve(request_id="request-low-disk", reservation_bytes=51)
+    assert raised.value.available_bytes == 50
+
+
 def test_bundle_rejects_credential_mount_leak_and_missing_health_logging(
     tmp_path: Path,
 ) -> None:
@@ -289,6 +500,8 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "artifacts.lock.json",
         "compose.yaml",
         "config.example.toml",
+        "codex/package.json",
+        "codex/package-lock.json",
         "openwa-handoff.md",
         "requirements.lock",
     )

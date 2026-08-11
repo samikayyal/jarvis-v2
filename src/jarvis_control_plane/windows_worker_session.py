@@ -39,6 +39,7 @@ class WindowsMtlsServerConfig:
     ca_file: Path
     certificate_file: Path
     private_key_file: Path
+    handshake_timeout_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         if not self.bind_host or self.bind_host.strip() != self.bind_host:
@@ -47,6 +48,12 @@ class WindowsMtlsServerConfig:
             raise ValueError("Windows mTLS listener must bind one overlay address")
         if isinstance(self.bind_port, bool) or not 1 <= self.bind_port <= 65535:
             raise ValueError("Windows mTLS bind port is invalid")
+        if (
+            isinstance(self.handshake_timeout_seconds, bool)
+            or not isinstance(self.handshake_timeout_seconds, (int, float))
+            or self.handshake_timeout_seconds <= 0
+        ):
+            raise ValueError("Windows mTLS handshake timeout must be positive")
         for name in ("ca_file", "certificate_file", "private_key_file"):
             value = Path(getattr(self, name))
             if not value.is_absolute():
@@ -206,7 +213,9 @@ class WindowsWorkerMtlsAcceptor:
         with listener:
             while True:
                 raw, _address = listener.accept()
+                tls: ssl.SSLSocket | None = None
                 try:
+                    raw.settimeout(self.config.handshake_timeout_seconds)
                     tls = context.wrap_socket(raw, server_side=True)
                     hello_frame = _receive_frame(tls)
                     if set(hello_frame) != {"hello"}:
@@ -219,6 +228,7 @@ class WindowsWorkerMtlsAcceptor:
                         tls_socket=tls,
                         application_hello=hello.encode("utf-8"),
                     )
+                    tls.settimeout(None)
                     session = SocketWindowsWorkerSession(
                         connection=tls, evidence=evidence
                     )
@@ -229,7 +239,7 @@ class WindowsWorkerMtlsAcceptor:
                         daemon=True,
                     ).start()
                 except Exception:  # noqa: BLE001 - reject one unauthenticated session
-                    raw.close()
+                    (tls if tls is not None else raw).close()
 
     def _maintain_session(self, session: SocketWindowsWorkerSession) -> None:
         interval = self.registration.heartbeat_interval_seconds

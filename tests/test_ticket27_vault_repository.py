@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from jarvis_control_plane.knowledge_vault import VaultRepositoryConflict
 from jarvis_control_plane.vault_repository import SubprocessVaultRepository
 
 
@@ -56,6 +57,11 @@ def test_production_vault_diff_matches_exact_staged_diff_and_pushes(
         ssh_config_path=(tmp_path / "ssh_config").resolve(),
         known_hosts_path=(tmp_path / "known_hosts").resolve(),
     )
+    repository.validate_remote(vault, str(remote))
+    with pytest.raises(VaultRepositoryConflict, match="active configuration"):
+        repository.validate_remote(vault, str(tmp_path / "other.git"))
+    assert repository._environment["GIT_CONFIG_KEY_0"] == "core.hooksPath"
+    assert repository._environment["GIT_CONFIG_VALUE_0"] == "/dev/null"
     base = repository.current_commit(vault)
     patch = repository.render_diff(
         vault,

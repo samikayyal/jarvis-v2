@@ -36,6 +36,8 @@ REQUIRED_FILES = (
     "artifacts.lock.json",
     "compose.yaml",
     "config.example.toml",
+    "codex/package.json",
+    "codex/package-lock.json",
     "openwa-handoff.md",
     "requirements.lock",
 )
@@ -44,9 +46,9 @@ RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
     {
         "inbound_receiver": ServiceResourceLimits("64M", Decimal("0.10"), 32),
         "capability_broker": ServiceResourceLimits("192M", Decimal("0.35"), 64),
-        "orchestration_agent": ServiceResourceLimits("256M", Decimal("0.45"), 96),
+        "orchestration_agent": ServiceResourceLimits("256M", Decimal("0.45"), 64),
         "audit_service": ServiceResourceLimits("64M", Decimal("0.10"), 32),
-        "google_connector": ServiceResourceLimits("96M", Decimal("0.15"), 64),
+        "google_connector": ServiceResourceLimits("96M", Decimal("0.15"), 48),
         "knowledge_vault_connector": ServiceResourceLimits("128M", Decimal("0.20"), 64),
         "openwa_outbound_connector": ServiceResourceLimits("64M", Decimal("0.10"), 32),
         "worker_gateway": ServiceResourceLimits("96M", Decimal("0.25"), 64),
@@ -54,6 +56,9 @@ RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
         "deleted_conversation_archive": ServiceResourceLimits(
             "48M", Decimal("0.10"), 32
         ),
+        "orchestration_egress_proxy": ServiceResourceLimits("32M", Decimal("0.03"), 16),
+        "google_egress_proxy": ServiceResourceLimits("32M", Decimal("0.03"), 16),
+        "vault_egress_proxy": ServiceResourceLimits("32M", Decimal("0.03"), 16),
     }
 )
 
@@ -69,6 +74,9 @@ EXPECTED_IDENTITIES: Mapping[str, str] = MappingProxyType(
         "worker_gateway": "jarvis-worker-gateway",
         "public_oauth_callback": "jarvis-oauth-callback",
         "deleted_conversation_archive": "jarvis-deleted-archive",
+        "orchestration_egress_proxy": "jarvis-orchestration-egress",
+        "google_egress_proxy": "jarvis-google-egress",
+        "vault_egress_proxy": "jarvis-vault-egress",
     }
 )
 
@@ -84,6 +92,9 @@ ALLOWED_CREDENTIAL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
         "worker_gateway": frozenset({"/run/credentials/windows-worker"}),
         "public_oauth_callback": frozenset(),
         "deleted_conversation_archive": frozenset(),
+        "orchestration_egress_proxy": frozenset(),
+        "google_egress_proxy": frozenset(),
+        "vault_egress_proxy": frozenset(),
     }
 )
 
@@ -143,6 +154,9 @@ ALLOWED_PROTOCOL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
         "deleted_conversation_archive": frozenset(
             {"/run/protocol/capability_broker--deleted_conversation_archive.key"}
         ),
+        "orchestration_egress_proxy": frozenset(),
+        "google_egress_proxy": frozenset(),
+        "vault_egress_proxy": frozenset(),
     }
 )
 
@@ -169,6 +183,9 @@ ALLOWED_STATE_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
                 "/run/jarvis-deleted",
             }
         ),
+        "orchestration_egress_proxy": frozenset(),
+        "google_egress_proxy": frozenset(),
+        "vault_egress_proxy": frozenset(),
     }
 )
 
@@ -418,8 +435,8 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
             egress.get("orchestration_hosts") != ["api.openai.com"]
             or egress.get("google_hosts") != expected_egress["google_hosts"]
             or egress.get("vault_hosts") != [vault_host]
-            or not isinstance(egress.get("worker_overlay_network"), str)
-            or not egress.get("worker_overlay_network")
+            or egress.get("worker_overlay_network")
+            != expected_egress["worker_overlay_network"]
         ):
             errors.append(
                 "active egress policy is inconsistent with connector endpoints"
@@ -559,8 +576,30 @@ def _validate_artifacts(
         errors.append("Dockerfile base image must be pinned by sha256 digest")
     elif from_instructions != expected_from:
         errors.append("Dockerfile images differ from artifact lock")
-    if "npm install --global --omit=dev @openai/codex@0.147.0" not in dockerfile:
-        errors.append("Dockerfile must install the pinned Codex CLI artifact")
+    codex_lock = _load_mapping(
+        root / "codex/package-lock.json", errors, "Codex package lock"
+    )
+    codex_packages = (
+        codex_lock.get("packages") if isinstance(codex_lock, Mapping) else None
+    )
+    codex_package = (
+        codex_packages.get("node_modules/@openai/codex")
+        if isinstance(codex_packages, Mapping)
+        else None
+    )
+    if not isinstance(codex_package, Mapping) or {
+        "version": codex_package.get("version"),
+        "integrity": codex_package.get("integrity"),
+    } != {
+        "version": "0.147.0",
+        "integrity": (
+            "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
+            "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
+        ),
+    }:
+        errors.append("Codex npm lock does not match the reviewed artifact")
+    if "RUN npm ci --omit=dev --ignore-scripts" not in dockerfile:
+        errors.append("Dockerfile must install Codex from the npm lock")
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
     if (
@@ -611,13 +650,26 @@ def _validate_compose(
     handoff_active = isinstance(networks, Mapping) and "openwa-handoff" in networks
     if handoff_active:
         errors.append("production OpenWA handoff network must not be activated")
-    egress_networks = {"orchestration_egress", "google_egress", "vault_egress"}
+    connector_egress_networks = {
+        "orchestration_egress",
+        "google_egress",
+        "vault_egress",
+    }
     if isinstance(networks, Mapping):
         for name, network in networks.items():
             if not isinstance(network, Mapping):
                 errors.append(f"network {name} must be an object")
-            elif name in egress_networks and network != {"internal": False}:
-                errors.append(f"network {name} must be a dedicated egress segment")
+            elif name in connector_egress_networks and network != {"internal": True}:
+                errors.append(f"network {name} must terminate at its egress proxy")
+            elif name == "external_egress" and network != {"internal": False}:
+                errors.append(
+                    "external_egress must be the sole Internet-routed segment"
+                )
+            elif name == "openwa_api" and network != {
+                "external": True,
+                "name": "jarvis-openwa-api",
+            }:
+                errors.append("openwa_api must reference the reviewed external route")
             elif name == "worker_overlay" and network != {
                 "external": True,
                 "name": "jarvis-worker-overlay",
@@ -626,7 +678,9 @@ def _validate_compose(
                     "worker_overlay must reference the manual private overlay"
                 )
             elif (
-                name not in egress_networks | {"worker_overlay"}
+                name
+                not in connector_egress_networks
+                | {"external_egress", "openwa_api", "worker_overlay"}
                 and network.get("internal") is not True
             ):
                 errors.append(f"network {name} must be private and non-published")
@@ -642,7 +696,13 @@ def _validate_compose(
             continue
         if raw.get("profiles") != ["manual-activation"]:
             errors.append(f"{service} must remain behind the manual-activation profile")
-        if raw.get("command") != ["serve", service]:
+        proxy_kind = service.removesuffix("_egress_proxy")
+        expected_command = (
+            ["serve-egress-proxy", proxy_kind]
+            if service.endswith("_egress_proxy")
+            else ["serve", service]
+        )
+        if raw.get("command") != expected_command:
             errors.append(f"{service} must run its role-specific composition root")
         if "image" in raw:
             errors.append(f"{service} must build only from the reviewed local artifact")
@@ -700,6 +760,30 @@ def _validate_compose(
     worker = services.get("worker_gateway", {})
     if isinstance(worker, Mapping) and worker.get("expose") != ["9443"]:
         errors.append("worker gateway must expose only the overlay mTLS session port")
+    expected_egress_memberships = {
+        "orchestration_agent": "orchestration_egress",
+        "orchestration_egress_proxy": "orchestration_egress",
+        "google_connector": "google_egress",
+        "google_egress_proxy": "google_egress",
+        "knowledge_vault_connector": "vault_egress",
+        "vault_egress_proxy": "vault_egress",
+    }
+    for service, segment in expected_egress_memberships.items():
+        raw = services.get(service, {})
+        memberships = raw.get("networks", []) if isinstance(raw, Mapping) else []
+        if segment not in memberships:
+            errors.append(f"{service} must join its private egress segment")
+        if service.endswith("_egress_proxy"):
+            if set(memberships) != {segment, "external_egress"}:
+                errors.append(f"{service} must be the sole egress bridge for {segment}")
+        elif "external_egress" in memberships:
+            errors.append(f"{service} must not bypass its egress proxy")
+    outbound = services.get("openwa_outbound_connector", {})
+    if isinstance(outbound, Mapping) and set(outbound.get("networks", [])) != {
+        "broker_openwa_outbound",
+        "openwa_api",
+    }:
+        errors.append("OpenWA outbound connector lacks its reviewed API route")
     return handoff_active
 
 

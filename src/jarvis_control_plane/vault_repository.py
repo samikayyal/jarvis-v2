@@ -34,6 +34,7 @@ class SubprocessVaultRepository:
         ssh_config_path: Path,
         known_hosts_path: Path,
         git_executable: Path = Path("/usr/bin/git"),
+        proxy_command: Sequence[str] | None = None,
     ) -> None:
         for path, name in (
             (git_executable, "git_executable"),
@@ -43,27 +44,35 @@ class SubprocessVaultRepository:
         ):
             if not path.is_absolute():
                 raise ValueError(f"{name} must be an absolute path")
+        if proxy_command is not None and (
+            not proxy_command or any(not item for item in proxy_command)
+        ):
+            raise ValueError("vault proxy command must be a non-empty argument list")
         self._git = git_executable
+        ssh_arguments = [
+            str(ssh_executable),
+            "-F",
+            str(ssh_config_path),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={known_hosts_path}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+        ]
+        if proxy_command is not None:
+            ssh_arguments.extend(("-o", f"ProxyCommand={shlex.join(proxy_command)}"))
         self._environment = {
             **os.environ,
             "GIT_TERMINAL_PROMPT": "0",
-            "GIT_SSH_COMMAND": shlex.join(
-                (
-                    str(ssh_executable),
-                    "-F",
-                    str(ssh_config_path),
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "IdentitiesOnly=yes",
-                    "-o",
-                    "StrictHostKeyChecking=yes",
-                    "-o",
-                    f"UserKnownHostsFile={known_hosts_path}",
-                    "-o",
-                    "GlobalKnownHostsFile=/dev/null",
-                )
-            ),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": "/dev/null",
+            "GIT_SSH_COMMAND": shlex.join(ssh_arguments),
         }
         self._last_synchronized_at: datetime | None = None
 
@@ -94,6 +103,19 @@ class SubprocessVaultRepository:
 
     def current_commit(self, root: Path, *, deadline: float | None = None) -> str:
         return self._run(root, ("rev-parse", "HEAD"), deadline).stdout.strip()
+
+    def validate_remote(
+        self, root: Path, expected_remote: str, *, deadline: float | None = None
+    ) -> None:
+        if not expected_remote or expected_remote.strip() != expected_remote:
+            raise ValueError("expected vault remote must be canonical")
+        actual_remote = self._run(
+            root, ("remote", "get-url", "origin"), deadline
+        ).stdout.strip()
+        if actual_remote != expected_remote:
+            raise VaultRepositoryConflict(
+                "knowledge-vault origin differs from active configuration"
+            )
 
     def fetch_remote_commit(self, root: Path, *, deadline: float | None = None) -> str:
         try:

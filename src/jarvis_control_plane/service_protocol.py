@@ -22,7 +22,8 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import RLock
 from types import MappingProxyType
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -49,7 +50,8 @@ from .ports import (
     OutboundConnectorError,
 )
 
-MAX_FRAME_BYTES = 1_048_576
+MAX_REQUEST_FRAME_BYTES = 1_048_576
+MAX_FRAME_BYTES = 4_194_304
 MAX_CLOCK_SKEW_SECONDS = 30
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
@@ -157,7 +159,19 @@ def _decode(value: object) -> object:
         if not math.isfinite(value):
             raise ServiceProtocolError("service protocol floats must be finite")
         return value
-    if not isinstance(value, dict) or len(value) != 1 and "$type" not in value:
+    if not isinstance(value, dict):
+        raise ServiceProtocolError("invalid typed protocol value")
+    if "$enum" in value:
+        if set(value) != {"$enum", "value"}:
+            raise ServiceProtocolError("invalid encoded enum")
+        enum_type = _TYPES.get(value["$enum"])
+        if enum_type is None or not issubclass(enum_type, Enum):
+            raise ServiceProtocolError("encoded enum is outside the registry")
+        return enum_type(_decode(value["value"]))
+    if "$type" in value:
+        if set(value) != {"$type", "fields"}:
+            raise ServiceProtocolError("invalid encoded model")
+    elif len(value) != 1:
         raise ServiceProtocolError("invalid typed protocol value")
     if "$bytes" in value:
         try:
@@ -189,11 +203,6 @@ def _decode(value: object) -> object:
         if not isinstance(items, dict) or not all(isinstance(k, str) for k in items):
             raise ServiceProtocolError("invalid encoded mapping")
         return {key: _decode(item) for key, item in items.items()}
-    if "$enum" in value:
-        enum_type = _TYPES.get(value["$enum"])
-        if enum_type is None or not issubclass(enum_type, Enum):
-            raise ServiceProtocolError("encoded enum is outside the registry")
-        return enum_type(_decode(value.get("value")))
     type_name = value.get("$type")
     fields = value.get("fields")
     model_type = _TYPES.get(type_name)
@@ -217,16 +226,20 @@ def _sign(frame: Mapping[str, object], secret: bytes) -> str:
     return hmac.new(secret, _canonical_json(frame), hashlib.sha256).hexdigest()
 
 
-def _signed_frame(frame: dict[str, object], secret: bytes) -> bytes:
+def _signed_frame(
+    frame: dict[str, object], secret: bytes, *, max_bytes: int = MAX_FRAME_BYTES
+) -> bytes:
     signed = {**frame, "signature": _sign(frame, secret)}
     payload = _canonical_json(signed)
-    if len(payload) > MAX_FRAME_BYTES:
+    if len(payload) > max_bytes:
         raise ServiceProtocolError("service protocol frame exceeds its fixed bound")
     return payload
 
 
-def _verify_frame(payload: bytes, secret: bytes) -> dict[str, object]:
-    if len(payload) > MAX_FRAME_BYTES:
+def _verify_frame(
+    payload: bytes, secret: bytes, *, max_bytes: int = MAX_FRAME_BYTES
+) -> dict[str, object]:
+    if len(payload) > max_bytes:
         raise ServiceProtocolError("service protocol frame exceeds its fixed bound")
     try:
         frame = json.loads(payload)
@@ -245,7 +258,7 @@ def _verify_frame(payload: bytes, secret: bytes) -> dict[str, object]:
 def _peek_client_identity(payload: bytes) -> str:
     """Select a per-link key without treating the unverified identity as trusted."""
 
-    if len(payload) > MAX_FRAME_BYTES:
+    if len(payload) > MAX_REQUEST_FRAME_BYTES:
         raise ServiceProtocolError("service protocol frame exceeds its fixed bound")
     try:
         frame = json.loads(payload)
@@ -269,6 +282,7 @@ class AuthenticatedServiceClient:
         host: str,
         port: int,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        operation_timeouts: Mapping[str, float] | None = None,
     ) -> None:
         if len(secret) < 32:
             raise ValueError("service protocol secret must contain at least 32 bytes")
@@ -284,6 +298,15 @@ class AuthenticatedServiceClient:
         self._secret = secret
         self._url = f"http://{host}:{port}/call"
         self._timeout_seconds = timeout_seconds
+        self._operation_timeouts = dict(operation_timeouts or {})
+        if any(
+            not name
+            or isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+            for name, timeout in self._operation_timeouts.items()
+        ):
+            raise ValueError("service operation timeouts must be positive")
 
     def call(self, operation: str, *args: object, **kwargs: object) -> object:
         if not operation or operation.strip() != operation or operation.startswith("_"):
@@ -301,12 +324,15 @@ class AuthenticatedServiceClient:
         }
         request = Request(
             self._url,
-            data=_signed_frame(frame, self._secret),
+            data=_signed_frame(frame, self._secret, max_bytes=MAX_REQUEST_FRAME_BYTES),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
+            timeout_seconds = self._operation_timeouts.get(
+                operation, self._timeout_seconds
+            )
+            with urlopen(request, timeout=timeout_seconds) as response:
                 payload = response.read(MAX_FRAME_BYTES + 1)
         except HTTPError as exc:
             payload = exc.read(MAX_FRAME_BYTES + 1)
@@ -392,6 +418,7 @@ class AuthenticatedServiceServer:
             )
         self.allowed_operations_by_client = selected_operation_allowlists
         self._seen_requests: dict[str, int] = {}
+        self._admission_lock = RLock()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -412,7 +439,8 @@ class AuthenticatedServiceServer:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-        self._server = HTTPServer((host, port), Handler)
+        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server.daemon_threads = True
 
     @property
     def port(self) -> int:
@@ -433,7 +461,7 @@ class AuthenticatedServiceServer:
             if handler.headers.get_content_type() != "application/json":
                 raise ServiceProtocolError("service protocol content type is invalid")
             length = int(handler.headers.get("Content-Length", "0"))
-            if length <= 0 or length > MAX_FRAME_BYTES:
+            if length <= 0 or length > MAX_REQUEST_FRAME_BYTES:
                 raise ServiceProtocolError("invalid service protocol frame length")
             payload = handler.rfile.read(length)
             client_identity = _peek_client_identity(payload)
@@ -442,7 +470,9 @@ class AuthenticatedServiceServer:
                 raise ServiceAuthenticationError(
                     "service client identity is not allowed"
                 )
-            frame = _verify_frame(payload, response_secret)
+            frame = _verify_frame(
+                payload, response_secret, max_bytes=MAX_REQUEST_FRAME_BYTES
+            )
             request_id = str(frame.get("request_id", "unknown"))
             self._admit(frame)
             operation = frame.get("operation")
@@ -516,15 +546,16 @@ class AuthenticatedServiceServer:
             )
         if not isinstance(request_id, str) or len(request_id) != 32:
             raise ServiceAuthenticationError("service request identifier is invalid")
-        oldest = int(time.time()) - MAX_CLOCK_SKEW_SECONDS
-        self._seen_requests = {
-            key: timestamp
-            for key, timestamp in self._seen_requests.items()
-            if timestamp >= oldest
-        }
-        if request_id in self._seen_requests:
-            raise ServiceAuthenticationError("service request was replayed")
-        self._seen_requests[request_id] = issued_at
+        with self._admission_lock:
+            oldest = int(time.time()) - MAX_CLOCK_SKEW_SECONDS
+            self._seen_requests = {
+                key: timestamp
+                for key, timestamp in self._seen_requests.items()
+                if timestamp >= oldest
+            }
+            if request_id in self._seen_requests:
+                raise ServiceAuthenticationError("service request was replayed")
+            self._seen_requests[request_id] = issued_at
 
 
 class RemoteAuditBoundary(AuditBoundary):
@@ -628,6 +659,7 @@ class OwnedActionService:
     def __init__(self, dispatcher: ActionDispatcher) -> None:
         self._dispatcher = dispatcher
         self._prepared: dict[str, ActionDispatchHandle] = {}
+        self._lock = RLock()
 
     def operations(self) -> Mapping[str, Callable[..., object]]:
         operations: dict[str, Callable[..., object]] = {
@@ -642,14 +674,16 @@ class OwnedActionService:
         return operations
 
     def prepare(self, action: models.FrozenActionProposal) -> None:
-        if action.action_id in self._prepared:
-            raise ActionDispatcherError(
-                "action is already prepared", may_have_dispatched=True
-            )
-        self._prepared[action.action_id] = self._dispatcher.prepare(action)
+        with self._lock:
+            if action.action_id in self._prepared:
+                raise ActionDispatcherError(
+                    "action is already prepared", may_have_dispatched=True
+                )
+            self._prepared[action.action_id] = self._dispatcher.prepare(action)
 
     def run(self, action_id: str) -> object | None:
-        handle = self._prepared.get(action_id)
+        with self._lock:
+            handle = self._prepared.get(action_id)
         if handle is None:
             raise ActionDispatcherError(
                 "prepared action is unavailable", may_have_dispatched=True
@@ -660,7 +694,8 @@ class OwnedActionService:
         return self._dispatcher.cancel(action_id=action_id)
 
     def finalize(self, action_id: str) -> None:
-        self._prepared.pop(action_id, None)
+        with self._lock:
+            self._prepared.pop(action_id, None)
         if isinstance(self._dispatcher, ActionFinalizer):
             self._dispatcher.finalize(action_id=action_id)
 

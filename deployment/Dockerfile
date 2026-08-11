@@ -1,5 +1,7 @@
 FROM node:24-bookworm-slim@sha256:65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848 AS codex
-RUN npm install --global --omit=dev @openai/codex@0.147.0
+WORKDIR /opt/codex
+COPY deployment/codex/package.json deployment/codex/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
 
 FROM ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664 AS uv
 FROM python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f
@@ -20,8 +22,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /opt/jarvis
 COPY --from=uv /uv /uvx /bin/
 COPY --from=codex /usr/local/bin/node /usr/local/bin/node
-COPY --from=codex /usr/local/bin/codex /usr/local/bin/codex
-COPY --from=codex /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@openai/codex
+COPY --from=codex /opt/codex /opt/codex
+RUN ln -s /opt/codex/node_modules/.bin/codex /usr/local/bin/codex
 RUN install -d -m 0700 -o 10002 -g 10002 \
         /var/lib/jarvis/state \
     && install -d -m 0700 -o 10002 -g 10002 /var/lib/jarvis/traces \

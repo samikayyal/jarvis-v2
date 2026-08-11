@@ -79,6 +79,9 @@ services:
     user: "10003:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-orchestration
+      HTTPS_PROXY: http://orchestration_egress_proxy:9080
+      HTTP_PROXY: http://orchestration_egress_proxy:9080
+      NO_PROXY: capability_broker,google_connector,knowledge_vault_connector,127.0.0.1,localhost
     command: [serve, orchestration_agent]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
@@ -89,7 +92,7 @@ services:
       - /var/lib/jarvis/codex-traces:/var/lib/jarvis/codex-traces
       - /srv/jarvis-workspace:/srv/jarvis-workspace:ro
     networks: [broker_orchestration, broker_google, broker_vault, orchestration_egress]
-    pids_limit: 96
+    pids_limit: 64
     deploy:
       resources:
         limits: {memory: 256M, cpus: "0.45"}
@@ -116,6 +119,9 @@ services:
     user: "10005:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-google
+      HTTPS_PROXY: http://google_egress_proxy:9080
+      HTTP_PROXY: http://google_egress_proxy:9080
+      NO_PROXY: capability_broker,audit_service,public_oauth_callback,127.0.0.1,localhost
     command: [serve, google_connector]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
@@ -126,7 +132,7 @@ services:
       - /etc/jarvis/protocol/google_connector--audit_service.key:/run/protocol/google_connector--audit_service.key:ro
       - /var/lib/jarvis/google-traces:/var/lib/jarvis/google-traces
     networks: [broker_google, broker_audit, oauth_google, google_egress]
-    pids_limit: 64
+    pids_limit: 48
     deploy:
       resources:
         limits: {memory: 96M, cpus: "0.15"}
@@ -159,7 +165,7 @@ services:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/openwa:/run/credentials/openwa:ro
       - /etc/jarvis/protocol/capability_broker--openwa_outbound_connector.key:/run/protocol/capability_broker--openwa_outbound_connector.key:ro
-    networks: [broker_openwa_outbound]
+    networks: [broker_openwa_outbound, openwa_api]
     pids_limit: 32
     deploy:
       resources:
@@ -216,6 +222,54 @@ services:
       resources:
         limits: {memory: 48M, cpus: "0.10"}
 
+  orchestration_egress_proxy:
+    <<: *service-defaults
+    user: "10011:20000"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-orchestration-egress
+    command: [serve-egress-proxy, orchestration]
+    volumes:
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+    networks: [orchestration_egress, external_egress]
+    healthcheck:
+      test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+    pids_limit: 16
+    deploy:
+      resources:
+        limits: {memory: 32M, cpus: "0.03"}
+
+  google_egress_proxy:
+    <<: *service-defaults
+    user: "10012:20000"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-google-egress
+    command: [serve-egress-proxy, google]
+    volumes:
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+    networks: [google_egress, external_egress]
+    healthcheck:
+      test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+    pids_limit: 16
+    deploy:
+      resources:
+        limits: {memory: 32M, cpus: "0.03"}
+
+  vault_egress_proxy:
+    <<: *service-defaults
+    user: "10013:20000"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-vault-egress
+    command: [serve-egress-proxy, vault]
+    volumes:
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+    networks: [vault_egress, external_egress]
+    healthcheck:
+      test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+    pids_limit: 16
+    deploy:
+      resources:
+        limits: {memory: 32M, cpus: "0.03"}
+
 networks:
   ingress_broker: {internal: true}
   broker_orchestration: {internal: true}
@@ -225,7 +279,9 @@ networks:
   broker_openwa_outbound: {internal: true}
   broker_worker: {internal: true}
   oauth_google: {internal: true}
-  orchestration_egress: {internal: false}
-  google_egress: {internal: false}
-  vault_egress: {internal: false}
+  orchestration_egress: {internal: true}
+  google_egress: {internal: true}
+  vault_egress: {internal: true}
+  external_egress: {internal: false}
+  openwa_api: {external: true, name: jarvis-openwa-api}
   worker_overlay: {external: true, name: jarvis-worker-overlay}

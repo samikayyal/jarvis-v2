@@ -14,6 +14,9 @@ openwa_outbound_connector = "jarvis-openwa-outbound"
 worker_gateway = "jarvis-worker-gateway"
 public_oauth_callback = "jarvis-oauth-callback"
 deleted_conversation_archive = "jarvis-deleted-archive"
+orchestration_egress_proxy = "jarvis-orchestration-egress"
+google_egress_proxy = "jarvis-google-egress"
+vault_egress_proxy = "jarvis-vault-egress"
 
 [deployment]
 operator_id = "example-operator-id"

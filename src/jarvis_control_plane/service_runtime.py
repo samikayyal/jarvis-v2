@@ -10,8 +10,9 @@ import stat
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import parse_qsl, urlsplit
@@ -41,6 +42,7 @@ from .conversation_archive import (
     serve_sqlite_deleted_conversation_archive,
 )
 from .deployment import BundleValidationError, validate_configuration
+from .egress_proxy import connect_through_proxy, serve_egress_proxy
 from .gmail_writes import GmailApiWriteProvider, GmailWriteConnector
 from .google_calendar import (
     CalendarActionDispatcher,
@@ -50,6 +52,7 @@ from .google_oauth import (
     GOOGLE_OAUTH_SCOPES,
     FileGoogleCredentialStore,
     GoogleLiveOAuthProvider,
+    GoogleOAuthError,
     GoogleOAuthLifecycle,
     SQLiteGoogleOAuthStateStore,
 )
@@ -74,6 +77,7 @@ from .service_protocol import (
     RemoteOrchestrationAdapter,
     RemoteOutboundConnector,
     RemoteVaultProposalPreparer,
+    _encode,
 )
 from .sessions import ModelAvailability, SQLiteWorkingSessionStore
 from .traces import DiagnosticTraceRecorder, SQLiteDiagnosticTraceStore
@@ -269,9 +273,14 @@ def _orchestration_operations(
 
     model_provider = OpenAIProvider(api_key=api_key)
     google = _RemoteGoogleReads(
-        _client(client_identity="jarvis-orchestration", server_role="google_connector")
+        _client(
+            config,
+            client_identity="jarvis-orchestration",
+            server_role="google_connector",
+        )
     )
     vault_client = _client(
+        config,
         client_identity="jarvis-orchestration",
         server_role="knowledge_vault_connector",
     )
@@ -280,7 +289,7 @@ def _orchestration_operations(
     if not isinstance(models, Mapping) or not isinstance(timeouts, Mapping):
         raise CompositionError("Codex deployment configuration is incomplete")
     _clock, _ids, trace = _service_trace(
-        "codex", root=Path("/var/lib/jarvis/codex-traces")
+        config, "codex", root=Path("/var/lib/jarvis/codex-traces")
     )
     codex_specialist = CodexSpecialist(
         config=CodexSpecialistConfig(
@@ -403,7 +412,42 @@ def _openwa_operations(
     }
 
 
-def _client(*, client_identity: str, server_role: str) -> AuthenticatedServiceClient:
+def _operation_timeouts(
+    config: Mapping[str, Any], *, server_role: str
+) -> Mapping[str, float]:
+    configured = config.get("timeouts")
+    if not isinstance(configured, Mapping):
+        raise CompositionError("service timeout configuration is unavailable")
+    try:
+        read = float(configured["read_connector_seconds"]) + 5
+        side_effect = float(configured["side_effect_connector_seconds"]) + 5
+        terminal = float(configured["terminal_seconds"]) + 5
+        active = float(configured["active_request_seconds"]) + 5
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CompositionError("service timeout configuration is invalid") from exc
+    role = SERVICE_ROLES[server_role]
+    if server_role == "capability_broker":
+        return {"receive": active}
+    if server_role == "orchestration_agent":
+        return {"run": active}
+    if server_role == "worker_gateway":
+        return {operation: terminal for operation in role.operations}
+    if server_role in {"google_connector", "knowledge_vault_connector"}:
+        return {
+            operation: (
+                read
+                if operation == "read"
+                or operation.startswith(("gmail_", "calendar_", "drive_"))
+                else side_effect
+            )
+            for operation in role.operations
+        }
+    return {operation: side_effect for operation in role.operations}
+
+
+def _client(
+    config: Mapping[str, Any], *, client_identity: str, server_role: str
+) -> AuthenticatedServiceClient:
     server = SERVICE_ROLES[server_role]
     client_role = next(
         (
@@ -423,6 +467,7 @@ def _client(*, client_identity: str, server_role: str) -> AuthenticatedServiceCl
         ),
         host=server_role,
         port=server.port,
+        operation_timeouts=_operation_timeouts(config, server_role=server_role),
     )
 
 
@@ -462,24 +507,32 @@ def _broker_operations(
     ids = UuidIdGenerator()
     state = _broker_state_store(state_root)
     audit = RemoteAuditBoundary(
-        _client(client_identity="jarvis-broker", server_role="audit_service")
+        _client(config, client_identity="jarvis-broker", server_role="audit_service")
     )
     orchestration = RemoteOrchestrationAdapter(
-        _client(client_identity="jarvis-broker", server_role="orchestration_agent")
+        _client(
+            config,
+            client_identity="jarvis-broker",
+            server_role="orchestration_agent",
+        )
     )
     outbound_client = _client(
-        client_identity="jarvis-broker", server_role="openwa_outbound_connector"
+        config, client_identity="jarvis-broker", server_role="openwa_outbound_connector"
     )
     google_actions = RemoteActionDispatcher(
-        _client(client_identity="jarvis-broker", server_role="google_connector"),
+        _client(
+            config,
+            client_identity="jarvis-broker",
+            server_role="google_connector",
+        ),
         bound=True,
     )
     vault_client = _client(
-        client_identity="jarvis-broker", server_role="knowledge_vault_connector"
+        config, client_identity="jarvis-broker", server_role="knowledge_vault_connector"
     )
     vault_actions = RemoteActionDispatcher(vault_client, bound=True)
     worker_actions = RemoteActionDispatcher(
-        _client(client_identity="jarvis-broker", server_role="worker_gateway")
+        _client(config, client_identity="jarvis-broker", server_role="worker_gateway")
     )
     actions = RoutedActionDispatcher(
         terminal=worker_actions,
@@ -490,7 +543,10 @@ def _broker_operations(
         vault=vault_actions,
         vault_lifecycle=vault_actions,
     )
-    trace_store = SQLiteDiagnosticTraceStore(trace_root / "traces.sqlite3")
+    trace_store = SQLiteDiagnosticTraceStore(
+        trace_root / "traces.sqlite3",
+        minimum_free_bytes=_minimum_free_bytes(config),
+    )
     trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
     allowed_models = model_config.get("allowed_models")
     allowed_reasoning = model_config.get("allowed_reasoning")
@@ -548,6 +604,7 @@ class _GoogleActionDispatcher:
         self._gmail = gmail
         self._calendar = calendar
         self._owners: dict[str, object] = {}
+        self._lock = RLock()
 
     def _owner(self, action: FrozenActionProposal) -> object:
         if action.kind in {"gmail_send", "gmail_reply"}:
@@ -570,23 +627,38 @@ class _GoogleActionDispatcher:
     def prepare(self, action: FrozenActionProposal) -> object:
         owner = self._owner(action)
         handle = owner.prepare(action)  # type: ignore[attr-defined]
-        self._owners[action.action_id] = owner
+        with self._lock:
+            self._owners[action.action_id] = owner
         return handle
 
     def cancel(self, *, action_id: str) -> ActionCancellationResult:
-        owner = self._owners.get(action_id)
+        with self._lock:
+            owner = self._owners.get(action_id)
         if owner is None:
             return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         return owner.cancel(action_id=action_id)  # type: ignore[attr-defined,no-any-return]
 
 
+def _minimum_free_bytes(config: Mapping[str, Any]) -> int:
+    bounds = config.get("resource_bounds")
+    if not isinstance(bounds, Mapping):
+        raise CompositionError("resource bound configuration is unavailable")
+    gib = bounds.get("minimum_free_disk_gib")
+    if isinstance(gib, bool) or not isinstance(gib, int) or gib < 0:
+        raise CompositionError("minimum free disk configuration is invalid")
+    return gib * 1024 * 1024 * 1024
+
+
 def _service_trace(
-    name: str, *, root: Path
+    config: Mapping[str, Any], name: str, *, root: Path
 ) -> tuple[SystemClock, UuidIdGenerator, DiagnosticTraceRecorder]:
     clock = SystemClock()
     ids = UuidIdGenerator()
     root.mkdir(parents=True, exist_ok=True)
-    store = SQLiteDiagnosticTraceStore(root / f"{name}.sqlite3")
+    store = SQLiteDiagnosticTraceStore(
+        root / f"{name}.sqlite3",
+        minimum_free_bytes=_minimum_free_bytes(config),
+    )
     return (
         clock,
         ids,
@@ -610,17 +682,19 @@ def _google_operations(
     state_store = SQLiteGoogleOAuthStateStore(
         "/run/credentials/google/oauth-state.sqlite3"
     )
-    credential = credential_store.current
-    if credential is not None and not state_store.get_connection().connected:
-        state_store.set_connection(
-            connected=True, granted_scopes=credential.granted_scopes
-        )
-
+    connection = state_store.get_connection()
+    if not connection.connected and credential_store.current is not None:
+        try:
+            credential_store.delete()
+        except GoogleOAuthError as exc:
+            raise CompositionError(
+                "disconnected Google credential could not be discarded"
+            ) from exc
     clock, ids, trace = _service_trace(
-        "google", root=Path("/var/lib/jarvis/google-traces")
+        config, "google", root=Path("/var/lib/jarvis/google-traces")
     )
     audit = RemoteAuditBoundary(
-        _client(client_identity="jarvis-google", server_role="audit_service")
+        _client(config, client_identity="jarvis-google", server_role="audit_service")
     )
     provider = GoogleLiveOAuthProvider(
         client_id=client_id,
@@ -721,6 +795,20 @@ def _vault_operations(
         ssh_executable=Path("/usr/bin/ssh"),
         ssh_config_path=Path("/run/credentials/vault/ssh_config"),
         known_hosts_path=Path("/run/credentials/vault/known_hosts"),
+        proxy_command=(
+            "/usr/local/bin/python",
+            "-m",
+            "jarvis_control_plane.service_runtime",
+            "egress-connect",
+            "%h",
+            "%p",
+            "--proxy-host",
+            "vault_egress_proxy",
+        ),
+    )
+    repository.validate_remote(
+        root,
+        _require_text(deployment.get("vault_remote"), "vault_remote"),
     )
     clock = SystemClock()
     reads = KnowledgeVaultConnector(root=root, synchronizer=repository, now=clock.now)
@@ -875,7 +963,7 @@ def _verified_inbound_event(
     return event if event.verify(signing_secret) else None
 
 
-def _serve_inbound_receiver(protocol_root: Path) -> None:
+def _serve_inbound_receiver(config: Mapping[str, Any], protocol_root: Path) -> None:
     credential = _credential_json(
         Path("/run/credentials/openwa-inbound/credentials.json")
     )
@@ -888,6 +976,7 @@ def _serve_inbound_receiver(protocol_root: Path) -> None:
         secret=_read_secret(protocol_root / "inbound_receiver--capability_broker.key"),
         host="capability_broker",
         port=SERVICE_ROLES["capability_broker"].port,
+        operation_timeouts=_operation_timeouts(config, server_role="capability_broker"),
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -947,12 +1036,14 @@ def _serve_inbound_receiver(protocol_root: Path) -> None:
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    HTTPServer(
+    server = ThreadingHTTPServer(
         ("0.0.0.0", SERVICE_ROLES["inbound_receiver"].port), Handler
-    ).serve_forever()
+    )
+    server.daemon_threads = True
+    server.serve_forever()
 
 
-def _serve_oauth_callback(protocol_root: Path) -> None:
+def _serve_oauth_callback(config: Mapping[str, Any], protocol_root: Path) -> None:
     google = AuthenticatedServiceClient(
         identity="jarvis-oauth-callback",
         expected_server_identity="jarvis-google",
@@ -961,6 +1052,7 @@ def _serve_oauth_callback(protocol_root: Path) -> None:
         ),
         host="google_connector",
         port=SERVICE_ROLES["google_connector"].port,
+        operation_timeouts=_operation_timeouts(config, server_role="google_connector"),
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -1009,9 +1101,11 @@ def _serve_oauth_callback(protocol_root: Path) -> None:
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    HTTPServer(
+    server = ThreadingHTTPServer(
         ("0.0.0.0", SERVICE_ROLES["public_oauth_callback"].port), Handler
-    ).serve_forever()
+    )
+    server.daemon_threads = True
+    server.serve_forever()
 
 
 def serve(role_name: str, *, configuration_path: Path, protocol_root: Path) -> None:
@@ -1029,10 +1123,10 @@ def serve(role_name: str, *, configuration_path: Path, protocol_root: Path) -> N
     ):
         raise CompositionError("configured service identity does not match its role")
     if role_name == "inbound_receiver":
-        _serve_inbound_receiver(protocol_root)
+        _serve_inbound_receiver(configuration, protocol_root)
         return
     if role_name == "public_oauth_callback":
-        _serve_oauth_callback(protocol_root)
+        _serve_oauth_callback(configuration, protocol_root)
         return
     if role_name == "deleted_conversation_archive":
         paths = configuration.get("paths")
@@ -1165,6 +1259,19 @@ def _parser() -> argparse.ArgumentParser:
         "--protocol-root", type=Path, default=Path("/run/protocol")
     )
     subcommands.add_parser("health")
+    proxy_parser = subcommands.add_parser("serve-egress-proxy")
+    proxy_parser.add_argument("kind", choices=("orchestration", "google", "vault"))
+    proxy_parser.add_argument("--port", type=int, default=9080)
+    proxy_parser.add_argument(
+        "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
+    )
+    proxy_health = subcommands.add_parser("proxy-health")
+    proxy_health.add_argument("--port", type=int, default=9080)
+    connect_parser = subcommands.add_parser("egress-connect")
+    connect_parser.add_argument("target_host")
+    connect_parser.add_argument("target_port", type=int)
+    connect_parser.add_argument("--proxy-host", required=True)
+    connect_parser.add_argument("--proxy-port", type=int, default=9080)
     authorize_parser = subcommands.add_parser("google-authorize")
     authorize_parser.add_argument("--operation-id", required=True)
     authorize_parser.add_argument(
@@ -1174,19 +1281,76 @@ def _parser() -> argparse.ArgumentParser:
     disconnect_parser.add_argument(
         "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
     )
+    for command in ("audit-view", "audit-export"):
+        audit_parser = subcommands.add_parser(command)
+        audit_parser.add_argument(
+            "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
+        )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    if arguments.command == "health":
+    if arguments.command == "serve-egress-proxy":
+        expected_identity = f"jarvis-{arguments.kind}-egress"
+        if os.environ.get("JARVIS_SERVICE_IDENTITY") != expected_identity:
+            raise CompositionError("egress proxy identity does not match its role")
+        configuration = _load_configuration(arguments.configuration)
+        egress = configuration.get("egress")
+        if not isinstance(egress, Mapping):
+            raise CompositionError("egress proxy configuration is unavailable")
+        hosts = egress.get(f"{arguments.kind}_hosts")
+        if not isinstance(hosts, list) or not all(
+            isinstance(item, str) for item in hosts
+        ):
+            raise CompositionError("egress proxy host allowlist is invalid")
+        serve_egress_proxy(
+            host="0.0.0.0",
+            port=arguments.port,
+            allowed_hosts=hosts,
+            allowed_ports=(22,) if arguments.kind == "vault" else (443,),
+        )
+    elif arguments.command == "proxy-health":
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", arguments.port), timeout=2
+            ) as probe:
+                probe.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                response = probe.recv(128)
+            if not response.startswith(b"HTTP/1.1 200 "):
+                raise CompositionError("egress proxy health response is invalid")
+        except OSError as exc:
+            raise CompositionError("egress proxy is not healthy") from exc
+    elif arguments.command == "egress-connect":
+        connect_through_proxy(
+            proxy_host=arguments.proxy_host,
+            proxy_port=arguments.proxy_port,
+            target_host=arguments.target_host,
+            target_port=arguments.target_port,
+        )
+    elif arguments.command == "health":
         health()
+    elif arguments.command in {"audit-view", "audit-export"}:
+        if os.environ.get("JARVIS_SERVICE_IDENTITY") != "jarvis-audit":
+            raise CompositionError("audit administration requires the audit identity")
+        configuration = _load_configuration(arguments.configuration)
+        paths = configuration.get("paths")
+        if not isinstance(paths, Mapping):
+            raise CompositionError("audit path configuration is unavailable")
+        audit_root = Path(_require_text(paths.get("audit"), "paths.audit"))
+        audit = SQLiteAuditBoundary(audit_root / "audit.sqlite3")
+        if arguments.command == "audit-view":
+            print(json.dumps(_encode(audit.safe_view()), separators=(",", ":")))
+        else:
+            print(audit.export_json())
     elif arguments.command in {"google-authorize", "google-disconnect"}:
         if os.environ.get("JARVIS_SERVICE_IDENTITY") != "jarvis-broker":
             raise CompositionError("Google administration requires the broker identity")
-        _load_configuration(arguments.configuration)
+        configuration = _load_configuration(arguments.configuration)
         client = _client(
-            client_identity="jarvis-broker", server_role="google_connector"
+            configuration,
+            client_identity="jarvis-broker",
+            server_role="google_connector",
         )
         if arguments.command == "google-authorize":
             result = client.call(
