@@ -1449,7 +1449,7 @@ def administrative_status(
     return {
         "messaging_ready": messaging_ready,
         "audit_writable": audit_writable,
-        "backup_freshness": "not-configured",
+        "backup_freshness": "host-check-required",
         "hosts": hosts,
         "release": release,
         "resource_pressure": resource_pressure,

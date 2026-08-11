@@ -11,7 +11,8 @@ import sqlite3
 import stat
 import tempfile
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,13 @@ DEFAULT_ROOTS = {
     "google_traces": Path("/var/lib/jarvis/google-traces"),
     "deleted_conversations": Path("/var/lib/jarvis/deleted-conversations"),
 }
+PROTECTED_ADMIN_ROOTS = tuple(DEFAULT_ROOTS.values()) + (
+    Path("/var/lib/jarvis/vault"),
+    Path("/srv/jarvis-workspace"),
+    Path("/etc/jarvis"),
+    Path("/run/credentials"),
+    Path("/run/protocol"),
+)
 
 
 class BackupError(RuntimeError):
@@ -64,7 +72,7 @@ def create_backup(
     config_path = _regular_file(configuration, "configuration")
     lock_path = _regular_file(artifact_lock, "artifact lock")
     config, lock, release = _metadata(config_path, lock_path)
-    del config, lock
+    del config
 
     resolved_roots: dict[str, Path] = {}
     for root_name in DEFAULT_ROOTS:
@@ -77,7 +85,11 @@ def create_backup(
         resolved_roots[root_name] = root
 
     destination_path = Path(destination).expanduser().resolve()
-    if any(_within(destination_path, root) for root in resolved_roots.values()):
+    protected_roots = {
+        *resolved_roots.values(),
+        *map(Path.resolve, PROTECTED_ADMIN_ROOTS),
+    }
+    if any(_within(destination_path, root) for root in protected_roots):
         raise BackupError("backup destination must be outside Jarvis data roots")
     destination_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     timestamp = (now or datetime.now(UTC)).astimezone(UTC)
@@ -95,29 +107,41 @@ def create_backup(
         _private_file(metadata_dir / "configuration.toml")
         _private_file(metadata_dir / "artifacts.lock.json")
 
-        root_metadata: dict[str, dict[str, int]] = {}
-        databases: list[dict[str, Any]] = []
-        for name, root_name, filename, required_table in DATABASES:
-            root = resolved_roots[root_name]
-            root_metadata.setdefault(root_name, _ownership(root))
-            source = _regular_file(root / filename, f"{name} database")
-            copied = staging / "data" / root_name / filename
-            copied.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _sqlite_backup(source, copied)
-            _private_file(copied)
-            schema_hash = _verify_database(copied, required_table)
-            source_ownership = _ownership(source)
-            databases.append(
-                {
-                    "name": name,
-                    "root": root_name,
-                    "filename": filename,
-                    "path": copied.relative_to(staging).as_posix(),
-                    "sha256": _sha256(copied),
-                    "schema_sha256": schema_hash,
-                    **source_ownership,
-                }
+        root_metadata = {
+            name: _ownership(root) for name, root in resolved_roots.items()
+        }
+        sources = [
+            (
+                name,
+                root_name,
+                filename,
+                required_table,
+                _regular_file(resolved_roots[root_name] / filename, f"{name} database"),
             )
+            for name, root_name, filename, required_table in DATABASES
+        ]
+        databases: list[dict[str, Any]] = []
+        with _consistent_snapshot([source for *_, source in sources]):
+            for name, root_name, filename, required_table, source in sources:
+                copied = staging / "data" / root_name / filename
+                copied.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _sqlite_backup(source, copied)
+                _private_file(copied)
+                schema_hash = _verify_database(copied, required_table)
+                if schema_hash != lock["database_schemas"][name]:
+                    raise BackupError(f"database schema compatibility failed: {name}")
+                source_ownership = _ownership(source)
+                databases.append(
+                    {
+                        "name": name,
+                        "root": root_name,
+                        "filename": filename,
+                        "path": copied.relative_to(staging).as_posix(),
+                        "sha256": _sha256(copied),
+                        "schema_sha256": schema_hash,
+                        **source_ownership,
+                    }
+                )
 
         manifest = {
             "schema_version": BACKUP_SCHEMA_VERSION,
@@ -181,19 +205,25 @@ def restore_backup(
         Path(path).expanduser().resolve()
         for path in current_config.get("paths", {}).values()
         if isinstance(path, str) and path.startswith("/")
-    } | {path.resolve() for path in DEFAULT_ROOTS.values()}
+    } | {path.resolve() for path in PROTECTED_ADMIN_ROOTS}
     if any(_within(target_path, root) for root in active_roots):
         raise BackupError("isolated restore target must be outside active data roots")
     if not _release_compatible(manifest["release"], current_release):
         raise BackupError("release compatibility check failed")
+    for item in manifest["databases"]:
+        if item["schema_sha256"] != _lock["database_schemas"][item["name"]]:
+            raise BackupError(f"database schema compatibility failed: {item['name']}")
     _verify_snapshot_files(snapshot_path, manifest)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{target_path.name}.partial-", dir=target_path.parent)
-    )
     try:
-        staging.chmod(0o700)
+        target_path.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise BackupError("isolated restore target must not already exist") from exc
+    staging = target_path
+    marker = staging / ".restore-in-progress"
+    try:
+        marker.touch(mode=0o600)
         for item in manifest["databases"]:
             source = _snapshot_member(snapshot_path, item["path"])
             restored = staging / item["path"]
@@ -220,7 +250,7 @@ def restore_backup(
         shutil.copyfile(snapshot_path / "manifest.json", staging / "manifest.json")
         _private_file(staging / "manifest.json")
         _verify_restored_ownership(staging, manifest)
-        staging.rename(target_path)
+        marker.unlink()
         return target_path
     except (BackupError, OSError, sqlite3.Error, ValueError, TypeError) as exc:
         shutil.rmtree(staging, ignore_errors=True)
@@ -248,6 +278,18 @@ def _metadata(
         }
         if not all(isinstance(value, str) and value for value in release.values()):
             raise TypeError
+        schemas = lock.get("database_schemas")
+        if not isinstance(schemas, dict) or set(schemas) != {
+            item[0] for item in DATABASES
+        }:
+            raise TypeError
+        if any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in schemas.values()
+        ):
+            raise TypeError
         return config, lock, release
     except (
         OSError,
@@ -273,6 +315,25 @@ def _sqlite_backup(source: Path, target: Path) -> None:
     finally:
         target_connection.close()
         source_connection.close()
+
+
+@contextmanager
+def _consistent_snapshot(databases: Sequence[Path]) -> Iterator[None]:
+    """Hold one SQLite write barrier across every authoritative database."""
+
+    connection = sqlite3.connect("file::memory:?cache=private", uri=True, timeout=30)
+    try:
+        for index, database in enumerate(databases):
+            uri = f"file:{quote(database.as_posix(), safe='/:')}"
+            connection.execute(f'ATTACH DATABASE ? AS "backup_{index}"', (uri,))
+        connection.execute("BEGIN IMMEDIATE")
+        yield
+    except sqlite3.Error as exc:
+        raise BackupError("consistent database snapshot could not be acquired") from exc
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
 
 
 def _verify_database(database: Path, required_table: str) -> str:

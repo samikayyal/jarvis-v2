@@ -969,7 +969,7 @@ def test_administrative_status_reports_safe_operational_state(
     assert status["messaging_ready"] is True
     assert status["hosts"] == {"ubuntu": "ready", "windows": "unavailable"}
     assert status["audit_writable"] is True
-    assert status["backup_freshness"] == "not-configured"
+    assert status["backup_freshness"] == "missing"
     assert status["resource_pressure"] == "ok"
 
 
@@ -1208,6 +1208,8 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "codex/package-lock.json",
         "openwa-handoff.md",
         "requirements.lock",
+        "systemd/jarvis-backup.service",
+        "systemd/jarvis-backup.timer",
     )
     assert report.host_mutations == ()
 

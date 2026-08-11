@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import stat
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from jarvis_control_plane.administrative_backup import (
     BackupError,
+    _consistent_snapshot,
     create_backup,
     restore_backup,
 )
+from jarvis_control_plane.deployment import _backup_freshness
 
 DATABASES = {
     "state": ("state.sqlite3", "CREATE TABLE request_state (request_id TEXT)"),
@@ -65,6 +69,17 @@ def _inputs(tmp_path: Path) -> tuple[dict[str, Path], Path, Path]:
     shipped = Path(__file__).parents[1] / "deployment"
     configuration.write_bytes((shipped / "config.example.toml").read_bytes())
     artifact_lock = tmp_path / "artifacts.lock.json"
+    schemas = {}
+    for name, (filename, _schema) in DATABASES.items():
+        root_name = "state" if name == "sessions" else name
+        with sqlite3.connect(roots[root_name] / filename) as connection:
+            schema_text = "\n".join(
+                row[0] or ""
+                for row in connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name"
+                )
+            )
+        schemas[name] = hashlib.sha256(schema_text.encode()).hexdigest()
     artifact_lock.write_text(
         json.dumps(
             {
@@ -74,6 +89,7 @@ def _inputs(tmp_path: Path) -> tuple[dict[str, Path], Path, Path]:
                     "version": "0.1.0",
                     "git_revision": "revision-28",
                 },
+                "database_schemas": schemas,
             }
         ),
         encoding="utf-8",
@@ -161,6 +177,24 @@ def test_pre_change_backup_uses_sqlite_online_snapshot_for_wal_data(
     assert values == ["state", "committed-in-wal"]
 
 
+def test_consistent_snapshot_holds_one_write_barrier_across_all_stores(
+    tmp_path: Path,
+) -> None:
+    roots, _configuration, _artifact_lock = _inputs(tmp_path)
+    databases = [
+        roots["state"] / "state.sqlite3",
+        roots["audit"] / "audit.sqlite3",
+    ]
+
+    with _consistent_snapshot(databases):
+        writer = sqlite3.connect(databases[1], timeout=0.01)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                writer.execute("INSERT INTO audit_evidence VALUES ('blocked')")
+        finally:
+            writer.close()
+
+
 def test_restore_rejects_tampering_and_incompatible_release(tmp_path: Path) -> None:
     roots, configuration, artifact_lock = _inputs(tmp_path)
     snapshot = create_backup(
@@ -217,6 +251,24 @@ def test_restore_rejects_tampering_and_incompatible_release(tmp_path: Path) -> N
             artifact_lock=incompatible,
         )
 
+    incompatible_schema = tmp_path / "incompatible-schema-lock.json"
+    incompatible_schema.write_text(
+        artifact_lock.read_text(encoding="utf-8").replace(
+            json.loads(artifact_lock.read_text(encoding="utf-8"))["database_schemas"][
+                "state"
+            ],
+            "0" * 64,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(BackupError, match="database schema compatibility"):
+        restore_backup(
+            snapshot=clean,
+            target=tmp_path / "incompatible-schema-restore",
+            configuration=configuration,
+            artifact_lock=incompatible_schema,
+        )
+
 
 def test_restore_requires_a_new_isolated_target(tmp_path: Path) -> None:
     roots, configuration, artifact_lock = _inputs(tmp_path)
@@ -252,3 +304,32 @@ def test_restore_requires_a_new_isolated_target(tmp_path: Path) -> None:
             artifact_lock=artifact_lock,
             roots=roots,
         )
+
+
+def test_bundle_ships_nightly_timer_and_reports_backup_freshness(
+    tmp_path: Path,
+) -> None:
+    deployment = Path(__file__).parents[1] / "deployment"
+    service = (deployment / "systemd" / "jarvis-backup.service").read_text(
+        encoding="utf-8"
+    )
+    timer = (deployment / "systemd" / "jarvis-backup.timer").read_text(encoding="utf-8")
+    assert "--kind nightly" in service
+    assert "User=root" in service
+    assert "OnCalendar=" in timer
+    assert "Persistent=true" in timer
+
+    now = datetime(2026, 8, 12, 12, tzinfo=UTC)
+    assert _backup_freshness(tmp_path, now=now) == "missing"
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "manifest.json").write_text(
+        json.dumps({"created_at": (now - timedelta(hours=1)).isoformat()}),
+        encoding="utf-8",
+    )
+    assert _backup_freshness(tmp_path, now=now) == "current"
+    (snapshot / "manifest.json").write_text(
+        json.dumps({"created_at": (now - timedelta(hours=48)).isoformat()}),
+        encoding="utf-8",
+    )
+    assert _backup_freshness(tmp_path, now=now) == "stale"

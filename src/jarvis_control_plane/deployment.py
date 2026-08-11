@@ -15,6 +15,7 @@ import subprocess
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
@@ -43,6 +44,8 @@ REQUIRED_FILES = (
     "codex/package-lock.json",
     "openwa-handoff.md",
     "requirements.lock",
+    "systemd/jarvis-backup.service",
+    "systemd/jarvis-backup.timer",
 )
 
 RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
@@ -271,6 +274,7 @@ def verify_bundle(
     )
     handoff_active = _validate_compose(compose, config, errors)
     _validate_handoff_description(root / "openwa-handoff.md", errors)
+    _validate_backup_units(root / "systemd", errors)
 
     if errors:
         raise BundleValidationError(tuple(dict.fromkeys(errors)))
@@ -535,6 +539,7 @@ def _validate_artifacts(
     if set(lock) != {
         "schema_version",
         "application",
+        "database_schemas",
         "python_base_image",
         "uv_build_image",
         "node_build_image",
@@ -558,6 +563,25 @@ def _validate_artifacts(
         source_root, errors
     ):
         errors.append("application source differs from the pinned artifact")
+    schemas = lock.get("database_schemas")
+    expected_schemas = {
+        "state",
+        "sessions",
+        "audit",
+        "traces",
+        "codex_traces",
+        "google_traces",
+        "deleted_conversations",
+    }
+    if (
+        not isinstance(schemas, Mapping)
+        or set(schemas) != expected_schemas
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in schemas.values()
+        )
+    ):
+        errors.append("database schema fingerprints must be complete and pinned")
     base = lock.get("python_base_image")
     reference = base.get("reference") if isinstance(base, Mapping) else None
     if not isinstance(reference, str) or not re.fullmatch(
@@ -1035,6 +1059,21 @@ def _validate_handoff_description(path: Path, errors: list[str]) -> None:
             errors.append(f"OpenWA handoff description is missing: {phrase}")
 
 
+def _validate_backup_units(root: Path, errors: list[str]) -> None:
+    service = (root / "jarvis-backup.service").read_text(encoding="utf-8")
+    timer = (root / "jarvis-backup.timer").read_text(encoding="utf-8")
+    for phrase in (
+        "User=root",
+        "UMask=0077",
+        "jarvis_control_plane.administrative_backup create --kind nightly",
+    ):
+        if phrase not in service:
+            errors.append(f"nightly backup service is missing: {phrase}")
+    for phrase in ("OnCalendar=", "Persistent=true", "Unit=jarvis-backup.service"):
+        if phrase not in timer:
+            errors.append(f"nightly backup timer is missing: {phrase}")
+
+
 def _memory_mib(value: str) -> int:
     return int(value.removesuffix("M"))
 
@@ -1061,6 +1100,8 @@ def administrative_status(
     bundle: str | Path,
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    backup_root: str | Path = "/var/backups/jarvis",
+    now: datetime | None = None,
 ) -> dict[str, object]:
     """Combine local Compose health with authenticated dependency status."""
 
@@ -1119,7 +1160,27 @@ def administrative_status(
         subprocess.CalledProcessError,
     ) as exc:
         raise RuntimeError("administrative status is unavailable") from exc
+    details["backup_freshness"] = _backup_freshness(Path(backup_root), now=now)
     return {"components": components, **details}
+
+
+def _backup_freshness(root: Path, *, now: datetime | None = None) -> str:
+    try:
+        manifests = list(root.glob("*/manifest.json"))
+        if not manifests:
+            return "missing"
+        created = max(
+            datetime.fromisoformat(
+                json.loads(manifest.read_text(encoding="utf-8"))["created_at"]
+            )
+            for manifest in manifests
+        )
+        if created.tzinfo is None:
+            raise ValueError
+        age = (now or datetime.now(UTC)).astimezone(UTC) - created.astimezone(UTC)
+        return "current" if timedelta(0) <= age <= timedelta(hours=36) else "stale"
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return "invalid"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

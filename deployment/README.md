@@ -148,8 +148,11 @@ artifact release metadata travel with every snapshot. Credentials, private keys,
 OpenWA state, caches, the knowledge-vault clone, and external authoritative
 content cannot enter the snapshot because they are not accepted inputs.
 
-Use the same command from the host's nightly root timer and immediately before a
-change, varying only the required kind:
+The unactivated bundle ships reviewed `jarvis-backup.service` and
+`jarvis-backup.timer` units for a persistent nightly run. Installing and enabling
+those units remains a manual activation step. Run the same command immediately
+before an upgrade, active-configuration change, or migration, varying only the
+required kind:
 
 ```console
 uv run python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
@@ -159,8 +162,8 @@ uv run python -m jarvis_control_plane.administrative_backup create --kind pre-ch
 Both commands create a new mode-`0700` versioned directory under
 `/var/backups/jarvis`; they never replace or automatically remove a snapshot.
 The administrator must provision that backup root outside every Jarvis-readable
-path. Scheduling or enabling the timer is a manual host-administration action and
-is intentionally not performed by the bundle.
+path. Installing or enabling the shipped timer is intentionally not performed by
+the bundle.
 
 Restore always targets a path that does not yet exist. It verifies every checksum,
 the complete database inventory and schema, SQLite integrity, audit readability,
