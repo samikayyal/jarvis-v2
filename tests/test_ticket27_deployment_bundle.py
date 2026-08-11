@@ -362,6 +362,39 @@ def test_google_administration_is_authenticated_and_not_model_accessible() -> No
     assert allowlists["jarvis-oauth-callback"] == ("oauth_callback",)
 
 
+def test_fresh_google_authorization_requests_only_identity_and_read_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    captured: dict[str, object] = {}
+
+    class Client:
+        def call(self, operation: str, **kwargs: object) -> str:
+            captured.update(operation=operation, **kwargs)
+            return "https://accounts.google.com/o/oauth2/v2/auth?state=test"
+
+    monkeypatch.setenv("JARVIS_SERVICE_IDENTITY", "jarvis-broker")
+    monkeypatch.setattr(runtime, "_load_configuration", lambda _path: {})
+    monkeypatch.setattr(runtime, "_client", lambda *_args, **_kwargs: Client())
+
+    assert runtime.main(["google-authorize", "--operation-id", "connect-01"]) == 0
+
+    requested_scopes = set(captured["requested_scopes"])
+    assert captured["operation"] == "start_authorization"
+    assert captured["operation_id"] == "connect-01"
+    assert "openid" in requested_scopes
+    assert "https://www.googleapis.com/auth/gmail.readonly" in requested_scopes
+    assert (
+        "https://www.googleapis.com/auth/calendar.events.readonly" in requested_scopes
+    )
+    assert "https://www.googleapis.com/auth/drive.readonly" in requested_scopes
+    assert "https://www.googleapis.com/auth/gmail.send" not in requested_scopes
+    assert "https://www.googleapis.com/auth/calendar.events" not in requested_scopes
+    assert capsys.readouterr().out.startswith("https://accounts.google.com/")
+
+
 def test_google_startup_does_not_revive_a_persisted_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

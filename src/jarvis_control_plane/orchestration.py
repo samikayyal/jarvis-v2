@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from typing import Any, Literal
 
@@ -39,6 +39,7 @@ _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000
 _READ_TOOL_TIMEOUT_SECONDS = 20.0
 _MAX_READ_TOOL_SECONDS = _READ_TOOL_TIMEOUT_SECONDS
+_MODEL_CANCELLATION_GRACE_SECONDS = 5.0
 _CLOSED_READ_TOOL_NAMES = frozenset(
     {
         "read_request_context",
@@ -55,6 +56,17 @@ _TERMINAL_PAYLOAD_FIELDS = frozenset(
 
 class _ModelTurnDeadlineExceeded(TimeoutError):
     """The adapter cancelled a still-pending Agents SDK task at its deadline."""
+
+
+class _ModelTurnCancelled(Exception):
+    """The operator cancelled an active Agents SDK task."""
+
+
+@dataclass(frozen=True)
+class _ActiveModelTurn:
+    loop: asyncio.AbstractEventLoop
+    task: asyncio.Task[Any]
+    quiesced: Event
 
 
 class AgentsSdkProposal(BaseModel):
@@ -323,6 +335,7 @@ class AgentsSdkOrchestrationAdapter:
             )
         self._cancellation_lock = Lock()
         self._cancelled_requests: set[str] = set()
+        self._active_model_turns: dict[str, _ActiveModelTurn] = {}
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
         try:
@@ -449,17 +462,43 @@ class AgentsSdkOrchestrationAdapter:
 
         async def run_bounded() -> object:
             operation = self._run_async(agent, model_input, **kwargs)
-            if self._model_turn_timeout_seconds is None:
-                return await operation
             task = asyncio.ensure_future(operation)
-            done, _pending = await asyncio.wait(
-                (task,), timeout=self._model_turn_timeout_seconds
+            active = _ActiveModelTurn(
+                loop=asyncio.get_running_loop(),
+                task=task,
+                quiesced=Event(),
             )
-            if task not in done:
+            request_id = request.state.request_id
+            with self._cancellation_lock:
+                if request_id in self._active_model_turns:
+                    task.cancel()
+                    raise OrchestrationAdapterError(
+                        "request already has an active Agents SDK model turn"
+                    )
+                self._active_model_turns[request_id] = active
+                cancel_immediately = request_id in self._cancelled_requests
+            if cancel_immediately:
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                raise _ModelTurnDeadlineExceeded
-            return await task
+            try:
+                if self._model_turn_timeout_seconds is None:
+                    return await task
+                done, _pending = await asyncio.wait(
+                    (task,), timeout=self._model_turn_timeout_seconds
+                )
+                if task not in done:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise _ModelTurnDeadlineExceeded
+                return await task
+            except asyncio.CancelledError as exc:
+                if self._request_is_cancelled(request_id):
+                    raise _ModelTurnCancelled from exc
+                raise
+            finally:
+                with self._cancellation_lock:
+                    if self._active_model_turns.get(request_id) is active:
+                        self._active_model_turns.pop(request_id, None)
+                active.quiesced.set()
 
         try:
             return asyncio.run(run_bounded())
@@ -468,15 +507,36 @@ class AgentsSdkOrchestrationAdapter:
             raise OrchestrationAdapterError(
                 "Agents SDK model turn exceeded its configured deadline"
             ) from exc
+        except _ModelTurnCancelled as exc:
+            raise OrchestrationAdapterError(
+                "Agents SDK model turn was cancelled"
+            ) from exc
 
     def cancel(self, *, request_id: str) -> bool:
-        """Propagate a request cancellation into an active Codex process scope."""
+        """Cancel active model and Codex work only after model-task quiescence."""
 
         with self._cancellation_lock:
             self._cancelled_requests.add(request_id)
-        if self._codex_specialist is None:
-            return False
-        return self._codex_specialist.cancel(request_id)
+            active = self._active_model_turns.get(request_id)
+            if active is not None:
+                try:
+                    active.loop.call_soon_threadsafe(active.task.cancel)
+                except RuntimeError as exc:
+                    raise OrchestrationAdapterError(
+                        "active Agents SDK model turn could not be cancelled"
+                    ) from exc
+        codex_cancelled = (
+            self._codex_specialist.cancel(request_id)
+            if self._codex_specialist is not None
+            else False
+        )
+        if active is not None and not active.quiesced.wait(
+            timeout=_MODEL_CANCELLATION_GRACE_SECONDS
+        ):
+            raise OrchestrationAdapterError(
+                "active Agents SDK model turn did not establish quiescence"
+            )
+        return active is not None or codex_cancelled
 
     def _request_is_cancelled(self, request_id: str) -> bool:
         with self._cancellation_lock:

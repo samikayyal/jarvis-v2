@@ -49,7 +49,7 @@ from .google_calendar import (
     GoogleApiCalendarWriteProvider,
 )
 from .google_oauth import (
-    GOOGLE_OAUTH_SCOPES,
+    GOOGLE_OAUTH_BASELINE_SCOPES,
     FileGoogleCredentialStore,
     GoogleLiveOAuthProvider,
     GoogleOAuthError,
@@ -1386,7 +1386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = client.call(
                 "start_authorization",
                 operation_id=arguments.operation_id,
-                requested_scopes=tuple(sorted(GOOGLE_OAUTH_SCOPES)),
+                requested_scopes=tuple(sorted(GOOGLE_OAUTH_BASELINE_SCOPES)),
             )
             if not isinstance(result, str) or not result.startswith(
                 "https://accounts.google.com/"

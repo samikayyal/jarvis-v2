@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -240,6 +240,50 @@ def test_agents_adapter_cancels_the_async_model_turn_at_its_deadline() -> None:
         adapter.run(_request("wait forever"))
 
     assert cancelled.is_set()
+
+
+def test_agents_adapter_cancels_an_active_async_model_turn_and_waits_for_quiescence() -> (
+    None
+):
+    started = Event()
+    cancelled = Event()
+    outcomes: list[OrchestrationAdapterError] = []
+
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=90,
+    )
+
+    def run() -> None:
+        try:
+            adapter.run(_request("wait for cancellation"))
+        except OrchestrationAdapterError as exc:
+            outcomes.append(exc)
+
+    runner = Thread(target=run)
+    runner.start()
+    assert started.wait(timeout=2)
+
+    assert adapter.cancel(request_id="request-001") is True
+    assert cancelled.is_set()
+    runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], OrchestrationAdapterError)
+    assert "model turn was cancelled" in str(outcomes[0])
 
 
 def test_agents_adapter_does_not_misreport_a_provider_timeout_as_its_deadline() -> None:

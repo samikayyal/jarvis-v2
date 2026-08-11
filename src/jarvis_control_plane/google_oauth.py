@@ -36,15 +36,19 @@ from .traces import DiagnosticTraceRecorder
 
 GOOGLE_OAUTH_STATE_TTL = timedelta(minutes=10)
 GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES = 32 * 1024
-GOOGLE_OAUTH_SCOPES = frozenset(
+GOOGLE_OAUTH_BASELINE_SCOPES = frozenset(
     {
         "openid",
         "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
         "https://www.googleapis.com/auth/calendar.events.readonly",
-        "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/drive.readonly",
+    }
+)
+GOOGLE_OAUTH_SCOPES = GOOGLE_OAUTH_BASELINE_SCOPES | frozenset(
+    {
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/calendar.events",
     }
 )
 _CALLBACK_FIELDS = frozenset(
