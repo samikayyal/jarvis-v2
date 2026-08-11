@@ -237,3 +237,18 @@ def test_restore_requires_a_new_isolated_target(tmp_path: Path) -> None:
             configuration=configuration,
             artifact_lock=artifact_lock,
         )
+    with pytest.raises(BackupError, match="outside the snapshot"):
+        restore_backup(
+            snapshot=snapshot,
+            target=snapshot / "nested-restore",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+        )
+    with pytest.raises(BackupError, match="outside Jarvis data roots"):
+        create_backup(
+            destination=roots["state"] / "backups",
+            kind="nightly",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+            roots=roots,
+        )

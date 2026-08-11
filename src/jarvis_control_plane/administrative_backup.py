@@ -66,7 +66,19 @@ def create_backup(
     config, lock, release = _metadata(config_path, lock_path)
     del config, lock
 
+    resolved_roots: dict[str, Path] = {}
+    for root_name in DEFAULT_ROOTS:
+        if root_name not in roots:
+            raise BackupError(f"missing backup root: {root_name}")
+        raw_root = Path(roots[root_name]).expanduser()
+        root = raw_root.resolve()
+        if not root.is_dir() or raw_root.is_symlink():
+            raise BackupError(f"backup root is unavailable: {root_name}")
+        resolved_roots[root_name] = root
+
     destination_path = Path(destination).expanduser().resolve()
+    if any(_within(destination_path, root) for root in resolved_roots.values()):
+        raise BackupError("backup destination must be outside Jarvis data roots")
     destination_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     timestamp = (now or datetime.now(UTC)).astimezone(UTC)
     snapshot = destination_path / (timestamp.strftime("%Y%m%dT%H%M%S.%fZ") + f"-{kind}")
@@ -86,12 +98,7 @@ def create_backup(
         root_metadata: dict[str, dict[str, int]] = {}
         databases: list[dict[str, Any]] = []
         for name, root_name, filename, required_table in DATABASES:
-            if root_name not in roots:
-                raise BackupError(f"missing backup root: {root_name}")
-            raw_root = Path(roots[root_name]).expanduser()
-            root = raw_root.resolve()
-            if not root.is_dir() or raw_root.is_symlink():
-                raise BackupError(f"backup root is unavailable: {root_name}")
+            root = resolved_roots[root_name]
             root_metadata.setdefault(root_name, _ownership(root))
             source = _regular_file(root / filename, f"{name} database")
             copied = staging / "data" / root_name / filename
@@ -161,13 +168,22 @@ def restore_backup(
         raise BackupError("isolated restore target must not already exist")
     if not snapshot_path.is_dir() or snapshot_path.is_symlink():
         raise BackupError("backup snapshot is unavailable")
+    if _within(target_path, snapshot_path):
+        raise BackupError("isolated restore target must be outside the snapshot")
 
     manifest = _read_manifest(snapshot_path / "manifest.json")
     _validate_manifest(manifest)
-    _config, _lock, current_release = _metadata(
+    current_config, _lock, current_release = _metadata(
         _regular_file(configuration, "configuration"),
         _regular_file(artifact_lock, "artifact lock"),
     )
+    active_roots = {
+        Path(path).expanduser().resolve()
+        for path in current_config.get("paths", {}).values()
+        if isinstance(path, str) and path.startswith("/")
+    } | {path.resolve() for path in DEFAULT_ROOTS.values()}
+    if any(_within(target_path, root) for root in active_roots):
+        raise BackupError("isolated restore target must be outside active data roots")
     if not _release_compatible(manifest["release"], current_release):
         raise BackupError("release compatibility check failed")
     _verify_snapshot_files(snapshot_path, manifest)
@@ -221,6 +237,8 @@ def _metadata(
         lock = json.loads(artifact_lock.read_text(encoding="utf-8"))
         validate_configuration(config)
         application = lock["application"]
+        if application.get("name") != "jarvis-v2":
+            raise BackupError("release metadata is invalid")
         if config.get("schema_version") != 1 or lock.get("schema_version") != 1:
             raise BackupError("schema compatibility check failed")
         release = {
@@ -397,6 +415,10 @@ def _regular_file(path: str | Path, label: str) -> Path:
 
 def _required_table(name: str) -> str:
     return next(item[3] for item in DATABASES if item[0] == name)
+
+
+def _within(child: Path, parent: Path) -> bool:
+    return child == parent or parent in child.parents
 
 
 def _release_compatible(
