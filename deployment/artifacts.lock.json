@@ -3,8 +3,8 @@
   "application": {
     "name": "jarvis-v2",
     "version": "0.1.0",
-    "git_revision": "6a4aace348dd61ef6e09354a979b56ac7edb906e",
-    "source_sha256": "cdf14ec606eaede11d82ef85b2bad426df2a0ef17c1640ff4a5e43b05c89c3ba"
+    "git_revision": "16bb585c48eba86f24ea0f872334e7f4743ef545",
+    "source_sha256": "a37a722b6deb2e94d70dea8d13f3f5f59a1e2776e844bfb2f348d1feda7a4afc"
   },
   "python_base_image": {
     "reference": "python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f"
