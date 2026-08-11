@@ -55,7 +55,8 @@ ubuntu_worker_socket = "/run/jarvis-worker/ubuntu.sock"
 configuration = "0444"
 credential_directory = "0700"
 credential_file = "0600"
-ubuntu_worker_socket = "0660"
+protocol_key = "0440"
+ubuntu_worker_socket = "0600"
 
 [openwa_handoff]
 activation = "manual-only"

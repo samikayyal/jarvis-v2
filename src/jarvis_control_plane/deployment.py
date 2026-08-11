@@ -70,14 +70,89 @@ EXPECTED_IDENTITIES: Mapping[str, str] = MappingProxyType(
 
 ALLOWED_CREDENTIAL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
-        "inbound_receiver": frozenset(),
-        "capability_broker": frozenset(),
+        "inbound_receiver": frozenset({"/run/credentials/openwa-inbound"}),
+        "capability_broker": frozenset({"/run/credentials/broker"}),
         "orchestration_agent": frozenset({"/run/credentials/openai"}),
         "audit_service": frozenset(),
         "google_connector": frozenset({"/run/credentials/google"}),
         "knowledge_vault_connector": frozenset({"/run/credentials/vault"}),
         "openwa_outbound_connector": frozenset({"/run/credentials/openwa"}),
         "worker_gateway": frozenset({"/run/credentials/windows-worker"}),
+        "public_oauth_callback": frozenset(),
+    }
+)
+
+ALLOWED_PROTOCOL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "inbound_receiver": frozenset(
+            {"/run/protocol/inbound_receiver--capability_broker.key"}
+        ),
+        "capability_broker": frozenset(
+            {
+                "/run/protocol/inbound_receiver--capability_broker.key",
+                "/run/protocol/capability_broker--orchestration_agent.key",
+                "/run/protocol/capability_broker--audit_service.key",
+                "/run/protocol/capability_broker--google_connector.key",
+                "/run/protocol/capability_broker--knowledge_vault_connector.key",
+                "/run/protocol/capability_broker--openwa_outbound_connector.key",
+                "/run/protocol/capability_broker--worker_gateway.key",
+            }
+        ),
+        "orchestration_agent": frozenset(
+            {
+                "/run/protocol/capability_broker--orchestration_agent.key",
+                "/run/protocol/orchestration_agent--google_connector.key",
+                "/run/protocol/orchestration_agent--knowledge_vault_connector.key",
+            }
+        ),
+        "audit_service": frozenset(
+            {
+                "/run/protocol/capability_broker--audit_service.key",
+                "/run/protocol/google_connector--audit_service.key",
+            }
+        ),
+        "google_connector": frozenset(
+            {
+                "/run/protocol/capability_broker--google_connector.key",
+                "/run/protocol/orchestration_agent--google_connector.key",
+                "/run/protocol/public_oauth_callback--google_connector.key",
+                "/run/protocol/google_connector--audit_service.key",
+            }
+        ),
+        "knowledge_vault_connector": frozenset(
+            {
+                "/run/protocol/capability_broker--knowledge_vault_connector.key",
+                "/run/protocol/orchestration_agent--knowledge_vault_connector.key",
+            }
+        ),
+        "openwa_outbound_connector": frozenset(
+            {"/run/protocol/capability_broker--openwa_outbound_connector.key"}
+        ),
+        "worker_gateway": frozenset(
+            {"/run/protocol/capability_broker--worker_gateway.key"}
+        ),
+        "public_oauth_callback": frozenset(
+            {"/run/protocol/public_oauth_callback--google_connector.key"}
+        ),
+    }
+)
+
+ALLOWED_STATE_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "inbound_receiver": frozenset(),
+        "capability_broker": frozenset(
+            {
+                "/var/lib/jarvis/state",
+                "/var/lib/jarvis/traces",
+                "/var/lib/jarvis/deleted-conversations",
+            }
+        ),
+        "orchestration_agent": frozenset(),
+        "audit_service": frozenset({"/var/lib/jarvis/audit"}),
+        "google_connector": frozenset({"/var/lib/jarvis/google-traces"}),
+        "knowledge_vault_connector": frozenset({"/var/lib/jarvis/vault"}),
+        "openwa_outbound_connector": frozenset(),
+        "worker_gateway": frozenset(),
         "public_oauth_callback": frozenset(),
     }
 )
@@ -234,7 +309,8 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
         "configuration": "0444",
         "credential_directory": "0700",
         "credential_file": "0600",
-        "ubuntu_worker_socket": "0660",
+        "protocol_key": "0440",
+        "ubuntu_worker_socket": "0600",
     }
     if permissions != expected_permissions:
         errors.append("deployment permissions do not match the reviewed contract")
@@ -379,6 +455,15 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
             errors.append("resource_bounds do not match the reviewed V1 limits")
 
 
+def validate_configuration(config: Mapping[str, Any]) -> None:
+    """Validate one configuration document independently of bundle artifacts."""
+
+    errors: list[str] = []
+    _validate_configuration(config, errors)
+    if errors:
+        raise BundleValidationError(tuple(dict.fromkeys(errors)))
+
+
 def _validate_artifacts(
     root: Path,
     lock: Mapping[str, Any],
@@ -391,6 +476,7 @@ def _validate_artifacts(
         "application",
         "python_base_image",
         "uv_build_image",
+        "os_packages",
         "requirements_lock",
     }:
         errors.append("artifact lock has missing or unknown keys")
@@ -438,6 +524,25 @@ def _validate_artifacts(
         errors.append("Dockerfile images differ from artifact lock")
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
+    if (
+        'ENTRYPOINT ["uv", "run", "--no-project", "python", "-m", '
+        '"jarvis_control_plane.service_runtime"]'
+    ) not in dockerfile:
+        errors.append("Dockerfile must enter the role-specific service runtime")
+    if lock.get("os_packages") != {
+        "git": "1:2.39.5-0+deb12u3",
+        "openssh-client": "1:9.2p1-2+deb12u10",
+    }:
+        errors.append("vault operating-system packages differ from the artifact lock")
+    if "ARG GIT_VERSION=1:2.39.5-0+deb12u3" not in dockerfile:
+        errors.append("Dockerfile must pin the vault Git client package")
+    if "ARG OPENSSH_CLIENT_VERSION=1:9.2p1-2+deb12u10" not in dockerfile:
+        errors.append("Dockerfile must pin the vault SSH client package")
+    if (
+        '"git=${GIT_VERSION}"' not in dockerfile
+        or '"openssh-client=${OPENSSH_CLIENT_VERSION}"' not in dockerfile
+    ):
+        errors.append("Dockerfile must install only the pinned vault clients")
 
     requirement = lock.get("requirements_lock")
     expected_hash = (
@@ -489,13 +594,17 @@ def _validate_compose(
 
     identities = config.get("identities", {})
     seen_users: set[str] = set()
-    for service, expected_limits in RESOURCE_LIMITS.items():
+    for service_index, (service, expected_limits) in enumerate(
+        RESOURCE_LIMITS.items(), start=1
+    ):
         raw = services.get(service)
         if not isinstance(raw, Mapping):
             errors.append(f"missing compose service: {service}")
             continue
         if raw.get("profiles") != ["manual-activation"]:
             errors.append(f"{service} must remain behind the manual-activation profile")
+        if raw.get("command") != ["serve", service]:
+            errors.append(f"{service} must run its role-specific composition root")
         if "image" in raw:
             errors.append(f"{service} must build only from the reviewed local artifact")
         build = raw.get("build")
@@ -517,6 +626,8 @@ def _validate_compose(
         elif user in seen_users:
             errors.append("container identities must be distinct")
         seen_users.add(user)
+        if user != f"{10000 + service_index}:20000":
+            errors.append(f"{service} identity differs from the reviewed UID/group")
         environment = raw.get("environment", {})
         expected_identity = (
             identities.get(service) if isinstance(identities, Mapping) else None
@@ -547,6 +658,9 @@ def _validate_compose(
         "127.0.0.1:8080:8080"
     ]:
         errors.append("OAuth callback must be the sole loopback-published endpoint")
+    worker = services.get("worker_gateway", {})
+    if isinstance(worker, Mapping) and worker.get("expose") != ["9443"]:
+        errors.append("worker gateway must expose only the overlay mTLS session port")
     return handoff_active
 
 
@@ -577,9 +691,22 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
             and target not in ALLOWED_CREDENTIAL_MOUNTS[service]
         ):
             errors.append(f"{service} has an unauthorized credential mount")
-        allowed_host_source = parts[0] == "/etc/jarvis/jarvis.toml" or parts[
-            0
-        ].startswith("/etc/jarvis/credentials/")
+        allowed_host_source = (
+            parts[0] == "/etc/jarvis/jarvis.toml"
+            or parts[0].startswith("/etc/jarvis/credentials/")
+            or parts[0].startswith("/etc/jarvis/protocol")
+            or (
+                service == "worker_gateway"
+                and parts[0] == "/run/jarvis-worker/ubuntu.sock"
+                and target == "/run/jarvis-worker/ubuntu.sock"
+                and parts[-1] == "ro"
+            )
+            or (
+                parts[0] == target
+                and target in ALLOWED_STATE_MOUNTS[service]
+                and len(parts) == 2
+            )
+        )
         if "/var/run/docker.sock" in volume or (
             volume.startswith("/") and not allowed_host_source
         ):
@@ -589,6 +716,18 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
     actual_credentials = {t for t in targets if t.startswith("/run/credentials/")}
     if actual_credentials != ALLOWED_CREDENTIAL_MOUNTS[service]:
         errors.append(f"{service} credential mounts differ from the reviewed boundary")
+    actual_protocol = {
+        target
+        for target in targets
+        if target == "/run/protocol" or target.startswith("/run/protocol/")
+    }
+    if actual_protocol != ALLOWED_PROTOCOL_MOUNTS[service]:
+        errors.append(
+            f"{service} protocol-key mounts differ from the reviewed boundary"
+        )
+    actual_state = {target for target in targets if target.startswith("/var/lib/")}
+    if actual_state != ALLOWED_STATE_MOUNTS[service]:
+        errors.append(f"{service} state mounts differ from the reviewed boundary")
 
 
 def _validate_service_resources(

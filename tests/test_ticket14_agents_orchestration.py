@@ -323,6 +323,46 @@ def test_model_failure_and_malformed_output_are_adapter_errors() -> None:
         malformed.run(_request("read the repository"))
 
 
+def test_calendar_insert_is_frozen_as_an_exact_typed_proposal() -> None:
+    complete_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the Calendar event.",
+                proposal=AgentsSdkProposal(
+                    kind="calendar_insert",
+                    preview="Create the event.",
+                    payload={
+                        "calendar_id": "primary",
+                        "complete_event": complete_event,
+                        "notification": "all",
+                        "connection_generation": 3,
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("create a design review"))
+
+    assert result.proposal is not None
+    assert result.proposal.kind == "calendar_insert"
+    assert '"summary":"Design review"' in result.proposal.payload
+    assert '"connection_generation":3' in result.proposal.payload
+
+
 def test_model_proposed_authority_fields_fail_closed_before_freezing() -> None:
     def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
         return SimpleNamespace(

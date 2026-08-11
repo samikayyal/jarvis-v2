@@ -22,6 +22,7 @@ from .gmail_actions import (
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
 )
+from .google_calendar import CalendarEventSnapshot, CalendarWriteProposal
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
@@ -61,6 +62,9 @@ class AgentsSdkProposal(BaseModel):
         "terminal",
         "gmail_send",
         "gmail_reply",
+        "calendar_insert",
+        "calendar_update",
+        "calendar_patch",
         "knowledge_vault_write",
     ]
     preview: str = Field(min_length=1, max_length=2_000)
@@ -280,10 +284,8 @@ class AgentsSdkOrchestrationAdapter:
         if google_read_connector is not None:
             # Keep the model-facing tool surface closed: only the connector
             # factory may introduce the three Google read handlers.
-            from .google_reads import GoogleReadConnector, _google_read_tools
+            from .google_reads import _google_read_tools
 
-            if not isinstance(google_read_connector, GoogleReadConnector):
-                raise TypeError("google_read_connector must be a GoogleReadConnector")
             read_tools.extend(_google_read_tools(google_read_connector))
         if vault_read_tool is not None and not isinstance(
             vault_read_tool, BoundedReadTool
@@ -596,6 +598,36 @@ class AgentsSdkOrchestrationAdapter:
                     request_id=request.state.request_id,
                     **payload,
                 )
+            elif plan.proposal.kind == "calendar_insert":
+                candidate = CalendarWriteProposal.insert(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    **payload,
+                )
+            elif plan.proposal.kind in {"calendar_update", "calendar_patch"}:
+                snapshot_payload = payload.get("snapshot")
+                if not isinstance(snapshot_payload, Mapping):
+                    raise OrchestrationAdapterError(
+                        "Calendar change requires an ETag-bound snapshot"
+                    )
+                snapshot = CalendarEventSnapshot(
+                    event=dict(snapshot_payload.get("event", {})),
+                    etag=snapshot_payload.get("etag"),
+                )
+                calendar_payload = {
+                    key: value for key, value in payload.items() if key != "snapshot"
+                }
+                factory = (
+                    CalendarWriteProposal.update
+                    if plan.proposal.kind == "calendar_update"
+                    else CalendarWriteProposal.patch
+                )
+                candidate = factory(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    snapshot=snapshot,
+                    **calendar_payload,
+                )
             elif plan.proposal.kind == "knowledge_vault_write":
                 if set(payload) != {"changes"}:
                     raise OrchestrationAdapterError(
@@ -671,7 +703,9 @@ def _instructions(
         "operator's Windows laptop or depends on it; a mere platform or "
         "file-format mention is not a dependency. For a Windows terminal "
         "selection, use only explicit_windows or windows_dependency. For a "
-        "terminal action or Gmail send/reply, emit one complete typed proposal; "
+        "terminal action, Gmail send/reply, or Calendar insert/update/patch, emit "
+        "one complete typed proposal; Calendar changes must include the exact "
+        "ETag-bound snapshot returned by the read tool. "
         "it will still be independently checked and require the broker's approval flow. "
         "Every exposed read tool has a closed typed schema and bounded result. "
         + (

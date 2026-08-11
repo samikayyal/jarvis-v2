@@ -9,6 +9,12 @@ import pytest
 import yaml
 
 from jarvis_control_plane.deployment import BundleValidationError, verify_bundle
+from jarvis_control_plane.models import SignedInboundEvent
+from jarvis_control_plane.service_runtime import (
+    CompositionError,
+    _load_configuration,
+    _verified_inbound_event,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SHIPPED_BUNDLE = REPOSITORY_ROOT / "deployment"
@@ -18,6 +24,29 @@ def _copy_bundle(tmp_path: Path) -> Path:
     target = tmp_path / "deployment"
     shutil.copytree(SHIPPED_BUNDLE, target)
     return target
+
+
+def _active_configuration(tmp_path: Path) -> Path:
+    content = (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
+    replacements = {
+        'configuration_kind = "example"': 'configuration_kind = "active"',
+        "example-operator-id": "operator-01",
+        "example-internal-session-id": "openwa-session-01",
+        "example-named-session": "openwa-named-01",
+        "example-operator-conversation-id": "conversation-01",
+        "example-google-subject": "operator@jarvis.invalid",
+        "https://oauth.example.invalid/callback": "https://oauth.jarvis.invalid/callback",
+        "example-windows-worker": "windows-01",
+        "example-ubuntu-worker": "ubuntu-01",
+        "ssh://vault.example.invalid/notes.git": "ssh://vault.jarvis.invalid/notes.git",
+        'vault_hosts = ["vault.example.invalid"]': 'vault_hosts = ["vault.jarvis.invalid"]',
+    }
+    for old, new in replacements.items():
+        content = content.replace(old, new)
+    path = tmp_path / "jarvis.toml"
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o444)
+    return path
 
 
 def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
@@ -40,6 +69,11 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
     assert report.host_mutations == ()
+    compose = yaml.safe_load((SHIPPED_BUNDLE / "compose.yaml").read_text("utf-8"))
+    commands = {
+        name: tuple(service["command"]) for name, service in compose["services"].items()
+    }
+    assert commands == {name: ("serve", name) for name in report.services}
 
 
 def test_bundle_rejects_unknown_configuration_and_identity_mismatch(
@@ -141,3 +175,56 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "requirements.lock",
     )
     assert report.host_mutations == ()
+
+
+def test_bundle_rejects_verifier_only_or_cross_wired_service_commands(
+    tmp_path: Path,
+) -> None:
+    bundle = _copy_bundle(tmp_path)
+    compose_path = bundle / "compose.yaml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    compose["services"]["audit_service"]["command"] = [
+        "serve",
+        "orchestration_agent",
+    ]
+    compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    assert (
+        "audit_service must run its role-specific composition root"
+        in raised.value.errors
+    )
+
+
+def test_runtime_rejects_unknown_active_configuration_before_binding(
+    tmp_path: Path,
+) -> None:
+    path = _active_configuration(tmp_path)
+    path.chmod(0o644)
+    path.write_text(f"unexpected = true\n{path.read_text('utf-8')}", encoding="utf-8")
+    path.chmod(0o444)
+
+    with pytest.raises(CompositionError, match="failed validation"):
+        _load_configuration(path)
+
+
+def test_runtime_rejects_wrong_active_configuration_mode(tmp_path: Path) -> None:
+    path = _active_configuration(tmp_path)
+    path.chmod(0o644)
+
+    with pytest.raises(CompositionError, match="mode 0444"):
+        _load_configuration(path)
+
+
+def test_inbound_receiver_verifies_raw_body_before_forwarding() -> None:
+    secret = b"receiver-scoped-openwa-signing-secret"
+    signed = SignedInboundEvent.from_mapping({"message": "exact"}, secret)
+
+    assert _verified_inbound_event(signed.raw_body, signed.signature, secret) == signed
+    assert (
+        _verified_inbound_event(signed.raw_body + b" ", signed.signature, secret)
+        is None
+    )
+    assert _verified_inbound_event(signed.raw_body, None, secret) is None

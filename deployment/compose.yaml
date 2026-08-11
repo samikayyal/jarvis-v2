@@ -13,7 +13,7 @@ x-service-defaults: &service-defaults
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
   healthcheck:
-    test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.deployment, /opt/jarvis/deployment, --configuration, /run/jarvis/config.toml, --source-root, /opt/jarvis]
+    test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, health]
     interval: 30s
     timeout: 5s
     retries: 3
@@ -27,11 +27,14 @@ x-service-defaults: &service-defaults
 services:
   inbound_receiver:
     <<: *service-defaults
-    user: "10001:10001"
+    user: "10001:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-inbound
+    command: [serve, inbound_receiver]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/credentials/openwa-inbound:/run/credentials/openwa-inbound:ro
+      - /etc/jarvis/protocol/inbound_receiver--capability_broker.key:/run/protocol/inbound_receiver--capability_broker.key:ro
     networks: [ingress_broker]
     pids_limit: 32
     deploy:
@@ -40,15 +43,23 @@ services:
 
   capability_broker:
     <<: *service-defaults
-    user: "10002:10002"
+    user: "10002:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-broker
+    command: [serve, capability_broker]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
-      - state_data:/var/lib/jarvis/state
-      - trace_data:/var/lib/jarvis/traces
-      - deleted_conversations:/var/lib/jarvis/deleted-conversations
-      - ubuntu_worker_socket:/run/jarvis-worker
+      - /etc/jarvis/credentials/broker:/run/credentials/broker:ro
+      - /etc/jarvis/protocol/inbound_receiver--capability_broker.key:/run/protocol/inbound_receiver--capability_broker.key:ro
+      - /etc/jarvis/protocol/capability_broker--orchestration_agent.key:/run/protocol/capability_broker--orchestration_agent.key:ro
+      - /etc/jarvis/protocol/capability_broker--audit_service.key:/run/protocol/capability_broker--audit_service.key:ro
+      - /etc/jarvis/protocol/capability_broker--google_connector.key:/run/protocol/capability_broker--google_connector.key:ro
+      - /etc/jarvis/protocol/capability_broker--knowledge_vault_connector.key:/run/protocol/capability_broker--knowledge_vault_connector.key:ro
+      - /etc/jarvis/protocol/capability_broker--openwa_outbound_connector.key:/run/protocol/capability_broker--openwa_outbound_connector.key:ro
+      - /etc/jarvis/protocol/capability_broker--worker_gateway.key:/run/protocol/capability_broker--worker_gateway.key:ro
+      - /var/lib/jarvis/state:/var/lib/jarvis/state
+      - /var/lib/jarvis/traces:/var/lib/jarvis/traces
+      - /var/lib/jarvis/deleted-conversations:/var/lib/jarvis/deleted-conversations
     networks:
       - ingress_broker
       - broker_orchestration
@@ -64,13 +75,17 @@ services:
 
   orchestration_agent:
     <<: *service-defaults
-    user: "10003:10003"
+    user: "10003:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-orchestration
+    command: [serve, orchestration_agent]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/openai:/run/credentials/openai:ro
-    networks: [broker_orchestration, orchestration_egress]
+      - /etc/jarvis/protocol/capability_broker--orchestration_agent.key:/run/protocol/capability_broker--orchestration_agent.key:ro
+      - /etc/jarvis/protocol/orchestration_agent--google_connector.key:/run/protocol/orchestration_agent--google_connector.key:ro
+      - /etc/jarvis/protocol/orchestration_agent--knowledge_vault_connector.key:/run/protocol/orchestration_agent--knowledge_vault_connector.key:ro
+    networks: [broker_orchestration, broker_google, broker_vault, orchestration_egress]
     pids_limit: 128
     deploy:
       resources:
@@ -78,12 +93,15 @@ services:
 
   audit_service:
     <<: *service-defaults
-    user: "10004:10004"
+    user: "10004:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-audit
+    command: [serve, audit_service]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
-      - audit_data:/var/lib/jarvis/audit
+      - /var/lib/jarvis/audit:/var/lib/jarvis/audit
+      - /etc/jarvis/protocol/capability_broker--audit_service.key:/run/protocol/capability_broker--audit_service.key:ro
+      - /etc/jarvis/protocol/google_connector--audit_service.key:/run/protocol/google_connector--audit_service.key:ro
     networks: [broker_audit]
     pids_limit: 32
     deploy:
@@ -92,13 +110,19 @@ services:
 
   google_connector:
     <<: *service-defaults
-    user: "10005:10005"
+    user: "10005:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-google
+    command: [serve, google_connector]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/google:/run/credentials/google
-    networks: [broker_google, oauth_google, google_egress]
+      - /etc/jarvis/protocol/capability_broker--google_connector.key:/run/protocol/capability_broker--google_connector.key:ro
+      - /etc/jarvis/protocol/orchestration_agent--google_connector.key:/run/protocol/orchestration_agent--google_connector.key:ro
+      - /etc/jarvis/protocol/public_oauth_callback--google_connector.key:/run/protocol/public_oauth_callback--google_connector.key:ro
+      - /etc/jarvis/protocol/google_connector--audit_service.key:/run/protocol/google_connector--audit_service.key:ro
+      - /var/lib/jarvis/google-traces:/var/lib/jarvis/google-traces
+    networks: [broker_google, broker_audit, oauth_google, google_egress]
     pids_limit: 64
     deploy:
       resources:
@@ -106,13 +130,16 @@ services:
 
   knowledge_vault_connector:
     <<: *service-defaults
-    user: "10006:10006"
+    user: "10006:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-vault
+    command: [serve, knowledge_vault_connector]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/vault:/run/credentials/vault:ro
-      - vault_clone:/var/lib/jarvis/vault
+      - /etc/jarvis/protocol/capability_broker--knowledge_vault_connector.key:/run/protocol/capability_broker--knowledge_vault_connector.key:ro
+      - /etc/jarvis/protocol/orchestration_agent--knowledge_vault_connector.key:/run/protocol/orchestration_agent--knowledge_vault_connector.key:ro
+      - /var/lib/jarvis/vault:/var/lib/jarvis/vault
     networks: [broker_vault, vault_egress]
     pids_limit: 64
     deploy:
@@ -121,12 +148,14 @@ services:
 
   openwa_outbound_connector:
     <<: *service-defaults
-    user: "10007:10007"
+    user: "10007:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-openwa-outbound
+    command: [serve, openwa_outbound_connector]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/openwa:/run/credentials/openwa:ro
+      - /etc/jarvis/protocol/capability_broker--openwa_outbound_connector.key:/run/protocol/capability_broker--openwa_outbound_connector.key:ro
     networks: [broker_openwa_outbound]
     pids_limit: 32
     deploy:
@@ -135,13 +164,17 @@ services:
 
   worker_gateway:
     <<: *service-defaults
-    user: "10008:10008"
+    user: "10008:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-worker-gateway
+    command: [serve, worker_gateway]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/windows-worker:/run/credentials/windows-worker:ro
+      - /etc/jarvis/protocol/capability_broker--worker_gateway.key:/run/protocol/capability_broker--worker_gateway.key:ro
+      - /run/jarvis-worker/ubuntu.sock:/run/jarvis-worker/ubuntu.sock:ro
     networks: [broker_worker, worker_overlay]
+    expose: ["9443"]
     pids_limit: 64
     deploy:
       resources:
@@ -149,11 +182,13 @@ services:
 
   public_oauth_callback:
     <<: *service-defaults
-    user: "10009:10009"
+    user: "10009:20000"
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-oauth-callback
+    command: [serve, public_oauth_callback]
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/protocol/public_oauth_callback--google_connector.key:/run/protocol/public_oauth_callback--google_connector.key:ro
     networks: [oauth_google]
     ports: ["127.0.0.1:8080:8080"]
     pids_limit: 32
@@ -174,11 +209,3 @@ networks:
   google_egress: {internal: false}
   vault_egress: {internal: false}
   worker_overlay: {external: true, name: jarvis-worker-overlay}
-
-volumes:
-  state_data: {}
-  audit_data: {}
-  trace_data: {}
-  deleted_conversations: {}
-  vault_clone: {}
-  ubuntu_worker_socket: {}
