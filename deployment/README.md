@@ -134,7 +134,45 @@ run `uv run python -m jarvis_control_plane.deployment deployment
 --administrative-status`. The host-side command reads Compose health locally and
 uses a one-off broker-identity process only for authenticated messaging, audit,
 and worker readiness. It reports no credentials or personal identifiers. Backup
-freshness remains `not-configured` until Ticket 28 is completed.
+freshness remains `not-configured` until the activated host wires its backup
+schedule into administrative status.
+
+## Administrative backup and isolated restore
+
+Run the backup command as the root administrator so SQLite can take online,
+transactionally consistent copies and the restore can preserve the original
+owners and modes. The fixed database inventory covers Jarvis state and sessions,
+append-only audit, broker/Codex/Google diagnostic traces, and the deleted-
+conversation archive. The reviewed configuration, SQLite schema hashes, and
+artifact release metadata travel with every snapshot. Credentials, private keys,
+OpenWA state, caches, the knowledge-vault clone, and external authoritative
+content cannot enter the snapshot because they are not accepted inputs.
+
+Use the same command from the host's nightly root timer and immediately before a
+change, varying only the required kind:
+
+```console
+uv run python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+uv run python -m jarvis_control_plane.administrative_backup create --kind pre-change --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+```
+
+Both commands create a new mode-`0700` versioned directory under
+`/var/backups/jarvis`; they never replace or automatically remove a snapshot.
+The administrator must provision that backup root outside every Jarvis-readable
+path. Scheduling or enabling the timer is a manual host-administration action and
+is intentionally not performed by the bundle.
+
+Restore always targets a path that does not yet exist. It verifies every checksum,
+the complete database inventory and schema, SQLite integrity, audit readability,
+owners and modes, and compatible configuration/release metadata before publishing
+the isolated result:
+
+```console
+uv run python -m jarvis_control_plane.administrative_backup restore /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-restore/rehearsal --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+```
+
+The restored tree is rehearsal material only. The command does not stop, start,
+reconfigure, migrate, or otherwise activate any Jarvis or OpenWA service.
 
 Orchestration, Google, and vault services have no direct Internet-routed
 network. Each reaches only its dedicated CONNECT proxy on a private segment;
