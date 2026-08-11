@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -214,6 +215,48 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
     ).run(_request("read the current request context"))
 
     assert result.reply_text.endswith("The late read was ignored.")
+
+
+def test_agents_adapter_cancels_the_async_model_turn_at_its_deadline() -> None:
+    cancelled = Event()
+
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="configured deadline"):
+        adapter.run(_request("wait forever"))
+
+    assert cancelled.is_set()
+
+
+def test_agents_adapter_does_not_misreport_a_provider_timeout_as_its_deadline() -> None:
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        raise TimeoutError("provider timed out first")
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=1,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="run was unavailable"):
+        adapter.run(_request("provider timeout"))
 
 
 def test_agents_adapter_enforces_a_per_request_read_invocation_limit() -> None:

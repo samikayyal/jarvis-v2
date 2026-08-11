@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import secrets
 import socket
 import ssl
 import struct
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Full, Queue
 from threading import Event, RLock, Thread
 from time import sleep
 
@@ -80,7 +82,10 @@ def _receive_frame(connection: socket.socket) -> dict[str, object]:
 def _receive_exact(connection: socket.socket, length: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < length:
-        chunk = connection.recv(length - len(chunks))
+        try:
+            chunk = connection.recv(length - len(chunks))
+        except OSError as exc:
+            raise ActionDispatcherError("Windows worker session disconnected") from exc
         if not chunk:
             raise ActionDispatcherError("Windows worker session disconnected")
         chunks.extend(chunk)
@@ -102,7 +107,11 @@ class SocketWindowsWorkerSession:
     ) -> None:
         self._connection = connection
         self._evidence = evidence
-        self._lock = RLock()
+        self._send_lock = RLock()
+        self._pending_lock = RLock()
+        self._pending: dict[str, Queue[object]] = {}
+        self._reader = Thread(target=self._read_responses, daemon=True)
+        self._reader.start()
 
     @property
     def evidence(self) -> WindowsWorkerSessionEvidence:
@@ -153,25 +162,81 @@ class SocketWindowsWorkerSession:
     def _call(
         self, operation: str, arguments: dict[str, object], *, timeout_seconds: int
     ) -> object:
-        with self._lock:
-            self._connection.settimeout(timeout_seconds)
-            try:
+        request_id = secrets.token_hex(16)
+        response_queue: Queue[object] = Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending[request_id] = response_queue
+        try:
+            with self._send_lock:
                 _send_frame(
                     self._connection,
-                    {"operation": operation, "arguments": arguments},
+                    {
+                        "request_id": request_id,
+                        "operation": operation,
+                        "arguments": arguments,
+                    },
                 )
+            response = response_queue.get(timeout=timeout_seconds)
+        except Empty as exc:
+            self._close()
+            raise ActionDispatcherError(
+                "Windows worker session call timed out",
+                may_have_dispatched=operation == "execute",
+            ) from exc
+        except (OSError, ActionDispatcherError) as exc:
+            raise ActionDispatcherError(
+                "Windows worker session call failed",
+                may_have_dispatched=operation == "execute",
+            ) from exc
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+        if isinstance(response, BaseException):
+            raise ActionDispatcherError(
+                "Windows worker session call failed",
+                may_have_dispatched=operation == "execute",
+            ) from response
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise ActionDispatcherError(
+                "Windows worker rejected the bounded operation",
+                may_have_dispatched=operation == "execute",
+            )
+        return response.get("result")
+
+    def _read_responses(self) -> None:
+        try:
+            while True:
                 response = _receive_frame(self._connection)
-            except (OSError, ActionDispatcherError) as exc:
-                raise ActionDispatcherError(
-                    "Windows worker session call failed",
-                    may_have_dispatched=operation == "execute",
-                ) from exc
-            if response.get("ok") is not True:
-                raise ActionDispatcherError(
-                    "Windows worker rejected the bounded operation",
-                    may_have_dispatched=operation == "execute",
-                )
-            return response.get("result")
+                request_id = response.get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    raise ActionDispatcherError(
+                        "Windows worker response request ID is invalid"
+                    )
+                with self._pending_lock:
+                    response_queue = self._pending.get(request_id)
+                if response_queue is None:
+                    raise ActionDispatcherError(
+                        "Windows worker response request ID is unknown"
+                    )
+                response_queue.put(response)
+        except (OSError, ActionDispatcherError) as exc:
+            self._fail_pending(exc)
+
+    def _fail_pending(self, error: BaseException) -> None:
+        with self._pending_lock:
+            queues = tuple(self._pending.values())
+        for response_queue in queues:
+            try:
+                response_queue.put_nowait(error)
+            except Full:
+                pass
+
+    def _close(self) -> None:
+        try:
+            self._connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._connection.close()
 
 
 class WindowsWorkerMtlsAcceptor:
@@ -260,10 +325,14 @@ def serve_windows_worker_session(
 ) -> None:
     """Run the Windows side of the closed session after mTLS connects."""
 
-    while True:
-        request = _receive_frame(connection)
+    send_lock = RLock()
+
+    def handle(request: dict[str, object]) -> None:
+        request_id = request.get("request_id")
         operation = request.get("operation")
         arguments = request.get("arguments")
+        if not isinstance(request_id, str) or not request_id:
+            raise ActionDispatcherError("Windows worker request ID is invalid")
         if not isinstance(arguments, dict):
             raise ActionDispatcherError("Windows worker request arguments are invalid")
         try:
@@ -292,9 +361,18 @@ def serve_windows_worker_session(
                 result = None
             else:
                 raise ActionDispatcherError("Windows worker operation is not allowed")
-            _send_frame(connection, {"ok": True, "result": result})
+            response = {"request_id": request_id, "ok": True, "result": result}
         except Exception:  # noqa: BLE001 - translate worker failures at the boundary
-            _send_frame(connection, {"ok": False})
+            response = {"request_id": request_id, "ok": False}
+        with send_lock:
+            _send_frame(connection, response)
+
+    while True:
+        request = _receive_frame(connection)
+        if request.get("operation") == "execute":
+            Thread(target=handle, args=(request,), daemon=True).start()
+        else:
+            handle(request)
 
 
 def run_windows_worker_client(

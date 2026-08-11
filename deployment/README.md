@@ -18,7 +18,15 @@ manual-activation` or run `up` during isolated verification.
 The image entry point is the role-specific runtime, not the offline verifier.
 Each Compose service selects exactly one composition root and exposes only its
 closed operation set. Owned-service calls use bounded JSON frames authenticated
-in both directions with a distinct HMAC key for each client-to-server link.
+in both directions with a distinct HMAC key for each client-to-server link. The
+offline verifier compares the exact network membership and network mode of every
+service with this reviewed topology, including the networkless deleted archive.
+
+The inbound HTTP role verifies the exact signed OpenWA body and waits only for
+the broker's durable ingress admission. It then returns the admission disposition
+while a broker-owned background worker claims and processes the message outside
+the webhook lifetime; model turns, connector calls, terminal work, and outbound
+delivery never hold the webhook request open.
 
 `config.example.toml` contains no real operator, Google, OpenWA, vault, or worker
 identity. Before a later supervised activation, a manual administrator must make
@@ -58,6 +66,11 @@ at `/srv/jarvis-workspace` read-only and keeps its Codex traces in the
 UID-10003-owned `/var/lib/jarvis/codex-traces` directory. Codex receives the
 same service-scoped OpenAI API key as the orchestration SDK, but it receives no
 connector, worker, deployment, or activation credential.
+The Agents SDK model turn is cancelled at `timeouts.model_turn_seconds`, and
+the broker's authenticated orchestration link exposes a separate cancellation
+operation so `/cancel` also reaches an active remote SDK or Codex run. The Codex
+subprocess receives only its API key, basic process environment, and the reviewed
+`HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` route variables.
 
 The native Ubuntu and Windows workers are not Compose services. Before activation,
 a root administrator creates `/run/jarvis-worker`, starts the reviewed native
@@ -76,7 +89,10 @@ private-overlay address (port `9443` in the reviewed Compose metadata), requires
 TLS 1.3 client authentication and the registered certificate/application
 identity, and attaches the worker-initiated session to the gateway transport.
 The native Windows service runs `run_windows_worker_client` with its existing
-Job Object executor; installation and activation remain manual-only.
+Job Object executor. Correlated request IDs let execution and cancellation share
+that single outbound session concurrently, so Job Object termination is not
+blocked behind the execution response. Installation and activation remain
+manual-only.
 
 The callback process intentionally binds plain HTTP only on host loopback. A
 separately reviewed host TLS reverse proxy must terminate the exact configured

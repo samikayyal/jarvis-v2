@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import tomllib
 from pathlib import Path
+from threading import Event, Thread
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
+from jarvis_control_plane.codex_runtime import CodexCliAdapter
+from jarvis_control_plane.codex_specialist import CodexExecutionEnvelope
 from jarvis_control_plane.deployment import (
     BundleValidationError,
     validate_configuration,
@@ -20,6 +25,7 @@ from jarvis_control_plane.ports import TraceCapacityError
 from jarvis_control_plane.service_runtime import (
     SERVICE_ROLES,
     CompositionError,
+    _AsyncIngressAdmission,
     _broker_state_store,
     _load_configuration,
     _operation_timeouts,
@@ -27,6 +33,7 @@ from jarvis_control_plane.service_runtime import (
     _service_access,
     _verified_inbound_event,
 )
+from jarvis_control_plane.sessions import SQLiteWorkingSessionStore
 from jarvis_control_plane.traces import SQLiteDiagnosticTraceStore
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -157,7 +164,10 @@ def test_orchestration_composition_includes_the_codex_specialist(
 
     def orchestration(**kwargs: object) -> object:
         captured.update(kwargs)
-        return SimpleNamespace(run=lambda _request: None)
+        return SimpleNamespace(
+            run=lambda _request: None,
+            cancel=lambda *, request_id: request_id == "request-01",
+        )
 
     monkeypatch.setattr(runtime, "AgentsSdkOrchestrationAdapter", orchestration)
     operations = _orchestration_operations(
@@ -166,12 +176,145 @@ def test_orchestration_composition_includes_the_codex_specialist(
                 "default_model": "gpt-5.6-terra",
                 "default_reasoning": "medium",
             },
-            "timeouts": {"codex_seconds": 300},
+            "timeouts": {"codex_seconds": 300, "model_turn_seconds": 90},
         }
     )
 
-    assert operations.keys() == {"run"}
+    assert operations.keys() == {"run", "cancel"}
     assert captured["codex_specialist"] is specialist
+    assert captured["model_turn_timeout_seconds"] == 90
+    identities, allowlists = _service_access(
+        "orchestration_agent", SERVICE_ROLES["orchestration_agent"]
+    )
+    assert identities == ("jarvis-broker",)
+    assert allowlists["jarvis-broker"] == ("run", "cancel")
+
+
+def test_deployed_codex_cli_preserves_only_the_reviewed_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import jarvis_control_plane.codex_runtime as runtime
+
+    executable = tmp_path / "codex"
+    executable.write_text("pinned", encoding="utf-8")
+    captured: dict[str, object] = {}
+    final = json.dumps(
+        {
+            "status": "completed",
+            "summary": "Reviewed.",
+            "changed_paths": [],
+            "test_evidence": [],
+            "unresolved_questions": [],
+        }
+    )
+
+    class Process:
+        returncode = 0
+        pid = 1
+
+        def communicate(self, _prompt: str, *, timeout: float) -> tuple[str, str]:
+            assert timeout > 0
+            return (
+                "\n".join(
+                    (
+                        json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {"type": "agent_message", "text": final},
+                            }
+                        ),
+                    )
+                ),
+                "",
+            )
+
+    def popen(_command: object, **kwargs: object) -> Process:
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://orchestration_egress_proxy:9080")
+    monkeypatch.setenv("HTTP_PROXY", "http://orchestration_egress_proxy:9080")
+    monkeypatch.setenv("NO_PROXY", "google_connector,knowledge_vault_connector")
+    monkeypatch.setenv("UNREVIEWED_SECRET", "must-not-cross")
+    monkeypatch.setattr(runtime.subprocess, "Popen", popen)
+    adapter = CodexCliAdapter(executable=executable, api_key="api-key")
+
+    adapter.invoke(
+        CodexExecutionEnvelope(
+            request_id="request-1",
+            task="Review the workspace.",
+            host="ubuntu",
+            cwd="/srv/jarvis-workspace",
+            model="gpt-5.6-terra",
+            reasoning="medium",
+            sandbox="read-only",
+            approval_policy="on-request",
+            timeout_seconds=300,
+            operation="review",
+            allowed_paths=(),
+            proposal_digest=None,
+        ),
+        deadline=monotonic() + 1,
+    )
+
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["HTTPS_PROXY"] == "http://orchestration_egress_proxy:9080"
+    assert environment["HTTP_PROXY"] == "http://orchestration_egress_proxy:9080"
+    assert environment["NO_PROXY"] == "google_connector,knowledge_vault_connector"
+    assert "UNREVIEWED_SECRET" not in environment
+
+
+def test_working_session_store_is_usable_from_service_handler_threads(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteWorkingSessionStore(tmp_path / "sessions.sqlite3")
+    results: list[object] = []
+
+    thread = Thread(target=lambda: results.append(store.load()))
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert results == [None]
+
+
+def test_durable_ingress_admission_returns_before_background_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    dispatch_started = Event()
+    release_dispatch = Event()
+
+    class Receiver:
+        def admit(self, _event: object) -> object:
+            return SimpleNamespace(disposition="admitted", status_code=202)
+
+    class Worker:
+        def __init__(self, **_kwargs: object) -> None:
+            self.calls = 0
+
+        def run_once(self) -> object | None:
+            self.calls += 1
+            if self.calls == 1:
+                dispatch_started.set()
+                assert release_dispatch.wait(timeout=2)
+                return SimpleNamespace(disposition="dispatched")
+            return None
+
+    monkeypatch.setattr(runtime, "OpenWAIngressWorker", Worker)
+    admission = _AsyncIngressAdmission(
+        receiver=Receiver(),  # type: ignore[arg-type]
+        state=object(),
+    )
+
+    result = admission.receive(object())  # type: ignore[arg-type]
+
+    assert result.status_code == 202
+    assert dispatch_started.wait(timeout=1)
+    release_dispatch.set()
 
 
 def test_broker_state_uses_only_the_write_only_deleted_archive_client(
@@ -414,6 +557,35 @@ def test_bundle_routes_credentialed_egress_only_through_allowlisted_proxies(
     with pytest.raises(BundleValidationError) as raised:
         verify_bundle(bundle, source_root=REPOSITORY_ROOT)
     assert "google_connector must not bypass its egress proxy" in raised.value.errors
+
+
+@pytest.mark.parametrize(
+    ("service", "network"),
+    [
+        ("capability_broker", "external_egress"),
+        ("deleted_conversation_archive", "external_egress"),
+    ],
+)
+def test_bundle_rejects_network_access_outside_every_reviewed_service_set(
+    tmp_path: Path, service: str, network: str
+) -> None:
+    bundle = _copy_bundle(tmp_path)
+    compose_path = bundle / "compose.yaml"
+    compose = yaml.safe_load(compose_path.read_text("utf-8"))
+    target = compose["services"][service]
+    target.pop("network_mode", None)
+    target["networks"] = [network]
+    compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    expected = (
+        "deleted conversation archive"
+        if service == "deleted_conversation_archive"
+        else service
+    )
+    assert any(expected in error for error in raised.value.errors)
 
 
 def test_openwa_route_worker_overlay_and_docker_context_are_reviewed() -> None:

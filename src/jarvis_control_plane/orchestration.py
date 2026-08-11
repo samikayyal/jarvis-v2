@@ -53,6 +53,10 @@ _TERMINAL_PAYLOAD_FIELDS = frozenset(
 )
 
 
+class _ModelTurnDeadlineExceeded(TimeoutError):
+    """The adapter cancelled a still-pending Agents SDK task at its deadline."""
+
+
 class AgentsSdkProposal(BaseModel):
     """The one model-emittable proposal shape available in this implementation."""
 
@@ -216,6 +220,7 @@ class AgentsSdkOrchestrationAdapter:
         *,
         agent_factory: Callable[..., Any] | None = None,
         run_sync: Callable[..., Any] | None = None,
+        run_async: Callable[..., Any] | None = None,
         model_settings_factory: Callable[..., Any] | None = None,
         reasoning_factory: Callable[..., Any] | None = None,
         run_config_factory: Callable[..., Any] | None = None,
@@ -226,6 +231,7 @@ class AgentsSdkOrchestrationAdapter:
         vault_read_tool: BoundedReadTool | None = None,
         vault_write_enabled: bool = False,
         codex_specialist: CodexSpecialist | None = None,
+        model_turn_timeout_seconds: float | None = None,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -247,26 +253,35 @@ class AgentsSdkOrchestrationAdapter:
             codex_specialist, CodexSpecialist
         ):
             raise TypeError("codex_specialist must be a CodexSpecialist")
+        if run_sync is not None and run_async is not None:
+            raise ValueError("provide only one Agents SDK runner")
+        if model_turn_timeout_seconds is not None and (
+            isinstance(model_turn_timeout_seconds, bool)
+            or not isinstance(model_turn_timeout_seconds, (int, float))
+            or model_turn_timeout_seconds <= 0
+        ):
+            raise ValueError("model turn timeout must be positive")
         if any(
             value is None
             for value in (
                 agent_factory,
-                run_sync,
                 model_settings_factory,
                 reasoning_factory,
                 run_config_factory,
             )
-        ):
+        ) or (run_sync is None and run_async is None):
             from agents import Agent, ModelSettings, RunConfig, Runner
             from openai.types.shared import Reasoning
 
             agent_factory = agent_factory or Agent
-            run_sync = run_sync or Runner.run_sync
+            if run_sync is None and run_async is None:
+                run_async = Runner.run
             model_settings_factory = model_settings_factory or ModelSettings
             reasoning_factory = reasoning_factory or Reasoning
             run_config_factory = run_config_factory or RunConfig
         self._agent_factory = agent_factory
         self._run_sync = run_sync
+        self._run_async = run_async
         self._model_settings_factory = model_settings_factory
         self._reasoning_factory = reasoning_factory
         self._run_config_factory = run_config_factory
@@ -301,6 +316,11 @@ class AgentsSdkOrchestrationAdapter:
         self._read_tools = tuple(read_tools)
         self._vault_write_enabled = vault_write_enabled
         self._codex_specialist = codex_specialist
+        self._model_turn_timeout_seconds = model_turn_timeout_seconds
+        if self._run_sync is not None and model_turn_timeout_seconds is not None:
+            raise ValueError(
+                "model turn timeout requires the cancellable async Agents SDK runner"
+            )
         self._cancellation_lock = Lock()
         self._cancelled_requests: set[str] = set()
 
@@ -356,14 +376,11 @@ class AgentsSdkOrchestrationAdapter:
                 trace_include_sensitive_data=False,
             )
             model_input = _model_input_with_history(request)
-            run_result = self._run_sync(
-                agent,
-                model_input,
-                max_turns=self._max_turns,
+            run_result = self._run_model_turn(
+                request=request,
+                agent=agent,
+                model_input=model_input,
                 run_config=run_config,
-                previous_response_id=None,
-                auto_previous_response_id=False,
-                conversation_id=None,
             )
         except OrchestrationAdapterError:
             raise
@@ -409,6 +426,48 @@ class AgentsSdkOrchestrationAdapter:
             host_reason_code=host_reason_code,
             milestones=tuple(milestones),
         )
+
+    def _run_model_turn(
+        self,
+        *,
+        request: OrchestrationRequest,
+        agent: object,
+        model_input: object,
+        run_config: object,
+    ) -> object:
+        kwargs = {
+            "max_turns": self._max_turns,
+            "run_config": run_config,
+            "previous_response_id": None,
+            "auto_previous_response_id": False,
+            "conversation_id": None,
+        }
+        if self._run_async is None:
+            if self._run_sync is None:
+                raise OrchestrationAdapterError("Agents SDK runner is unavailable")
+            return self._run_sync(agent, model_input, **kwargs)
+
+        async def run_bounded() -> object:
+            operation = self._run_async(agent, model_input, **kwargs)
+            if self._model_turn_timeout_seconds is None:
+                return await operation
+            task = asyncio.ensure_future(operation)
+            done, _pending = await asyncio.wait(
+                (task,), timeout=self._model_turn_timeout_seconds
+            )
+            if task not in done:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise _ModelTurnDeadlineExceeded
+            return await task
+
+        try:
+            return asyncio.run(run_bounded())
+        except _ModelTurnDeadlineExceeded as exc:
+            self.cancel(request_id=request.state.request_id)
+            raise OrchestrationAdapterError(
+                "Agents SDK model turn exceeded its configured deadline"
+            ) from exc
 
     def cancel(self, *, request_id: str) -> bool:
         """Propagate a request cancellation into an active Codex process scope."""

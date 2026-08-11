@@ -51,7 +51,9 @@ from .ports import (
 )
 
 MAX_REQUEST_FRAME_BYTES = 1_048_576
-MAX_FRAME_BYTES = 4_194_304
+# Two valid 1 MiB terminal streams can expand six-fold when JSON escapes control
+# characters. Leave bounded room for progress events and the authenticated envelope.
+MAX_FRAME_BYTES = 16_777_216
 MAX_CLOCK_SKEW_SECONDS = 30
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
@@ -605,6 +607,17 @@ class RemoteOrchestrationAdapter(OrchestrationAdapter):
         if not isinstance(result, models.OrchestrationResult):
             raise OrchestrationAdapterError(
                 "orchestration service returned an invalid result"
+            )
+        return result
+
+    def cancel(self, *, request_id: str) -> bool:
+        try:
+            result = self._client.call("cancel", request_id=request_id)
+        except ServiceProtocolError as exc:
+            raise OrchestrationAdapterError(str(exc)) from exc
+        if not isinstance(result, bool):
+            raise OrchestrationAdapterError(
+                "orchestration service returned an invalid cancellation result"
             )
         return result
 

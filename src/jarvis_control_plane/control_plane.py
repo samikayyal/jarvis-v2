@@ -4047,7 +4047,12 @@ class DeterministicCapabilityBroker:
             if cancelled_request_id is not None and callable(cancel_orchestration):
                 try:
                     cancel_orchestration(request_id=cancelled_request_id)
-                except (RuntimeError, TypeError, ValueError) as exc:
+                except (
+                    OrchestrationAdapterError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
                     self._best_effort_audit(
                         kind="orchestration_cancellation_failed",
                         event_id=message.event_id,

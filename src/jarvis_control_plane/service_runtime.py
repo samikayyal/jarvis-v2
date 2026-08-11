@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import parse_qsl, urlsplit
@@ -64,7 +64,7 @@ from .knowledge_vault import (
 )
 from .knowledge_vault_writes import KnowledgeVaultWriteConnector
 from .models import FrozenActionProposal, SignedInboundEvent
-from .openwa import OpenWAConfig, OpenWAOutboundConnector
+from .openwa import OpenWAConfig, OpenWAIngressWorker, OpenWAOutboundConnector
 from .orchestration import AgentsSdkOrchestrationAdapter, BoundedReadTool
 from .ports import ActionCancellationResult, ActionCancellationStatus
 from .service_protocol import (
@@ -105,7 +105,9 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
     for role in (
         ServiceRole("inbound_receiver", "jarvis-inbound", 9011, ("receive",)),
         ServiceRole("capability_broker", "jarvis-broker", 9012, ("receive",)),
-        ServiceRole("orchestration_agent", "jarvis-orchestration", 9013, ("run",)),
+        ServiceRole(
+            "orchestration_agent", "jarvis-orchestration", 9013, ("run", "cancel")
+        ),
         ServiceRole(
             "audit_service",
             "jarvis-audit",
@@ -337,11 +339,12 @@ def _orchestration_operations(
         ),
         vault_write_enabled=True,
         codex_specialist=codex_specialist,
+        model_turn_timeout_seconds=float(timeouts.get("model_turn_seconds", 0)),
         run_config_factory=lambda **kwargs: RunConfig(
             model_provider=model_provider, **kwargs
         ),
     )
-    return {"run": orchestration.run}
+    return {"run": orchestration.run, "cancel": orchestration.cancel}
 
 
 class _RemoteGoogleReads:
@@ -429,7 +432,7 @@ def _operation_timeouts(
     if server_role == "capability_broker":
         return {"receive": active}
     if server_role == "orchestration_agent":
-        return {"run": active}
+        return {"run": active, "cancel": side_effect}
     if server_role == "worker_gateway":
         return {operation: terminal for operation in role.operations}
     if server_role in {"google_connector", "knowledge_vault_connector"}:
@@ -484,6 +487,32 @@ def _broker_state_store(state_root: Path) -> SQLiteDurableStateStore:
     return SQLiteDurableStateStore(
         state_root / "state.sqlite3", deleted_archive=deleted_archive
     )
+
+
+class _AsyncIngressAdmission:
+    """Acknowledge durable admission while one background worker drains ingress."""
+
+    def __init__(self, *, receiver: SignedMessageReceiver, state: object) -> None:
+        self._receiver = receiver
+        self._worker = OpenWAIngressWorker(receiver=receiver, state=state)  # type: ignore[arg-type]
+        self._wakeup = Event()
+        Thread(target=self._drain, daemon=True).start()
+
+    def receive(self, event: SignedInboundEvent) -> object:
+        result = self._receiver.admit(event)
+        if result.disposition == "admitted":
+            self._wakeup.set()
+        return result
+
+    def _drain(self) -> None:
+        while True:
+            self._wakeup.wait()
+            self._wakeup.clear()
+            try:
+                while self._worker.run_once() is not None:
+                    pass
+            except Exception:  # noqa: BLE001 - isolate one interrupted ingress item
+                self._wakeup.set()
 
 
 def _broker_operations(
@@ -594,7 +623,8 @@ def _broker_operations(
         clock=clock,
         ids=ids,
     )
-    return {"receive": receiver.receive}
+    ingress = _AsyncIngressAdmission(receiver=receiver, state=state)
+    return {"receive": ingress.receive}
 
 
 class _GoogleActionDispatcher:

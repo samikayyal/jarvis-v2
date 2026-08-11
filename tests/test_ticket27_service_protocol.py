@@ -32,12 +32,14 @@ from jarvis_control_plane.service_protocol import (
     OwnedActionService,
     RemoteActionDispatcher,
     RemoteAuditBoundary,
+    RemoteOrchestrationAdapter,
     ServiceAuthenticationError,
     _decode,
     _encode,
     find_available_port,
     wait_until_ready,
 )
+from jarvis_control_plane.terminal_policy import TerminalAction
 from jarvis_control_plane.windows_worker import (
     OutboundWindowsWorkerTransport,
     WindowsMtlsClientConfig,
@@ -51,7 +53,11 @@ from jarvis_control_plane.windows_worker_session import (
     run_windows_worker_client,
     serve_windows_worker_session,
 )
-from jarvis_control_plane.worker_gateway import WorkerIdentity
+from jarvis_control_plane.worker_gateway import (
+    WorkerExecutionResult,
+    WorkerIdentity,
+    WorkerInvocation,
+)
 
 SECRET = b"ticket-27-test-secret-with-enough-entropy"
 ORCHESTRATION_SECRET = b"ticket-27-orchestration-link-secret!!"
@@ -207,7 +213,7 @@ def test_protocol_round_trips_enums_and_valid_large_terminal_envelopes() -> None
     assert MAX_REQUEST_FRAME_BYTES < MAX_FRAME_BYTES
 
     port = find_available_port()
-    result = "x" * (2 * 1024 * 1024)
+    result = "\0" * (2 * 1024 * 1024)
     server = AuthenticatedServiceServer(
         identity="jarvis-worker-gateway",
         secret=SECRET,
@@ -228,6 +234,20 @@ def test_protocol_round_trips_enums_and_valid_large_terminal_envelopes() -> None
         assert client.call("result") == result
     finally:
         server.shutdown()
+
+
+def test_remote_orchestration_cancellation_crosses_the_authenticated_adapter() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class Client:
+        def call(self, operation: str, **kwargs: object) -> object:
+            calls.append((operation, kwargs))
+            return True
+
+    adapter = RemoteOrchestrationAdapter(Client())  # type: ignore[arg-type]
+
+    assert adapter.cancel(request_id="request-cancel") is True
+    assert calls == [("cancel", {"request_id": "request-cancel"})]
 
 
 def test_service_controls_remain_responsive_during_an_active_request() -> None:
@@ -388,6 +408,93 @@ def test_windows_worker_outbound_session_carries_closed_lifecycle_calls() -> Non
         assert executor.cancelled == ["action-01"]
         assert executor.finalized == ["action-01"]
     finally:
+        gateway_socket.close()
+        worker_socket.close()
+
+
+def test_windows_worker_cancellation_crosses_the_session_during_execution() -> None:
+    execution_started = Event()
+    release_execution = Event()
+
+    class Executor:
+        def execute(self, _invocation: object, _progress: object) -> object:
+            execution_started.set()
+            assert release_execution.wait(timeout=3)
+            return WorkerExecutionResult.completed()
+
+        def terminate(self, *, action_id: str, timeout_seconds: int) -> bool:
+            assert action_id == "action-concurrent-cancel"
+            assert timeout_seconds == 2
+            release_execution.set()
+            return True
+
+        def finalize(self, *, action_id: str, timeout_seconds: int) -> None:
+            return
+
+    gateway_socket, worker_socket = socket.socketpair()
+
+    def serve_until_disconnect() -> None:
+        try:
+            serve_windows_worker_session(
+                worker_socket,
+                Executor(),  # type: ignore[arg-type]
+            )
+        except ActionDispatcherError:
+            return
+
+    worker = Thread(
+        target=serve_until_disconnect,
+        daemon=True,
+    )
+    worker.start()
+    session = SocketWindowsWorkerSession(
+        connection=gateway_socket,
+        evidence=WindowsWorkerSessionEvidence(
+            host="windows",
+            worker_id="windows-01",
+            connection_id="boot-01",
+            certificate_identity="spiffe://jarvis/workers/windows-01",
+            application_identity="jarvis-windows-worker/windows-01",
+        ),
+    )
+    invocation = WorkerInvocation(
+        action_id="action-concurrent-cancel",
+        action=TerminalAction(
+            host="windows",
+            executable="C:\\Windows\\System32\\whoami.exe",
+            arguments=(),
+            cwd="C:\\Windows\\System32",
+        ),
+        interactive=False,
+        deadline_seconds=3,
+        stdout_limit_bytes=1024 * 1024,
+        stderr_limit_bytes=1024 * 1024,
+        cancellation_grace_seconds=2,
+        progress_event_limit=32,
+        milestone_limit_bytes=4096,
+        worker_identity=WorkerIdentity(
+            host="windows", worker_id="windows-01", connection_id="boot-01"
+        ),
+    )
+    outcomes: list[WorkerExecutionResult] = []
+    execution = Thread(
+        target=lambda: outcomes.append(session.execute(invocation, lambda _event: None))
+    )
+    try:
+        execution.start()
+        assert execution_started.wait(timeout=1)
+        assert (
+            session.terminate_job_object(
+                action_id="action-concurrent-cancel", timeout_seconds=2
+            )
+            is True
+        )
+        execution.join(timeout=2)
+        assert not execution.is_alive()
+        assert outcomes == [WorkerExecutionResult.completed()]
+    finally:
+        release_execution.set()
+        execution.join(timeout=2)
         gateway_socket.close()
         worker_socket.close()
 

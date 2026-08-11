@@ -768,6 +768,53 @@ def _validate_compose(
         "knowledge_vault_connector": "vault_egress",
         "vault_egress_proxy": "vault_egress",
     }
+    expected_networks = {
+        "inbound_receiver": {"ingress_broker"},
+        "capability_broker": {
+            "ingress_broker",
+            "broker_orchestration",
+            "broker_audit",
+            "broker_google",
+            "broker_vault",
+            "broker_openwa_outbound",
+            "broker_worker",
+        },
+        "orchestration_agent": {
+            "broker_orchestration",
+            "broker_google",
+            "broker_vault",
+            "orchestration_egress",
+        },
+        "audit_service": {"broker_audit"},
+        "google_connector": {
+            "broker_google",
+            "broker_audit",
+            "oauth_google",
+            "google_egress",
+        },
+        "knowledge_vault_connector": {"broker_vault", "vault_egress"},
+        "openwa_outbound_connector": {"broker_openwa_outbound", "openwa_api"},
+        "worker_gateway": {"broker_worker", "worker_overlay"},
+        "public_oauth_callback": {"oauth_google"},
+        "orchestration_egress_proxy": {
+            "orchestration_egress",
+            "external_egress",
+        },
+        "google_egress_proxy": {"google_egress", "external_egress"},
+        "vault_egress_proxy": {"vault_egress", "external_egress"},
+    }
+    for service, expected in expected_networks.items():
+        raw = services.get(service, {})
+        actual = raw.get("networks", []) if isinstance(raw, Mapping) else []
+        if not isinstance(actual, list) or set(actual) != expected:
+            errors.append(f"{service} networks differ from the reviewed topology")
+        if isinstance(raw, Mapping) and raw.get("network_mode") is not None:
+            errors.append(f"{service} must not override its reviewed network mode")
+    archive = services.get("deleted_conversation_archive", {})
+    if isinstance(archive, Mapping) and (
+        archive.get("network_mode") != "none" or archive.get("networks") is not None
+    ):
+        errors.append("deleted conversation archive must remain networkless")
     for service, segment in expected_egress_memberships.items():
         raw = services.get(service, {})
         memberships = raw.get("networks", []) if isinstance(raw, Mapping) else []

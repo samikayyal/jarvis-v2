@@ -64,6 +64,10 @@ class CodexCliAdapter:
             "OPENAI_API_KEY": self._api_key,
             "PATH": os.environ.get("PATH", ""),
         }
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
