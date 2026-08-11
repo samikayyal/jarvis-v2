@@ -468,22 +468,31 @@ def test_durable_ingress_dispatches_cancel_while_ordinary_work_is_active(
     ordinary_started = Event()
     release_ordinary = Event()
     cancel_dispatched = Event()
+    cancel_finished = Event()
+    dispatch_count = 0
 
     class Receiver:
         def admit(self, _event: object) -> object:
             return SimpleNamespace(disposition="admitted", status_code=202)
 
         def dispatch_admitted_message(self, message: InboundMessage) -> object:
+            nonlocal dispatch_count
             if message.text == "/cancel":
+                dispatch_count += 1
                 cancel_dispatched.set()
             return SimpleNamespace(disposition="dispatched")
 
     class State:
+        finish_attempts = 0
+
         def begin_ingress_dispatch(self, **_kwargs: object) -> bool:
             return True
 
         def finish_ingress_dispatch(self, **_kwargs: object) -> None:
-            return None
+            self.finish_attempts += 1
+            if self.finish_attempts == 1:
+                raise RuntimeError("temporary durable-state failure")
+            cancel_finished.set()
 
     class Worker:
         def __init__(self, **_kwargs: object) -> None:
@@ -525,6 +534,8 @@ def test_durable_ingress_dispatches_cancel_while_ordinary_work_is_active(
     admission.receive(event("/cancel", "cancel"))
 
     assert cancel_dispatched.wait(timeout=1)
+    assert cancel_finished.wait(timeout=1)
+    assert dispatch_count == 1
     release_ordinary.set()
 
 

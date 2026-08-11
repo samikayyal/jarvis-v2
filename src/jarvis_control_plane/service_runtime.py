@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Queue
 from threading import Event, RLock, Thread
+from time import sleep
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import parse_qsl, urlsplit
@@ -527,7 +528,7 @@ class _AsyncIngressAdmission:
         self._state = state
         self._worker = OpenWAIngressWorker(receiver=receiver, state=state)
         self._wakeup = Event()
-        self._controls: Queue[InboundMessage] = Queue()
+        self._controls: Queue[tuple[InboundMessage, str | None]] = Queue()
         Thread(target=self._drain, daemon=True).start()
         Thread(target=self._drain_controls, daemon=True).start()
 
@@ -542,32 +543,34 @@ class _AsyncIngressAdmission:
                 ControlCommand.CANCEL,
                 ControlCommand.NEW,
             }:
-                self._controls.put(message)
+                self._controls.put((message, None))
             self._wakeup.set()
         return result
 
     def _drain_controls(self) -> None:
         while True:
-            message = self._controls.get()
+            message, disposition = self._controls.get()
             try:
-                if not self._state.begin_ingress_dispatch(
-                    transport_session_id=message.session_id,
-                    message_id=message.message_id,
-                ):
-                    continue
-                try:
-                    self._receiver.dispatch_admitted_message(message)
-                except Exception:  # noqa: BLE001 - preserve interrupted ingress
-                    disposition = "interrupted"
-                else:
-                    disposition = "dispatched"
+                if disposition is None:
+                    if not self._state.begin_ingress_dispatch(
+                        transport_session_id=message.session_id,
+                        message_id=message.message_id,
+                    ):
+                        continue
+                    try:
+                        self._receiver.dispatch_admitted_message(message)
+                    except Exception:  # noqa: BLE001 - preserve interrupted ingress
+                        disposition = "interrupted"
+                    else:
+                        disposition = "dispatched"
                 self._state.finish_ingress_dispatch(
                     transport_session_id=message.session_id,
                     message_id=message.message_id,
                     disposition=disposition,
                 )
-            except Exception:  # noqa: BLE001,S110 - keep the control lane available
-                pass
+            except Exception:  # noqa: BLE001 - retain durable terminalization
+                sleep(0.1)
+                self._controls.put((message, disposition))
 
     def _drain(self) -> None:
         while True:

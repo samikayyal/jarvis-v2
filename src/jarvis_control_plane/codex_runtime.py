@@ -173,7 +173,7 @@ class CodexCliAdapter:
         )
 
     @staticmethod
-    def _stop(process: subprocess.Popen[str]) -> None:
+    def _stop(process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
         if os.name == "posix":
