@@ -395,6 +395,58 @@ def test_fresh_google_authorization_requests_only_identity_and_read_scopes(
     assert capsys.readouterr().out.startswith("https://accounts.google.com/")
 
 
+@pytest.mark.parametrize(
+    ("access", "expected_scope", "excluded_scope"),
+    (
+        (
+            "gmail-send",
+            "https://www.googleapis.com/auth/gmail.send",
+            "https://www.googleapis.com/auth/calendar.events",
+        ),
+        (
+            "calendar-write",
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/gmail.send",
+        ),
+    ),
+)
+def test_google_administration_requests_only_the_named_incremental_write_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    access: str,
+    expected_scope: str,
+    excluded_scope: str,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    captured: dict[str, object] = {}
+
+    class Client:
+        def call(self, operation: str, **kwargs: object) -> str:
+            captured.update(operation=operation, **kwargs)
+            return "https://accounts.google.com/o/oauth2/v2/auth?state=test"
+
+    monkeypatch.setenv("JARVIS_SERVICE_IDENTITY", "jarvis-broker")
+    monkeypatch.setattr(runtime, "_load_configuration", lambda _path: {})
+    monkeypatch.setattr(runtime, "_client", lambda *_args, **_kwargs: Client())
+
+    assert (
+        runtime.main(
+            [
+                "google-authorize",
+                "--operation-id",
+                f"enable-{access}",
+                "--access",
+                access,
+            ]
+        )
+        == 0
+    )
+
+    requested_scopes = set(captured["requested_scopes"])
+    assert expected_scope in requested_scopes
+    assert excluded_scope not in requested_scopes
+
+
 def test_google_startup_does_not_revive_a_persisted_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -520,6 +572,27 @@ def test_bundle_rejects_unknown_configuration_and_identity_mismatch(
     assert "unknown configuration key: unexpected" in raised.value.errors
     assert (
         "service identity mismatch for openwa_outbound_connector" in raised.value.errors
+    )
+
+
+@pytest.mark.parametrize(
+    "note_directories",
+    ([1], ["Notes", "Notes"], ["/Notes"], [".private"]),
+)
+def test_configuration_rejects_noncanonical_vault_note_directories(
+    note_directories: list[object],
+) -> None:
+    config = tomllib.loads(
+        (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
+    )
+    config["deployment"]["vault_note_directories"] = note_directories
+
+    with pytest.raises(BundleValidationError) as raised:
+        validate_configuration(config)
+
+    assert (
+        "vault_note_directories must contain canonical unique paths"
+        in raised.value.errors
     )
 
 

@@ -48,6 +48,8 @@ from .ports import (
     OrchestrationAdapterError,
     OutboundConnector,
     OutboundConnectorError,
+    WorkerReadiness,
+    WorkerReadinessProvider,
 )
 
 MAX_REQUEST_FRAME_BYTES = 1_048_576
@@ -663,6 +665,20 @@ class RemoteMessagingReadinessProvider(MessagingGatewayReadinessProvider):
             raise OutboundConnectorError(
                 "messaging service returned invalid readiness", may_have_sent=False
             )
+        return result
+
+
+class RemoteWorkerReadinessProvider(WorkerReadinessProvider):
+    def __init__(self, client: AuthenticatedServiceClient) -> None:
+        self._client = client
+
+    def current(self) -> WorkerReadiness:
+        try:
+            result = self._client.call("current")
+        except ServiceProtocolError as exc:
+            raise ActionDispatcherError("worker readiness is unavailable") from exc
+        if not isinstance(result, WorkerReadiness):
+            raise ActionDispatcherError("worker service returned invalid readiness")
         return result
 
 

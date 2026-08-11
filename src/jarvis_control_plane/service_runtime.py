@@ -43,8 +43,10 @@ from .conversation_archive import (
 )
 from .deployment import BundleValidationError, validate_configuration
 from .egress_proxy import connect_through_proxy, serve_egress_proxy
+from .gmail_actions import GMAIL_SEND_SCOPE
 from .gmail_writes import GmailApiWriteProvider, GmailWriteConnector
 from .google_calendar import (
+    CALENDAR_WRITE_SCOPE,
     CalendarActionDispatcher,
     GoogleApiCalendarWriteProvider,
 )
@@ -77,6 +79,7 @@ from .service_protocol import (
     RemoteOrchestrationAdapter,
     RemoteOutboundConnector,
     RemoteVaultProposalPreparer,
+    RemoteWorkerReadinessProvider,
     _encode,
 )
 from .sessions import ModelAvailability, SQLiteWorkingSessionStore
@@ -85,7 +88,10 @@ from .ubuntu_worker import (
     UbuntuLocalPeerExpectation,
     UnixSocketUbuntuLocalAuthenticator,
 )
-from .ubuntu_worker_ipc import UnixSocketUbuntuWorkerTransport
+from .ubuntu_worker_ipc import (
+    ReconnectingUnixSocketUbuntuWorkerTransport,
+    UnixSocketUbuntuWorkerTransport,
+)
 from .vault_repository import SubprocessVaultRepository
 from .windows_worker import OutboundWindowsWorkerTransport, WindowsWorkerRegistration
 from .windows_worker_session import WindowsMtlsServerConfig, WindowsWorkerMtlsAcceptor
@@ -165,7 +171,13 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
             "worker_gateway",
             "jarvis-worker-gateway",
             9018,
-            ("action_prepare", "action_run", "action_cancel", "action_finalize"),
+            (
+                "current",
+                "action_prepare",
+                "action_run",
+                "action_cancel",
+                "action_finalize",
+            ),
         ),
         ServiceRole(
             "public_oauth_callback", "jarvis-oauth-callback", 8080, ("callback",)
@@ -177,6 +189,12 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
             (),
         ),
     )
+}
+
+_GOOGLE_AUTHORIZATION_ACCESS_SCOPES: Mapping[str, frozenset[str]] = {
+    "baseline": frozenset(),
+    "gmail-send": frozenset({GMAIL_SEND_SCOPE}),
+    "calendar-write": frozenset({CALENDAR_WRITE_SCOPE}),
 }
 
 
@@ -560,9 +578,10 @@ def _broker_operations(
         config, client_identity="jarvis-broker", server_role="knowledge_vault_connector"
     )
     vault_actions = RemoteActionDispatcher(vault_client, bound=True)
-    worker_actions = RemoteActionDispatcher(
-        _client(config, client_identity="jarvis-broker", server_role="worker_gateway")
+    worker_client = _client(
+        config, client_identity="jarvis-broker", server_role="worker_gateway"
     )
+    worker_actions = RemoteActionDispatcher(worker_client)
     actions = RoutedActionDispatcher(
         terminal=worker_actions,
         gmail=google_actions,
@@ -610,6 +629,7 @@ def _broker_operations(
             )
         ),
         messaging_readiness_provider=RemoteMessagingReadinessProvider(outbound_client),
+        worker_readiness_provider=RemoteWorkerReadinessProvider(worker_client),
         working_sessions=SQLiteWorkingSessionStore(state_root / "sessions.sqlite3"),
         action_dispatcher=actions,
         action_lifecycle=actions,
@@ -876,12 +896,6 @@ def _worker_operations(
     socket_path = _require_text(
         paths.get("ubuntu_worker_socket"), "ubuntu_worker_socket"
     )
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        connection.connect(socket_path)
-    except OSError as exc:
-        connection.close()
-        raise CompositionError("native Ubuntu worker socket is unavailable") from exc
     ubuntu_identity = WorkerIdentity(
         host="ubuntu",
         worker_id=_require_text(
@@ -891,20 +905,37 @@ def _worker_operations(
             credentials.get("ubuntu_connection_id"), "ubuntu_connection_id"
         ),
     )
-    authenticator = UnixSocketUbuntuLocalAuthenticator(
-        connection=connection,
+    ubuntu_peer = UbuntuLocalPeerExpectation(
+        peer_uid=int(credentials.get("ubuntu_peer_uid")),
+        socket_owner_uid=int(credentials.get("ubuntu_socket_owner_uid")),
         socket_path=socket_path,
-        connection_id=ubuntu_identity.connection_id,
     )
-    ubuntu = UnixSocketUbuntuWorkerTransport(
-        connection=connection,
-        authenticator=authenticator,
-        expected_peer=UbuntuLocalPeerExpectation(
-            peer_uid=int(credentials.get("ubuntu_peer_uid")),
-            socket_owner_uid=int(credentials.get("ubuntu_socket_owner_uid")),
-            socket_path=socket_path,
-        ),
-        registered_identity=ubuntu_identity,
+
+    def connect_ubuntu() -> UnixSocketUbuntuWorkerTransport:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(socket_path)
+            return UnixSocketUbuntuWorkerTransport(
+                connection=connection,
+                authenticator=UnixSocketUbuntuLocalAuthenticator(
+                    connection=connection,
+                    socket_path=socket_path,
+                    connection_id=ubuntu_identity.connection_id,
+                ),
+                expected_peer=ubuntu_peer,
+                registered_identity=ubuntu_identity,
+            )
+        except BaseException:
+            connection.close()
+            raise
+
+    try:
+        initial_ubuntu = connect_ubuntu()
+    except OSError as exc:
+        raise CompositionError("native Ubuntu worker socket is unavailable") from exc
+    ubuntu = ReconnectingUnixSocketUbuntuWorkerTransport(
+        connect=connect_ubuntu,
+        initial=initial_ubuntu,
     )
     windows_identity = WorkerIdentity(
         host="windows",
@@ -953,7 +984,9 @@ def _worker_operations(
             "windows": windows_identity,
         },
     )
-    return OwnedActionService(gateway).operations()
+    operations = dict(OwnedActionService(gateway).operations())
+    operations["current"] = gateway.current
+    return operations
 
 
 _ROOTS: Mapping[
@@ -1305,6 +1338,11 @@ def _parser() -> argparse.ArgumentParser:
     authorize_parser = subcommands.add_parser("google-authorize")
     authorize_parser.add_argument("--operation-id", required=True)
     authorize_parser.add_argument(
+        "--access",
+        choices=tuple(_GOOGLE_AUTHORIZATION_ACCESS_SCOPES),
+        default="baseline",
+    )
+    authorize_parser.add_argument(
         "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
     )
     disconnect_parser = subcommands.add_parser("google-disconnect")
@@ -1383,10 +1421,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             server_role="google_connector",
         )
         if arguments.command == "google-authorize":
+            requested_scopes = (
+                GOOGLE_OAUTH_BASELINE_SCOPES
+                | (_GOOGLE_AUTHORIZATION_ACCESS_SCOPES[arguments.access])
+            )
             result = client.call(
                 "start_authorization",
                 operation_id=arguments.operation_id,
-                requested_scopes=tuple(sorted(GOOGLE_OAUTH_BASELINE_SCOPES)),
+                requested_scopes=tuple(sorted(requested_scopes)),
             )
             if not isinstance(result, str) or not result.startswith(
                 "https://accounts.google.com/"

@@ -987,6 +987,11 @@ class GoogleOAuthLifecycle:
     ) -> OAuthAuthorization:
         operation_id = _canonical_string(operation_id, "operation_id")
         scopes = _canonical_scopes(requested_scopes)
+        connection = self.connection
+        if connection.connected:
+            # An action-specific consent adds one capability without silently
+            # dropping scopes from the current reviewed connection.
+            scopes = _canonical_scopes(scopes | connection.granted_scopes)
         self._append_audit(
             kind="google_oauth_authorization_started",
             request_id=operation_id,

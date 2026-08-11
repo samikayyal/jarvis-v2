@@ -466,6 +466,23 @@ class MessagingGatewayReadinessProvider(Protocol):
     def current(self) -> MessagingGatewayReadiness: ...
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerReadiness:
+    """Safe broker-facing readiness for the two configured execution hosts."""
+
+    ubuntu: str
+    windows: str
+
+    def __post_init__(self) -> None:
+        allowed = {"ready", "unavailable"}
+        if self.ubuntu not in allowed or self.windows not in allowed:
+            raise ValueError("worker readiness must be ready or unavailable")
+
+
+class WorkerReadinessProvider(Protocol):
+    def current(self) -> WorkerReadiness: ...
+
+
 class OutboundConnector(Protocol):
     """Closed outbound capability with a side-effect-free admission check."""
 

@@ -147,6 +147,30 @@ def test_callback_consumes_state_once_and_replaces_connector_credential() -> Non
         trace_store._close_writer_service()
 
 
+def test_incremental_authorization_retains_existing_scopes_and_adds_one_write_scope() -> (
+    None
+):
+    gmail_send = "https://www.googleapis.com/auth/gmail.send"
+    calendar_write = "https://www.googleapis.com/auth/calendar.events"
+    state = InMemoryGoogleOAuthStateStore()
+    state.set_connection(
+        connected=True,
+        granted_scopes=frozenset({*READ_SCOPES, "openid", gmail_send}),
+    )
+    lifecycle, trace_store = build_lifecycle(state_store=state)
+    try:
+        authorization = lifecycle.start_authorization(
+            operation_id="enable-calendar-write",
+            requested_scopes=(*READ_SCOPES, "openid", calendar_write),
+        )
+
+        assert authorization.requested_scopes == frozenset(
+            {*READ_SCOPES, "openid", gmail_send, calendar_write}
+        )
+    finally:
+        trace_store._close_writer_service()
+
+
 def test_manual_trace_retains_complete_oauth_exchange_and_revocation_payloads() -> None:
     credentials = InMemoryGoogleCredentialStore()
     lifecycle, trace_store = build_lifecycle(credentials=credentials)

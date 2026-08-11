@@ -9,7 +9,7 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from threading import Event, RLock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from typing import Protocol, cast
 
 import pytest
@@ -41,6 +41,9 @@ from jarvis_control_plane import (
     ubuntu_worker_runner,
 )
 from jarvis_control_plane.terminal_policy import TerminalAction, TerminalComponent
+from jarvis_control_plane.ubuntu_worker_ipc import (
+    ReconnectingUnixSocketUbuntuWorkerTransport,
+)
 
 
 class _CancellableHandle(Protocol):
@@ -401,6 +404,69 @@ def test_transport_disconnect_returns_a_typed_ambiguous_error() -> None:
     assert len(failures) == 1
     assert isinstance(failures[0], ActionDispatcherError)
     assert failures[0].may_have_dispatched is True
+
+
+def test_gateway_reconnects_native_ubuntu_transport_before_the_next_action() -> None:
+    first_gateway, first_worker = socket.socketpair()
+    identity = WorkerIdentity(
+        host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+    )
+    initial = UbuntuWorkerTransport(
+        connection=first_gateway,
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=first_gateway
+        ),
+        expected_peer=_peer_expectation(),
+        registered_identity=identity,
+    )
+    first_worker.close()
+    deadline = monotonic() + 2
+    while not initial.is_closed and monotonic() < deadline:
+        sleep(0.01)
+    assert initial.is_closed
+
+    second_gateway, second_worker = socket.socketpair()
+    process_scope = ControlledUbuntuProcessScope(
+        result=WorkerExecutionResult.completed(stdout="after-reconnect")
+    )
+    service = _worker(process_scope=process_scope, channel=second_worker)
+    server = Thread(
+        target=serve_ubuntu_worker_connection,
+        args=(second_worker, service),
+        daemon=True,
+    )
+    server.start()
+    replacement = UbuntuWorkerTransport(
+        connection=second_gateway,
+        authenticator=ControlledUbuntuLocalAuthenticator(
+            _local_peer(), connection=second_gateway
+        ),
+        expected_peer=_peer_expectation(),
+        registered_identity=identity,
+    )
+    reconnects: list[object] = []
+
+    def reconnect() -> UbuntuWorkerTransport:
+        reconnects.append(object())
+        return replacement
+
+    transport = ReconnectingUnixSocketUbuntuWorkerTransport(
+        connect=reconnect,
+        initial=initial,
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": transport},
+        registered_identities={"ubuntu": identity},
+    )
+    try:
+        result = gateway.dispatch(_proposal("action-ubuntu-reconnected"))
+    finally:
+        transport.close()
+        server.join(timeout=2)
+
+    assert result.stdout == "after-reconnect"
+    assert len(reconnects) == 1
+    assert not server.is_alive()
 
 
 def test_disconnect_retires_a_connection_owned_reservation() -> None:

@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .knowledge_vault_writes import canonical_allowed_note_directories
+
 
 @dataclass(frozen=True, slots=True)
 class ServiceResourceLimits:
@@ -379,8 +381,10 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
             if not isinstance(value, str) or not value.strip():
                 errors.append(f"deployment value {key} must be non-empty")
         note_directories = deployment.get("vault_note_directories")
-        if not isinstance(note_directories, list) or not note_directories:
-            errors.append("vault_note_directories must contain at least one path")
+        try:
+            canonical_allowed_note_directories(note_directories)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            errors.append("vault_note_directories must contain canonical unique paths")
         if config.get("configuration_kind") == "active" and any(
             "example" in str(value).lower() for value in deployment.values()
         ):

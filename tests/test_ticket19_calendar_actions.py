@@ -118,6 +118,28 @@ def test_update_freezes_complete_event_and_dispatches_the_stored_operation_once(
     assert json.loads(proposal.payload)["complete_event"] == snapshot.event
 
 
+def test_calendar_connector_binds_and_revalidates_its_current_generation() -> None:
+    dispatcher, _provider, state = connected_dispatcher()
+    proposal = CalendarWriteProposal.insert(
+        action_id="calendar-bound-generation",
+        request_id="request-bound-generation",
+        calendar_id="primary",
+        complete_event=event(),
+        notification="none",
+        connection_generation=999,
+    )
+
+    bound = dispatcher.bind_proposal(proposal)
+
+    assert CalendarWriteRequest.from_proposal(bound).connection_generation == (
+        state.get_connection().generation
+    )
+    dispatcher.validate_pending_action(bound)
+    state.set_connection(connected=False)
+    with pytest.raises(ActionDispatcherError, match="stale"):
+        dispatcher.validate_pending_action(bound)
+
+
 def test_stale_generation_or_tampered_proposal_never_reaches_calendar() -> None:
     dispatcher, provider, state = connected_dispatcher()
     proposal = CalendarWriteProposal.insert(

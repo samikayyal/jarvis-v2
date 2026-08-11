@@ -106,12 +106,18 @@ endpoint or to the orchestration model. With the Google connector running, use:
 
 ```text
 docker compose --file deployment/compose.yaml run --rm capability_broker google-authorize --operation-id <reviewed-id>
+docker compose --file deployment/compose.yaml run --rm capability_broker google-authorize --operation-id <reviewed-id> --access gmail-send
+docker compose --file deployment/compose.yaml run --rm capability_broker google-authorize --operation-id <reviewed-id> --access calendar-write
 docker compose --file deployment/compose.yaml run --rm capability_broker google-disconnect
 ```
 
-The first command prints the single-use Google consent URL. The grant always
-includes `openid` so the connector can bind the returned OpenID subject to the
-configured identity. The second command revokes and removes the current grant.
+The first command prints the single-use baseline Google consent URL. Run the
+matching `--access gmail-send` or `--access calendar-write` command before
+approving an action that needs that write capability. Each incremental flow
+retains the already reviewed grant scopes and adds only its named write scope.
+Every grant includes `openid` so the connector can bind the returned OpenID
+subject to the configured identity. The final command revokes and removes the
+current grant.
 
 Safe audit inspection stays inside the UID-10004 audit boundary. A local
 administrator can run `audit-view` or `audit-export` as a one-off

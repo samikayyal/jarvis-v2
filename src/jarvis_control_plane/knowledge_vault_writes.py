@@ -361,7 +361,7 @@ class KnowledgeVaultWriteConnector:
         self._root = resolved_root
         self._repository = repository
         self._now = now
-        self._allowed_directories = _canonical_allowed_directories(
+        self._allowed_directories = canonical_allowed_note_directories(
             allowed_note_directories
         )
         self._commit_identity = commit_identity or VaultCommitIdentity()
@@ -991,7 +991,9 @@ def _coerce_identity(
     return VaultCommitIdentity(name=value["name"], email=value["email"])  # type: ignore[arg-type]
 
 
-def _canonical_allowed_directories(value: Sequence[str]) -> tuple[tuple[str, ...], ...]:
+def canonical_allowed_note_directories(
+    value: Sequence[str],
+) -> tuple[tuple[str, ...], ...]:
     if isinstance(value, (str, bytes)) or not value or len(value) > _MAX_WRITE_PATHS:
         raise ValueError("allowed note directories must be a bounded sequence")
     result: list[tuple[str, ...]] = []
