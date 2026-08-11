@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from typing import Any, Literal
 
@@ -22,6 +22,7 @@ from .gmail_actions import (
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
 )
+from .google_calendar import CalendarEventSnapshot, CalendarWriteProposal
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
@@ -38,6 +39,7 @@ _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000
 _READ_TOOL_TIMEOUT_SECONDS = 20.0
 _MAX_READ_TOOL_SECONDS = _READ_TOOL_TIMEOUT_SECONDS
+_MODEL_CANCELLATION_GRACE_SECONDS = 5.0
 _CLOSED_READ_TOOL_NAMES = frozenset(
     {
         "read_request_context",
@@ -52,6 +54,21 @@ _TERMINAL_PAYLOAD_FIELDS = frozenset(
 )
 
 
+class _ModelTurnDeadlineExceeded(TimeoutError):
+    """The adapter cancelled a still-pending Agents SDK task at its deadline."""
+
+
+class _ModelTurnCancelled(Exception):
+    """The operator cancelled an active Agents SDK task."""
+
+
+@dataclass(frozen=True)
+class _ActiveModelTurn:
+    loop: asyncio.AbstractEventLoop
+    task: asyncio.Task[Any]
+    quiesced: Event
+
+
 class AgentsSdkProposal(BaseModel):
     """The one model-emittable proposal shape available in this implementation."""
 
@@ -61,6 +78,9 @@ class AgentsSdkProposal(BaseModel):
         "terminal",
         "gmail_send",
         "gmail_reply",
+        "calendar_insert",
+        "calendar_update",
+        "calendar_patch",
         "knowledge_vault_write",
     ]
     preview: str = Field(min_length=1, max_length=2_000)
@@ -212,6 +232,7 @@ class AgentsSdkOrchestrationAdapter:
         *,
         agent_factory: Callable[..., Any] | None = None,
         run_sync: Callable[..., Any] | None = None,
+        run_async: Callable[..., Any] | None = None,
         model_settings_factory: Callable[..., Any] | None = None,
         reasoning_factory: Callable[..., Any] | None = None,
         run_config_factory: Callable[..., Any] | None = None,
@@ -222,6 +243,7 @@ class AgentsSdkOrchestrationAdapter:
         vault_read_tool: BoundedReadTool | None = None,
         vault_write_enabled: bool = False,
         codex_specialist: CodexSpecialist | None = None,
+        model_turn_timeout_seconds: float | None = None,
     ) -> None:
         if (
             isinstance(max_turns, bool)
@@ -243,26 +265,35 @@ class AgentsSdkOrchestrationAdapter:
             codex_specialist, CodexSpecialist
         ):
             raise TypeError("codex_specialist must be a CodexSpecialist")
+        if run_sync is not None and run_async is not None:
+            raise ValueError("provide only one Agents SDK runner")
+        if model_turn_timeout_seconds is not None and (
+            isinstance(model_turn_timeout_seconds, bool)
+            or not isinstance(model_turn_timeout_seconds, (int, float))
+            or model_turn_timeout_seconds <= 0
+        ):
+            raise ValueError("model turn timeout must be positive")
         if any(
             value is None
             for value in (
                 agent_factory,
-                run_sync,
                 model_settings_factory,
                 reasoning_factory,
                 run_config_factory,
             )
-        ):
+        ) or (run_sync is None and run_async is None):
             from agents import Agent, ModelSettings, RunConfig, Runner
             from openai.types.shared import Reasoning
 
             agent_factory = agent_factory or Agent
-            run_sync = run_sync or Runner.run_sync
+            if run_sync is None and run_async is None:
+                run_async = Runner.run
             model_settings_factory = model_settings_factory or ModelSettings
             reasoning_factory = reasoning_factory or Reasoning
             run_config_factory = run_config_factory or RunConfig
         self._agent_factory = agent_factory
         self._run_sync = run_sync
+        self._run_async = run_async
         self._model_settings_factory = model_settings_factory
         self._reasoning_factory = reasoning_factory
         self._run_config_factory = run_config_factory
@@ -280,10 +311,8 @@ class AgentsSdkOrchestrationAdapter:
         if google_read_connector is not None:
             # Keep the model-facing tool surface closed: only the connector
             # factory may introduce the three Google read handlers.
-            from .google_reads import GoogleReadConnector, _google_read_tools
+            from .google_reads import _google_read_tools
 
-            if not isinstance(google_read_connector, GoogleReadConnector):
-                raise TypeError("google_read_connector must be a GoogleReadConnector")
             read_tools.extend(_google_read_tools(google_read_connector))
         if vault_read_tool is not None and not isinstance(
             vault_read_tool, BoundedReadTool
@@ -299,8 +328,14 @@ class AgentsSdkOrchestrationAdapter:
         self._read_tools = tuple(read_tools)
         self._vault_write_enabled = vault_write_enabled
         self._codex_specialist = codex_specialist
+        self._model_turn_timeout_seconds = model_turn_timeout_seconds
+        if self._run_sync is not None and model_turn_timeout_seconds is not None:
+            raise ValueError(
+                "model turn timeout requires the cancellable async Agents SDK runner"
+            )
         self._cancellation_lock = Lock()
         self._cancelled_requests: set[str] = set()
+        self._active_model_turns: dict[str, _ActiveModelTurn] = {}
 
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
         try:
@@ -354,14 +389,11 @@ class AgentsSdkOrchestrationAdapter:
                 trace_include_sensitive_data=False,
             )
             model_input = _model_input_with_history(request)
-            run_result = self._run_sync(
-                agent,
-                model_input,
-                max_turns=self._max_turns,
+            run_result = self._run_model_turn(
+                request=request,
+                agent=agent,
+                model_input=model_input,
                 run_config=run_config,
-                previous_response_id=None,
-                auto_previous_response_id=False,
-                conversation_id=None,
             )
         except OrchestrationAdapterError:
             raise
@@ -408,14 +440,111 @@ class AgentsSdkOrchestrationAdapter:
             milestones=tuple(milestones),
         )
 
+    def _run_model_turn(
+        self,
+        *,
+        request: OrchestrationRequest,
+        agent: object,
+        model_input: object,
+        run_config: object,
+    ) -> object:
+        kwargs = {
+            "max_turns": self._max_turns,
+            "run_config": run_config,
+            "previous_response_id": None,
+            "auto_previous_response_id": False,
+            "conversation_id": None,
+        }
+        if self._run_async is None:
+            if self._run_sync is None:
+                raise OrchestrationAdapterError("Agents SDK runner is unavailable")
+            return self._run_sync(agent, model_input, **kwargs)
+
+        async def run_bounded() -> object:
+            operation = self._run_async(agent, model_input, **kwargs)
+            task = asyncio.ensure_future(operation)
+            active = _ActiveModelTurn(
+                loop=asyncio.get_running_loop(),
+                task=task,
+                quiesced=Event(),
+            )
+            request_id = request.state.request_id
+            with self._cancellation_lock:
+                if request_id in self._active_model_turns:
+                    task.cancel()
+                    raise OrchestrationAdapterError(
+                        "request already has an active Agents SDK model turn"
+                    )
+                self._active_model_turns[request_id] = active
+                cancel_immediately = request_id in self._cancelled_requests
+            if cancel_immediately:
+                task.cancel()
+            try:
+                if self._model_turn_timeout_seconds is None:
+                    return await task
+                done, _pending = await asyncio.wait(
+                    (task,), timeout=self._model_turn_timeout_seconds
+                )
+                if task not in done:
+                    task.cancel()
+                    done, _pending = await asyncio.wait(
+                        (task,), timeout=_MODEL_CANCELLATION_GRACE_SECONDS
+                    )
+                    if task not in done:
+                        task.cancel()
+                        raise OrchestrationAdapterError(
+                            "Agents SDK model turn did not establish quiescence"
+                        )
+                    raise _ModelTurnDeadlineExceeded
+                return await task
+            except asyncio.CancelledError as exc:
+                if self._request_is_cancelled(request_id):
+                    raise _ModelTurnCancelled from exc
+                raise
+            finally:
+                with self._cancellation_lock:
+                    if self._active_model_turns.get(request_id) is active:
+                        self._active_model_turns.pop(request_id, None)
+                if task.done():
+                    active.quiesced.set()
+
+        try:
+            return asyncio.run(run_bounded())
+        except _ModelTurnDeadlineExceeded as exc:
+            self.cancel(request_id=request.state.request_id)
+            raise OrchestrationAdapterError(
+                "Agents SDK model turn exceeded its configured deadline"
+            ) from exc
+        except _ModelTurnCancelled as exc:
+            raise OrchestrationAdapterError(
+                "Agents SDK model turn was cancelled"
+            ) from exc
+
     def cancel(self, *, request_id: str) -> bool:
-        """Propagate a request cancellation into an active Codex process scope."""
+        """Cancel active model and Codex work only after model-task quiescence."""
 
         with self._cancellation_lock:
             self._cancelled_requests.add(request_id)
-        if self._codex_specialist is None:
-            return False
-        return self._codex_specialist.cancel(request_id)
+            active = self._active_model_turns.get(request_id)
+            if active is not None:
+                try:
+                    active.loop.call_soon_threadsafe(active.task.cancel)
+                except RuntimeError as exc:
+                    raise OrchestrationAdapterError(
+                        "active Agents SDK model turn could not be cancelled"
+                    ) from exc
+        codex_cancelled = (
+            self._codex_specialist.cancel(request_id)
+            if self._codex_specialist is not None
+            else False
+        )
+        if active is not None and not active.quiesced.wait(
+            timeout=_MODEL_CANCELLATION_GRACE_SECONDS
+        ):
+            raise OrchestrationAdapterError(
+                "active Agents SDK model turn did not establish quiescence"
+            )
+        return active is not None or codex_cancelled
 
     def _request_is_cancelled(self, request_id: str) -> bool:
         with self._cancellation_lock:
@@ -596,6 +725,46 @@ class AgentsSdkOrchestrationAdapter:
                     request_id=request.state.request_id,
                     **payload,
                 )
+            elif plan.proposal.kind == "calendar_insert":
+                if "connection_generation" in payload:
+                    raise OrchestrationAdapterError(
+                        "model proposed connector-owned Calendar state"
+                    )
+                candidate = CalendarWriteProposal.insert(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    connection_generation=0,
+                    **payload,
+                )
+            elif plan.proposal.kind in {"calendar_update", "calendar_patch"}:
+                if "connection_generation" in payload:
+                    raise OrchestrationAdapterError(
+                        "model proposed connector-owned Calendar state"
+                    )
+                snapshot_payload = payload.get("snapshot")
+                if not isinstance(snapshot_payload, Mapping):
+                    raise OrchestrationAdapterError(
+                        "Calendar change requires an ETag-bound snapshot"
+                    )
+                snapshot = CalendarEventSnapshot(
+                    event=dict(snapshot_payload.get("event", {})),
+                    etag=snapshot_payload.get("etag"),
+                )
+                calendar_payload = {
+                    key: value for key, value in payload.items() if key != "snapshot"
+                }
+                factory = (
+                    CalendarWriteProposal.update
+                    if plan.proposal.kind == "calendar_update"
+                    else CalendarWriteProposal.patch
+                )
+                candidate = factory(
+                    action_id=f"{request.state.request_id}:proposal",
+                    request_id=request.state.request_id,
+                    snapshot=snapshot,
+                    connection_generation=0,
+                    **calendar_payload,
+                )
             elif plan.proposal.kind == "knowledge_vault_write":
                 if set(payload) != {"changes"}:
                     raise OrchestrationAdapterError(
@@ -671,7 +840,9 @@ def _instructions(
         "operator's Windows laptop or depends on it; a mere platform or "
         "file-format mention is not a dependency. For a Windows terminal "
         "selection, use only explicit_windows or windows_dependency. For a "
-        "terminal action or Gmail send/reply, emit one complete typed proposal; "
+        "terminal action, Gmail send/reply, or Calendar insert/update/patch, emit "
+        "one complete typed proposal; Calendar changes must include the exact "
+        "ETag-bound snapshot returned by the read tool. "
         "it will still be independently checked and require the broker's approval flow. "
         "Every exposed read tool has a closed typed schema and bounded result. "
         + (

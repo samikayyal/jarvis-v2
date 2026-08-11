@@ -12,7 +12,7 @@ import secrets
 import select
 import socket
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from threading import Event, RLock, Thread
 from time import monotonic
 from typing import cast
@@ -74,6 +74,10 @@ class UnixSocketUbuntuWorkerTransport:
         self._closed = Event()
         self._reader = Thread(target=self._read_responses, daemon=True)
         self._reader.start()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed.is_set()
 
     def register_execution(
         self,
@@ -277,6 +281,127 @@ class UnixSocketUbuntuWorkerTransport:
                 )
             except queue.Full:
                 pass
+
+
+class ReconnectingUnixSocketUbuntuWorkerTransport:
+    """Replace a failed native-worker channel before the next operation.
+
+    An in-flight operation is never retried: its result remains conservative.
+    Only a later readiness probe or action gets a freshly authenticated socket.
+    """
+
+    def __init__(
+        self,
+        *,
+        connect: Callable[[], UnixSocketUbuntuWorkerTransport],
+        initial: UnixSocketUbuntuWorkerTransport,
+    ) -> None:
+        if not callable(connect):
+            raise TypeError("connect must be callable")
+        if not isinstance(initial, UnixSocketUbuntuWorkerTransport):
+            raise TypeError("initial must be a UnixSocketUbuntuWorkerTransport")
+        self._connect = connect
+        self._current_transport: UnixSocketUbuntuWorkerTransport | None = initial
+        self._lock = RLock()
+        self._closed = False
+
+    def register_execution(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> None:
+        self._invoke(
+            "register_execution",
+            action_id=action_id,
+            timeout_seconds=timeout_seconds,
+            retention_seconds=retention_seconds,
+        )
+
+    def authenticate(
+        self, *, selected_host: str, timeout_seconds: int
+    ) -> WorkerIdentity:
+        return cast(
+            WorkerIdentity,
+            self._invoke(
+                "authenticate",
+                selected_host=selected_host,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+
+    def execute(
+        self, invocation: WorkerInvocation, progress: WorkerProgressSink
+    ) -> WorkerExecutionResult:
+        return cast(
+            WorkerExecutionResult,
+            self._invoke("execute", invocation, progress),
+        )
+
+    def cancel(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> ActionCancellationResult:
+        return cast(
+            ActionCancellationResult,
+            self._invoke(
+                "cancel",
+                action_id=action_id,
+                timeout_seconds=timeout_seconds,
+                retention_seconds=retention_seconds,
+            ),
+        )
+
+    def finalize_execution(
+        self,
+        *,
+        action_id: str,
+        timeout_seconds: int,
+        retention_seconds: int,
+    ) -> None:
+        self._invoke(
+            "finalize_execution",
+            action_id=action_id,
+            timeout_seconds=timeout_seconds,
+            retention_seconds=retention_seconds,
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            transport = self._current_transport
+            self._current_transport = None
+        if transport is not None:
+            transport.close()
+
+    def _transport(self) -> UnixSocketUbuntuWorkerTransport:
+        stale: UnixSocketUbuntuWorkerTransport | None = None
+        with self._lock:
+            if self._closed:
+                raise ActionDispatcherError("Ubuntu worker channel is unavailable")
+            transport = self._current_transport
+            if transport is None or transport.is_closed:
+                stale = transport
+                transport = self._connect()
+                self._current_transport = transport
+        if stale is not None:
+            stale.close()
+        return transport
+
+    def _invoke(self, method: str, *args: object, **kwargs: object) -> object:
+        transport = self._transport()
+        try:
+            return getattr(transport, method)(*args, **kwargs)
+        finally:
+            if transport.is_closed:
+                with self._lock:
+                    if self._current_transport is transport:
+                        self._current_transport = None
+                transport.close()
 
 
 def serve_ubuntu_worker_connection(

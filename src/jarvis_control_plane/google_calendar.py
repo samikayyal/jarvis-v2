@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Literal, Protocol
 from urllib.parse import quote, urlencode
@@ -620,6 +620,19 @@ class CalendarWriteProposal:
             connection_generation=connection_generation,
             reviewed_patch=normalized_patch,
         )
+        return CalendarWriteProposal._from_request(
+            action_id=action_id,
+            request_id=request_id,
+            request=request,
+        )
+
+    @staticmethod
+    def _from_request(
+        *,
+        action_id: str,
+        request_id: str,
+        request: CalendarWriteRequest,
+    ) -> FrozenActionProposal:
         payload = {
             "schema": "calendar_write_v1",
             "operation": request.operation,
@@ -637,7 +650,7 @@ class CalendarWriteProposal:
         return FrozenActionProposal.create(
             action_id=action_id,
             request_id=request_id,
-            kind=f"calendar_{operation}",
+            kind=f"calendar_{request.operation}",
             preview=preview,
             payload=payload,
         )
@@ -908,6 +921,27 @@ class CalendarActionDispatcher:
         self._on_invalid_grant = on_invalid_grant
         self._prepared_lock = RLock()
         self._prepared: dict[str, _CalendarWriteDispatch] = {}
+
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Freeze the connector-owned Google generation before presentation."""
+
+        request = self._parse_request(action)
+        connection = self._connection_state.get_connection()
+        bound_request = replace(
+            request,
+            connection_generation=connection.generation,
+        )
+        self._require_current_connection(bound_request)
+        return CalendarWriteProposal._from_request(
+            action_id=action.action_id,
+            request_id=action.request_id,
+            request=bound_request,
+        )
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """Reject a frozen Calendar action if the OAuth generation changed."""
+
+        self._require_current_connection(self._parse_request(action))
 
     def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
         handle = _CalendarWriteDispatch(self, action)

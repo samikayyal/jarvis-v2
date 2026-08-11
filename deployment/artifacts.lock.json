@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "application": {
+    "name": "jarvis-v2",
+    "version": "0.1.0",
+    "git_revision": "abc98a21d51cb367666cf14ef8a50271c22491e4",
+    "source_sha256": "a6f1adc5ced0163b696f4c3e64a3d93316138cd31bbd20acbbac1d68bd3c1b33"
+  },
+  "python_base_image": {
+    "reference": "python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f"
+  },
+  "uv_build_image": {
+    "reference": "ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664"
+  },
+  "node_build_image": {
+    "reference": "node:24-bookworm-slim@sha256:65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848"
+  },
+  "codex_cli": {
+    "package": "@openai/codex",
+    "version": "0.147.0",
+    "integrity": "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w==",
+    "package_lock_sha256": "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
+  },
+  "os_packages": {
+    "git": "1:2.39.5-0+deb12u3",
+    "openssh-client": "1:9.2p1-2+deb12u10"
+  },
+  "requirements_lock": {
+    "path": "requirements.lock",
+    "sha256": "694df9bfd8835bdff02dd24cd6646028376d6b3fa815861f9e461fc86580b908"
+  }
+}

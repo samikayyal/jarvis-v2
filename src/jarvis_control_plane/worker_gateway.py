@@ -20,6 +20,7 @@ from .ports import (
     ActionCancellationStatus,
     ActionDispatcherError,
     ActionDispatchHandle,
+    WorkerReadiness,
 )
 from .terminal_policy import (
     TerminalAction,
@@ -675,6 +676,36 @@ class WorkerGateway:
         self._running: dict[str, _WorkerDispatchHandle] = {}
         self._handles: dict[str, _WorkerDispatchHandle] = {}
         self._lock = RLock()
+
+    def current(self) -> WorkerReadiness:
+        """Authenticate both worker seams and publish only safe readiness labels."""
+
+        levels: dict[str, str] = {}
+        for host in ("ubuntu", "windows"):
+            worker = self._workers.get(host)
+            expected = self._registered_identities.get(host)
+            if worker is None or expected is None:
+                levels[host] = "unavailable"
+                continue
+            try:
+                identity = worker.authenticate(
+                    selected_host=host,
+                    timeout_seconds=self._limits.authentication_timeout_seconds,
+                )
+            except (
+                ActionDispatcherError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+            ):
+                levels[host] = "unavailable"
+            else:
+                levels[host] = "ready" if identity == expected else "unavailable"
+        return WorkerReadiness(
+            ubuntu=levels["ubuntu"],
+            windows=levels["windows"],
+        )
 
     def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
         terminal = _terminal_action(action)

@@ -513,6 +513,7 @@ def _build_trace_writer_store(configuration: Mapping[str, Any]) -> DiagnosticTra
                 if physical_capacity is not None
                 else None
             ),
+            minimum_free_bytes=int(configuration.get("minimum_free_bytes", 0)),
         )
     raise RuntimeError("unknown trace writer store kind")
 
@@ -798,7 +799,7 @@ class _TraceCapacityProvider(Protocol):
 class _FileSystemTraceCapacityProvider:
     """Conservatively account for free space and concurrent local reservations."""
 
-    def __init__(self, location: str | Path) -> None:
+    def __init__(self, location: str | Path, *, minimum_free_bytes: int = 0) -> None:
         location_path = Path(location)
         self._directory = (
             Path.cwd()
@@ -806,6 +807,9 @@ class _FileSystemTraceCapacityProvider:
             else location_path.expanduser().resolve().parent
         )
         self._reserved = 0
+        self._minimum_free_bytes = _validate_non_negative_int(
+            minimum_free_bytes, "minimum_free_bytes"
+        )
         self._lock = threading.RLock()
 
     def available_bytes(self) -> int:
@@ -814,7 +818,7 @@ class _FileSystemTraceCapacityProvider:
                 free = shutil.disk_usage(self._directory).free
             except OSError:
                 return 0
-            return max(0, free - self._reserved)
+            return max(0, free - self._minimum_free_bytes - self._reserved)
 
     def reserve(self, amount: int) -> None:
         with self._lock:
@@ -1192,6 +1196,7 @@ class SQLiteDiagnosticTraceStore(_DiagnosticTraceStoreBase):
         reservation_bytes: int = DEFAULT_TRACE_RESERVATION_BYTES,
         hard_max_bytes: int = MAX_TRACE_RESERVATION_BYTES,
         capacity_provider: _TraceCapacityProvider | None = None,
+        minimum_free_bytes: int = 0,
     ) -> None:
         self._database_location = str(database)
         self._owns_connection = not isinstance(database, sqlite3.Connection)
@@ -1206,7 +1211,12 @@ class SQLiteDiagnosticTraceStore(_DiagnosticTraceStoreBase):
             and not isinstance(database, sqlite3.Connection)
             and str(database) != ":memory:"
         ):
-            capacity_provider = _FileSystemTraceCapacityProvider(database)
+            capacity_provider = _FileSystemTraceCapacityProvider(
+                database, minimum_free_bytes=minimum_free_bytes
+            )
+        self._minimum_free_bytes = _validate_non_negative_int(
+            minimum_free_bytes, "minimum_free_bytes"
+        )
         super().__init__(
             DiagnosticTraceLimits(
                 reservation_bytes=reservation_bytes,
@@ -1287,6 +1297,7 @@ class SQLiteDiagnosticTraceStore(_DiagnosticTraceStoreBase):
             "reservation_bytes": self.limits.reservation_bytes,
             "hard_max_bytes": self.limits.hard_max_bytes,
             "physical_capacity_bytes": physical_capacity,
+            "minimum_free_bytes": self._minimum_free_bytes,
         }
 
     def _persist_trace(self, trace: DiagnosticTrace) -> None:

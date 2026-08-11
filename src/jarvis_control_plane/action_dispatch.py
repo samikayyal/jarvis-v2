@@ -25,6 +25,8 @@ class RoutedActionDispatcher:
         terminal: ActionDispatcher,
         gmail: ActionDispatcher,
         gmail_lifecycle: BoundActionLifecycle,
+        calendar: ActionDispatcher | None = None,
+        calendar_lifecycle: BoundActionLifecycle | None = None,
         vault: ActionDispatcher | None = None,
         vault_lifecycle: BoundActionLifecycle | None = None,
     ) -> None:
@@ -33,12 +35,30 @@ class RoutedActionDispatcher:
             "gmail_send": gmail,
             "gmail_reply": gmail,
         }
+        if calendar is not None:
+            self._dispatchers.update(
+                {
+                    "calendar_insert": calendar,
+                    "calendar_update": calendar,
+                    "calendar_patch": calendar,
+                }
+            )
         if vault is not None:
             self._dispatchers["knowledge_vault_write"] = vault
         self._bound_lifecycles = {
             "gmail_send": gmail_lifecycle,
             "gmail_reply": gmail_lifecycle,
         }
+        if calendar_lifecycle is not None:
+            if calendar is None:
+                raise ValueError("calendar_lifecycle requires a calendar dispatcher")
+            self._bound_lifecycles.update(
+                {
+                    "calendar_insert": calendar_lifecycle,
+                    "calendar_update": calendar_lifecycle,
+                    "calendar_patch": calendar_lifecycle,
+                }
+            )
         if vault_lifecycle is not None:
             if vault is None:
                 raise ValueError("vault_lifecycle requires a vault dispatcher")

@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -216,6 +217,118 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
     assert result.reply_text.endswith("The late read was ignored.")
 
 
+def test_agents_adapter_cancels_the_async_model_turn_at_its_deadline() -> None:
+    cancelled = Event()
+
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="configured deadline"):
+        adapter.run(_request("wait forever"))
+
+    assert cancelled.is_set()
+
+
+def test_agents_adapter_bounds_cancellation_quiescence_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jarvis_control_plane import orchestration
+
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        try:
+            await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.02)
+            raise
+
+    monkeypatch.setattr(orchestration, "_MODEL_CANCELLATION_GRACE_SECONDS", 0.01)
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="establish quiescence"):
+        adapter.run(_request("delay cancellation"))
+
+
+def test_agents_adapter_cancels_an_active_async_model_turn_and_waits_for_quiescence() -> (
+    None
+):
+    started = Event()
+    cancelled = Event()
+    outcomes: list[OrchestrationAdapterError] = []
+
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=90,
+    )
+
+    def run() -> None:
+        try:
+            adapter.run(_request("wait for cancellation"))
+        except OrchestrationAdapterError as exc:
+            outcomes.append(exc)
+
+    runner = Thread(target=run)
+    runner.start()
+    assert started.wait(timeout=2)
+
+    assert adapter.cancel(request_id="request-001") is True
+    assert cancelled.is_set()
+    runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], OrchestrationAdapterError)
+    assert "model turn was cancelled" in str(outcomes[0])
+
+
+def test_agents_adapter_does_not_misreport_a_provider_timeout_as_its_deadline() -> None:
+    async def run_async(_agent: object, _text: str, **_kwargs: object) -> object:
+        raise TimeoutError("provider timed out first")
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        model_turn_timeout_seconds=1,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="run was unavailable"):
+        adapter.run(_request("provider timeout"))
+
+
 def test_agents_adapter_enforces_a_per_request_read_invocation_limit() -> None:
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
         read_tool = agent.tools[0]
@@ -321,6 +434,45 @@ def test_model_failure_and_malformed_output_are_adapter_errors() -> None:
     )
     with pytest.raises(OrchestrationAdapterError, match="malformed structured output"):
         malformed.run(_request("read the repository"))
+
+
+def test_calendar_insert_gets_an_internal_generation_placeholder() -> None:
+    complete_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the Calendar event.",
+                proposal=AgentsSdkProposal(
+                    kind="calendar_insert",
+                    preview="Create the event.",
+                    payload={
+                        "calendar_id": "primary",
+                        "complete_event": complete_event,
+                        "notification": "all",
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("create a design review"))
+
+    assert result.proposal is not None
+    assert result.proposal.kind == "calendar_insert"
+    assert '"summary":"Design review"' in result.proposal.payload
+    assert '"connection_generation":0' in result.proposal.payload
 
 
 def test_model_proposed_authority_fields_fail_closed_before_freezing() -> None:

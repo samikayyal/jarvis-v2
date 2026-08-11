@@ -16,8 +16,9 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from .conversation_archive import (
     InMemoryDeletedConversationArchive,
@@ -268,6 +269,20 @@ class DeterministicIdGenerator:
         return f"{self.prefix}-{namespace}-{next_value:04d}"
 
 
+def _locked_durable_state(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize one durable-state transaction on its shared state boundary."""
+
+    @wraps(method)
+    def locked(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+_locked_sqlite_state = _locked_durable_state
+
+
 class InMemoryDurableStateStore:
     """A failure-controllable state port for narrow unit tests."""
 
@@ -293,22 +308,26 @@ class InMemoryDurableStateStore:
         self.fail_update = False
         self._lock = threading.RLock()
 
+    @_locked_durable_state
     def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None:
         with self._lock:
             return self._recovery_degraded_marker
 
+    @_locked_durable_state
     def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None:
         marker = RecoveryDegradedMarker(reason=reason, marked_at=marked_at)
         with self._lock:
             if self._recovery_degraded_marker is None:
                 self._recovery_degraded_marker = marker
 
+    @_locked_durable_state
     def acknowledge_recovery_degraded(self) -> None:
         """Clear the marker only when called by an explicit admin flow."""
 
         with self._lock:
             self._recovery_degraded_marker = None
 
+    @_locked_durable_state
     def admit_ingress(
         self,
         *,
@@ -379,6 +398,7 @@ class InMemoryDurableStateStore:
                 disposition=disposition,
             )
 
+    @_locked_durable_state
     def claim_ingress(
         self,
         *,
@@ -417,6 +437,7 @@ class InMemoryDurableStateStore:
             )
             return True
 
+    @_locked_durable_state
     def update_ingress_disposition(
         self,
         *,
@@ -441,6 +462,7 @@ class InMemoryDurableStateStore:
                 disposition=disposition,
             )
 
+    @_locked_durable_state
     def begin_next_ingress_dispatch(self) -> ConversationMessage | None:
         with self._lock:
             pending = sorted(
@@ -464,6 +486,7 @@ class InMemoryDurableStateStore:
                 return message
             return None
 
+    @_locked_durable_state
     def begin_ingress_dispatch(
         self, *, transport_session_id: str, message_id: str
     ) -> bool:
@@ -479,6 +502,7 @@ class InMemoryDurableStateStore:
             self.claims[key] = replace(claim, disposition="dispatching")
             return True
 
+    @_locked_durable_state
     def finish_ingress_dispatch(
         self,
         *,
@@ -495,6 +519,7 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("ingress dispatch is not active")
             self.claims[key] = replace(claim, disposition=disposition)
 
+    @_locked_durable_state
     def reconcile_ingress_restart(
         self,
         *,
@@ -1055,12 +1080,14 @@ class InMemoryDurableStateStore:
             self.memories[memory_id] = forgotten
             return forgotten
 
+    @_locked_durable_state
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
             if self.fail_claim:
                 raise StateStoreError("controlled ingress claim failure")
             return (session_id, message_id) in self.claims
 
+    @_locked_durable_state
     def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         with self._lock:
             key = (session_id, message_id)
@@ -1068,6 +1095,7 @@ class InMemoryDurableStateStore:
             self.conversation_messages.pop(key, None)
             return released
 
+    @_locked_durable_state
     def save_request(self, request: RequestState) -> None:
         with self._lock:
             if self.fail_save:
@@ -1076,6 +1104,7 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("request identifier already exists")
             self.requests[request.request_id] = request
 
+    @_locked_durable_state
     def update_request(self, request: RequestState) -> None:
         with self._lock:
             if self.fail_update:
@@ -1084,26 +1113,32 @@ class InMemoryDurableStateStore:
                 raise StateStoreError("request identifier does not exist")
             self.requests[request.request_id] = request
 
+    @_locked_durable_state
     def delete_request(self, request_id: str) -> bool:
         with self._lock:
             return self.requests.pop(request_id, None) is not None
 
+    @_locked_durable_state
     def get_request(self, request_id: str) -> RequestState | None:
         with self._lock:
             return self.requests.get(request_id)
 
+    @_locked_durable_state
     def list_requests(self) -> tuple[RequestState, ...]:
         with self._lock:
             return tuple(self.requests.values())
 
+    @_locked_durable_state
     def list_ingress_claims(self) -> tuple[IngressClaim, ...]:
         with self._lock:
             return tuple(self.claims.values())
 
+    @_locked_durable_state
     def load_knowledge_vault_synchronized_at(self) -> datetime | None:
         with self._lock:
             return self._knowledge_vault_synchronized_at
 
+    @_locked_durable_state
     def save_knowledge_vault_synchronized_at(self, synchronized_at: datetime) -> None:
         with self._lock:
             self._knowledge_vault_synchronized_at = ensure_utc(synchronized_at)
@@ -1122,9 +1157,10 @@ class SQLiteDurableStateStore:
         self.connection = (
             database
             if isinstance(database, sqlite3.Connection)
-            else sqlite3.connect(str(database))
+            else sqlite3.connect(str(database), check_same_thread=False)
         )
         self.connection.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._conversation_has_legacy_session = False
         self._deleted_archive = deleted_archive
         try:
@@ -1362,6 +1398,7 @@ class SQLiteDurableStateStore:
                 "SQLite outbound state requires the manual Ticket 12 migration"
             )
 
+    @_locked_sqlite_state
     def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None:
         try:
             row = self.connection.execute(
@@ -1385,6 +1422,7 @@ class SQLiteDurableStateStore:
         except (KeyError, TypeError, ValueError) as exc:
             raise StateStoreError("stored recovery-degraded marker is invalid") from exc
 
+    @_locked_sqlite_state
     def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None:
         marker = RecoveryDegradedMarker(reason=reason, marked_at=marked_at)
         try:
@@ -1404,6 +1442,7 @@ class SQLiteDurableStateStore:
                 "could not persist the recovery-degraded marker"
             ) from exc
 
+    @_locked_sqlite_state
     def acknowledge_recovery_degraded(self) -> None:
         """Clear the marker only when called by an explicit admin flow."""
 
@@ -1419,6 +1458,7 @@ class SQLiteDurableStateStore:
                 "could not acknowledge the recovery-degraded marker"
             ) from exc
 
+    @_locked_sqlite_state
     def admit_ingress(
         self,
         *,
@@ -1607,6 +1647,7 @@ class SQLiteDurableStateStore:
             ),
         )
 
+    @_locked_sqlite_state
     def claim_ingress(
         self,
         *,
@@ -1658,6 +1699,7 @@ class SQLiteDurableStateStore:
                 pass
             raise StateStoreError("could not claim ingress") from exc
 
+    @_locked_sqlite_state
     def update_ingress_disposition(
         self,
         *,
@@ -1685,6 +1727,7 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("could not update ingress disposition") from exc
 
+    @_locked_sqlite_state
     def begin_next_ingress_dispatch(self) -> ConversationMessage | None:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -1724,6 +1767,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not begin ingress dispatch") from exc
 
+    @_locked_sqlite_state
     def begin_ingress_dispatch(
         self, *, transport_session_id: str, message_id: str
     ) -> bool:
@@ -1748,6 +1792,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not begin ingress dispatch") from exc
 
+    @_locked_sqlite_state
     def finish_ingress_dispatch(
         self,
         *,
@@ -1777,6 +1822,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not finish ingress dispatch") from exc
 
+    @_locked_sqlite_state
     def reconcile_ingress_restart(
         self,
         *,
@@ -1814,6 +1860,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not reconcile ingress restart") from exc
 
+    @_locked_sqlite_state
     def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         try:
             row = self.connection.execute(
@@ -1827,6 +1874,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not inspect ingress claim") from exc
         return row is not None
 
+    @_locked_sqlite_state
     def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool:
         try:
             cursor = self.connection.execute(
@@ -1838,6 +1886,7 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("could not release ingress claim") from exc
 
+    @_locked_sqlite_state
     def save_request(self, request: RequestState) -> None:
         try:
             self.connection.execute(
@@ -1854,6 +1903,7 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("could not save request state") from exc
 
+    @_locked_sqlite_state
     def update_request(self, request: RequestState) -> None:
         try:
             cursor = self.connection.execute(
@@ -1891,6 +1941,7 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("could not update request state") from exc
 
+    @_locked_sqlite_state
     def delete_request(self, request_id: str) -> bool:
         try:
             cursor = self.connection.execute(
@@ -1902,6 +1953,7 @@ class SQLiteDurableStateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("could not delete request state") from exc
 
+    @_locked_sqlite_state
     def get_request(self, request_id: str) -> RequestState | None:
         try:
             row = self.connection.execute(
@@ -1912,6 +1964,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not read request state") from exc
         return _request_from_row(row) if row else None
 
+    @_locked_sqlite_state
     def list_requests(self) -> tuple[RequestState, ...]:
         try:
             rows = self.connection.execute(
@@ -1921,6 +1974,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not list request state") from exc
         return tuple(_request_from_row(row) for row in rows)
 
+    @_locked_sqlite_state
     def list_ingress_claims(self) -> tuple[IngressClaim, ...]:
         try:
             rows = self.connection.execute(
@@ -1942,6 +1996,7 @@ class SQLiteDurableStateStore:
             for row in rows
         )
 
+    @_locked_sqlite_state
     def load_knowledge_vault_synchronized_at(self) -> datetime | None:
         try:
             row = self.connection.execute(
@@ -1963,6 +2018,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("knowledge-vault synchronization metadata is invalid")
         return ensure_utc(synchronized_at)
 
+    @_locked_sqlite_state
     def save_knowledge_vault_synchronized_at(self, synchronized_at: datetime) -> None:
         try:
             self.connection.execute(
@@ -1979,6 +2035,7 @@ class SQLiteDurableStateStore:
                 "could not save knowledge-vault synchronization"
             ) from exc
 
+    @_locked_sqlite_state
     def list_conversation_messages(self) -> tuple[ConversationMessage, ...]:
         try:
             rows = self.connection.execute(
@@ -2009,6 +2066,7 @@ class SQLiteDurableStateStore:
             for row in rows
         )
 
+    @_locked_sqlite_state
     def append_conversation_message(self, message: ConversationMessage) -> None:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -2023,6 +2081,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not append conversation history") from exc
 
+    @_locked_sqlite_state
     def reserve_outbound_conversation_message(
         self, message: ConversationMessage
     ) -> None:
@@ -2082,6 +2141,7 @@ class SQLiteDurableStateStore:
                 "could not reserve outbound conversation history"
             ) from exc
 
+    @_locked_sqlite_state
     def mark_outbound_conversation_attempted(
         self,
         *,
@@ -2113,6 +2173,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not mark outbound attempt") from exc
 
+    @_locked_sqlite_state
     def terminalize_outbound_conversation_attempt(
         self,
         *,
@@ -2229,6 +2290,7 @@ class SQLiteDurableStateStore:
                 "could not terminalize outbound conversation attempt"
             ) from exc
 
+    @_locked_sqlite_state
     def accept_reserved_outbound_conversation_message(
         self,
         *,
@@ -2261,6 +2323,7 @@ class SQLiteDurableStateStore:
             outbound_id=outbound_id,
         )
 
+    @_locked_sqlite_state
     def list_outbound_conversation_attempts(
         self,
     ) -> tuple[OutboundAttemptRecord, ...]:
@@ -2282,6 +2345,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not list outbound attempts") from exc
         return tuple(_outbound_attempt_from_row(row) for row in rows)
 
+    @_locked_sqlite_state
     def list_outbound_conversation_attempt_recovery(
         self,
     ) -> tuple[OutboundAttemptRecoveryProjection, ...]:
@@ -2348,6 +2412,7 @@ class SQLiteDurableStateStore:
         )
         return tuple(projections)
 
+    @_locked_sqlite_state
     def reconcile_outbound_conversation_attempts(
         self, *, interrupted_at: datetime
     ) -> tuple[OutboundAttemptRecord, ...]:
@@ -2427,6 +2492,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not reconcile outbound attempts") from exc
         return tuple(reconciled)
 
+    @_locked_sqlite_state
     def search_conversation_messages(
         self,
         *,
@@ -2502,11 +2568,13 @@ class SQLiteDurableStateStore:
         )
         return matches
 
+    @_locked_sqlite_state
     def export_conversation_messages(self, **query: object) -> str:
         return _export_conversation_messages(
             self.search_conversation_messages(**query)  # type: ignore[arg-type]
         )
 
+    @_locked_sqlite_state
     def select_history_for_context(
         self,
         *,
@@ -2547,6 +2615,7 @@ class SQLiteDurableStateStore:
             )
         )
 
+    @_locked_sqlite_state
     def preview_conversation_deletion(
         self, scope: ConversationDeletionScope
     ) -> ConversationDeletionPreview:
@@ -2614,6 +2683,7 @@ class SQLiteDurableStateStore:
             ) from exc
         return tuple(_conversation_message_from_row(row) for row in rows)
 
+    @_locked_sqlite_state
     def delete_conversation_history(
         self,
         preview: ConversationDeletionPreview,
@@ -2769,6 +2839,7 @@ class SQLiteDurableStateStore:
 
     delete_conversation_messages = delete_conversation_history
 
+    @_locked_sqlite_state
     def list_conversation_tombstones(
         self, *, history_ids: tuple[str, ...] = ()
     ) -> tuple[ConversationTombstone, ...]:
@@ -2809,6 +2880,7 @@ class SQLiteDurableStateStore:
             for row in rows
         )
 
+    @_locked_sqlite_state
     def list_memories(
         self, *, include_terminal: bool = True, limit: int = 50
     ) -> tuple[DurableMemory, ...]:
@@ -2834,6 +2906,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not list durable assistant memory") from exc
         return tuple(_durable_memory_from_row(row) for row in rows)
 
+    @_locked_sqlite_state
     def get_memory(self, memory_id: str) -> DurableMemory | None:
         if not isinstance(memory_id, str) or not memory_id:
             raise ValueError("memory_id must be a non-empty string")
@@ -2851,6 +2924,7 @@ class SQLiteDurableStateStore:
             raise StateStoreError("could not inspect durable assistant memory") from exc
         return None if row is None else _durable_memory_from_row(row)
 
+    @_locked_sqlite_state
     def search_memories(
         self,
         *,
@@ -2937,6 +3011,7 @@ class SQLiteDurableStateStore:
             scanned_rows=scanned_rows,
         )
 
+    @_locked_sqlite_state
     def select_memories_for_context(
         self, *, text: str, limit: int = 5
     ) -> MemorySelection:
@@ -2978,6 +3053,7 @@ class SQLiteDurableStateStore:
             )
         )
 
+    @_locked_sqlite_state
     def create_memory(self, memory: DurableMemory) -> None:
         if not isinstance(memory, DurableMemory):
             raise TypeError("memory must be a DurableMemory")
@@ -2996,6 +3072,7 @@ class SQLiteDurableStateStore:
 
     save_memory = create_memory
 
+    @_locked_sqlite_state
     def replace_memory(
         self,
         memory_id: str,
@@ -3065,6 +3142,7 @@ class SQLiteDurableStateStore:
             self.connection.rollback()
             raise StateStoreError("could not replace durable assistant memory") from exc
 
+    @_locked_sqlite_state
     def forget_memory(
         self,
         memory_id: str,
@@ -3271,6 +3349,7 @@ class SQLiteDurableStateStore:
             )
         self.connection.commit()
 
+    @_locked_sqlite_state
     def close(self) -> None:
         self._deleted_archive = None
         if self._owns_connection:
@@ -3851,6 +3930,9 @@ class InMemoryAuditBoundary:
     def append(self, evidence: AuditEvidence) -> None:
         self.append_batch((evidence,))
 
+    def writable(self) -> bool:
+        return not self.fail
+
     def append_batch(self, evidence: Sequence[AuditEvidence]) -> None:
         records = tuple(evidence)
         if any(not isinstance(record, AuditEvidence) for record in records):
@@ -3991,9 +4073,10 @@ class SQLiteAuditBoundary:
         self._connection = (
             database
             if isinstance(database, sqlite3.Connection)
-            else sqlite3.connect(str(database))
+            else sqlite3.connect(str(database), check_same_thread=False)
         )
         self._connection.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._append_transaction_active = False
         try:
             self._connection.execute("PRAGMA recursive_triggers = ON")
@@ -4192,7 +4275,24 @@ class SQLiteAuditBoundary:
     def append(self, evidence: AuditEvidence) -> None:
         self.append_batch((evidence,))
 
+    def writable(self) -> bool:
+        """Probe the audit write lock without changing retained evidence."""
+
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.rollback()
+                return True
+            except sqlite3.Error:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                return False
+
     def append_batch(self, evidence: Sequence[AuditEvidence]) -> None:
+        with self._lock:
+            self._append_batch_locked(evidence)
+
+    def _append_batch_locked(self, evidence: Sequence[AuditEvidence]) -> None:
         records = tuple(evidence)
         if any(not isinstance(record, AuditEvidence) for record in records):
             raise TypeError("audit boundary accepts only AuditEvidence")
@@ -4302,6 +4402,14 @@ class SQLiteAuditBoundary:
         return self.safe_view()
 
     def safe_view(
+        self,
+        query: AuditFilter | None = None,
+        **filters: object,
+    ) -> tuple[AuditEvidence, ...]:
+        with self._lock:
+            return self._safe_view_locked(query, **filters)
+
+    def _safe_view_locked(
         self,
         query: AuditFilter | None = None,
         **filters: object,
@@ -4482,8 +4590,9 @@ class SQLiteAuditBoundary:
         )
 
     def close(self) -> None:
-        if self._owns_connection:
-            self._connection.close()
+        with self._lock:
+            if self._owns_connection:
+                self._connection.close()
 
 
 class ControlledOrchestrationAdapter:

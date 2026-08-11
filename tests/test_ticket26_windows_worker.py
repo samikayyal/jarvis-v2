@@ -27,6 +27,7 @@ from jarvis_control_plane import (
     authenticate_windows_worker_session,
 )
 from jarvis_control_plane.terminal_policy import TerminalAction
+from jarvis_control_plane.windows_worker_session import SocketWindowsWorkerSession
 
 WINDOWS_IDENTITY = WorkerIdentity(
     host="windows", worker_id="windows-01", connection_id="boot-01"
@@ -326,6 +327,32 @@ def test_windows_worker_runs_one_noninteractive_job_object_action_at_a_time() ->
     assert not worker.is_alive()
     assert result[0].status is WorkerExecutionStatus.COMPLETED
     assert [item.action_id for item in session.invocations] == ["running"]
+
+
+def test_windows_session_execute_timeout_includes_cleanup_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, int] = {}
+
+    def call(
+        _self: object,
+        _operation: str,
+        _arguments: dict[str, object],
+        *,
+        timeout_seconds: int,
+    ) -> object:
+        captured["timeout_seconds"] = timeout_seconds
+        raise RuntimeError("stop after capturing timeout")
+
+    monkeypatch.setattr(SocketWindowsWorkerSession, "_call", call)
+    invocation = replace(_invocation("cleanup-timeout"), cancellation_grace_seconds=10)
+
+    with pytest.raises(RuntimeError, match="capturing timeout"):
+        object.__new__(SocketWindowsWorkerSession).execute(
+            invocation, lambda _event: None
+        )
+
+    assert captured["timeout_seconds"] == 40
 
 
 def test_cancellation_reports_stopped_only_after_job_object_tree_termination() -> None:
