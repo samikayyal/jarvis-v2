@@ -44,13 +44,16 @@ RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
     {
         "inbound_receiver": ServiceResourceLimits("64M", Decimal("0.10"), 32),
         "capability_broker": ServiceResourceLimits("192M", Decimal("0.35"), 64),
-        "orchestration_agent": ServiceResourceLimits("256M", Decimal("0.45"), 128),
+        "orchestration_agent": ServiceResourceLimits("256M", Decimal("0.45"), 96),
         "audit_service": ServiceResourceLimits("64M", Decimal("0.10"), 32),
         "google_connector": ServiceResourceLimits("96M", Decimal("0.15"), 64),
         "knowledge_vault_connector": ServiceResourceLimits("128M", Decimal("0.20"), 64),
         "openwa_outbound_connector": ServiceResourceLimits("64M", Decimal("0.10"), 32),
         "worker_gateway": ServiceResourceLimits("96M", Decimal("0.25"), 64),
         "public_oauth_callback": ServiceResourceLimits("48M", Decimal("0.10"), 32),
+        "deleted_conversation_archive": ServiceResourceLimits(
+            "48M", Decimal("0.10"), 32
+        ),
     }
 )
 
@@ -65,6 +68,7 @@ EXPECTED_IDENTITIES: Mapping[str, str] = MappingProxyType(
         "openwa_outbound_connector": "jarvis-openwa-outbound",
         "worker_gateway": "jarvis-worker-gateway",
         "public_oauth_callback": "jarvis-oauth-callback",
+        "deleted_conversation_archive": "jarvis-deleted-archive",
     }
 )
 
@@ -79,6 +83,7 @@ ALLOWED_CREDENTIAL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
         "openwa_outbound_connector": frozenset({"/run/credentials/openwa"}),
         "worker_gateway": frozenset({"/run/credentials/windows-worker"}),
         "public_oauth_callback": frozenset(),
+        "deleted_conversation_archive": frozenset(),
     }
 )
 
@@ -96,6 +101,7 @@ ALLOWED_PROTOCOL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
                 "/run/protocol/capability_broker--knowledge_vault_connector.key",
                 "/run/protocol/capability_broker--openwa_outbound_connector.key",
                 "/run/protocol/capability_broker--worker_gateway.key",
+                "/run/protocol/capability_broker--deleted_conversation_archive.key",
             }
         ),
         "orchestration_agent": frozenset(
@@ -134,6 +140,9 @@ ALLOWED_PROTOCOL_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
         "public_oauth_callback": frozenset(
             {"/run/protocol/public_oauth_callback--google_connector.key"}
         ),
+        "deleted_conversation_archive": frozenset(
+            {"/run/protocol/capability_broker--deleted_conversation_archive.key"}
+        ),
     }
 )
 
@@ -144,16 +153,22 @@ ALLOWED_STATE_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
             {
                 "/var/lib/jarvis/state",
                 "/var/lib/jarvis/traces",
-                "/var/lib/jarvis/deleted-conversations",
+                "/run/jarvis-deleted",
             }
         ),
-        "orchestration_agent": frozenset(),
+        "orchestration_agent": frozenset({"/var/lib/jarvis/codex-traces"}),
         "audit_service": frozenset({"/var/lib/jarvis/audit"}),
         "google_connector": frozenset({"/var/lib/jarvis/google-traces"}),
         "knowledge_vault_connector": frozenset({"/var/lib/jarvis/vault"}),
         "openwa_outbound_connector": frozenset(),
         "worker_gateway": frozenset(),
         "public_oauth_callback": frozenset(),
+        "deleted_conversation_archive": frozenset(
+            {
+                "/var/lib/jarvis/deleted-conversations",
+                "/run/jarvis-deleted",
+            }
+        ),
     }
 )
 
@@ -381,6 +396,7 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
             "accounts.google.com",
             "oauth2.googleapis.com",
             "gmail.googleapis.com",
+            "openidconnect.googleapis.com",
             "www.googleapis.com",
         ],
         "vault_hosts": ["vault.example.invalid"],
@@ -476,6 +492,8 @@ def _validate_artifacts(
         "application",
         "python_base_image",
         "uv_build_image",
+        "node_build_image",
+        "codex_cli",
         "os_packages",
         "requirements_lock",
     }:
@@ -507,21 +525,42 @@ def _validate_artifacts(
         r"ghcr\.io/astral-sh/uv:0\.6\.14@sha256:[0-9a-f]{64}", uv_reference
     ):
         errors.append("uv build image must be pinned by tag and sha256 digest")
+    node_image = lock.get("node_build_image")
+    node_reference = (
+        node_image.get("reference") if isinstance(node_image, Mapping) else None
+    )
+    if node_reference != (
+        "node:24-bookworm-slim@sha256:"
+        "65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848"
+    ):
+        errors.append("Node build image must be pinned by tag and sha256 digest")
+    if lock.get("codex_cli") != {
+        "package": "@openai/codex",
+        "version": "0.147.0",
+        "integrity": (
+            "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
+            "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
+        ),
+    }:
+        errors.append("Codex CLI artifact differs from the reviewed pin")
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
     from_instructions = tuple(
         line.strip() for line in dockerfile.splitlines() if line.startswith("FROM ")
     )
     expected_from = (
+        f"FROM {node_reference} AS codex",
         f"FROM {uv_reference} AS uv",
         f"FROM {reference}",
     )
-    if len(from_instructions) != 2 or not re.fullmatch(
+    if len(from_instructions) != 3 or not re.fullmatch(
         r"FROM python:3\.13\.13-slim-bookworm@sha256:[0-9a-f]{64}",
         from_instructions[-1] if from_instructions else "",
     ):
         errors.append("Dockerfile base image must be pinned by sha256 digest")
     elif from_instructions != expected_from:
         errors.append("Dockerfile images differ from artifact lock")
+    if "npm install --global --omit=dev @openai/codex@0.147.0" not in dockerfile:
+        errors.append("Dockerfile must install the pinned Codex CLI artifact")
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
     if (
@@ -566,7 +605,7 @@ def _validate_compose(
         errors.append("compose services must be an object")
         return False
     if set(services) != set(RESOURCE_LIMITS):
-        errors.append("compose must contain exactly the nine reviewed services")
+        errors.append("compose must contain exactly the reviewed services")
 
     networks = compose.get("networks")
     handoff_active = isinstance(networks, Mapping) and "openwa-handoff" in networks
@@ -702,6 +741,17 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
                 and parts[-1] == "ro"
             )
             or (
+                parts[0] == "/run/jarvis/deleted-archive-ipc"
+                and target == "/run/jarvis-deleted"
+                and service in {"capability_broker", "deleted_conversation_archive"}
+            )
+            or (
+                service == "orchestration_agent"
+                and parts[0] == "/srv/jarvis-workspace"
+                and target == "/srv/jarvis-workspace"
+                and parts[-1] == "ro"
+            )
+            or (
                 parts[0] == target
                 and target in ALLOWED_STATE_MOUNTS[service]
                 and len(parts) == 2
@@ -725,7 +775,9 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
         errors.append(
             f"{service} protocol-key mounts differ from the reviewed boundary"
         )
-    actual_state = {target for target in targets if target.startswith("/var/lib/")}
+    actual_state = {
+        target for target in targets if target in ALLOWED_STATE_MOUNTS[service]
+    }
     if actual_state != ALLOWED_STATE_MOUNTS[service]:
         errors.append(f"{service} state mounts differ from the reviewed boundary")
 

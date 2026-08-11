@@ -13,6 +13,7 @@ knowledge_vault_connector = "jarvis-vault"
 openwa_outbound_connector = "jarvis-openwa-outbound"
 worker_gateway = "jarvis-worker-gateway"
 public_oauth_callback = "jarvis-oauth-callback"
+deleted_conversation_archive = "jarvis-deleted-archive"
 
 [deployment]
 operator_id = "example-operator-id"
@@ -40,7 +41,7 @@ vault = ["read", "search", "write_markdown"]
 
 [egress]
 orchestration_hosts = ["api.openai.com"]
-google_hosts = ["accounts.google.com", "oauth2.googleapis.com", "gmail.googleapis.com", "www.googleapis.com"]
+google_hosts = ["accounts.google.com", "oauth2.googleapis.com", "gmail.googleapis.com", "openidconnect.googleapis.com", "www.googleapis.com"]
 vault_hosts = ["vault.example.invalid"]
 worker_overlay_network = "jarvis-worker-overlay"
 

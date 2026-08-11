@@ -51,6 +51,13 @@ mounted only into those two roles. A server selects the key by the claimed
 client identity and verifies the frame before admitting the operation, so a
 key for a read-only link cannot impersonate the capability broker.
 
+The orchestration image includes the reviewed `@openai/codex` CLI version from
+`artifacts.lock.json`. The orchestration role mounts exactly one Git workspace
+at `/srv/jarvis-workspace` read-only and keeps its Codex traces in the
+UID-10003-owned `/var/lib/jarvis/codex-traces` directory. Codex receives the
+same service-scoped OpenAI API key as the orchestration SDK, but it receives no
+connector, worker, deployment, or activation credential.
+
 The native Ubuntu and Windows workers are not Compose services. Before activation,
 a root administrator creates `/run/jarvis-worker`, starts the reviewed native
 Ubuntu worker so its mode-`0600` socket is present there, and verifies ownership
@@ -74,13 +81,31 @@ HTTPS callback URL and route only `/callback` to `127.0.0.1:8080`; it must not
 expose any private service port. That proxy is an activation prerequisite, not
 an unreviewed Compose service.
 
+Google authorization is initiated only by a manual administrator through the
+authenticated broker-to-Google service link; it is not exposed on the callback
+endpoint or to the orchestration model. With the Google connector running, use:
+
+```text
+docker compose --file deployment/compose.yaml run --rm capability_broker google-authorize --operation-id <reviewed-id>
+docker compose --file deployment/compose.yaml run --rm capability_broker google-disconnect
+```
+
+The first command prints the single-use Google consent URL. The grant always
+includes `openid` so the connector can bind the returned OpenID subject to the
+configured identity. The second command revokes and removes the current grant.
+
 Fresh persistent directories are also a manual activation prerequisite. Create
-the state/trace paths for UID 10002, audit for UID 10004, Google trace and
-credential state for UID 10005, and the vault clone for UID 10006, all with the
-reviewed `0700` directory mode. The long-lived services never start as root and
+the state/trace paths for UID 10002, Codex traces for UID 10003, audit for UID
+10004, Google trace and credential state for UID 10005, the vault clone for UID
+10006, and the deleted-conversation archive for UID 10010, all with the reviewed
+`0700` directory mode. Create `/run/jarvis/deleted-archive-ipc` for group 20000
+with mode `0770`. Only the broker's write-only authenticated archive client and
+the UID-10010 archive service mount that IPC directory; only UID 10010 mounts
+the retained archive database. The long-lived services never start as root and
 do not repair ownership themselves.
 
 The image build is reproducible from the Git-pinned application artifact, the
-digest-pinned Python base, and the hash-locked exported requirements. Building,
+digest-pinned Python and Node build bases, the pinned Codex CLI, and the
+hash-locked exported requirements. Building,
 publishing, credential provisioning, worker installation, OpenWA attachment,
 and activation are separate manual-administration steps.

@@ -38,6 +38,7 @@ GOOGLE_OAUTH_STATE_TTL = timedelta(minutes=10)
 GOOGLE_OAUTH_TRACE_PAYLOAD_LIMIT_BYTES = 32 * 1024
 GOOGLE_OAUTH_SCOPES = frozenset(
     {
+        "openid",
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
@@ -705,6 +706,24 @@ class GoogleLiveOAuthProvider:
         self._redirect_uri = _canonical_string(redirect_uri, "redirect_uri")
         self._opener = build_opener(_RejectOAuthRedirects())
 
+    def authorization_url(self, authorization: OAuthAuthorization) -> str:
+        """Build the exact operator-visible URL for one issued state."""
+
+        if not isinstance(authorization, OAuthAuthorization):
+            raise TypeError("authorization must be an OAuthAuthorization")
+        return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
+            {
+                "access_type": "offline",
+                "client_id": self._client_id,
+                "include_granted_scopes": "false",
+                "prompt": "consent",
+                "redirect_uri": self._redirect_uri,
+                "response_type": "code",
+                "scope": " ".join(sorted(authorization.requested_scopes)),
+                "state": authorization.state,
+            }
+        )
+
     def exchange_code(
         self, *, code: str, requested_scopes: frozenset[str]
     ) -> OAuthGrant:
@@ -961,7 +980,7 @@ class GoogleOAuthLifecycle:
         self, *, operation_id: str, requested_scopes: Sequence[str]
     ) -> OAuthAuthorization:
         operation_id = _canonical_string(operation_id, "operation_id")
-        scopes = _canonical_scopes(requested_scopes)
+        scopes = _canonical_scopes((*requested_scopes, "openid"))
         self._append_audit(
             kind="google_oauth_authorization_started",
             request_id=operation_id,

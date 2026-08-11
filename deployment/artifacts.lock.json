@@ -4,13 +4,21 @@
     "name": "jarvis-v2",
     "version": "0.1.0",
     "git_revision": "86593b0d4c115447fbda09e0723af7b65b69f8b2",
-    "source_sha256": "ad81e03e2f7843bee8debc410929cbabffbd8a083abc31311c27b08e29767f14"
+    "source_sha256": "c9d138aa4a5cb6f96db016e56795f46badb0f3984938c4c10b62d5a4e25aba29"
   },
   "python_base_image": {
     "reference": "python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f"
   },
   "uv_build_image": {
     "reference": "ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664"
+  },
+  "node_build_image": {
+    "reference": "node:24-bookworm-slim@sha256:65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848"
+  },
+  "codex_cli": {
+    "package": "@openai/codex",
+    "version": "0.147.0",
+    "integrity": "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
   },
   "os_packages": {
     "git": "1:2.39.5-0+deb12u3",

@@ -57,9 +57,10 @@ services:
       - /etc/jarvis/protocol/capability_broker--knowledge_vault_connector.key:/run/protocol/capability_broker--knowledge_vault_connector.key:ro
       - /etc/jarvis/protocol/capability_broker--openwa_outbound_connector.key:/run/protocol/capability_broker--openwa_outbound_connector.key:ro
       - /etc/jarvis/protocol/capability_broker--worker_gateway.key:/run/protocol/capability_broker--worker_gateway.key:ro
+      - /etc/jarvis/protocol/capability_broker--deleted_conversation_archive.key:/run/protocol/capability_broker--deleted_conversation_archive.key:ro
       - /var/lib/jarvis/state:/var/lib/jarvis/state
       - /var/lib/jarvis/traces:/var/lib/jarvis/traces
-      - /var/lib/jarvis/deleted-conversations:/var/lib/jarvis/deleted-conversations
+      - /run/jarvis/deleted-archive-ipc:/run/jarvis-deleted
     networks:
       - ingress_broker
       - broker_orchestration
@@ -85,8 +86,10 @@ services:
       - /etc/jarvis/protocol/capability_broker--orchestration_agent.key:/run/protocol/capability_broker--orchestration_agent.key:ro
       - /etc/jarvis/protocol/orchestration_agent--google_connector.key:/run/protocol/orchestration_agent--google_connector.key:ro
       - /etc/jarvis/protocol/orchestration_agent--knowledge_vault_connector.key:/run/protocol/orchestration_agent--knowledge_vault_connector.key:ro
+      - /var/lib/jarvis/codex-traces:/var/lib/jarvis/codex-traces
+      - /srv/jarvis-workspace:/srv/jarvis-workspace:ro
     networks: [broker_orchestration, broker_google, broker_vault, orchestration_egress]
-    pids_limit: 128
+    pids_limit: 96
     deploy:
       resources:
         limits: {memory: 256M, cpus: "0.45"}
@@ -191,6 +194,23 @@ services:
       - /etc/jarvis/protocol/public_oauth_callback--google_connector.key:/run/protocol/public_oauth_callback--google_connector.key:ro
     networks: [oauth_google]
     ports: ["127.0.0.1:8080:8080"]
+    pids_limit: 32
+    deploy:
+      resources:
+        limits: {memory: 48M, cpus: "0.10"}
+
+  deleted_conversation_archive:
+    <<: *service-defaults
+    user: "10010:20000"
+    environment:
+      JARVIS_SERVICE_IDENTITY: jarvis-deleted-archive
+    command: [serve, deleted_conversation_archive]
+    volumes:
+      - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
+      - /etc/jarvis/protocol/capability_broker--deleted_conversation_archive.key:/run/protocol/capability_broker--deleted_conversation_archive.key:ro
+      - /var/lib/jarvis/deleted-conversations:/var/lib/jarvis/deleted-conversations
+      - /run/jarvis/deleted-archive-ipc:/run/jarvis-deleted
+    network_mode: none
     pids_limit: 32
     deploy:
       resources:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -25,12 +26,14 @@ from jarvis_control_plane import (
     SQLiteGoogleOAuthStateStore,
     TraceWriteError,
 )
+from jarvis_control_plane.google_oauth import GoogleLiveOAuthProvider
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.traces import DiagnosticTraceRecorder
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
 READ_SCOPES = (
+    "openid",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 )
@@ -84,6 +87,15 @@ def test_callback_accepts_only_get_and_documented_fields_without_a_body() -> Non
         authorization = lifecycle.start_authorization(
             operation_id="connect-google", requested_scopes=READ_SCOPES
         )
+        assert "openid" in authorization.requested_scopes
+        url = GoogleLiveOAuthProvider(
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uri="https://oauth.jarvis.invalid/callback",
+        ).authorization_url(authorization)
+        query = parse_qs(urlsplit(url).query)
+        assert "openid" in query["scope"][0].split()
+        assert query["state"] == [authorization.state]
 
         wrong_method = lifecycle.handle_callback(
             method="POST", query={"state": authorization.state, "code": "code-1"}

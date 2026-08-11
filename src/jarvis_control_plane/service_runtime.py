@@ -25,10 +25,20 @@ from .adapters import (
     SystemClock,
     UuidIdGenerator,
 )
+from .codex_runtime import CodexCliAdapter, GitCodexWorkspaceInspector
+from .codex_specialist import (
+    CodexSpecialist,
+    CodexSpecialistConfig,
+    CodexWorkspace,
+)
 from .control_plane import (
     ControlPlaneConfig,
     DeterministicCapabilityBroker,
     SignedMessageReceiver,
+)
+from .conversation_archive import (
+    SQLiteDeletedConversationArchiveWriter,
+    serve_sqlite_deleted_conversation_archive,
 )
 from .deployment import BundleValidationError, validate_configuration
 from .gmail_writes import GmailApiWriteProvider, GmailWriteConnector
@@ -37,6 +47,7 @@ from .google_calendar import (
     GoogleApiCalendarWriteProvider,
 )
 from .google_oauth import (
+    GOOGLE_OAUTH_SCOPES,
     FileGoogleCredentialStore,
     GoogleLiveOAuthProvider,
     GoogleOAuthLifecycle,
@@ -153,6 +164,12 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
         ServiceRole(
             "public_oauth_callback", "jarvis-oauth-callback", 8080, ("callback",)
         ),
+        ServiceRole(
+            "deleted_conversation_archive",
+            "jarvis-deleted-archive",
+            0,
+            (),
+        ),
     )
 }
 
@@ -243,7 +260,7 @@ def _audit_operations(config: Mapping[str, Any]) -> Mapping[str, Callable[..., o
 
 
 def _orchestration_operations(
-    _config: Mapping[str, Any],
+    config: Mapping[str, Any],
 ) -> Mapping[str, Callable[..., object]]:
     credential = _credential_json(Path("/run/credentials/openai/credentials.json"))
     api_key = _require_text(credential.get("api_key"), "OpenAI api_key")
@@ -257,6 +274,34 @@ def _orchestration_operations(
     vault_client = _client(
         client_identity="jarvis-orchestration",
         server_role="knowledge_vault_connector",
+    )
+    models = config.get("models")
+    timeouts = config.get("timeouts")
+    if not isinstance(models, Mapping) or not isinstance(timeouts, Mapping):
+        raise CompositionError("Codex deployment configuration is incomplete")
+    _clock, _ids, trace = _service_trace(
+        "codex", root=Path("/var/lib/jarvis/codex-traces")
+    )
+    codex_specialist = CodexSpecialist(
+        config=CodexSpecialistConfig(
+            workspaces=(
+                CodexWorkspace(
+                    name="jarvis",
+                    host="ubuntu",
+                    cwd="/srv/jarvis-workspace",
+                ),
+            ),
+            model=_require_text(models.get("default_model"), "default_model"),
+            reasoning=_require_text(
+                models.get("default_reasoning"), "default_reasoning"
+            ),
+            timeout_seconds=float(timeouts.get("codex_seconds", 0)),
+        ),
+        adapter=CodexCliAdapter(
+            executable=Path("/usr/local/bin/codex"), api_key=api_key
+        ),
+        inspector=GitCodexWorkspaceInspector(),
+        trace=trace,
     )
 
     def read_vault(_request: object, typed_input: object, deadline: float) -> object:
@@ -282,6 +327,7 @@ def _orchestration_operations(
             handler=read_vault,  # type: ignore[arg-type]
         ),
         vault_write_enabled=True,
+        codex_specialist=codex_specialist,
         run_config_factory=lambda **kwargs: RunConfig(
             model_provider=model_provider, **kwargs
         ),
@@ -380,6 +426,21 @@ def _client(*, client_identity: str, server_role: str) -> AuthenticatedServiceCl
     )
 
 
+def _broker_state_store(state_root: Path) -> SQLiteDurableStateStore:
+    """Compose durable broker state with the separate write-only archive client."""
+
+    deleted_archive = SQLiteDeletedConversationArchiveWriter(
+        "/run/jarvis-deleted/writer.sock",
+        authkey=_read_secret(
+            Path("/run/protocol")
+            / "capability_broker--deleted_conversation_archive.key"
+        ),
+    )
+    return SQLiteDurableStateStore(
+        state_root / "state.sqlite3", deleted_archive=deleted_archive
+    )
+
+
 def _broker_operations(
     config: Mapping[str, Any],
 ) -> Mapping[str, Callable[..., object]]:
@@ -399,7 +460,7 @@ def _broker_operations(
     trace_root.mkdir(parents=True, exist_ok=True)
     clock = SystemClock()
     ids = UuidIdGenerator()
-    state = SQLiteDurableStateStore(state_root / "state.sqlite3")
+    state = _broker_state_store(state_root)
     audit = RemoteAuditBoundary(
         _client(client_identity="jarvis-broker", server_role="audit_service")
     )
@@ -561,17 +622,18 @@ def _google_operations(
     audit = RemoteAuditBoundary(
         _client(client_identity="jarvis-google", server_role="audit_service")
     )
+    provider = GoogleLiveOAuthProvider(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=_require_text(
+            deployment.get("oauth_callback_url"), "oauth_callback_url"
+        ),
+    )
     lifecycle = GoogleOAuthLifecycle(
         configured_identity=identity,
         state_store=state_store,
         credential_store=credential_store,
-        provider=GoogleLiveOAuthProvider(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=_require_text(
-                deployment.get("oauth_callback_url"), "oauth_callback_url"
-            ),
-        ),
+        provider=provider,
         audit=audit,
         trace=trace,
         clock=clock,
@@ -628,7 +690,9 @@ def _google_operations(
     )
     operations.update(
         {
-            "start_authorization": lifecycle.start_authorization,
+            "start_authorization": lambda **kwargs: provider.authorization_url(
+                lifecycle.start_authorization(**kwargs)
+            ),
             "oauth_callback": lifecycle.handle_callback,
             "disconnect": lifecycle.disconnect,
         }
@@ -962,7 +1026,52 @@ def serve(role_name: str, *, configuration_path: Path, protocol_root: Path) -> N
     if role_name == "public_oauth_callback":
         _serve_oauth_callback(protocol_root)
         return
+    if role_name == "deleted_conversation_archive":
+        paths = configuration.get("paths")
+        if not isinstance(paths, Mapping):
+            raise CompositionError("deleted archive configuration is incomplete")
+        archive_root = Path(
+            _require_text(
+                paths.get("deleted_conversations"), "paths.deleted_conversations"
+            )
+        )
+        archive_root.mkdir(parents=True, exist_ok=True)
+        serve_sqlite_deleted_conversation_archive(
+            archive_root / "deleted-conversations.sqlite3",
+            "/run/jarvis-deleted/writer.sock",
+            authkey=_read_secret(
+                protocol_root / "capability_broker--deleted_conversation_archive.key"
+            ),
+        )
+        return
     operations = build_operations(role_name, configuration)
+    allowed_identities, operation_allowlists = _service_access(role_name, role)
+    client_secrets: dict[str, bytes] = {}
+    for client_identity in allowed_identities:
+        client_role = next(
+            item.name
+            for item in SERVICE_ROLES.values()
+            if item.identity == client_identity
+        )
+        client_secrets[client_identity] = _read_secret(
+            protocol_root / f"{client_role}--{role_name}.key"
+        )
+    AuthenticatedServiceServer(
+        identity=role.identity,
+        client_secrets=client_secrets,
+        host="0.0.0.0",
+        port=role.port,
+        operations=operations,
+        allowed_client_identities=allowed_identities,
+        allowed_operations_by_client=operation_allowlists,
+    ).serve_forever()
+
+
+def _service_access(
+    role_name: str, role: ServiceRole
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    """Return the exact authenticated peers and operations for one service."""
+
     allowed_identities = {
         "capability_broker": ("jarvis-inbound",),
         "audit_service": ("jarvis-broker", "jarvis-google"),
@@ -976,16 +1085,6 @@ def serve(role_name: str, *, configuration_path: Path, protocol_root: Path) -> N
             "jarvis-orchestration",
         ),
     }.get(role_name, ("jarvis-broker",))
-    client_secrets: dict[str, bytes] = {}
-    for client_identity in allowed_identities:
-        client_role = next(
-            item.name
-            for item in SERVICE_ROLES.values()
-            if item.identity == client_identity
-        )
-        client_secrets[client_identity] = _read_secret(
-            protocol_root / f"{client_role}--{role_name}.key"
-        )
     operation_allowlists: dict[str, tuple[str, ...]] = {
         identity: role.operations for identity in allowed_identities
     }
@@ -1002,6 +1101,7 @@ def serve(role_name: str, *, configuration_path: Path, protocol_root: Path) -> N
                 operation
                 for operation in role.operations
                 if operation.startswith("action_")
+                or operation in {"start_authorization", "disconnect"}
             ),
             "jarvis-orchestration": tuple(
                 operation
@@ -1017,15 +1117,7 @@ def serve(role_name: str, *, configuration_path: Path, protocol_root: Path) -> N
             ),
             "jarvis-orchestration": ("read",),
         }
-    AuthenticatedServiceServer(
-        identity=role.identity,
-        client_secrets=client_secrets,
-        host="0.0.0.0",
-        port=role.port,
-        operations=operations,
-        allowed_client_identities=allowed_identities,
-        allowed_operations_by_client=operation_allowlists,
-    ).serve_forever()
+    return allowed_identities, operation_allowlists
 
 
 def health() -> None:
@@ -1035,6 +1127,16 @@ def health() -> None:
     )
     if role is None:
         raise CompositionError("runtime service identity is unknown")
+    if role.name == "deleted_conversation_archive":
+        writer = SQLiteDeletedConversationArchiveWriter(
+            "/run/jarvis-deleted/writer.sock",
+            authkey=_read_secret(
+                Path("/run/protocol")
+                / "capability_broker--deleted_conversation_archive.key"
+            ),
+        )
+        writer.close()
+        return
     try:
         with urlopen(f"http://127.0.0.1:{role.port}/health", timeout=2) as response:
             if response.status != 200 or response.read(3) != b"ok":
@@ -1055,6 +1157,15 @@ def _parser() -> argparse.ArgumentParser:
         "--protocol-root", type=Path, default=Path("/run/protocol")
     )
     subcommands.add_parser("health")
+    authorize_parser = subcommands.add_parser("google-authorize")
+    authorize_parser.add_argument("--operation-id", required=True)
+    authorize_parser.add_argument(
+        "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
+    )
+    disconnect_parser = subcommands.add_parser("google-disconnect")
+    disconnect_parser.add_argument(
+        "--configuration", type=Path, default=Path("/run/jarvis/config.toml")
+    )
     return parser
 
 
@@ -1062,6 +1173,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.command == "health":
         health()
+    elif arguments.command in {"google-authorize", "google-disconnect"}:
+        if os.environ.get("JARVIS_SERVICE_IDENTITY") != "jarvis-broker":
+            raise CompositionError("Google administration requires the broker identity")
+        _load_configuration(arguments.configuration)
+        client = _client(
+            client_identity="jarvis-broker", server_role="google_connector"
+        )
+        if arguments.command == "google-authorize":
+            result = client.call(
+                "start_authorization",
+                operation_id=arguments.operation_id,
+                requested_scopes=tuple(sorted(GOOGLE_OAUTH_SCOPES)),
+            )
+            if not isinstance(result, str) or not result.startswith(
+                "https://accounts.google.com/"
+            ):
+                raise CompositionError("Google authorization URL was unavailable")
+            print(result)
+        else:
+            client.call("disconnect")
+            print("Google connection disconnected.")
     else:
         serve(
             arguments.role,

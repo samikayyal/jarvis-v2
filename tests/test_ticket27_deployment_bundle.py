@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -11,8 +12,12 @@ import yaml
 from jarvis_control_plane.deployment import BundleValidationError, verify_bundle
 from jarvis_control_plane.models import SignedInboundEvent
 from jarvis_control_plane.service_runtime import (
+    SERVICE_ROLES,
     CompositionError,
+    _broker_state_store,
     _load_configuration,
+    _orchestration_operations,
+    _service_access,
     _verified_inbound_event,
 )
 
@@ -56,6 +61,7 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     assert report.services == (
         "audit_service",
         "capability_broker",
+        "deleted_conversation_archive",
         "google_connector",
         "inbound_receiver",
         "knowledge_vault_connector",
@@ -64,8 +70,8 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "public_oauth_callback",
         "worker_gateway",
     )
-    assert report.aggregate_memory_mib == 1008
-    assert report.aggregate_cpus == pytest.approx(1.8)
+    assert report.aggregate_memory_mib == 1056
+    assert report.aggregate_cpus == pytest.approx(1.9)
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
     assert report.host_mutations == ()
@@ -74,6 +80,118 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         name: tuple(service["command"]) for name, service in compose["services"].items()
     }
     assert commands == {name: ("serve", name) for name in report.services}
+
+
+def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
+    compose = yaml.safe_load((SHIPPED_BUNDLE / "compose.yaml").read_text("utf-8"))
+    services = compose["services"]
+    broker_mounts = tuple(services["capability_broker"]["volumes"])
+    archive_mounts = tuple(services["deleted_conversation_archive"]["volumes"])
+    orchestration_mounts = tuple(services["orchestration_agent"]["volumes"])
+
+    assert not any(
+        mount.endswith(":/var/lib/jarvis/deleted-conversations")
+        for mount in broker_mounts
+    )
+    assert any(
+        mount.endswith(":/var/lib/jarvis/deleted-conversations")
+        for mount in archive_mounts
+    )
+    assert services["deleted_conversation_archive"]["user"] == "10010:20000"
+    assert services["deleted_conversation_archive"]["network_mode"] == "none"
+    assert "/srv/jarvis-workspace:/srv/jarvis-workspace:ro" in orchestration_mounts
+
+    lock = yaml.safe_load((SHIPPED_BUNDLE / "artifacts.lock.json").read_text("utf-8"))
+    assert lock["codex_cli"] == {
+        "package": "@openai/codex",
+        "version": "0.147.0",
+        "integrity": (
+            "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
+            "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
+        ),
+    }
+    config = (SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8")
+    assert "openidconnect.googleapis.com" in config
+
+
+def test_orchestration_composition_includes_the_codex_specialist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    captured: dict[str, object] = {}
+    specialist = object()
+    monkeypatch.setattr(runtime, "_credential_json", lambda _path: {"api_key": "key"})
+    monkeypatch.setattr(runtime, "_client", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        runtime, "_service_trace", lambda *_args, **_kwargs: (None, None, object())
+    )
+    monkeypatch.setattr(runtime, "CodexCliAdapter", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime, "GitCodexWorkspaceInspector", lambda: object())
+    monkeypatch.setattr(runtime, "CodexSpecialist", lambda **_kwargs: specialist)
+
+    def orchestration(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(run=lambda _request: None)
+
+    monkeypatch.setattr(runtime, "AgentsSdkOrchestrationAdapter", orchestration)
+    operations = _orchestration_operations(
+        {
+            "models": {
+                "default_model": "gpt-5.6-terra",
+                "default_reasoning": "medium",
+            },
+            "timeouts": {"codex_seconds": 300},
+        }
+    )
+
+    assert operations.keys() == {"run"}
+    assert captured["codex_specialist"] is specialist
+
+
+def test_broker_state_uses_only_the_write_only_deleted_archive_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    archive = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(runtime, "_read_secret", lambda _path: b"a" * 32)
+    monkeypatch.setattr(
+        runtime,
+        "SQLiteDeletedConversationArchiveWriter",
+        lambda endpoint, **kwargs: (
+            captured.update(endpoint=endpoint, **kwargs) or archive
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "SQLiteDurableStateStore",
+        lambda database, **kwargs: (
+            captured.update(database=database, **kwargs) or object()
+        ),
+    )
+
+    _broker_state_store(tmp_path)
+
+    assert captured["endpoint"] == "/run/jarvis-deleted/writer.sock"
+    assert captured["deleted_archive"] is archive
+    assert captured["database"] == tmp_path / "state.sqlite3"
+
+
+def test_google_administration_is_authenticated_and_not_model_accessible() -> None:
+    identities, allowlists = _service_access(
+        "google_connector", SERVICE_ROLES["google_connector"]
+    )
+
+    assert identities == (
+        "jarvis-broker",
+        "jarvis-orchestration",
+        "jarvis-oauth-callback",
+    )
+    assert {"start_authorization", "disconnect"} <= set(allowlists["jarvis-broker"])
+    assert "start_authorization" not in allowlists["jarvis-orchestration"]
+    assert allowlists["jarvis-oauth-callback"] == ("oauth_callback",)
 
 
 def test_bundle_rejects_unknown_configuration_and_identity_mismatch(
