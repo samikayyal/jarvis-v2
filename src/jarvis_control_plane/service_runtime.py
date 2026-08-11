@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from queue import Queue
 from threading import Event, RLock, Thread
 from typing import Any
 from urllib.error import URLError
@@ -33,6 +34,7 @@ from .codex_specialist import (
     CodexSpecialistConfig,
     CodexWorkspace,
 )
+from .control_grammar import ControlCommand, parse_control
 from .control_plane import (
     ControlPlaneConfig,
     DeterministicCapabilityBroker,
@@ -66,10 +68,10 @@ from .knowledge_vault import (
     VaultReadInput,
 )
 from .knowledge_vault_writes import KnowledgeVaultWriteConnector
-from .models import FrozenActionProposal, SignedInboundEvent
+from .models import FrozenActionProposal, InboundMessage, SignedInboundEvent
 from .openwa import OpenWAConfig, OpenWAIngressWorker, OpenWAOutboundConnector
 from .orchestration import AgentsSdkOrchestrationAdapter, BoundedReadTool
-from .ports import ActionCancellationResult, ActionCancellationStatus
+from .ports import ActionCancellationResult, ActionCancellationStatus, DurableStateStore
 from .service_protocol import (
     AuthenticatedServiceClient,
     AuthenticatedServiceServer,
@@ -96,7 +98,7 @@ from .ubuntu_worker_ipc import (
 from .vault_repository import SubprocessVaultRepository
 from .windows_worker import OutboundWindowsWorkerTransport, WindowsWorkerRegistration
 from .windows_worker_session import WindowsMtlsServerConfig, WindowsWorkerMtlsAcceptor
-from .worker_gateway import WorkerGateway, WorkerIdentity
+from .worker_gateway import WorkerExecutionLimits, WorkerGateway, WorkerIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +236,9 @@ def _read_secret(path: Path) -> bytes:
     if path.is_symlink():
         raise CompositionError("service protocol key must not be a symbolic link")
     if os.name == "posix" and (
-        stat.S_IMODE(metadata.st_mode) != 0o440 or metadata.st_gid != 20000
+        stat.S_IMODE(metadata.st_mode) != 0o440
+        or metadata.st_uid != 0
+        or metadata.st_gid != 20000
     ):
         raise CompositionError("service protocol key ownership or mode is invalid")
     if secret.endswith(b"\n"):
@@ -444,7 +448,11 @@ def _operation_timeouts(
     try:
         read = float(configured["read_connector_seconds"]) + 5
         side_effect = float(configured["side_effect_connector_seconds"]) + 5
-        terminal = float(configured["terminal_seconds"]) + 5
+        terminal = (
+            float(configured["terminal_seconds"])
+            + 2 * WorkerExecutionLimits().cancellation_grace_seconds
+            + 5
+        )
         active = float(configured["active_request_seconds"]) + 5
     except (KeyError, TypeError, ValueError) as exc:
         raise CompositionError("service timeout configuration is invalid") from exc
@@ -512,17 +520,54 @@ def _broker_state_store(state_root: Path) -> SQLiteDurableStateStore:
 class _AsyncIngressAdmission:
     """Acknowledge durable admission while one background worker drains ingress."""
 
-    def __init__(self, *, receiver: SignedMessageReceiver, state: object) -> None:
+    def __init__(
+        self, *, receiver: SignedMessageReceiver, state: DurableStateStore
+    ) -> None:
         self._receiver = receiver
-        self._worker = OpenWAIngressWorker(receiver=receiver, state=state)  # type: ignore[arg-type]
+        self._state = state
+        self._worker = OpenWAIngressWorker(receiver=receiver, state=state)
         self._wakeup = Event()
+        self._controls: Queue[InboundMessage] = Queue()
         Thread(target=self._drain, daemon=True).start()
+        Thread(target=self._drain_controls, daemon=True).start()
 
     def receive(self, event: SignedInboundEvent) -> object:
         result = self._receiver.admit(event)
         if result.disposition == "admitted":
+            message = event.decode()
+            if isinstance(message.text, str) and parse_control(
+                message.text
+            ).command in {
+                ControlCommand.STATUS,
+                ControlCommand.CANCEL,
+                ControlCommand.NEW,
+            }:
+                self._controls.put(message)
             self._wakeup.set()
         return result
+
+    def _drain_controls(self) -> None:
+        while True:
+            message = self._controls.get()
+            try:
+                if not self._state.begin_ingress_dispatch(
+                    transport_session_id=message.session_id,
+                    message_id=message.message_id,
+                ):
+                    continue
+                try:
+                    self._receiver.dispatch_admitted_message(message)
+                except Exception:  # noqa: BLE001 - preserve interrupted ingress
+                    disposition = "interrupted"
+                else:
+                    disposition = "dispatched"
+                self._state.finish_ingress_dispatch(
+                    transport_session_id=message.session_id,
+                    message_id=message.message_id,
+                    disposition=disposition,
+                )
+            except Exception:  # noqa: BLE001,S110 - keep the control lane available
+                pass
 
     def _drain(self) -> None:
         while True:
@@ -689,6 +734,10 @@ class _GoogleActionDispatcher:
         if owner is None:
             return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         return owner.cancel(action_id=action_id)  # type: ignore[attr-defined,no-any-return]
+
+    def finalize(self, *, action_id: str) -> None:
+        with self._lock:
+            self._owners.pop(action_id, None)
 
 
 def _minimum_free_bytes(config: Mapping[str, Any]) -> int:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import tomllib
+from io import BytesIO
 from pathlib import Path
 from threading import Event, Thread
 from time import monotonic
@@ -13,8 +14,14 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from jarvis_control_plane.codex_runtime import CodexCliAdapter
-from jarvis_control_plane.codex_specialist import CodexExecutionEnvelope
+from jarvis_control_plane.codex_runtime import (
+    CodexCliAdapter,
+    GitCodexWorkspaceInspector,
+)
+from jarvis_control_plane.codex_specialist import (
+    CodexExecutionEnvelope,
+    CodexVerificationError,
+)
 from jarvis_control_plane.deployment import (
     BundleValidationError,
     validate_configuration,
@@ -23,17 +30,23 @@ from jarvis_control_plane.deployment import (
 from jarvis_control_plane.deployment import (
     administrative_status as deployment_administrative_status,
 )
-from jarvis_control_plane.models import SignedInboundEvent
+from jarvis_control_plane.models import InboundMessage, SignedInboundEvent
 from jarvis_control_plane.openwa import OpenWAReadiness
-from jarvis_control_plane.ports import TraceCapacityError, WorkerReadiness
+from jarvis_control_plane.ports import (
+    ActionCancellationStatus,
+    TraceCapacityError,
+    WorkerReadiness,
+)
 from jarvis_control_plane.service_runtime import (
     SERVICE_ROLES,
     CompositionError,
     _AsyncIngressAdmission,
     _broker_state_store,
+    _GoogleActionDispatcher,
     _load_configuration,
     _operation_timeouts,
     _orchestration_operations,
+    _read_secret,
     _service_access,
     _verified_inbound_event,
 )
@@ -218,23 +231,24 @@ def test_deployed_codex_cli_preserves_only_the_reviewed_proxy_environment(
     class Process:
         returncode = 0
         pid = 1
+        stdin = BytesIO()
+        stdout = BytesIO(
+            "\n".join(
+                (
+                    json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {"type": "agent_message", "text": final},
+                        }
+                    ),
+                )
+            ).encode()
+        )
+        stderr = BytesIO()
 
-        def communicate(self, _prompt: str, *, timeout: float) -> tuple[str, str]:
-            assert timeout > 0
-            return (
-                "\n".join(
-                    (
-                        json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                        json.dumps(
-                            {
-                                "type": "item.completed",
-                                "item": {"type": "agent_message", "text": final},
-                            }
-                        ),
-                    )
-                ),
-                "",
-            )
+        def wait(self, *, timeout: float | None = None) -> int:
+            return self.returncode
 
     def popen(_command: object, **kwargs: object) -> Process:
         captured.update(kwargs)
@@ -326,6 +340,59 @@ def test_deployed_codex_cli_stops_a_process_after_an_expired_deadline(
     assert process.stopped is True
 
 
+def test_deployed_codex_cli_bounds_each_output_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import jarvis_control_plane.codex_runtime as runtime
+
+    executable = tmp_path / "codex"
+    executable.write_text("pinned", encoding="utf-8")
+
+    class Process:
+        returncode = 0
+        pid = 1
+        stdin = BytesIO()
+        stdout = BytesIO(b"x" * 17)
+        stderr = BytesIO()
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, *, timeout: float) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(runtime, "MAX_CODEX_OUTPUT_BYTES", 16)
+    monkeypatch.setattr(
+        runtime.subprocess, "Popen", lambda *_args, **_kwargs: Process()
+    )
+    adapter = CodexCliAdapter(executable=executable, api_key="api-key")
+
+    with pytest.raises(CodexVerificationError, match="output bound"):
+        adapter.invoke(
+            CodexExecutionEnvelope(
+                request_id="verbose-request",
+                task="Review the workspace.",
+                host="ubuntu",
+                cwd="/srv/jarvis-workspace",
+                model="gpt-5.6-terra",
+                reasoning="medium",
+                sandbox="read-only",
+                approval_policy="on-request",
+                timeout_seconds=300,
+                operation="review",
+                allowed_paths=(),
+                proposal_digest=None,
+            ),
+            deadline=monotonic() + 1,
+        )
+
+
+def test_git_inspection_disables_repository_fsmonitor_commands() -> None:
+    assert ("-c", "core.fsmonitor=false") == tuple(
+        GitCodexWorkspaceInspector._GIT_PREFIX[1:3]
+    )
+
+
 def test_working_session_store_is_usable_from_service_handler_threads(
     tmp_path: Path,
 ) -> None:
@@ -370,11 +437,128 @@ def test_durable_ingress_admission_returns_before_background_dispatch(
         state=object(),
     )
 
-    result = admission.receive(object())  # type: ignore[arg-type]
+    result = admission.receive(
+        SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id="session-1",
+                event_id="event-1",
+                message_id="message-1",
+                sender_id="operator",
+                chat_id="operator",
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text="do slow work",
+            ),
+            b"unused-test-secret",
+        )
+    )
 
     assert result.status_code == 202
     assert dispatch_started.wait(timeout=1)
     release_dispatch.set()
+
+
+def test_durable_ingress_dispatches_cancel_while_ordinary_work_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    ordinary_started = Event()
+    release_ordinary = Event()
+    cancel_dispatched = Event()
+
+    class Receiver:
+        def admit(self, _event: object) -> object:
+            return SimpleNamespace(disposition="admitted", status_code=202)
+
+        def dispatch_admitted_message(self, message: InboundMessage) -> object:
+            if message.text == "/cancel":
+                cancel_dispatched.set()
+            return SimpleNamespace(disposition="dispatched")
+
+    class State:
+        def begin_ingress_dispatch(self, **_kwargs: object) -> bool:
+            return True
+
+        def finish_ingress_dispatch(self, **_kwargs: object) -> None:
+            return None
+
+    class Worker:
+        def __init__(self, **_kwargs: object) -> None:
+            self.calls = 0
+
+        def run_once(self) -> object | None:
+            self.calls += 1
+            if self.calls == 1:
+                ordinary_started.set()
+                assert release_ordinary.wait(timeout=2)
+                return SimpleNamespace(disposition="dispatched")
+            return None
+
+    def event(text: str, suffix: str) -> SignedInboundEvent:
+        return SignedInboundEvent.from_message(
+            InboundMessage(
+                event_type="message.received",
+                session_id="session-1",
+                event_id=f"event-{suffix}",
+                message_id=f"message-{suffix}",
+                sender_id="operator",
+                chat_id="operator",
+                chat_type="direct",
+                message_type="text",
+                from_me=False,
+                text=text,
+            ),
+            b"unused-test-secret",
+        )
+
+    monkeypatch.setattr(runtime, "OpenWAIngressWorker", Worker)
+    admission = _AsyncIngressAdmission(
+        receiver=Receiver(),  # type: ignore[arg-type]
+        state=State(),  # type: ignore[arg-type]
+    )
+
+    admission.receive(event("do slow work", "ordinary"))
+    assert ordinary_started.wait(timeout=1)
+    admission.receive(event("/cancel", "cancel"))
+
+    assert cancel_dispatched.wait(timeout=1)
+    release_ordinary.set()
+
+
+def test_google_action_finalization_retires_owner() -> None:
+    owner = SimpleNamespace(
+        prepare=lambda _action: object(),
+        cancel=lambda **_kwargs: None,
+    )
+    dispatcher = _GoogleActionDispatcher(gmail=owner, calendar=owner)  # type: ignore[arg-type]
+    action = SimpleNamespace(kind="gmail_send", action_id="action-1")
+
+    dispatcher.prepare(action)  # type: ignore[arg-type]
+    dispatcher.finalize(action_id="action-1")
+
+    assert (
+        dispatcher.cancel(action_id="action-1").status
+        is ActionCancellationStatus.UNKNOWN
+    )
+
+
+def test_protocol_keys_require_root_ownership_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    path = SimpleNamespace(
+        stat=lambda: SimpleNamespace(st_mode=0o440, st_gid=20000, st_uid=10010),
+        read_bytes=lambda: b"a" * 32,
+        is_symlink=lambda: False,
+    )
+    monkeypatch.setattr(runtime.os, "name", "posix")
+
+    with pytest.raises(CompositionError, match="ownership or mode"):
+        _read_secret(path)  # type: ignore[arg-type]
 
 
 def test_broker_state_uses_only_the_write_only_deleted_archive_client(
@@ -871,7 +1055,7 @@ def test_service_transport_timeouts_cover_configured_operation_deadlines() -> No
     assert _operation_timeouts(config, server_role="capability_broker")["receive"] > 480
     assert _operation_timeouts(config, server_role="orchestration_agent")["run"] > 480
     worker = _operation_timeouts(config, server_role="worker_gateway")
-    assert set(worker.values()) == {125.0}
+    assert set(worker.values()) == {145.0}
 
 
 def test_trace_admission_preserves_the_configured_free_disk_floor(

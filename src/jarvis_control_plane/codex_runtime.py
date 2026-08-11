@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import subprocess
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Lock
 from time import monotonic
@@ -21,6 +22,8 @@ from .codex_specialist import (
     CodexWorkspaceSnapshot,
 )
 
+MAX_CODEX_OUTPUT_BYTES = 1024 * 1024
+
 
 class CodexCliAdapter:
     """Invoke the pinned Codex CLI with Jarvis-owned read-only settings."""
@@ -33,7 +36,7 @@ class CodexCliAdapter:
         self._executable = executable
         self._api_key = api_key
         self._lock = Lock()
-        self._processes: dict[str, subprocess.Popen[str]] = {}
+        self._processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def invoke(
         self, envelope: CodexExecutionEnvelope, *, deadline: float
@@ -73,9 +76,6 @@ class CodexCliAdapter:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
             env=environment,
             start_new_session=True,
         )
@@ -86,8 +86,8 @@ class CodexCliAdapter:
             if remaining <= 0:
                 self._stop(process)
                 raise TimeoutError("Codex CLI exceeded its frozen deadline")
-            stdout, stderr = process.communicate(
-                self._prompt(envelope), timeout=remaining
+            stdout, stderr = self._communicate_bounded(
+                process, self._prompt(envelope), deadline
             )
         except subprocess.TimeoutExpired as exc:
             self._stop(process)
@@ -101,6 +101,53 @@ class CodexCliAdapter:
                 f"Codex CLI failed without verified output: {message}"
             )
         return self._parse_events(stdout)
+
+    def _communicate_bounded(
+        self, process: subprocess.Popen[bytes], prompt: str, deadline: float
+    ) -> tuple[str, str]:
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise CodexVerificationError("Codex CLI pipes are unavailable")
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+            process.stdin.close()
+        except (BrokenPipeError, OSError) as exc:
+            self._stop(process)
+            raise CodexVerificationError("Codex CLI input was unavailable") from exc
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            stdout_future = executor.submit(
+                process.stdout.read, MAX_CODEX_OUTPUT_BYTES + 1
+            )
+            stderr_future = executor.submit(
+                process.stderr.read, MAX_CODEX_OUTPUT_BYTES + 1
+            )
+            process_future = executor.submit(process.wait)
+            pending = {stdout_future, stderr_future, process_future}
+            while pending:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    self._stop(process)
+                    raise TimeoutError("Codex CLI exceeded its frozen deadline")
+                completed, _ = wait(
+                    pending, timeout=remaining, return_when=FIRST_COMPLETED
+                )
+                if not completed:
+                    self._stop(process)
+                    raise TimeoutError("Codex CLI exceeded its frozen deadline")
+                pending.difference_update(completed)
+                for future in completed & {stdout_future, stderr_future}:
+                    if len(future.result()) > MAX_CODEX_OUTPUT_BYTES:
+                        self._stop(process)
+                        raise CodexVerificationError(
+                            "Codex CLI exceeded its fixed output bound"
+                        )
+        try:
+            return (
+                stdout_future.result().decode("utf-8", errors="strict"),
+                stderr_future.result().decode("utf-8", errors="strict"),
+            )
+        except UnicodeDecodeError as exc:
+            raise CodexVerificationError("Codex CLI output was not UTF-8") from exc
 
     def interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
         with self._lock:
@@ -191,6 +238,8 @@ class GitCodexWorkspaceInspector:
 
     _GIT_PREFIX = (
         "git",
+        "-c",
+        "core.fsmonitor=false",
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
