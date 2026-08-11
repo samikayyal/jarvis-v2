@@ -688,11 +688,19 @@ def _google_operations(
             _GoogleActionDispatcher(gmail=gmail, calendar=calendar)  # type: ignore[arg-type]
         ).operations()
     )
+
+    def start_authorization(
+        *, operation_id: str, requested_scopes: Sequence[str]
+    ) -> str:
+        authorization = lifecycle.start_authorization(
+            operation_id=operation_id,
+            requested_scopes=(*requested_scopes, "openid"),
+        )
+        return provider.authorization_url(authorization)
+
     operations.update(
         {
-            "start_authorization": lambda **kwargs: provider.authorization_url(
-                lifecycle.start_authorization(**kwargs)
-            ),
+            "start_authorization": start_authorization,
             "oauth_callback": lifecycle.handle_callback,
             "disconnect": lifecycle.disconnect,
         }

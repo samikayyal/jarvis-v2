@@ -711,6 +711,8 @@ class GoogleLiveOAuthProvider:
 
         if not isinstance(authorization, OAuthAuthorization):
             raise TypeError("authorization must be an OAuthAuthorization")
+        if "openid" not in authorization.requested_scopes:
+            raise GoogleOAuthError("live Google authorization requires openid")
         return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
             {
                 "access_type": "offline",
@@ -980,7 +982,7 @@ class GoogleOAuthLifecycle:
         self, *, operation_id: str, requested_scopes: Sequence[str]
     ) -> OAuthAuthorization:
         operation_id = _canonical_string(operation_id, "operation_id")
-        scopes = _canonical_scopes((*requested_scopes, "openid"))
+        scopes = _canonical_scopes(requested_scopes)
         self._append_audit(
             kind="google_oauth_authorization_started",
             request_id=operation_id,

@@ -33,7 +33,6 @@ from jarvis_control_plane.traces import DiagnosticTraceRecorder
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
 READ_SCOPES = (
-    "openid",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 )
@@ -85,7 +84,7 @@ def test_callback_accepts_only_get_and_documented_fields_without_a_body() -> Non
     lifecycle, trace_store = build_lifecycle()
     try:
         authorization = lifecycle.start_authorization(
-            operation_id="connect-google", requested_scopes=READ_SCOPES
+            operation_id="connect-google", requested_scopes=(*READ_SCOPES, "openid")
         )
         assert "openid" in authorization.requested_scopes
         url = GoogleLiveOAuthProvider(
