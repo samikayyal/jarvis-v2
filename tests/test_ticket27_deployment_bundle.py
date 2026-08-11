@@ -9,7 +9,6 @@ from pathlib import Path
 from threading import Event, Thread
 from time import monotonic
 from types import SimpleNamespace
-from typing import Self
 
 import pytest
 import yaml
@@ -20,6 +19,9 @@ from jarvis_control_plane.deployment import (
     BundleValidationError,
     validate_configuration,
     verify_bundle,
+)
+from jarvis_control_plane.deployment import (
+    administrative_status as deployment_administrative_status,
 )
 from jarvis_control_plane.models import SignedInboundEvent
 from jarvis_control_plane.openwa import OpenWAReadiness
@@ -34,7 +36,9 @@ from jarvis_control_plane.service_runtime import (
     _orchestration_operations,
     _service_access,
     _verified_inbound_event,
-    administrative_status,
+)
+from jarvis_control_plane.service_runtime import (
+    administrative_status as service_administrative_status,
 )
 from jarvis_control_plane.sessions import SQLiteWorkingSessionStore
 from jarvis_control_plane.traces import SQLiteDiagnosticTraceStore
@@ -629,40 +633,46 @@ def test_administrative_status_reports_safe_operational_state(
             self.role = role
 
         def call(self, operation: str) -> object:
+            if self.role == "audit_service":
+                assert operation == "writable"
+                return True
             assert operation == "current"
             if self.role == "openwa_outbound_connector":
                 return OpenWAReadiness(True, "ready")
             return WorkerReadiness(ubuntu="ready", windows="unavailable")
-
-    class Response:
-        status = 200
-
-        def __enter__(self) -> Self:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def read(self, _size: int) -> bytes:
-            return b"ok"
 
     monkeypatch.setattr(
         "jarvis_control_plane.service_runtime._client",
         lambda _config, *, client_identity, server_role: Client(server_role),
     )
     monkeypatch.setattr(
-        "jarvis_control_plane.service_runtime.urlopen",
-        lambda *_args, **_kwargs: Response(),
-    )
-    monkeypatch.setattr(
         "jarvis_control_plane.service_runtime.shutil.disk_usage",
         lambda _path: SimpleNamespace(free=3 * 1024**3),
     )
 
-    status = administrative_status(
+    dependency_status = service_administrative_status(
         config,
         artifact_lock_path=SHIPPED_BUNDLE / "artifacts.lock.json",
     )
+
+    services = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT).services
+    calls = 0
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    [
+                        {"Service": service, "State": "running", "Health": "healthy"}
+                        for service in services
+                    ]
+                )
+            )
+        return SimpleNamespace(stdout=json.dumps(dependency_status))
+
+    status = deployment_administrative_status(SHIPPED_BUNDLE, runner=run)
 
     assert set(status) == {
         "components",

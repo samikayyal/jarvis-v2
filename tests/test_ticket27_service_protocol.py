@@ -86,6 +86,7 @@ def _serve_audit(port: int, database: str) -> None:
         operations={
             "append": lambda evidence: audit.append(evidence),
             "append_batch": lambda evidence: audit.append_batch(evidence),
+            "writable": audit.writable,
             "safe_view": lambda query=None: audit.safe_view(query),
             "export_json": lambda query=None: audit.export_json(query),
         },
@@ -120,16 +121,16 @@ def test_authenticated_audit_adapter_crosses_real_process_boundary() -> None:
         process.start()
         try:
             wait_until_ready("127.0.0.1", port)
-            audit = RemoteAuditBoundary(
-                AuthenticatedServiceClient(
-                    identity="jarvis-broker",
-                    expected_server_identity="jarvis-audit",
-                    secret=SECRET,
-                    host="127.0.0.1",
-                    port=port,
-                )
+            client = AuthenticatedServiceClient(
+                identity="jarvis-broker",
+                expected_server_identity="jarvis-audit",
+                secret=SECRET,
+                host="127.0.0.1",
+                port=port,
             )
+            audit = RemoteAuditBoundary(client)
 
+            assert client.call("writable") is True
             audit.append(_evidence("one"))
 
             assert audit.safe_view(AuditFilter(request_id="request-one")) == (

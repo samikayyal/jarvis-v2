@@ -119,7 +119,7 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
             "audit_service",
             "jarvis-audit",
             9014,
-            ("append", "append_batch", "safe_view", "export_json"),
+            ("append", "append_batch", "writable", "safe_view", "export_json"),
         ),
         ServiceRole(
             "google_connector",
@@ -279,6 +279,7 @@ def _audit_operations(config: Mapping[str, Any]) -> Mapping[str, Callable[..., o
     return {
         "append": audit.append,
         "append_batch": audit.append_batch,
+        "writable": audit.writable,
         "safe_view": audit.safe_view,
         "export_json": audit.export_json,
     }
@@ -1258,7 +1259,7 @@ def _service_access(
         operation_allowlists["jarvis-inbound"] = ("receive",)
     elif role_name == "audit_service":
         operation_allowlists = {
-            "jarvis-broker": ("append", "append_batch"),
+            "jarvis-broker": ("append", "append_batch", "writable"),
             "jarvis-google": ("append", "append_batch"),
         }
     elif role_name == "google_connector":
@@ -1318,19 +1319,6 @@ def administrative_status(
 ) -> dict[str, object]:
     """Return the local administrator's bounded, content-free status view."""
 
-    primary_roles = tuple(
-        name for name in SERVICE_ROLES if name != "deleted_conversation_archive"
-    )
-    components: dict[str, str] = {}
-    for name in primary_roles:
-        role = SERVICE_ROLES[name]
-        try:
-            with urlopen(f"http://{name}:{role.port}/health", timeout=2) as response:
-                ready = response.status == 200 and response.read(3) == b"ok"
-        except (OSError, URLError):
-            ready = False
-        components[name] = "ready" if ready else "unavailable"
-
     try:
         messaging = _client(
             config,
@@ -1352,6 +1340,16 @@ def administrative_status(
         }
     except (OSError, RuntimeError, TypeError, ValueError):
         hosts = {"ubuntu": "unavailable", "windows": "unavailable"}
+    try:
+        audit_writable = bool(
+            _client(
+                config,
+                client_identity="jarvis-broker",
+                server_role="audit_service",
+            ).call("writable")
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        audit_writable = False
 
     paths = config.get("paths")
     bounds = config.get("resource_bounds")
@@ -1374,9 +1372,8 @@ def administrative_status(
         release = {"id": config.get("release_id"), "version": None, "revision": None}
 
     return {
-        "components": components,
         "messaging_ready": messaging_ready,
-        "audit_writable": components.get("audit_service") == "ready",
+        "audit_writable": audit_writable,
         "backup_freshness": "not-configured",
         "hosts": hosts,
         "release": release,

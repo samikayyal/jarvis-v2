@@ -3930,6 +3930,9 @@ class InMemoryAuditBoundary:
     def append(self, evidence: AuditEvidence) -> None:
         self.append_batch((evidence,))
 
+    def writable(self) -> bool:
+        return not self.fail
+
     def append_batch(self, evidence: Sequence[AuditEvidence]) -> None:
         records = tuple(evidence)
         if any(not isinstance(record, AuditEvidence) for record in records):
@@ -4271,6 +4274,19 @@ class SQLiteAuditBoundary:
 
     def append(self, evidence: AuditEvidence) -> None:
         self.append_batch((evidence,))
+
+    def writable(self) -> bool:
+        """Probe the audit write lock without changing retained evidence."""
+
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.rollback()
+                return True
+            except sqlite3.Error:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                return False
 
     def append_batch(self, evidence: Sequence[AuditEvidence]) -> None:
         with self._lock:

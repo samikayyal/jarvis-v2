@@ -69,7 +69,6 @@ services:
       - broker_vault
       - broker_openwa_outbound
       - broker_worker
-      - oauth_google
     pids_limit: 32
     deploy:
       resources:

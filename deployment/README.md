@@ -130,11 +130,11 @@ administrator can run `audit-view` or `audit-export` as a one-off
 the broker protocol.
 
 For a content-free aggregate view after activation, a local administrator can
-run `docker compose --file deployment/compose.yaml run --rm capability_broker
-admin-status`. It reports component and messaging readiness, audit writability,
-backup freshness, execution-host availability, release identity, and resource
-pressure without credentials or personal identifiers. Backup freshness remains
-`not-configured` until Ticket 28 is completed.
+run `uv run python -m jarvis_control_plane.deployment deployment
+--administrative-status`. The host-side command reads Compose health locally and
+uses a one-off broker-identity process only for authenticated messaging, audit,
+and worker readiness. It reports no credentials or personal identifiers. Backup
+freshness remains `not-configured` until Ticket 28 is completed.
 
 Orchestration, Google, and vault services have no direct Internet-routed
 network. Each reaches only its dedicated CONNECT proxy on a private segment;

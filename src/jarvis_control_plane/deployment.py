@@ -11,8 +11,9 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -807,7 +808,6 @@ def _validate_compose(
             "broker_vault",
             "broker_openwa_outbound",
             "broker_worker",
-            "oauth_google",
         },
         "orchestration_agent": {
             "broker_orchestration",
@@ -1001,11 +1001,77 @@ def _application_source_sha256(source_root: Path, errors: list[str]) -> str:
     return digest.hexdigest()
 
 
+def administrative_status(
+    bundle: str | Path,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, object]:
+    """Combine local Compose health with authenticated dependency status."""
+
+    compose = Path(bundle).resolve() / "compose.yaml"
+    base = [
+        "docker",
+        "compose",
+        "--file",
+        str(compose),
+        "--profile",
+        "manual-activation",
+    ]
+    try:
+        observed = runner(
+            [*base, "ps", "--all", "--format", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rows = json.loads(observed.stdout or "[]")
+        if isinstance(rows, Mapping):
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise TypeError("Compose status is not a list")
+        by_service = {
+            row.get("Service"): row for row in rows if isinstance(row, Mapping)
+        }
+        components = {
+            service: (
+                "ready"
+                if by_service.get(service, {}).get("State") == "running"
+                and by_service.get(service, {}).get("Health") in {"", "healthy"}
+                else "unavailable"
+            )
+            for service in RESOURCE_LIMITS
+        }
+        dependency = runner(
+            [*base, "run", "--rm", "capability_broker", "admin-status"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        details = next(
+            json.loads(line)
+            for line in reversed(dependency.stdout.splitlines())
+            if line.startswith("{")
+        )
+        if not isinstance(details, dict):
+            raise TypeError("dependency status is not an object")
+    except (
+        OSError,
+        StopIteration,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        raise RuntimeError("administrative status is unavailable") from exc
+    return {"components": components, **details}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path, help="deployment bundle directory")
     parser.add_argument("--configuration", type=Path)
     parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--administrative-status", action="store_true")
     args = parser.parse_args(argv)
     try:
         report = verify_bundle(
@@ -1017,11 +1083,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         for error in exc.errors:
             print(f"ERROR: {error}")
         return 1
-    print(
-        f"verified {report.release_id}: {len(report.services)} services, "
-        f"{report.aggregate_memory_mib} MiB, {report.aggregate_cpus:.2f} CPU, "
-        f"{report.aggregate_pids} PIDs; activation unchanged"
-    )
+    if args.administrative_status:
+        print(json.dumps(administrative_status(args.bundle), sort_keys=True))
+    else:
+        print(
+            f"verified {report.release_id}: {len(report.services)} services, "
+            f"{report.aggregate_memory_mib} MiB, {report.aggregate_cpus:.2f} CPU, "
+            f"{report.aggregate_pids} PIDs; activation unchanged"
+        )
     return 0
 
 
