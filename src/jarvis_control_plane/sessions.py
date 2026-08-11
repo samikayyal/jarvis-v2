@@ -16,13 +16,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from .models import AuditEvidence
 
@@ -2584,6 +2584,18 @@ def _session_from_json(value: str) -> WorkingSession:
         raise SessionStoreError("persisted working session is invalid") from exc
 
 
+def _locked_working_session_store(
+    method: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Serialize access to the one cross-thread SQLite connection."""
+
+    def locked(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
 class SQLiteWorkingSessionStore:
     """SQLite current-session store with complete-state compare-and-set.
 
@@ -2594,11 +2606,12 @@ class SQLiteWorkingSessionStore:
     """
 
     def __init__(self, database: str | Path | sqlite3.Connection = ":memory:") -> None:
+        self._lock = threading.RLock()
         self._owns_connection = not isinstance(database, sqlite3.Connection)
         self.connection = (
             database
             if isinstance(database, sqlite3.Connection)
-            else sqlite3.connect(str(database))
+            else sqlite3.connect(str(database), check_same_thread=False)
         )
         try:
             self.connection.execute("PRAGMA journal_mode = WAL")
@@ -2627,6 +2640,7 @@ class SQLiteWorkingSessionStore:
                 "could not initialize working-session store"
             ) from exc
 
+    @_locked_working_session_store
     def load(self) -> WorkingSession | None:
         try:
             row = self.connection.execute(
@@ -2660,6 +2674,7 @@ class SQLiteWorkingSessionStore:
                 ) from exc
         return restored
 
+    @_locked_working_session_store
     def create(self, session: WorkingSession) -> None:
         try:
             self.connection.execute(
@@ -2671,6 +2686,7 @@ class SQLiteWorkingSessionStore:
             self.connection.rollback()
             raise SessionStoreError("could not create working session") from exc
 
+    @_locked_working_session_store
     def compare_and_set(
         self,
         expected: WorkingSession,
@@ -2711,6 +2727,7 @@ class SQLiteWorkingSessionStore:
                 "could not compare and set working session"
             ) from exc
 
+    @_locked_working_session_store
     def compare_and_set_with_audit(
         self,
         expected: WorkingSession,
@@ -2768,6 +2785,7 @@ class SQLiteWorkingSessionStore:
                 "could not atomically commit working-session audit admission"
             ) from exc
 
+    @_locked_working_session_store
     def append_history(self, entry: HistoryEntry) -> None:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -2797,6 +2815,7 @@ class SQLiteWorkingSessionStore:
             ),
         )
 
+    @_locked_working_session_store
     def list_history(self, session_id: str | None = None) -> tuple[HistoryEntry, ...]:
         try:
             if session_id is None:
@@ -2829,6 +2848,7 @@ class SQLiteWorkingSessionStore:
             for row in rows
         )
 
+    @_locked_working_session_store
     def close(self) -> None:
         if self._owns_connection:
             self.connection.close()

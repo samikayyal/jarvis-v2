@@ -74,6 +74,7 @@ from .ports import (
     StateStoreError,
     TraceCapacityError,
     TraceWriteError,
+    WorkerReadinessProvider,
     require_non_empty,
 )
 from .sessions import (
@@ -394,6 +395,7 @@ class DeterministicCapabilityBroker:
         trace: DiagnosticTraceRecorder,
         model_availability_provider: ModelAvailabilityProvider,
         messaging_readiness_provider: MessagingGatewayReadinessProvider | None = None,
+        worker_readiness_provider: WorkerReadinessProvider | None = None,
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
         action_lifecycle: BoundActionLifecycle | None = None,
@@ -413,6 +415,7 @@ class DeterministicCapabilityBroker:
         self.ids = ids
         self.model_availability_provider = model_availability_provider
         self.messaging_readiness_provider = messaging_readiness_provider
+        self.worker_readiness_provider = worker_readiness_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
         selected_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
         if not isinstance(selected_dispatcher, ActionDispatcher):
@@ -482,6 +485,9 @@ class DeterministicCapabilityBroker:
             )
         session = self._reconcile_inactivity()
         readiness_failure = self._refresh_messaging_readiness()
+        if readiness_failure is not None:
+            return readiness_failure
+        readiness_failure = self._refresh_worker_readiness()
         if readiness_failure is not None:
             return readiness_failure
         session = self._current_working_session()
@@ -645,6 +651,38 @@ class DeterministicCapabilityBroker:
                 status_code=503,
                 disposition="readiness_state_unavailable",
                 reason="messaging-gateway readiness could not be persisted",
+            )
+        return None
+
+    def _refresh_worker_readiness(self) -> ReceiveResult | None:
+        provider = self.worker_readiness_provider
+        if provider is None:
+            return None
+        try:
+            observation = provider.current()
+            ubuntu = observation.ubuntu
+            windows = observation.windows
+        except (RuntimeError, TypeError, ValueError):
+            ubuntu = "unavailable"
+            windows = "unavailable"
+        current = self._current_working_session()
+        if current.readiness.ubuntu == ubuntu and current.readiness.windows == windows:
+            return None
+        updated = replace(
+            current,
+            readiness=replace(
+                current.readiness,
+                ubuntu=ubuntu,
+                windows=windows,
+            ),
+        )
+        try:
+            self.working_sessions.compare_and_set(current, updated)
+        except SessionStoreError:
+            return ReceiveResult(
+                status_code=503,
+                disposition="readiness_state_unavailable",
+                reason="worker readiness could not be persisted",
             )
         return None
 
@@ -4047,7 +4085,12 @@ class DeterministicCapabilityBroker:
             if cancelled_request_id is not None and callable(cancel_orchestration):
                 try:
                     cancel_orchestration(request_id=cancelled_request_id)
-                except (RuntimeError, TypeError, ValueError) as exc:
+                except (
+                    OrchestrationAdapterError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
                     self._best_effort_audit(
                         kind="orchestration_cancellation_failed",
                         event_id=message.event_id,

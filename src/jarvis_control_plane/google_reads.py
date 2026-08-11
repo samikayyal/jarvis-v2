@@ -828,10 +828,24 @@ class GoogleReadOutput(BaseModel):
     continuation_available: bool
 
 
-def _google_read_tools(connector: GoogleReadConnector) -> tuple[BoundedReadTool, ...]:
+def _google_read_tools(connector: object) -> tuple[BoundedReadTool, ...]:
     """Return the three closed Google service tools for orchestration injection."""
-    if not isinstance(connector, GoogleReadConnector):
-        raise TypeError("connector must be a GoogleReadConnector")
+    required_operations = (
+        "gmail_messages_list",
+        "gmail_messages_get",
+        "gmail_threads_list",
+        "gmail_threads_get",
+        "calendar_list",
+        "calendar_events_list",
+        "calendar_events_get",
+        "drive_files_list",
+        "drive_files_get",
+        "drive_files_export",
+    )
+    if any(
+        not callable(getattr(connector, name, None)) for name in required_operations
+    ):
+        raise TypeError("connector must provide the closed Google read surface")
 
     def gmail(
         _request: OrchestrationRequest, input: BaseModel, _deadline: float

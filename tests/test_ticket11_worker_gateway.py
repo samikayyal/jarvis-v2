@@ -31,6 +31,7 @@ from jarvis_control_plane import (
     WorkerProgressSink,
 )
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
+from jarvis_control_plane.ports import WorkerReadiness
 from jarvis_control_plane.sessions import DispatchStatus, ReadinessState
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
@@ -64,6 +65,50 @@ def _event(text: str, suffix: str) -> SignedInboundEvent:
         ),
         SECRET,
     )
+
+
+def test_gateway_authenticates_each_worker_before_publishing_readiness() -> None:
+    ubuntu = ControlledWorkerTransport(identities={"ubuntu": _worker_identity()})
+    windows_expected = _worker_identity(
+        host="windows", worker_id="windows-01", connection_id="windows-boot-01"
+    )
+    windows = ControlledWorkerTransport(
+        identities={
+            "windows": replace(windows_expected, connection_id="unexpected-boot")
+        }
+    )
+    gateway = WorkerGateway(
+        workers={"ubuntu": ubuntu, "windows": windows},
+        registered_identities={
+            "ubuntu": _worker_identity(),
+            "windows": windows_expected,
+        },
+    )
+
+    assert gateway.current() == WorkerReadiness(ubuntu="ready", windows="unavailable")
+
+
+def test_broker_persists_current_worker_readiness_before_handling_messages() -> None:
+    class FixedWorkerReadiness:
+        @staticmethod
+        def current() -> WorkerReadiness:
+            return WorkerReadiness(ubuntu="ready", windows="unavailable")
+
+    components = build_receiver_components(
+        operator_id=OPERATOR,
+        transport_session_id=TRANSPORT_SESSION,
+        signing_secret=SECRET,
+        now=NOW,
+        id_prefix="ticket11-readiness",
+        worker_readiness_provider=FixedWorkerReadiness(),
+    )
+
+    components.receiver.receive(_event("/status", "readiness"))
+
+    current = components.broker.working_sessions.load()
+    assert current is not None
+    assert current.readiness.ubuntu == "ready"
+    assert current.readiness.windows == "unavailable"
 
 
 def test_worker_gateway_rejects_mismatched_authenticated_identity_without_failover() -> (

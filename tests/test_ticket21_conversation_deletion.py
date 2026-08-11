@@ -389,6 +389,23 @@ def test_closing_one_writer_does_not_stop_the_archive_service(tmp_path) -> None:
         admin_archive.close()
 
 
+def test_archive_accepts_health_writer_while_broker_writer_remains_connected(
+    tmp_path,
+) -> None:
+    database = tmp_path / "deleted.sqlite3"
+    service = start_sqlite_deleted_conversation_archive_service(database)
+    probe = None
+    try:
+        probe = SQLiteDeletedConversationArchiveWriter(
+            service.endpoint,
+            authkey=service._authkey,  # type: ignore[attr-defined]
+        )
+    finally:
+        if probe is not None:
+            probe.close()
+        service.close()
+
+
 def test_sqlite_deletion_stages_transfer_before_live_write_transaction(tmp_path):
     connection = sqlite3.connect(tmp_path / "jarvis.sqlite3")
     archive = _TransactionObservingArchive(connection)

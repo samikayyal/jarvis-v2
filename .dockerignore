@@ -1,0 +1,9 @@
+.git
+.github
+.scratch
+.venv
+**/__pycache__
+**/*.pyc
+deployment/credentials
+deployment/credentials/**
+tests
