@@ -231,6 +231,53 @@ def test_consistent_snapshot_holds_one_write_barrier_across_all_stores(
             writer.close()
 
 
+def test_backup_rejects_a_database_replaced_after_identity_capture(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    _database(source, DATABASES["state"][1], "original")
+    identity = administrative_backup._file_identity(source)
+    _database(replacement, DATABASES["state"][1], "replacement")
+    replacement.replace(source)
+
+    with pytest.raises(BackupError, match="database changed during backup"):
+        administrative_backup._sqlite_backup(
+            source, tmp_path / "copied.sqlite3", identity
+        )
+
+
+def test_backup_releases_the_write_barrier_before_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    original_verify = administrative_backup._verify_database
+    verified = False
+
+    def verify_after_write(database: Path, required_table: str) -> str:
+        nonlocal verified
+        if not verified:
+            with sqlite3.connect(
+                roots["audit"] / "audit.sqlite3", timeout=0.01
+            ) as writer:
+                writer.execute(
+                    "INSERT INTO audit_evidence VALUES ('verification-write')"
+                )
+            verified = True
+        return original_verify(database, required_table)
+
+    monkeypatch.setattr(administrative_backup, "_verify_database", verify_after_write)
+    create_backup(
+        destination=tmp_path / "backups",
+        kind="nightly",
+        configuration=configuration,
+        artifact_lock=artifact_lock,
+        roots=roots,
+    )
+
+    assert verified
+
+
 def test_restore_rejects_tampering_and_incompatible_release(tmp_path: Path) -> None:
     roots, configuration, artifact_lock = _inputs(tmp_path)
     snapshot = create_backup(
@@ -304,6 +351,42 @@ def test_restore_rejects_tampering_and_incompatible_release(tmp_path: Path) -> N
             configuration=configuration,
             artifact_lock=incompatible_schema,
         )
+
+
+def test_restore_verifies_the_files_copied_to_the_isolated_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    snapshot = create_backup(
+        destination=tmp_path / "backups",
+        kind="nightly",
+        configuration=configuration,
+        artifact_lock=artifact_lock,
+        roots=roots,
+    )
+    source = snapshot / "data" / "state" / "state.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    _database(replacement, DATABASES["state"][1], "unverified-replacement")
+    original_copyfile = administrative_backup.shutil.copyfile
+
+    def replace_after_verification(copy_source: str | Path, target: str | Path) -> str:
+        if Path(copy_source) == source and replacement.exists():
+            replacement.replace(source)
+        return original_copyfile(copy_source, target)
+
+    monkeypatch.setattr(
+        administrative_backup.shutil, "copyfile", replace_after_verification
+    )
+    target = tmp_path / "isolated-restore"
+    with pytest.raises(BackupError, match="checksum"):
+        restore_backup(
+            snapshot=snapshot,
+            target=target,
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+        )
+
+    assert not target.exists()
 
 
 def test_restore_requires_a_new_isolated_target(tmp_path: Path) -> None:

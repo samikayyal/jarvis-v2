@@ -126,27 +126,48 @@ def create_backup(
             for name, root_name, filename, required_table in DATABASES
         ]
         databases: list[dict[str, Any]] = []
-        with _consistent_snapshot([source for *_, source in sources]):
-            for name, root_name, filename, required_table, source in sources:
+        copied_databases = []
+        with _consistent_snapshot([source for *_, source in sources]) as identities:
+            for index, (name, root_name, filename, required_table, source) in enumerate(
+                sources
+            ):
                 copied = staging / "data" / root_name / filename
                 copied.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                _sqlite_backup(source, copied)
+                _sqlite_backup(source, copied, identities[index])
                 _private_file(copied)
-                schema_hash = _verify_database(copied, required_table)
-                if schema_hash != lock["database_schemas"][name]:
-                    raise BackupError(f"database schema compatibility failed: {name}")
-                source_ownership = _ownership(source)
-                databases.append(
-                    {
-                        "name": name,
-                        "root": root_name,
-                        "filename": filename,
-                        "path": copied.relative_to(staging).as_posix(),
-                        "sha256": _sha256(copied),
-                        "schema_sha256": schema_hash,
-                        **source_ownership,
-                    }
+                copied_databases.append(
+                    (
+                        name,
+                        root_name,
+                        filename,
+                        required_table,
+                        copied,
+                        _ownership(source, identities[index]),
+                    )
                 )
+
+        for (
+            name,
+            root_name,
+            filename,
+            required_table,
+            copied,
+            source_ownership,
+        ) in copied_databases:
+            schema_hash = _verify_database(copied, required_table)
+            if schema_hash != lock["database_schemas"][name]:
+                raise BackupError(f"database schema compatibility failed: {name}")
+            databases.append(
+                {
+                    "name": name,
+                    "root": root_name,
+                    "filename": filename,
+                    "path": copied.relative_to(staging).as_posix(),
+                    "sha256": _sha256(copied),
+                    "schema_sha256": schema_hash,
+                    **source_ownership,
+                }
+            )
 
         manifest = {
             "schema_version": BACKUP_SCHEMA_VERSION,
@@ -218,8 +239,6 @@ def restore_backup(
     for item in manifest["databases"]:
         if item["schema_sha256"] != _lock["database_schemas"][item["name"]]:
             raise BackupError(f"database schema compatibility failed: {item['name']}")
-    _verify_snapshot_files(snapshot_path, manifest)
-
     target_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         target_path.mkdir(mode=0o700)
@@ -234,15 +253,7 @@ def restore_backup(
             restored = staging / item["path"]
             restored.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             shutil.copyfile(source, restored)
-            _apply_ownership(restored, item)
-            schema_hash = _verify_database(restored, _required_table(item["name"]))
-            if schema_hash != item["schema_sha256"]:
-                raise BackupError(
-                    f"database schema compatibility failed: {item['name']}"
-                )
-
-        for root_name, ownership in manifest["roots"].items():
-            _apply_ownership(staging / "data" / root_name, ownership)
+            _private_file(restored)
         metadata_dir = staging / "metadata"
         metadata_dir.mkdir(mode=0o700)
         for key, filename in (
@@ -251,9 +262,24 @@ def restore_backup(
         ):
             source = _snapshot_member(snapshot_path, manifest["metadata"][key]["path"])
             shutil.copyfile(source, metadata_dir / filename)
-            _apply_ownership(metadata_dir / filename, manifest["metadata"][key])
-        shutil.copyfile(snapshot_path / "manifest.json", staging / "manifest.json")
+            _private_file(metadata_dir / filename)
+        shutil.copyfile(
+            _snapshot_member(snapshot_path, "manifest.json"), staging / "manifest.json"
+        )
         _private_file(staging / "manifest.json")
+        if _read_manifest(staging / "manifest.json") != manifest:
+            raise BackupError("backup manifest changed during restore")
+        _verify_snapshot_files(staging, manifest)
+
+        for item in manifest["databases"]:
+            _apply_ownership(staging / item["path"], item)
+        for root_name, ownership in manifest["roots"].items():
+            _apply_ownership(staging / "data" / root_name, ownership)
+        for key, filename in (
+            ("configuration", "configuration.toml"),
+            ("artifact_lock", "artifacts.lock.json"),
+        ):
+            _apply_ownership(metadata_dir / filename, manifest["metadata"][key])
         _verify_restored_ownership(staging, manifest)
         marker.unlink()
         return target_path
@@ -310,12 +336,18 @@ def _metadata(
         raise BackupError("release metadata is invalid") from exc
 
 
-def _sqlite_backup(source: Path, target: Path) -> None:
+def _sqlite_backup(source: Path, target: Path, identity: tuple[int, int]) -> None:
+    if _file_identity(source) != identity:
+        raise BackupError(f"database changed during backup: {source.name}")
     uri = f"file:{quote(source.as_posix(), safe='/:')}?mode=ro"
     source_connection = sqlite3.connect(uri, uri=True)
     target_connection = sqlite3.connect(target)
     try:
+        if _file_identity(source) != identity:
+            raise BackupError(f"database changed during backup: {source.name}")
         source_connection.backup(target_connection)
+        if _file_identity(source) != identity:
+            raise BackupError(f"database changed during backup: {source.name}")
         target_connection.execute("PRAGMA journal_mode = DELETE")
     finally:
         target_connection.close()
@@ -323,22 +355,32 @@ def _sqlite_backup(source: Path, target: Path) -> None:
 
 
 @contextmanager
-def _consistent_snapshot(databases: Sequence[Path]) -> Iterator[None]:
+def _consistent_snapshot(
+    databases: Sequence[Path],
+) -> Iterator[list[tuple[int, int]]]:
     """Hold one SQLite write barrier across every authoritative database."""
 
     connection = sqlite3.connect("file::memory:?cache=private", uri=True, timeout=30)
     try:
-        for index, database in enumerate(databases):
+        identities = [_file_identity(database) for database in databases]
+        for index, (database, identity) in enumerate(zip(databases, identities)):
             uri = f"file:{quote(database.as_posix(), safe='/:')}"
             connection.execute(f'ATTACH DATABASE ? AS "backup_{index}"', (uri,))
+            if _file_identity(database) != identity:
+                raise BackupError(f"database changed during backup: {database.name}")
         connection.execute("BEGIN IMMEDIATE")
-        yield
+        yield identities
     except sqlite3.Error as exc:
         raise BackupError("consistent database snapshot could not be acquired") from exc
     finally:
         if connection.in_transaction:
             connection.rollback()
         connection.close()
+
+
+def _file_identity(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino
 
 
 def _verify_database(database: Path, required_table: str) -> str:
@@ -498,8 +540,10 @@ def _release_compatible(
         return False
 
 
-def _ownership(path: Path) -> dict[str, int]:
+def _ownership(path: Path, identity: tuple[int, int] | None = None) -> dict[str, int]:
     status = path.stat()
+    if identity is not None and (status.st_dev, status.st_ino) != identity:
+        raise BackupError(f"database changed during backup: {path.name}")
     return {
         "mode": stat.S_IMODE(status.st_mode),
         "uid": getattr(status, "st_uid", 0),
