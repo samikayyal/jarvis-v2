@@ -10,9 +10,10 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -76,6 +77,7 @@ def create_backup(
     image_digests: str | Path | None = None,
     roots: Mapping[str, str | Path] = DEFAULT_ROOTS,
     now: datetime | None = None,
+    runner: Callable[..., object] | None = None,
 ) -> Path:
     """Create one internally consistent, credential-excluding backup snapshot."""
 
@@ -142,7 +144,13 @@ def create_backup(
             metadata_dir / "artifacts.lock.json",
         )
         _validate_deployment_metadata(
-            metadata_dir / "compose.yaml", metadata_dir / "image-digests.json"
+            metadata_dir / "compose.yaml",
+            metadata_dir / "image-digests.json",
+            activated_image_ids=(
+                _activated_image_ids(metadata_sources["compose_manifest"], runner)
+                if runner is not None
+                else None
+            ),
         )
 
         root_metadata = {
@@ -416,6 +424,8 @@ def _verify_database(database: Path, required_table: str) -> str:
         if result != ("ok",):
             raise BackupError(f"database integrity check failed: {database.name}")
         connection.execute(f'SELECT COUNT(*) FROM "{required_table}"').fetchone()
+        if required_table == "audit_evidence":
+            _verify_audit_records(connection)
         schema = "\n".join(
             row[0] or ""
             for row in connection.execute(
@@ -429,6 +439,22 @@ def _verify_database(database: Path, required_table: str) -> str:
         ) from exc
     finally:
         connection.close()
+
+
+def _verify_audit_records(connection: sqlite3.Connection) -> None:
+    from .adapters import SQLiteAuditBoundary
+
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(audit_evidence)")
+    }
+    if not set(SQLiteAuditBoundary._AUDIT_COLUMNS) <= columns:
+        return
+    connection.row_factory = sqlite3.Row
+    try:
+        for row in connection.execute("SELECT * FROM audit_evidence"):
+            SQLiteAuditBoundary._evidence_from_row(row)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BackupError("audit readability check failed") from exc
 
 
 def _verify_snapshot_files(snapshot: Path, manifest: Mapping[str, Any]) -> None:
@@ -506,7 +532,12 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         raise BackupError("backup metadata inventory is invalid")
 
 
-def _validate_deployment_metadata(compose_path: Path, digests_path: Path) -> None:
+def _validate_deployment_metadata(
+    compose_path: Path,
+    digests_path: Path,
+    *,
+    activated_image_ids: Mapping[str, str] | None = None,
+) -> None:
     try:
         compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
         services = compose.get("services") if isinstance(compose, dict) else None
@@ -524,6 +555,10 @@ def _validate_deployment_metadata(compose_path: Path, digests_path: Path) -> Non
             )
         ):
             raise TypeError
+        if activated_image_ids is not None and {
+            name: value.rsplit("@", 1)[1] for name, value in digests.items()
+        } != dict(activated_image_ids):
+            raise BackupError("image digests do not match the activated images")
     except (
         OSError,
         TypeError,
@@ -532,6 +567,54 @@ def _validate_deployment_metadata(compose_path: Path, digests_path: Path) -> Non
         yaml.YAMLError,
     ) as exc:
         raise BackupError("deployment metadata is invalid") from exc
+
+
+def _activated_image_ids(
+    compose_path: Path, runner: Callable[..., object]
+) -> dict[str, str]:
+    try:
+        base = [
+            "docker",
+            "compose",
+            "--file",
+            str(compose_path),
+            "--profile",
+            "manual-activation",
+        ]
+        observed = runner(
+            [*base, "ps", "--all", "--format", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rows = json.loads(str(getattr(observed, "stdout", "")) or "[]")
+        if isinstance(rows, Mapping):
+            rows = [rows]
+        containers = {
+            row["Service"]: row["ID"]
+            for row in rows
+            if isinstance(row, Mapping) and row.get("Service") and row.get("ID")
+        }
+        if len(containers) != len(rows) or not containers:
+            raise TypeError
+        inspected = runner(
+            ["docker", "inspect", "--format", "{{.Image}}", *containers.values()],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        image_ids = str(getattr(inspected, "stdout", "")).splitlines()
+        if len(image_ids) != len(containers):
+            raise TypeError
+        return dict(zip(containers, image_ids))
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        raise BackupError("activated images are unavailable") from exc
 
 
 def _validate_file_record(item: object) -> None:
@@ -721,6 +804,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 compose_manifest=args.compose_manifest,
                 image_digests=args.image_digests,
                 roots=roots,
+                runner=subprocess.run,
             )
         else:
             result = restore_backup(

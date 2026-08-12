@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from jarvis_control_plane import administrative_backup
+from jarvis_control_plane import administrative_backup, deployment
 from jarvis_control_plane.administrative_backup import (
     BackupError,
     _consistent_snapshot,
@@ -552,6 +552,100 @@ def test_bundle_ships_nightly_timer_and_reports_backup_freshness(
         encoding="utf-8",
     )
     assert _backup_freshness(tmp_path, now=now) == "stale"
+
+
+def test_backup_rejects_image_digests_that_do_not_match_activated_containers(
+    tmp_path: Path,
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    (tmp_path / "image-digests.json").write_text(
+        json.dumps({"broker": "jarvis-broker@sha256:" + "2" * 64}),
+        encoding="utf-8",
+    )
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        if command[1] == "compose":
+            return SimpleNamespace(
+                stdout=json.dumps({"Service": "broker", "ID": "container-1"})
+            )
+        return SimpleNamespace(stdout="sha256:" + "1" * 64 + "\n")
+
+    with pytest.raises(BackupError, match="activated images"):
+        create_backup(
+            destination=tmp_path / "backups",
+            kind="nightly",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+            roots=roots,
+            runner=run,
+        )
+
+
+def test_backup_rejects_an_audit_row_the_safe_reader_cannot_parse(
+    tmp_path: Path,
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    audit_database = roots["audit"] / "audit.sqlite3"
+    with sqlite3.connect(audit_database) as connection:
+        connection.execute("DROP TABLE audit_evidence")
+    from jarvis_control_plane.adapters import SQLiteAuditBoundary
+
+    SQLiteAuditBoundary(audit_database).close()
+    with sqlite3.connect(audit_database) as connection:
+        connection.execute(
+            """
+            INSERT INTO audit_evidence(
+                evidence_id, kind, occurred_at, outcome, actor, details_json, redacted
+            ) VALUES (?, ?, ?, ?, ?, ?, 1)
+            """,
+            ("bad-audit", "test", "not-a-date", "ok", "test", "{}"),
+        )
+    with sqlite3.connect(audit_database) as connection:
+        schema = "\n".join(
+            row[0] or ""
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name"
+            )
+        )
+    lock = json.loads(artifact_lock.read_text(encoding="utf-8"))
+    lock["database_schemas"]["audit"] = hashlib.sha256(schema.encode()).hexdigest()
+    artifact_lock.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(BackupError, match="audit readability"):
+        create_backup(
+            destination=tmp_path / "backups",
+            kind="nightly",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+            roots=roots,
+        )
+
+
+def test_administrative_status_cli_accepts_a_custom_backup_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(deployment, "verify_bundle", lambda *_args, **_kwargs: None)
+
+    def status(_bundle: Path, **kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(deployment, "administrative_status", status)
+    backup_root = tmp_path / "backups"
+
+    assert (
+        deployment.main(
+            [
+                str(tmp_path),
+                "--administrative-status",
+                "--backup-root",
+                str(backup_root),
+            ]
+        )
+        == 0
+    )
+    assert observed == {"backup_root": backup_root}
 
 
 def test_bundle_rejects_effective_backup_unit_overrides(tmp_path: Path) -> None:

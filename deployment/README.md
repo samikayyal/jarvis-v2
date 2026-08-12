@@ -131,7 +131,7 @@ the broker protocol.
 
 For a content-free aggregate view after activation, a local administrator can
 run `uv run python -m jarvis_control_plane.deployment deployment
---administrative-status`. The host-side command reads Compose health locally and
+--administrative-status [--backup-root /configured/backup/root]`. The host-side command reads Compose health locally and
 uses a one-off broker-identity process only for authenticated messaging, audit,
 and worker readiness. It reports no credentials or personal identifiers. Backup
 freshness is calculated on the host as `missing`, `current`, `stale`, or `invalid`
@@ -164,7 +164,8 @@ uv pip install --python /opt/jarvis/current/.venv/bin/python --require-hashes -r
 During manual activation, record the exact activated `image@sha256:...` value
 for every Compose service in `/etc/jarvis/image-digests.json`, then make the
 file root-owned and mode `0600`. The shipped timer passes that explicit file to
-the backup command.
+the backup command, which compares every recorded digest with the active
+container image ID before publishing a snapshot.
 
 Run the same installed Python immediately before an upgrade, active-
 configuration change, or migration, varying only the required kind:

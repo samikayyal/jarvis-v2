@@ -1231,6 +1231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--configuration", type=Path)
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--administrative-status", action="store_true")
+    parser.add_argument("--backup-root", type=Path, default=Path("/var/backups/jarvis"))
     args = parser.parse_args(argv)
     try:
         report = verify_bundle(
@@ -1243,7 +1244,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"ERROR: {error}")
         return 1
     if args.administrative_status:
-        print(json.dumps(administrative_status(args.bundle), sort_keys=True))
+        print(
+            json.dumps(
+                administrative_status(args.bundle, backup_root=args.backup_root),
+                sort_keys=True,
+            )
+        )
     else:
         print(
             f"verified {report.release_id}: {len(report.services)} services, "
