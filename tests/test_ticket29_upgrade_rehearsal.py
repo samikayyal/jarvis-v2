@@ -12,8 +12,12 @@ from pathlib import Path
 import pytest
 from test_ticket28_backup_restore import _inputs
 
-from jarvis_control_plane import SQLiteDurableStateStore, upgrade_rehearsal
+from jarvis_control_plane import (
+    SQLiteDurableStateStore,
+    upgrade_rehearsal,
+)
 from jarvis_control_plane.administrative_backup import create_backup
+from jarvis_control_plane.sessions import SQLiteWorkingSessionStore
 from jarvis_control_plane.upgrade_rehearsal import rehearse_upgrade
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=UTC)
@@ -41,10 +45,37 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
     state_database.unlink()
     state = SQLiteDurableStateStore(state_database)
     state.close()
+    session_database = roots["state"] / "sessions.sqlite3"
+    gc.collect()
+    session_database.unlink()
+    sessions = SQLiteWorkingSessionStore(session_database)
+    sessions.close()
     with sqlite3.connect(state_database) as connection:
         connection.execute(
             "INSERT INTO ingress_claims VALUES (?, ?, ?, ?, ?)",
             ("session", "inbound-1", "event-1", NOW.isoformat(), "dispatched"),
+        )
+        connection.execute(
+            """
+            INSERT INTO request_state(
+                request_id, event_id, message_id, operator_id, session_id,
+                chat_id, created_at, updated_at, status, phase, model, reasoning
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "request-active",
+                "event-active",
+                "inbound-1",
+                "operator",
+                "session",
+                "chat",
+                NOW.isoformat(),
+                NOW.isoformat(),
+                "processing",
+                "orchestration",
+                "gpt-5.6-terra",
+                "medium",
+            ),
         )
         for message_id, status, attempted_at in (
             ("reply-not-started", "unattempted", None),
@@ -79,6 +110,7 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
         connection.commit()
     lock = json.loads(artifact_lock.read_text(encoding="utf-8"))
     lock["database_schemas"]["state"] = _schema_hash(state_database)
+    lock["database_schemas"]["sessions"] = _schema_hash(session_database)
     artifact_lock.write_text(json.dumps(lock), encoding="utf-8")
     snapshot = create_backup(
         destination=tmp_path / "backups",
@@ -95,6 +127,17 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
         bundle = tmp_path / name / "deployment"
         bundle.mkdir(parents=True)
         (bundle / "artifacts.lock.json").write_bytes(artifact_lock.read_bytes())
+    monkeypatch.setattr(
+        upgrade_rehearsal,
+        "__file__",
+        str(
+            tmp_path
+            / "replacement-release"
+            / "src"
+            / "jarvis_control_plane"
+            / "upgrade_rehearsal.py"
+        ),
+    )
 
     def verify_release(_bundle: Path, **kwargs: Path) -> None:
         assert kwargs["configuration"] == configuration.resolve()
@@ -108,6 +151,7 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
         configuration=configuration,
         snapshot=snapshot,
         workspace=tmp_path / "rehearsal",
+        admission_stopped_at=NOW - timedelta(seconds=1),
         window_start=NOW - timedelta(minutes=1),
         window_end=NOW + timedelta(minutes=1),
         force_failure=force_failure,
@@ -116,6 +160,7 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
     assert report.outcome == ("rolled_back" if force_failure else "rehearsed")
     assert report.admission_stopped is True
     assert report.ingress_claims == 1
+    assert report.requests_interrupted == 1
     assert report.outbound_not_started == 1
     assert report.outbound_unknown == 1
     assert verified == [
@@ -135,6 +180,10 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
             ).fetchone()[0]
             == 0
         )
+        assert connection.execute(
+            "SELECT status, phase, outcome FROM request_state "
+            "WHERE request_id = 'request-active'"
+        ).fetchone() == ("interrupted", "interrupted", "interrupted")
     if force_failure:
         assert report.rollback_state is not None
         with sqlite3.connect(report.rollback_state) as connection:
@@ -145,6 +194,13 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
                 ("reply-not-started", "unattempted"),
                 ("reply-unknown", "attempted"),
             ]
+            assert (
+                connection.execute(
+                    "SELECT status FROM request_state "
+                    "WHERE request_id = 'request-active'"
+                ).fetchone()[0]
+                == "processing"
+            )
     else:
         assert report.rollback_state is None
     assert active_sentinel.read_text(encoding="utf-8") == "running"

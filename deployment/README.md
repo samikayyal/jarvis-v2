@@ -203,13 +203,17 @@ bundles and the active configuration are validated before state is restored.
 The bounded message window must contain every unfinished outbound attempt:
 
 ```console
-/opt/jarvis/replacement/.venv/bin/python -m jarvis_control_plane.upgrade_rehearsal /opt/jarvis/previous /opt/jarvis/replacement /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-rehearsal/20260812T080000Z --configuration /etc/jarvis/jarvis.toml --window-start 2026-08-12T07:55:00+00:00 --window-end 2026-08-12T08:05:00+00:00
+/opt/jarvis/replacement/.venv/bin/python -m jarvis_control_plane.upgrade_rehearsal /opt/jarvis/previous /opt/jarvis/replacement /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-rehearsal/20260812T080000Z --configuration /etc/jarvis/jarvis.toml --admission-stopped-at 2026-08-12T07:59:00+00:00 --window-start 2026-08-12T07:55:00+00:00 --window-end 2026-08-12T08:05:00+00:00
 ```
 
-The rehearsal initializes the replacement release only against the isolated
-restore. It verifies the durable ingress deduplication key, leaves ingress
-claims unchanged, closes known-unattempted outbound work as `not_started`, and
-closes attempted-but-unconfirmed work as `unknown` without dispatching either.
+The command must run with the replacement release's installed Python and rejects
+another runtime. It requires the admission-stop timestamp and verifies that the
+snapshot is a later pre-change backup of the exact previous release. The
+rehearsal initializes the replacement release only against the isolated restore.
+It verifies the durable ingress deduplication key, leaves ingress claims
+unchanged, interrupts unfinished requests and pending actions, and closes
+known-unattempted or attempted-but-unconfirmed dispatch and outbound work as
+`not_started` or `unknown` without replaying either.
 Use `--force-failure` to exercise rollback; the command then restores the same
 pre-change snapshot using the previous release's compatible artifact lock.
 The command creates files only below the new rehearsal workspace. It never
