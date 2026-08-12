@@ -223,7 +223,9 @@ def create_backup(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         _private_file(manifest_path)
+        _sync_tree(staging)
         staging.rename(snapshot)
+        _sync_directory(destination_path)
         return snapshot
     except (BackupError, OSError, sqlite3.Error, ValueError, TypeError) as exc:
         shutil.rmtree(staging, ignore_errors=True)
@@ -268,7 +270,7 @@ def restore_backup(
     for item in manifest["databases"]:
         if item["schema_sha256"] != _lock["database_schemas"][item["name"]]:
             raise BackupError(f"database schema compatibility failed: {item['name']}")
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    _trusted_admin_directory(target_path.parent, "restore parent")
     try:
         target_path.mkdir(mode=0o700)
     except FileExistsError as exc:
@@ -637,6 +639,43 @@ def _private_file(path: Path) -> None:
     path.chmod(0o600)
 
 
+def _trusted_admin_directory(path: Path, label: str) -> None:
+    if not path.is_dir() or path.is_symlink():
+        raise BackupError(f"{label} must be an existing private directory")
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is None:
+        return
+    directory_stat = path.stat()
+    if directory_stat.st_uid != get_effective_uid() or directory_stat.st_mode & 0o022:
+        raise BackupError(f"{label} must have the effective owner and private mode")
+
+
+def _sync_tree(root: Path) -> None:
+    if os.name == "nt":
+        return
+    for path in root.rglob("*"):
+        if path.is_file():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+    for path in sorted(
+        (item for item in root.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        _sync_directory(path)
+    _sync_directory(root)
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -655,6 +694,8 @@ def _parser() -> argparse.ArgumentParser:
         "--configuration", type=Path, default=Path("/etc/jarvis/jarvis.toml")
     )
     create.add_argument("--artifact-lock", type=Path, required=True)
+    create.add_argument("--compose-manifest", type=Path)
+    create.add_argument("--image-digests", type=Path)
     for name, default in DEFAULT_ROOTS.items():
         create.add_argument(f"--{name.replace('_', '-')}", type=Path, default=default)
     restore = commands.add_parser("restore")
@@ -677,6 +718,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 kind=args.kind,
                 configuration=args.configuration,
                 artifact_lock=args.artifact_lock,
+                compose_manifest=args.compose_manifest,
+                image_digests=args.image_digests,
                 roots=roots,
             )
         else:

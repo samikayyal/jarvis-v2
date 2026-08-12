@@ -448,6 +448,74 @@ def test_restore_requires_a_new_isolated_target(tmp_path: Path) -> None:
         )
 
 
+def test_restore_requires_a_private_administrative_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    snapshot = create_backup(
+        destination=tmp_path / "backups",
+        kind="nightly",
+        configuration=configuration,
+        artifact_lock=artifact_lock,
+        roots=roots,
+    )
+    parent = (tmp_path / "restore-parent").resolve()
+    parent.mkdir()
+    parent.chmod(0o777)
+    monkeypatch.setattr(administrative_backup.os, "geteuid", lambda: 0, raising=False)
+    original_stat = Path.stat
+
+    def root_owned_stat(path: Path, *args: object, **kwargs: object) -> object:
+        result = original_stat(path, *args, **kwargs)
+        if path == parent:
+            return SimpleNamespace(st_uid=0, st_mode=result.st_mode)
+        return result
+
+    monkeypatch.setattr(Path, "stat", root_owned_stat)
+
+    with pytest.raises(BackupError, match="restore parent"):
+        restore_backup(
+            snapshot=snapshot,
+            target=parent / "restore",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+        )
+
+
+def test_backup_syncs_before_and_after_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    events: list[str] = []
+    original_rename = Path.rename
+
+    monkeypatch.setattr(
+        administrative_backup,
+        "_sync_tree",
+        lambda _path: events.append("tree"),
+    )
+    monkeypatch.setattr(
+        administrative_backup,
+        "_sync_directory",
+        lambda _path: events.append("directory"),
+    )
+
+    def recording_rename(source: Path, target: Path) -> Path:
+        events.append("rename")
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", recording_rename)
+    create_backup(
+        destination=tmp_path / "backups",
+        kind="nightly",
+        configuration=configuration,
+        artifact_lock=artifact_lock,
+        roots=roots,
+    )
+
+    assert events == ["tree", "rename", "directory"]
+
+
 def test_bundle_ships_nightly_timer_and_reports_backup_freshness(
     tmp_path: Path,
 ) -> None:
@@ -457,6 +525,7 @@ def test_bundle_ships_nightly_timer_and_reports_backup_freshness(
     )
     timer = (deployment / "systemd" / "jarvis-backup.timer").read_text(encoding="utf-8")
     assert "--kind nightly" in service
+    assert "--image-digests /etc/jarvis/image-digests.json" in service
     assert "User=root" in service
     assert "/opt/jarvis/current/.venv/bin/python" in service
     assert "uv run" not in service

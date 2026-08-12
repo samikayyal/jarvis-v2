@@ -1071,7 +1071,9 @@ def _validate_backup_units(root: Path, errors: list[str]) -> None:
             (
                 "/opt/jarvis/current/.venv/bin/python -m "
                 "jarvis_control_plane.administrative_backup create --kind nightly "
-                "--artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json"
+                "--artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json "
+                "--compose-manifest /opt/jarvis/current/deployment/compose.yaml "
+                "--image-digests /etc/jarvis/image-digests.json"
             ),
         ),
     }

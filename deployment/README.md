@@ -161,12 +161,17 @@ uv venv --python 3.13 /opt/jarvis/current/.venv
 uv pip install --python /opt/jarvis/current/.venv/bin/python --require-hashes -r /opt/jarvis/current/deployment/requirements.lock
 ```
 
+During manual activation, record the exact activated `image@sha256:...` value
+for every Compose service in `/etc/jarvis/image-digests.json`, then make the
+file root-owned and mode `0600`. The shipped timer passes that explicit file to
+the backup command.
+
 Run the same installed Python immediately before an upgrade, active-
 configuration change, or migration, varying only the required kind:
 
 ```console
-/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
-/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind pre-change --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json --compose-manifest /opt/jarvis/current/deployment/compose.yaml --image-digests /etc/jarvis/image-digests.json
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind pre-change --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json --compose-manifest /opt/jarvis/current/deployment/compose.yaml --image-digests /etc/jarvis/image-digests.json
 ```
 
 Both commands create a new mode-`0700` versioned directory under
@@ -175,7 +180,8 @@ The administrator must provision that backup root outside every Jarvis-readable
 path. Installing or enabling the shipped timer is intentionally not performed by
 the bundle.
 
-Restore always targets a path that does not yet exist. It verifies every checksum,
+Restore always targets a path that does not yet exist beneath an already
+provisioned, root-owned directory that is not group/world-writable. It verifies every checksum,
 the complete database inventory and schema, SQLite integrity, audit readability,
 owners and modes, and compatible configuration/release metadata before publishing
 the isolated result:
