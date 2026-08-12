@@ -20,7 +20,6 @@ from pathlib import Path
 from .adapters import (
     SQLiteAuditBoundary,
     SQLiteDurableStateStore,
-    migrate_sqlite_outbound_conversation_attempts,
 )
 from .administrative_backup import BackupError, restore_backup
 from .deployment import BundleValidationError, validate_configuration, verify_bundle
@@ -29,6 +28,7 @@ from .models import (
     OutboundAttemptRecoveryProjection,
     OutboundAttemptStatus,
 )
+from .release_migrations import migrate_release_databases
 from .sessions import (
     DispatchStatus,
     SQLiteWorkingSessionStore,
@@ -38,6 +38,10 @@ from .sessions import (
 
 class UpgradeRehearsalError(RuntimeError):
     """The isolated upgrade rehearsal could not be completed safely."""
+
+
+class _ForcedRehearsalFailure(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +147,8 @@ def rehearse_upgrade(
     target = Path(workspace).resolve()
     if target.exists():
         raise UpgradeRehearsalError("rehearsal workspace must not already exist")
+    if target.is_relative_to(previous) or target.is_relative_to(replacement):
+        raise UpgradeRehearsalError("rehearsal workspace must be outside releases")
     if replacement not in Path(__file__).resolve().parents or Path(
         sys.executable
     ).absolute() != _python(replacement):
@@ -187,7 +193,7 @@ def rehearse_upgrade(
     rollback_state: Path | None = None
     outcome = "rehearsed"
     try:
-        _migrate_candidate(candidate, artifact_lock=lock, applied_at=end)
+        _migrate_candidate(candidate, applied_at=end)
         _validate_candidate_schemas(candidate, lock)
         stats = _reconcile_known_window(
             state_path,
@@ -198,7 +204,7 @@ def rehearse_upgrade(
             end=end,
         )
         if force_failure:
-            raise UpgradeRehearsalError("forced rehearsal failure")
+            raise _ForcedRehearsalFailure
     except Exception as candidate_error:
         try:
             rollback = restore_backup(
@@ -211,7 +217,7 @@ def rehearse_upgrade(
             raise UpgradeRehearsalError("rollback rehearsal failed") from rollback_error
         outcome = "rolled_back"
         rollback_state = rollback / "data" / "state" / "state.sqlite3"
-        if not force_failure:
+        if not isinstance(candidate_error, _ForcedRehearsalFailure):
             raise UpgradeRehearsalError(
                 f"candidate rehearsal failed; rollback restored at {rollback}"
             ) from candidate_error
@@ -256,21 +262,8 @@ def _validate_maintenance_snapshot(
         )
 
 
-def _migrate_candidate(
-    candidate: Path, *, artifact_lock: Path, applied_at: datetime
-) -> None:
-    state_path = candidate / "data" / "state" / "state.sqlite3"
-    expected_state = json.loads(artifact_lock.read_text(encoding="utf-8"))[
-        "database_schemas"
-    ]["state"]
-    if _schema_hash(state_path) != expected_state:
-        migrate_sqlite_outbound_conversation_attempts(state_path, applied_at=applied_at)
-    for store in (
-        SQLiteDurableStateStore(state_path),
-        SQLiteWorkingSessionStore(candidate / "data" / "state" / "sessions.sqlite3"),
-        SQLiteAuditBoundary(candidate / "data" / "audit" / "audit.sqlite3"),
-    ):
-        store.close()
+def _migrate_candidate(candidate: Path, *, applied_at: datetime) -> None:
+    migrate_release_databases(candidate, applied_at=applied_at)
 
 
 def _schema_hash(database: Path) -> str:
@@ -469,6 +462,15 @@ def _reconcile_known_window(
             or not start
             <= datetime.fromisoformat(item.reserved_at).astimezone(UTC)
             <= end
+            or (
+                item.status == OutboundAttemptStatus.ATTEMPTED.value
+                and (
+                    item.attempted_at is None
+                    or not start
+                    <= datetime.fromisoformat(item.attempted_at).astimezone(UTC)
+                    <= end
+                )
+            )
             for item in pending
         ):
             raise UpgradeRehearsalError(

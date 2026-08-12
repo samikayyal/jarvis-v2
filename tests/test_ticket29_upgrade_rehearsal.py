@@ -41,7 +41,10 @@ def _schema_hash(database: Path) -> str:
     return hashlib.sha256(schema.encode()).hexdigest()
 
 
-@pytest.mark.parametrize("mode", ["success", "forced", "unexpected"])
+@pytest.mark.parametrize(
+    "mode",
+    ["success", "forced", "unexpected", "premature-forced", "late-attempt"],
+)
 def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_state(
     tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -94,7 +97,14 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
         )
         for message_id, status, attempted_at in (
             ("reply-not-started", "unattempted", None),
-            ("reply-unknown", "attempted", (NOW + timedelta(seconds=1)).isoformat()),
+            (
+                "reply-unknown",
+                "attempted",
+                (
+                    NOW
+                    + timedelta(minutes=2 if mode == "late-attempt" else 0, seconds=1)
+                ).isoformat(),
+            ),
         ):
             connection.execute(
                 "INSERT INTO outbound_attempt_record VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)",
@@ -212,9 +222,9 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
         "window_start": NOW - timedelta(minutes=1),
         "window_end": NOW + timedelta(minutes=1),
         "history_export": history_export,
-        "force_failure": mode == "forced",
+        "force_failure": mode in {"forced", "premature-forced"},
     }
-    if mode == "unexpected":
+    if mode in {"unexpected", "premature-forced"}:
         monkeypatch.setattr(
             upgrade_rehearsal,
             "_reconcile_known_window",
@@ -225,6 +235,10 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
         assert (
             tmp_path / "rehearsal/rollback-state/data/state/state.sqlite3"
         ).is_file()
+        return
+    if mode == "late-attempt":
+        with pytest.raises(UpgradeRehearsalError, match="candidate rehearsal failed"):
+            rehearse_upgrade(**arguments)
         return
 
     report = rehearse_upgrade(**arguments)
@@ -298,3 +312,25 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
     else:
         assert report.rollback_state is None
     assert active_sentinel.read_text(encoding="utf-8") == "running"
+
+
+@pytest.mark.parametrize("release_name", ["previous", "replacement"])
+def test_upgrade_rejects_workspace_inside_a_release(
+    tmp_path: Path, release_name: str
+) -> None:
+    previous = tmp_path / "previous"
+    replacement = tmp_path / "replacement"
+    previous.mkdir()
+    replacement.mkdir()
+    with pytest.raises(UpgradeRehearsalError, match="outside releases"):
+        rehearse_upgrade(
+            previous_release=previous,
+            replacement_release=replacement,
+            configuration=tmp_path / "config.toml",
+            snapshot=tmp_path / "snapshot",
+            workspace=tmp_path / release_name / "workspace",
+            admission_stopped_at=NOW,
+            window_start=NOW,
+            window_end=NOW,
+            history_export=tmp_path / "history.json",
+        )
