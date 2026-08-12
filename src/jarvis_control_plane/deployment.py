@@ -15,6 +15,7 @@ import subprocess
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
@@ -43,6 +44,20 @@ REQUIRED_FILES = (
     "codex/package-lock.json",
     "openwa-handoff.md",
     "requirements.lock",
+    "systemd/jarvis-backup.service",
+    "systemd/jarvis-backup.timer",
+)
+
+DATABASE_SCHEMAS = MappingProxyType(
+    {
+        "state": "4c4e03d8f879ad235051543caa4ef7782f408c05953087d5cf0201c261a59c43",
+        "sessions": "702f19c90b7c336532f4a7e598801150ac9f68bc3471b5d2b0e69317eb974470",
+        "audit": "07918a1e796be9ed5f0c720fd490ca59354e39742eee2b9e77769f6ec1702648",
+        "traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
+        "codex_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
+        "google_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
+        "deleted_conversations": "fb1b292ce25216b5f697aba99a90a83f77dbc6aba755c61ce69488748bef066d",
+    }
 )
 
 RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
@@ -271,6 +286,7 @@ def verify_bundle(
     )
     handoff_active = _validate_compose(compose, config, errors)
     _validate_handoff_description(root / "openwa-handoff.md", errors)
+    _validate_backup_units(root / "systemd", errors)
 
     if errors:
         raise BundleValidationError(tuple(dict.fromkeys(errors)))
@@ -535,6 +551,7 @@ def _validate_artifacts(
     if set(lock) != {
         "schema_version",
         "application",
+        "database_schemas",
         "python_base_image",
         "uv_build_image",
         "node_build_image",
@@ -558,6 +575,9 @@ def _validate_artifacts(
         source_root, errors
     ):
         errors.append("application source differs from the pinned artifact")
+    schemas = lock.get("database_schemas")
+    if schemas != DATABASE_SCHEMAS:
+        errors.append("database schema fingerprints must be complete and pinned")
     base = lock.get("python_base_image")
     reference = base.get("reference") if isinstance(base, Mapping) else None
     if not isinstance(reference, str) or not re.fullmatch(
@@ -1035,6 +1055,63 @@ def _validate_handoff_description(path: Path, errors: list[str]) -> None:
             errors.append(f"OpenWA handoff description is missing: {phrase}")
 
 
+def _validate_backup_units(root: Path, errors: list[str]) -> None:
+    service = _unit_directives(
+        (root / "jarvis-backup.service").read_text(encoding="utf-8")
+    )
+    timer = _unit_directives((root / "jarvis-backup.timer").read_text(encoding="utf-8"))
+    expected_service = {
+        ("Unit", "Description"): ("Create the nightly Jarvis administrative backup",),
+        ("Service", "Type"): ("oneshot",),
+        ("Service", "User"): ("root",),
+        ("Service", "UMask"): ("0077",),
+        ("Service", "WorkingDirectory"): ("/opt/jarvis/current",),
+        ("Service", "Environment"): ("PYTHONPATH=/opt/jarvis/current/src",),
+        ("Service", "ExecStart"): (
+            (
+                "/opt/jarvis/current/.venv/bin/python -m "
+                "jarvis_control_plane.administrative_backup create --kind nightly "
+                "--artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json "
+                "--compose-manifest /opt/jarvis/current/deployment/compose.yaml "
+                "--image-digests /etc/jarvis/image-digests.json"
+            ),
+        ),
+    }
+    expected_timer = {
+        ("Unit", "Description"): ("Run the Jarvis administrative backup nightly",),
+        ("Timer", "OnCalendar"): ("*-*-* 02:00:00 UTC",),
+        ("Timer", "Persistent"): ("true",),
+        ("Timer", "RandomizedDelaySec"): ("15m",),
+        ("Timer", "Unit"): ("jarvis-backup.service",),
+        ("Install", "WantedBy"): ("timers.target",),
+    }
+    if service != expected_service:
+        errors.append("nightly backup service differs from the reviewed directives")
+    if timer != expected_timer:
+        errors.append("nightly backup timer differs from the reviewed directives")
+
+
+def _unit_directives(text: str) -> dict[tuple[str, str], tuple[str, ...]]:
+    section = ""
+    values: dict[tuple[str, str], list[str]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        directive = values.setdefault((section, key), [])
+        if not value:
+            directive.clear()
+        else:
+            directive.append(value)
+    return {key: tuple(value) for key, value in values.items()}
+
+
 def _memory_mib(value: str) -> int:
     return int(value.removesuffix("M"))
 
@@ -1061,6 +1138,8 @@ def administrative_status(
     bundle: str | Path,
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    backup_root: str | Path = "/var/backups/jarvis",
+    now: datetime | None = None,
 ) -> dict[str, object]:
     """Combine local Compose health with authenticated dependency status."""
 
@@ -1119,7 +1198,31 @@ def administrative_status(
         subprocess.CalledProcessError,
     ) as exc:
         raise RuntimeError("administrative status is unavailable") from exc
+    details["backup_freshness"] = _backup_freshness(Path(backup_root), now=now)
     return {"components": components, **details}
+
+
+def _backup_freshness(root: Path, *, now: datetime | None = None) -> str:
+    try:
+        manifests = [
+            manifest
+            for manifest in root.glob("*/manifest.json")
+            if not manifest.parent.name.startswith(".partial-")
+        ]
+        if not manifests:
+            return "missing"
+        created = max(
+            datetime.fromisoformat(
+                json.loads(manifest.read_text(encoding="utf-8"))["created_at"]
+            )
+            for manifest in manifests
+        )
+        if created.tzinfo is None:
+            raise ValueError
+        age = (now or datetime.now(UTC)).astimezone(UTC) - created.astimezone(UTC)
+        return "current" if timedelta(0) <= age <= timedelta(hours=36) else "stale"
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return "invalid"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1128,6 +1231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--configuration", type=Path)
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--administrative-status", action="store_true")
+    parser.add_argument("--backup-root", type=Path, default=Path("/var/backups/jarvis"))
     args = parser.parse_args(argv)
     try:
         report = verify_bundle(
@@ -1140,7 +1244,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"ERROR: {error}")
         return 1
     if args.administrative_status:
-        print(json.dumps(administrative_status(args.bundle), sort_keys=True))
+        print(
+            json.dumps(
+                administrative_status(args.bundle, backup_root=args.backup_root),
+                sort_keys=True,
+            )
+        )
     else:
         print(
             f"verified {report.release_id}: {len(report.services)} services, "

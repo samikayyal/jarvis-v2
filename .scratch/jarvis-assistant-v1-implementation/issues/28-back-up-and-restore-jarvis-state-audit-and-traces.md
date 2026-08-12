@@ -4,9 +4,9 @@
 
 **Blocked by:** 27 — Assemble and verify the unactivated deployment bundle.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] Backups contain consistent state, append-only audit, deleted-conversation archive, complete diagnostic traces, non-secret configuration, schema, and release metadata.
-- [ ] Credential files, private keys, OpenWA state, caches, and external authoritative content remain excluded.
-- [ ] Isolated restore verifies checksums, ownership, permissions, database integrity, audit readability, schema compatibility, and release compatibility without activation.
+- [x] Backups contain consistent state, append-only audit, deleted-conversation archive, complete diagnostic traces, non-secret configuration, schema, and release metadata.
+- [x] Credential files, private keys, OpenWA state, caches, and external authoritative content remain excluded.
+- [x] Isolated restore verifies checksums, ownership, permissions, database integrity, audit readability, schema compatibility, and release compatibility without activation.
 

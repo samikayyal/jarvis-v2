@@ -131,10 +131,68 @@ the broker protocol.
 
 For a content-free aggregate view after activation, a local administrator can
 run `uv run python -m jarvis_control_plane.deployment deployment
---administrative-status`. The host-side command reads Compose health locally and
+--administrative-status [--backup-root /configured/backup/root]`. The host-side command reads Compose health locally and
 uses a one-off broker-identity process only for authenticated messaging, audit,
 and worker readiness. It reports no credentials or personal identifiers. Backup
-freshness remains `not-configured` until Ticket 28 is completed.
+freshness is calculated on the host as `missing`, `current`, `stale`, or `invalid`
+from the local snapshot manifests without exposing backup contents.
+
+## Administrative backup and isolated restore
+
+Run the backup command as the root administrator so SQLite can take online,
+transactionally consistent copies and the restore can preserve the original
+owners and modes. The fixed database inventory covers Jarvis state and sessions,
+append-only audit, broker/Codex/Google diagnostic traces, and the deleted-
+conversation archive. The reviewed configuration, SQLite schema hashes, and
+artifact release metadata travel with every snapshot. The active `compose.yaml`
+and adjacent `image-digests.json` also travel with it; the digest file maps every
+Compose service name to its activated `image@sha256:...` reference. Credentials, private keys,
+OpenWA state, caches, the knowledge-vault clone, and external authoritative
+content cannot enter the snapshot because they are not accepted inputs.
+
+The unactivated bundle ships reviewed `jarvis-backup.service` and
+`jarvis-backup.timer` units for a persistent nightly run. Installing and enabling
+those units remains a manual activation step. Before installing them, create the
+service environment from the shipped hash-locked requirements; the timer never
+resolves or downloads dependencies:
+
+```console
+uv venv --python 3.13 /opt/jarvis/current/.venv
+uv pip install --python /opt/jarvis/current/.venv/bin/python --require-hashes -r /opt/jarvis/current/deployment/requirements.lock
+```
+
+During manual activation, record the exact activated `image@sha256:...` value
+for every Compose service in `/etc/jarvis/image-digests.json`, then make the
+file root-owned and mode `0600`. The shipped timer passes that explicit file to
+the backup command, which compares every recorded digest with the active
+container image ID before publishing a snapshot.
+
+Run the same installed Python immediately before an upgrade, active-
+configuration change, or migration, varying only the required kind:
+
+```console
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json --compose-manifest /opt/jarvis/current/deployment/compose.yaml --image-digests /etc/jarvis/image-digests.json
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind pre-change --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json --compose-manifest /opt/jarvis/current/deployment/compose.yaml --image-digests /etc/jarvis/image-digests.json
+```
+
+Both commands create a new mode-`0700` versioned directory under
+`/var/backups/jarvis`; they never replace or automatically remove a snapshot.
+The administrator must provision that backup root outside every Jarvis-readable
+path. Installing or enabling the shipped timer is intentionally not performed by
+the bundle.
+
+Restore always targets a path that does not yet exist beneath an already
+provisioned, root-owned directory that is not group/world-writable. It verifies every checksum,
+the complete database inventory and schema, SQLite integrity, audit readability,
+owners and modes, and compatible configuration/release metadata before publishing
+the isolated result:
+
+```console
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup restore /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-restore/rehearsal --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+```
+
+The restored tree is rehearsal material only. The command does not stop, start,
+reconfigure, migrate, or otherwise activate any Jarvis or OpenWA service.
 
 Orchestration, Google, and vault services have no direct Internet-routed
 network. Each reaches only its dedicated CONNECT proxy on a private segment;
