@@ -56,6 +56,10 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
             ("session", "inbound-1", "event-1", NOW.isoformat(), "dispatched"),
         )
         connection.execute(
+            "INSERT INTO ingress_claims VALUES (?, ?, ?, ?, ?)",
+            ("session", "inbound-pending", "event-2", NOW.isoformat(), "admitted"),
+        )
+        connection.execute(
             """
             INSERT INTO request_state(
                 request_id, event_id, message_id, operator_id, session_id,
@@ -159,7 +163,8 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
 
     assert report.outcome == ("rolled_back" if force_failure else "rehearsed")
     assert report.admission_stopped is True
-    assert report.ingress_claims == 1
+    assert report.ingress_claims == 2
+    assert report.ingress_interrupted == 1
     assert report.requests_interrupted == 1
     assert report.outbound_not_started == 1
     assert report.outbound_unknown == 1
@@ -184,6 +189,13 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
             "SELECT status, phase, outcome FROM request_state "
             "WHERE request_id = 'request-active'"
         ).fetchone() == ("interrupted", "interrupted", "interrupted")
+        assert (
+            connection.execute(
+                "SELECT disposition FROM ingress_claims "
+                "WHERE message_id = 'inbound-pending'"
+            ).fetchone()[0]
+            == "interrupted"
+        )
     if force_failure:
         assert report.rollback_state is not None
         with sqlite3.connect(report.rollback_state) as connection:
@@ -200,6 +212,13 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
                     "WHERE request_id = 'request-active'"
                 ).fetchone()[0]
                 == "processing"
+            )
+            assert (
+                connection.execute(
+                    "SELECT disposition FROM ingress_claims "
+                    "WHERE message_id = 'inbound-pending'"
+                ).fetchone()[0]
+                == "admitted"
             )
     else:
         assert report.rollback_state is None

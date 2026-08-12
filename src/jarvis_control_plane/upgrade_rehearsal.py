@@ -11,10 +11,10 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .adapters import SQLiteDurableStateStore
+from .adapters import InMemoryAuditBoundary, SQLiteDurableStateStore
 from .administrative_backup import BackupError, restore_backup
 from .deployment import BundleValidationError, validate_configuration, verify_bundle
-from .models import OutboundAttemptStatus
+from .models import AuditEvidence, OutboundAttemptStatus
 from .sessions import (
     DispatchStatus,
     SQLiteWorkingSessionStore,
@@ -31,6 +31,7 @@ class UpgradeRehearsalReport:
     outcome: str
     admission_stopped: bool
     ingress_claims: int
+    ingress_interrupted: int
     requests_interrupted: int
     pending_actions_invalidated: int
     dispatch_not_started: int
@@ -40,6 +41,18 @@ class UpgradeRehearsalReport:
     candidate_state: Path
     rollback_state: Path | None
     host_mutations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationStats:
+    ingress_claims: int = 0
+    ingress_interrupted: int = 0
+    requests_interrupted: int = 0
+    pending_actions_invalidated: int = 0
+    dispatch_not_started: int = 0
+    dispatch_unknown: int = 0
+    outbound_not_started: int = 0
+    outbound_unknown: int = 0
 
 
 def _bundle(release: Path) -> Path:
@@ -124,7 +137,7 @@ def rehearse_upgrade(
 
     state_path = candidate / "data" / "state" / "state.sqlite3"
     session_path = candidate / "data" / "state" / "sessions.sqlite3"
-    stats = (0, 0, 0, 0, 0, 0, 0)
+    stats = _ReconciliationStats()
     rollback_state: Path | None = None
     outcome = "rehearsed"
     try:
@@ -152,13 +165,14 @@ def rehearse_upgrade(
     return UpgradeRehearsalReport(
         outcome=outcome,
         admission_stopped=True,
-        ingress_claims=stats[0],
-        requests_interrupted=stats[1],
-        pending_actions_invalidated=stats[2],
-        dispatch_not_started=stats[3],
-        dispatch_unknown=stats[4],
-        outbound_not_started=stats[5],
-        outbound_unknown=stats[6],
+        ingress_claims=stats.ingress_claims,
+        ingress_interrupted=stats.ingress_interrupted,
+        requests_interrupted=stats.requests_interrupted,
+        pending_actions_invalidated=stats.pending_actions_invalidated,
+        dispatch_not_started=stats.dispatch_not_started,
+        dispatch_unknown=stats.dispatch_unknown,
+        outbound_not_started=stats.outbound_not_started,
+        outbound_unknown=stats.outbound_unknown,
         candidate_state=state_path,
         rollback_state=rollback_state,
         host_mutations=(str(target),),
@@ -191,7 +205,7 @@ def _reconcile_known_window(
     session_path: Path,
     start: datetime,
     end: datetime,
-) -> tuple[int, int, int, int, int, int, int]:
+) -> _ReconciliationStats:
     state = SQLiteDurableStateStore(database)
     sessions = SQLiteWorkingSessionStore(session_path)
     try:
@@ -292,6 +306,22 @@ def _reconcile_known_window(
                     error_code="upgrade_rehearsal",
                 )
             )
+        ingress_interrupted = state.reconcile_ingress_restart(
+            audit=InMemoryAuditBoundary(),
+            audit_evidence=AuditEvidence(
+                evidence_id="upgrade-rehearsal-ingress",
+                kind="service_restart",
+                occurred_at=end,
+                event_id=None,
+                request_id=None,
+                outcome="interrupted",
+                actor="control_plane",
+                operation_type="working_session",
+                target_category="working_session",
+                execution_status="recorded",
+                details={"interrupted_ingress": "nonterminal"},
+            ),
+        )
         reconciled = state.reconcile_outbound_conversation_attempts(interrupted_at=end)
         ingress_after = int(
             state.connection.execute(
@@ -301,16 +331,19 @@ def _reconcile_known_window(
         )
         if ingress_after != ingress_before:
             raise UpgradeRehearsalError("maintenance admission stop was not preserved")
-        return (
-            ingress_before,
-            len(requests),
-            pending_actions,
-            dispatch_not_started,
-            dispatch_unknown,
-            sum(
+        return _ReconciliationStats(
+            ingress_claims=ingress_before,
+            ingress_interrupted=ingress_interrupted,
+            requests_interrupted=len(requests),
+            pending_actions_invalidated=pending_actions,
+            dispatch_not_started=dispatch_not_started,
+            dispatch_unknown=dispatch_unknown,
+            outbound_not_started=sum(
                 item.status is OutboundAttemptStatus.NOT_STARTED for item in reconciled
             ),
-            sum(item.status is OutboundAttemptStatus.UNKNOWN for item in reconciled),
+            outbound_unknown=sum(
+                item.status is OutboundAttemptStatus.UNKNOWN for item in reconciled
+            ),
         )
     finally:
         sessions.close()
