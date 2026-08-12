@@ -5,7 +5,9 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,7 +21,10 @@ from jarvis_control_plane import (
 )
 from jarvis_control_plane.administrative_backup import create_backup
 from jarvis_control_plane.sessions import SQLiteWorkingSessionStore
-from jarvis_control_plane.upgrade_rehearsal import rehearse_upgrade
+from jarvis_control_plane.upgrade_rehearsal import (
+    UpgradeRehearsalError,
+    rehearse_upgrade,
+)
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=UTC)
 
@@ -36,9 +41,9 @@ def _schema_hash(database: Path) -> str:
     return hashlib.sha256(schema.encode()).hexdigest()
 
 
-@pytest.mark.parametrize("force_failure", [False, True])
+@pytest.mark.parametrize("mode", ["success", "forced", "unexpected"])
 def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_state(
-    tmp_path: Path, force_failure: bool, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     roots, configuration, artifact_lock = _inputs(tmp_path)
     state_database = roots["state"] / "state.sqlite3"
@@ -134,10 +139,22 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
     active_sentinel = tmp_path / "active-service"
     active_sentinel.write_text("running", encoding="utf-8")
     verified: list[Path] = []
+    replacement_executable: Path | None = None
     for name in ("previous-release", "replacement-release"):
-        bundle = tmp_path / name / "deployment"
+        release = tmp_path / name
+        bundle = release / "deployment"
         bundle.mkdir(parents=True)
         (bundle / "artifacts.lock.json").write_bytes(artifact_lock.read_bytes())
+        executable = (
+            release
+            / ".venv"
+            / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        )
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        if name == "replacement-release":
+            replacement_executable = executable
+    assert replacement_executable is not None
     monkeypatch.setattr(
         upgrade_rehearsal,
         "__file__",
@@ -149,28 +166,72 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
             / "upgrade_rehearsal.py"
         ),
     )
+    monkeypatch.setattr(
+        sys,
+        "executable",
+        str(replacement_executable),
+    )
 
     def verify_release(_bundle: Path, **kwargs: Path) -> None:
         assert kwargs["configuration"] == configuration.resolve()
         verified.append(kwargs["source_root"])
 
     monkeypatch.setattr(upgrade_rehearsal, "verify_bundle", verify_release)
-
-    report = rehearse_upgrade(
-        previous_release=tmp_path / "previous-release",
-        replacement_release=tmp_path / "replacement-release",
-        configuration=configuration,
-        snapshot=snapshot,
-        workspace=tmp_path / "rehearsal",
-        admission_stopped_at=NOW - timedelta(seconds=1),
-        window_start=NOW - timedelta(minutes=1),
-        window_end=NOW + timedelta(minutes=1),
-        force_failure=force_failure,
+    monkeypatch.setattr(
+        upgrade_rehearsal,
+        "_verify_previous_release",
+        lambda release, _configuration: verified.append(release),
+    )
+    history_export = tmp_path / "history.json"
+    history_export.write_text(
+        json.dumps(
+            [
+                {
+                    "session_id": "session",
+                    "message_id": message_id,
+                    "event_id": event_id,
+                    "occurred_at": NOW.isoformat(),
+                }
+                for message_id, event_id in (
+                    ("inbound-1", "event-1"),
+                    ("inbound-pending", "event-2"),
+                    ("inbound-missed", "event-3"),
+                )
+            ]
+        ),
+        encoding="utf-8",
     )
 
-    assert report.outcome == ("rolled_back" if force_failure else "rehearsed")
+    arguments = {
+        "previous_release": tmp_path / "previous-release",
+        "replacement_release": tmp_path / "replacement-release",
+        "configuration": configuration,
+        "snapshot": snapshot,
+        "workspace": tmp_path / "rehearsal",
+        "admission_stopped_at": NOW - timedelta(seconds=1),
+        "window_start": NOW - timedelta(minutes=1),
+        "window_end": NOW + timedelta(minutes=1),
+        "history_export": history_export,
+        "force_failure": mode == "forced",
+    }
+    if mode == "unexpected":
+        monkeypatch.setattr(
+            upgrade_rehearsal,
+            "_reconcile_known_window",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        with pytest.raises(UpgradeRehearsalError, match="candidate rehearsal failed"):
+            rehearse_upgrade(**arguments)
+        assert (
+            tmp_path / "rehearsal/rollback-state/data/state/state.sqlite3"
+        ).is_file()
+        return
+
+    report = rehearse_upgrade(**arguments)
+
+    assert report.outcome == ("rolled_back" if mode == "forced" else "rehearsed")
     assert report.admission_stopped is True
-    assert report.ingress_claims == 2
+    assert report.ingress_claims == 3
     assert report.ingress_interrupted == 1
     assert report.requests_interrupted == 1
     assert report.outbound_not_started == 1
@@ -203,7 +264,14 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
             ).fetchone()[0]
             == "interrupted"
         )
-    if force_failure:
+        assert (
+            connection.execute(
+                "SELECT disposition FROM ingress_claims "
+                "WHERE message_id = 'inbound-missed'"
+            ).fetchone()[0]
+            == "interrupted"
+        )
+    if mode == "forced":
         assert report.rollback_state is not None
         with sqlite3.connect(report.rollback_state) as connection:
             assert connection.execute(

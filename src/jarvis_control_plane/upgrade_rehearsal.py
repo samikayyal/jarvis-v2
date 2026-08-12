@@ -3,18 +3,32 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tomllib
+import uuid
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .adapters import SQLiteAuditBoundary, SQLiteDurableStateStore
+from .adapters import (
+    SQLiteAuditBoundary,
+    SQLiteDurableStateStore,
+    migrate_sqlite_outbound_conversation_attempts,
+)
 from .administrative_backup import BackupError, restore_backup
 from .deployment import BundleValidationError, validate_configuration, verify_bundle
-from .models import AuditEvidence, OutboundAttemptStatus
+from .models import (
+    AuditEvidence,
+    OutboundAttemptRecoveryProjection,
+    OutboundAttemptStatus,
+)
 from .sessions import (
     DispatchStatus,
     SQLiteWorkingSessionStore,
@@ -60,10 +74,36 @@ def _bundle(release: Path) -> Path:
     return bundle if bundle.is_dir() else release
 
 
-def _verify_release(release: Path, configuration: Path) -> object:
-    return verify_bundle(
-        _bundle(release), configuration=configuration, source_root=release
+def _python(release: Path) -> Path:
+    executable = (
+        release / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     )
+    if not executable.is_file():
+        raise UpgradeRehearsalError("release Python runtime is unavailable")
+    return executable.absolute()
+
+
+def _verify_previous_release(release: Path, configuration: Path) -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(release / "src")
+    result = subprocess.run(
+        (
+            str(_python(release)),
+            "-m",
+            "jarvis_control_plane.deployment",
+            str(_bundle(release)),
+            "--configuration",
+            str(configuration),
+            "--source-root",
+            str(release),
+        ),
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+    if result.returncode:
+        raise UpgradeRehearsalError("previous release artifact validation failed")
 
 
 def rehearse_upgrade(
@@ -76,6 +116,7 @@ def rehearse_upgrade(
     admission_stopped_at: datetime,
     window_start: datetime,
     window_end: datetime,
+    history_export: str | Path,
     force_failure: bool = False,
 ) -> UpgradeRehearsalReport:
     """Rehearse one replacement and rollback entirely below a new workspace."""
@@ -102,15 +143,19 @@ def rehearse_upgrade(
     target = Path(workspace).resolve()
     if target.exists():
         raise UpgradeRehearsalError("rehearsal workspace must not already exist")
-    if replacement not in Path(__file__).resolve().parents:
+    if replacement not in Path(__file__).resolve().parents or Path(
+        sys.executable
+    ).absolute() != _python(replacement):
         raise UpgradeRehearsalError(
             "replacement release must run its own rehearsal module"
         )
 
     try:
         validate_configuration(tomllib.loads(config.read_text(encoding="utf-8")))
-        _verify_release(previous, config)
-        _verify_release(replacement, config)
+        _verify_previous_release(previous, config)
+        verify_bundle(
+            _bundle(replacement), configuration=config, source_root=replacement
+        )
         _validate_maintenance_snapshot(
             Path(snapshot).resolve(),
             admission_stopped_at=stopped_at,
@@ -121,7 +166,7 @@ def rehearse_upgrade(
             snapshot=snapshot,
             target=target / "candidate-state",
             configuration=config,
-            artifact_lock=lock,
+            artifact_lock=previous_lock,
         )
     except (
         BackupError,
@@ -142,16 +187,19 @@ def rehearse_upgrade(
     rollback_state: Path | None = None
     outcome = "rehearsed"
     try:
+        _migrate_candidate(candidate, artifact_lock=lock, applied_at=end)
+        _validate_candidate_schemas(candidate, lock)
         stats = _reconcile_known_window(
             state_path,
             session_path=session_path,
             audit_path=audit_path,
+            history_export=Path(history_export).resolve(),
             start=start,
             end=end,
         )
         if force_failure:
             raise UpgradeRehearsalError("forced rehearsal failure")
-    except Exception:  # noqa: BLE001 - every candidate failure must rehearse rollback
+    except Exception as candidate_error:
         try:
             rollback = restore_backup(
                 snapshot=snapshot,
@@ -163,6 +211,10 @@ def rehearse_upgrade(
             raise UpgradeRehearsalError("rollback rehearsal failed") from rollback_error
         outcome = "rolled_back"
         rollback_state = rollback / "data" / "state" / "state.sqlite3"
+        if not force_failure:
+            raise UpgradeRehearsalError(
+                f"candidate rehearsal failed; rollback restored at {rollback}"
+            ) from candidate_error
 
     return UpgradeRehearsalReport(
         outcome=outcome,
@@ -189,16 +241,99 @@ def _validate_maintenance_snapshot(
 ) -> None:
     manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
     previous_lock = json.loads(previous_artifact_lock.read_text(encoding="utf-8"))
+    captured_lock = snapshot / manifest["metadata"]["artifact_lock"]["path"]
     created_at = datetime.fromisoformat(manifest["created_at"]).astimezone(UTC)
     if (
         manifest.get("kind") != "pre-change"
         or created_at < admission_stopped_at
         or manifest.get("release", {}).get("revision")
         != previous_lock.get("application", {}).get("git_revision")
+        or hashlib.sha256(captured_lock.read_bytes()).hexdigest()
+        != hashlib.sha256(previous_artifact_lock.read_bytes()).hexdigest()
     ):
         raise UpgradeRehearsalError(
             "pre-change backup does not follow the documented admission stop"
         )
+
+
+def _migrate_candidate(
+    candidate: Path, *, artifact_lock: Path, applied_at: datetime
+) -> None:
+    state_path = candidate / "data" / "state" / "state.sqlite3"
+    expected_state = json.loads(artifact_lock.read_text(encoding="utf-8"))[
+        "database_schemas"
+    ]["state"]
+    if _schema_hash(state_path) != expected_state:
+        migrate_sqlite_outbound_conversation_attempts(state_path, applied_at=applied_at)
+    for store in (
+        SQLiteDurableStateStore(state_path),
+        SQLiteWorkingSessionStore(candidate / "data" / "state" / "sessions.sqlite3"),
+        SQLiteAuditBoundary(candidate / "data" / "audit" / "audit.sqlite3"),
+    ):
+        store.close()
+
+
+def _schema_hash(database: Path) -> str:
+    with sqlite3.connect(database) as connection:
+        schema = "\n".join(
+            row[0] or ""
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name"
+            )
+        )
+    return hashlib.sha256(schema.encode()).hexdigest()
+
+
+def _validate_candidate_schemas(candidate: Path, artifact_lock: Path) -> None:
+    schemas = json.loads(artifact_lock.read_text(encoding="utf-8"))["database_schemas"]
+    databases = {
+        "state": candidate / "data/state/state.sqlite3",
+        "sessions": candidate / "data/state/sessions.sqlite3",
+        "audit": candidate / "data/audit/audit.sqlite3",
+        "traces": candidate / "data/traces/traces.sqlite3",
+        "codex_traces": candidate / "data/codex_traces/codex.sqlite3",
+        "google_traces": candidate / "data/google_traces/google.sqlite3",
+        "deleted_conversations": candidate
+        / "data/deleted_conversations/deleted-conversations.sqlite3",
+    }
+    if any(_schema_hash(path) != schemas[name] for name, path in databases.items()):
+        raise UpgradeRehearsalError("replacement database migration is incomplete")
+
+
+def _restart_evidence(
+    occurred_at: datetime,
+    requests: int,
+    pending: Sequence[OutboundAttemptRecoveryProjection],
+    missing_ingress: int,
+) -> AuditEvidence:
+    return AuditEvidence(
+        evidence_id=f"upgrade-rehearsal-{uuid.uuid4()}",
+        kind="service_restart",
+        occurred_at=occurred_at,
+        event_id=None,
+        request_id=None,
+        outcome="interrupted",
+        actor="control_plane",
+        operation_type="working_session",
+        target_category="working_session",
+        execution_status="recorded",
+        details={
+            "interrupted_requests": str(requests),
+            "interrupted_ingress": str(missing_ingress),
+            "outbound_not_started": str(
+                sum(
+                    item.status == OutboundAttemptStatus.UNATTEMPTED.value
+                    for item in pending
+                )
+            ),
+            "outbound_unknown": str(
+                sum(
+                    item.status == OutboundAttemptStatus.ATTEMPTED.value
+                    for item in pending
+                )
+            ),
+        },
+    )
 
 
 def _reconcile_known_window(
@@ -206,6 +341,7 @@ def _reconcile_known_window(
     *,
     session_path: Path,
     audit_path: Path,
+    history_export: Path,
     start: datetime,
     end: datetime,
 ) -> _ReconciliationStats:
@@ -223,13 +359,48 @@ def _reconcile_known_window(
         )
         if primary_key != ("session_id", "message_id"):
             raise UpgradeRehearsalError("ingress deduplication is not durable")
+        history = json.loads(history_export.read_text(encoding="utf-8"))
+        if not isinstance(history, list):
+            raise UpgradeRehearsalError("bounded message history export is invalid")
+        keys: set[tuple[str, str]] = set()
+        missing_history: list[tuple[str, str, str, datetime]] = []
+        claimed_keys = {
+            (claim.session_id, claim.message_id)
+            for claim in state.list_ingress_claims()
+        }
+        for item in history:
+            try:
+                key = (item["session_id"], item["message_id"])
+                occurred_at = datetime.fromisoformat(item["occurred_at"])
+                event_id = item["event_id"]
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                raise UpgradeRehearsalError(
+                    "bounded message history export is invalid"
+                ) from exc
+            if (
+                not all(isinstance(value, str) and value for value in (*key, event_id))
+                or occurred_at.tzinfo is None
+                or key in keys
+                or not start <= occurred_at.astimezone(UTC) <= end
+            ):
+                raise UpgradeRehearsalError("bounded message history export is invalid")
+            occurred_at = occurred_at.astimezone(UTC)
+            keys.add(key)
+            if key not in claimed_keys:
+                missing_history.append((*key, event_id, occurred_at))
+        if any(
+            start <= claim.claimed_at <= end
+            and (claim.session_id, claim.message_id) not in keys
+            for claim in state.list_ingress_claims()
+        ):
+            raise UpgradeRehearsalError("bounded message history export is incomplete")
         window = (start.isoformat(), end.isoformat())
         ingress_before = int(
             state.connection.execute(
                 "SELECT COUNT(*) FROM ingress_claims WHERE claimed_at BETWEEN ? AND ?",
                 window,
             ).fetchone()[0]
-        )
+        ) + len(missing_history)
         nonterminal_ingress = tuple(
             claim
             for claim in state.list_ingress_claims()
@@ -249,36 +420,46 @@ def _reconcile_known_window(
                 OutboundAttemptStatus.ATTEMPTED.value,
             }
         )
-        if any(
-            not item.attempt_present
-            or item.outbox_present
-            != (
-                item.status
-                in {
-                    OutboundAttemptStatus.UNATTEMPTED.value,
-                    OutboundAttemptStatus.ATTEMPTED.value,
-                }
-            )
+        open_statuses = {
+            OutboundAttemptStatus.UNATTEMPTED.value,
+            OutboundAttemptStatus.ATTEMPTED.value,
+        }
+        terminal_statuses = {
+            OutboundAttemptStatus.CONFIRMED.value,
+            OutboundAttemptStatus.UNKNOWN.value,
+            OutboundAttemptStatus.NOT_STARTED.value,
+        }
+        inconsistencies = Counter(
+            reason
             for item in projections
-        ):
+            if (
+                reason := _outbound_inconsistency(
+                    item, open_statuses, terminal_statuses
+                )
+            )
+        )
+        if inconsistencies:
             reason = "outbound recovery state is inconsistent"
-            audit.append(
-                AuditEvidence(
-                    evidence_id="upgrade-rehearsal-inconsistency",
-                    kind="restart_inconsistency",
-                    occurred_at=end,
-                    event_id=None,
-                    request_id=None,
-                    outcome="degraded",
-                    actor="control_plane",
-                    operation_type="state_recovery",
-                    target_category="durable_state",
-                    execution_status="recorded",
-                    details={
-                        "count": "1",
-                        "reason": "outbound_recovery_state",
-                        "state": "administrative_degraded",
-                    },
+            audit.append_batch(
+                tuple(
+                    AuditEvidence(
+                        evidence_id=f"upgrade-rehearsal-inconsistency-{uuid.uuid4()}",
+                        kind="restart_inconsistency",
+                        occurred_at=end,
+                        event_id=None,
+                        request_id=None,
+                        outcome="degraded",
+                        actor="control_plane",
+                        operation_type="state_recovery",
+                        target_category="durable_state",
+                        execution_status="recorded",
+                        details={
+                            "count": str(count),
+                            "reason": inconsistency,
+                            "state": "administrative_degraded",
+                        },
+                    )
+                    for inconsistency, count in sorted(inconsistencies.items())
                 )
             )
             state.mark_recovery_degraded(reason=reason, marked_at=end)
@@ -344,12 +525,29 @@ def _reconcile_known_window(
                 if item.is_open
             )
             dispatch_unknown = sum(
-                item.status is DispatchStatus.ATTEMPTED
+                item.status is not DispatchStatus.UNATTEMPTED
                 for item in session.action_outbox
                 if item.is_open
             )
             transition = interrupt_for_restart(session, now=end)
-            sessions.compare_and_set(session, transition.state)
+            restart_evidence = _restart_evidence(
+                end, len(requests), pending, len(missing_history)
+            )
+            sessions.compare_and_set_with_audit(
+                session, transition.state, audit=audit, evidence=restart_evidence
+            )
+        else:
+            audit.append(
+                _restart_evidence(end, len(requests), pending, len(missing_history))
+            )
+        for session_id, message_id, event_id, occurred_at in missing_history:
+            state.claim_ingress(
+                session_id=session_id,
+                message_id=message_id,
+                event_id=event_id,
+                claimed_at=occurred_at,
+                disposition="interrupted",
+            )
         for request in requests:
             state.update_request(
                 replace(
@@ -406,6 +604,24 @@ def _reconcile_known_window(
         state.close()
 
 
+def _outbound_inconsistency(
+    item: OutboundAttemptRecoveryProjection,
+    open_statuses: set[str],
+    terminal_statuses: set[str],
+) -> str | None:
+    if not item.attempt_present:
+        return "outbox_without_attempt"
+    if item.status in open_statuses:
+        if not item.outbox_present:
+            return "open_attempt_without_outbox"
+        if item.outbox_request_id != item.attempt_request_id:
+            return "attempt_outbox_request_mismatch"
+        return None
+    if item.status not in terminal_statuses:
+        return "unsupported_attempt_status"
+    return "terminal_attempt_with_outbox" if item.outbox_present else None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("previous_release", type=Path)
@@ -418,6 +634,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--window-start", type=datetime.fromisoformat, required=True)
     parser.add_argument("--window-end", type=datetime.fromisoformat, required=True)
+    parser.add_argument("--history-export", type=Path, required=True)
     parser.add_argument("--force-failure", action="store_true")
     return parser
 
@@ -434,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             admission_stopped_at=args.admission_stopped_at,
             window_start=args.window_start,
             window_end=args.window_end,
+            history_export=args.history_export,
             force_failure=args.force_failure,
         )
     except UpgradeRehearsalError as exc:

@@ -203,15 +203,18 @@ bundles and the active configuration are validated before state is restored.
 The bounded message window must contain every unfinished outbound attempt:
 
 ```console
-/opt/jarvis/replacement/.venv/bin/python -m jarvis_control_plane.upgrade_rehearsal /opt/jarvis/previous /opt/jarvis/replacement /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-rehearsal/20260812T080000Z --configuration /etc/jarvis/jarvis.toml --admission-stopped-at 2026-08-12T07:59:00+00:00 --window-start 2026-08-12T07:55:00+00:00 --window-end 2026-08-12T08:05:00+00:00
+PYTHONPATH=/opt/jarvis/replacement/src /opt/jarvis/replacement/.venv/bin/python -m jarvis_control_plane.upgrade_rehearsal /opt/jarvis/previous /opt/jarvis/replacement /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-rehearsal/20260812T080000Z --configuration /etc/jarvis/jarvis.toml --admission-stopped-at 2026-08-12T07:59:00+00:00 --window-start 2026-08-12T07:55:00+00:00 --window-end 2026-08-12T08:05:00+00:00 --history-export /var/lib/jarvis-rehearsal/openwa-history.json
 ```
 
 The command must run with the replacement release's installed Python and rejects
 another runtime. It requires the admission-stop timestamp and verifies that the
-snapshot is a later pre-change backup of the exact previous release. The
+snapshot is a later pre-change backup of the exact previous artifact lock. The
 rehearsal initializes the replacement release only against the isolated restore.
-It verifies the durable ingress deduplication key, leaves ingress claims
-unchanged, interrupts unfinished requests and pending actions, and closes
+The required bounded OpenWA history export is a JSON array of non-secret
+`session_id`, `message_id`, `event_id`, and timezone-aware `occurred_at` values;
+it lets the rehearsal record messages missing from the restored inbox under the
+durable deduplication key. The rehearsal interrupts unfinished requests and
+pending actions, and closes
 known-unattempted or attempted-but-unconfirmed dispatch and outbound work as
 `not_started` or `unknown` without replaying either.
 Use `--force-failure` to exercise rollback; the command then restores the same
