@@ -13,6 +13,7 @@ import pytest
 from test_ticket28_backup_restore import _inputs
 
 from jarvis_control_plane import (
+    SQLiteAuditBoundary,
     SQLiteDurableStateStore,
     upgrade_rehearsal,
 )
@@ -50,6 +51,11 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
     session_database.unlink()
     sessions = SQLiteWorkingSessionStore(session_database)
     sessions.close()
+    audit_database = roots["audit"] / "audit.sqlite3"
+    gc.collect()
+    audit_database.unlink()
+    audit = SQLiteAuditBoundary(audit_database)
+    audit.close()
     with sqlite3.connect(state_database) as connection:
         connection.execute(
             "INSERT INTO ingress_claims VALUES (?, ?, ?, ?, ?)",
@@ -115,6 +121,7 @@ def test_upgrade_reconciles_in_isolation_and_forced_failure_restores_previous_st
     lock = json.loads(artifact_lock.read_text(encoding="utf-8"))
     lock["database_schemas"]["state"] = _schema_hash(state_database)
     lock["database_schemas"]["sessions"] = _schema_hash(session_database)
+    lock["database_schemas"]["audit"] = _schema_hash(audit_database)
     artifact_lock.write_text(json.dumps(lock), encoding="utf-8")
     snapshot = create_backup(
         destination=tmp_path / "backups",

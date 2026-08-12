@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .adapters import InMemoryAuditBoundary, SQLiteDurableStateStore
+from .adapters import SQLiteAuditBoundary, SQLiteDurableStateStore
 from .administrative_backup import BackupError, restore_backup
 from .deployment import BundleValidationError, validate_configuration, verify_bundle
 from .models import AuditEvidence, OutboundAttemptStatus
@@ -137,6 +137,7 @@ def rehearse_upgrade(
 
     state_path = candidate / "data" / "state" / "state.sqlite3"
     session_path = candidate / "data" / "state" / "sessions.sqlite3"
+    audit_path = candidate / "data" / "audit" / "audit.sqlite3"
     stats = _ReconciliationStats()
     rollback_state: Path | None = None
     outcome = "rehearsed"
@@ -144,6 +145,7 @@ def rehearse_upgrade(
         stats = _reconcile_known_window(
             state_path,
             session_path=session_path,
+            audit_path=audit_path,
             start=start,
             end=end,
         )
@@ -203,11 +205,13 @@ def _reconcile_known_window(
     database: Path,
     *,
     session_path: Path,
+    audit_path: Path,
     start: datetime,
     end: datetime,
 ) -> _ReconciliationStats:
     state = SQLiteDurableStateStore(database)
     sessions = SQLiteWorkingSessionStore(session_path)
+    audit = SQLiteAuditBoundary(audit_path)
     try:
         primary_key = tuple(
             row[1]
@@ -226,6 +230,15 @@ def _reconcile_known_window(
                 window,
             ).fetchone()[0]
         )
+        nonterminal_ingress = tuple(
+            claim
+            for claim in state.list_ingress_claims()
+            if claim.disposition in {"admitted", "dispatching"}
+        )
+        if any(not start <= claim.claimed_at <= end for claim in nonterminal_ingress):
+            raise UpgradeRehearsalError(
+                "unfinished ingress falls outside the known message window"
+            )
         projections = state.list_outbound_conversation_attempt_recovery()
         pending = tuple(
             item
@@ -248,6 +261,27 @@ def _reconcile_known_window(
             )
             for item in projections
         ):
+            reason = "outbound recovery state is inconsistent"
+            audit.append(
+                AuditEvidence(
+                    evidence_id="upgrade-rehearsal-inconsistency",
+                    kind="restart_inconsistency",
+                    occurred_at=end,
+                    event_id=None,
+                    request_id=None,
+                    outcome="degraded",
+                    actor="control_plane",
+                    operation_type="state_recovery",
+                    target_category="durable_state",
+                    execution_status="recorded",
+                    details={
+                        "count": "1",
+                        "reason": "outbound_recovery_state",
+                        "state": "administrative_degraded",
+                    },
+                )
+            )
+            state.mark_recovery_degraded(reason=reason, marked_at=end)
             raise UpgradeRehearsalError("outbound recovery state is inconsistent")
         if any(
             item.reserved_at is None
@@ -283,6 +317,27 @@ def _reconcile_known_window(
         )
         dispatch_not_started = dispatch_unknown = 0
         if session is not None:
+            live_times = tuple(
+                timestamp
+                for timestamp in (
+                    session.active_request.created_at
+                    if session.active_request is not None
+                    else None,
+                    session.pending_action.created_at
+                    if session.pending_action is not None
+                    else None,
+                    *(
+                        item.approved_at
+                        for item in session.action_outbox
+                        if item.is_open
+                    ),
+                )
+                if timestamp is not None
+            )
+            if any(not start <= timestamp <= end for timestamp in live_times):
+                raise UpgradeRehearsalError(
+                    "unfinished session work falls outside the known message window"
+                )
             dispatch_not_started = sum(
                 item.status is DispatchStatus.UNATTEMPTED
                 for item in session.action_outbox
@@ -307,7 +362,7 @@ def _reconcile_known_window(
                 )
             )
         ingress_interrupted = state.reconcile_ingress_restart(
-            audit=InMemoryAuditBoundary(),
+            audit=audit,
             audit_evidence=AuditEvidence(
                 evidence_id="upgrade-rehearsal-ingress",
                 kind="service_restart",
@@ -346,6 +401,7 @@ def _reconcile_known_window(
             ),
         )
     finally:
+        audit.close()
         sessions.close()
         state.close()
 
