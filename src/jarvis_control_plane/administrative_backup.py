@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+import yaml
 
 from .deployment import BundleValidationError, validate_configuration
 
@@ -51,6 +54,12 @@ PROTECTED_ADMIN_ROOTS = tuple(DEFAULT_ROOTS.values()) + (
     Path("/run/protocol"),
     Path("/run/jarvis/deleted-archive-ipc"),
 )
+METADATA_FILES = (
+    ("configuration", "configuration.toml"),
+    ("artifact_lock", "artifacts.lock.json"),
+    ("compose_manifest", "compose.yaml"),
+    ("image_digests", "image-digests.json"),
+)
 
 
 class BackupError(RuntimeError):
@@ -63,6 +72,8 @@ def create_backup(
     kind: str,
     configuration: str | Path,
     artifact_lock: str | Path,
+    compose_manifest: str | Path | None = None,
+    image_digests: str | Path | None = None,
     roots: Mapping[str, str | Path] = DEFAULT_ROOTS,
     now: datetime | None = None,
 ) -> Path:
@@ -72,8 +83,19 @@ def create_backup(
         raise BackupError("backup kind must be nightly or pre-change")
     config_path = _regular_file(configuration, "configuration")
     lock_path = _regular_file(artifact_lock, "artifact lock")
-    config_ownership = _ownership(config_path)
-    lock_ownership = _ownership(lock_path)
+    metadata_sources = {
+        "configuration": config_path,
+        "artifact_lock": lock_path,
+        "compose_manifest": _regular_file(
+            compose_manifest or lock_path.parent / "compose.yaml", "Compose manifest"
+        ),
+        "image_digests": _regular_file(
+            image_digests or lock_path.parent / "image-digests.json", "image digests"
+        ),
+    }
+    metadata_ownership = {
+        name: _ownership(path) for name, path in metadata_sources.items()
+    }
 
     resolved_roots: dict[str, Path] = {}
     for root_name in DEFAULT_ROOTS:
@@ -93,6 +115,15 @@ def create_backup(
     if any(_within(destination_path, root) for root in protected_roots):
         raise BackupError("backup destination must be outside Jarvis data roots")
     destination_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    get_effective_uid = getattr(os, "geteuid", None)
+    destination_stat = destination_path.stat()
+    if get_effective_uid is not None and (
+        destination_stat.st_uid != get_effective_uid()
+        or stat.S_IMODE(destination_stat.st_mode) != 0o700
+    ):
+        raise BackupError(
+            "backup destination must have the effective owner and mode 0700"
+        )
     timestamp = (now or datetime.now(UTC)).astimezone(UTC)
     snapshot = destination_path / (timestamp.strftime("%Y%m%dT%H%M%S.%fZ") + f"-{kind}")
     if snapshot.exists():
@@ -103,13 +134,15 @@ def create_backup(
         staging.chmod(0o700)
         metadata_dir = staging / "metadata"
         metadata_dir.mkdir(mode=0o700)
-        shutil.copyfile(config_path, metadata_dir / "configuration.toml")
-        shutil.copyfile(lock_path, metadata_dir / "artifacts.lock.json")
-        _private_file(metadata_dir / "configuration.toml")
-        _private_file(metadata_dir / "artifacts.lock.json")
+        for name, filename in METADATA_FILES:
+            shutil.copyfile(metadata_sources[name], metadata_dir / filename)
+            _private_file(metadata_dir / filename)
         _config, lock, release = _metadata(
             metadata_dir / "configuration.toml",
             metadata_dir / "artifacts.lock.json",
+        )
+        _validate_deployment_metadata(
+            metadata_dir / "compose.yaml", metadata_dir / "image-digests.json"
         )
 
         root_metadata = {
@@ -176,16 +209,12 @@ def create_backup(
             "release": release,
             "roots": root_metadata,
             "metadata": {
-                "configuration": {
-                    "path": "metadata/configuration.toml",
-                    "sha256": _sha256(metadata_dir / "configuration.toml"),
-                    **config_ownership,
-                },
-                "artifact_lock": {
-                    "path": "metadata/artifacts.lock.json",
-                    "sha256": _sha256(metadata_dir / "artifacts.lock.json"),
-                    **lock_ownership,
-                },
+                name: {
+                    "path": f"metadata/{filename}",
+                    "sha256": _sha256(metadata_dir / filename),
+                    **metadata_ownership[name],
+                }
+                for name, filename in METADATA_FILES
             },
             "databases": databases,
         }
@@ -256,10 +285,7 @@ def restore_backup(
             _private_file(restored)
         metadata_dir = staging / "metadata"
         metadata_dir.mkdir(mode=0o700)
-        for key, filename in (
-            ("configuration", "configuration.toml"),
-            ("artifact_lock", "artifacts.lock.json"),
-        ):
+        for key, filename in METADATA_FILES:
             source = _snapshot_member(snapshot_path, manifest["metadata"][key]["path"])
             shutil.copyfile(source, metadata_dir / filename)
             _private_file(metadata_dir / filename)
@@ -275,10 +301,7 @@ def restore_backup(
             _apply_ownership(staging / item["path"], item)
         for root_name, ownership in manifest["roots"].items():
             _apply_ownership(staging / "data" / root_name, ownership)
-        for key, filename in (
-            ("configuration", "configuration.toml"),
-            ("artifact_lock", "artifacts.lock.json"),
-        ):
+        for key, filename in METADATA_FILES:
             _apply_ownership(metadata_dir / filename, manifest["metadata"][key])
         _verify_restored_ownership(staging, manifest)
         marker.unlink()
@@ -424,6 +447,10 @@ def _verify_snapshot_files(snapshot: Path, manifest: Mapping[str, Any]) -> None:
     del snapshot_config, snapshot_lock
     if snapshot_release != manifest["release"]:
         raise BackupError("snapshot release metadata is inconsistent")
+    _validate_deployment_metadata(
+        _snapshot_member(snapshot, manifest["metadata"]["compose_manifest"]["path"]),
+        _snapshot_member(snapshot, manifest["metadata"]["image_digests"]["path"]),
+    )
 
 
 def _validate_manifest(manifest: Mapping[str, Any]) -> None:
@@ -465,17 +492,44 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         _validate_ownership(ownership)
     metadata = manifest.get("metadata")
     if not isinstance(metadata, dict) or set(metadata) != {
-        "configuration",
-        "artifact_lock",
+        name for name, _filename in METADATA_FILES
     }:
         raise BackupError("backup manifest is incomplete")
     for item in metadata.values():
         _validate_file_record(item)
-    if (
-        metadata["configuration"]["path"] != "metadata/configuration.toml"
-        or metadata["artifact_lock"]["path"] != "metadata/artifacts.lock.json"
+    if any(
+        metadata[name]["path"] != f"metadata/{filename}"
+        for name, filename in METADATA_FILES
     ):
         raise BackupError("backup metadata inventory is invalid")
+
+
+def _validate_deployment_metadata(compose_path: Path, digests_path: Path) -> None:
+    try:
+        compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+        services = compose.get("services") if isinstance(compose, dict) else None
+        digests = json.loads(digests_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(services, dict)
+            or not services
+            or not isinstance(digests, dict)
+            or set(digests) != set(services)
+            or any(
+                not isinstance(name, str)
+                or not isinstance(value, str)
+                or re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", value) is None
+                for name, value in digests.items()
+            )
+        ):
+            raise TypeError
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        yaml.YAMLError,
+    ) as exc:
+        raise BackupError("deployment metadata is invalid") from exc
 
 
 def _validate_file_record(item: object) -> None:
@@ -571,10 +625,7 @@ def _verify_restored_ownership(target: Path, manifest: Mapping[str, Any]) -> Non
             key: int(expected[key]) for key in ("mode", "uid", "gid")
         }:
             raise BackupError(f"restored ownership or permissions differ: {root_name}")
-    for key, filename in (
-        ("configuration", "configuration.toml"),
-        ("artifact_lock", "artifacts.lock.json"),
-    ):
+    for key, filename in METADATA_FILES:
         expected = manifest["metadata"][key]
         if _ownership(target / "metadata" / filename) != {
             field: int(expected[field]) for field in ("mode", "uid", "gid")

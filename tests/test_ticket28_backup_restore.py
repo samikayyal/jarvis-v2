@@ -7,6 +7,7 @@ import sqlite3
 import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +100,14 @@ def _inputs(tmp_path: Path) -> tuple[dict[str, Path], Path, Path]:
         ),
         encoding="utf-8",
     )
+    (tmp_path / "compose.yaml").write_text(
+        "name: jarvis-assistant-v1\nservices:\n  broker:\n    image: jarvis-broker\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "image-digests.json").write_text(
+        json.dumps({"broker": "jarvis-broker@sha256:" + "1" * 64}),
+        encoding="utf-8",
+    )
     return roots, configuration, artifact_lock
 
 
@@ -131,6 +140,18 @@ def test_nightly_backup_and_isolated_restore_cover_every_authoritative_store(
         "revision": "revision-28",
     }
     assert {item["name"] for item in manifest["databases"]} == set(DATABASES)
+    assert set(manifest["metadata"]) == {
+        "configuration",
+        "artifact_lock",
+        "compose_manifest",
+        "image_digests",
+    }
+    assert (snapshot / "metadata" / "compose.yaml").read_text(encoding="utf-8") == (
+        tmp_path / "compose.yaml"
+    ).read_text(encoding="utf-8")
+    assert json.loads(
+        (snapshot / "metadata" / "image-digests.json").read_text(encoding="utf-8")
+    ) == {"broker": "jarvis-broker@sha256:" + "1" * 64}
     snapshot_text = " ".join(path.name for path in snapshot.rglob("*"))
     assert "cache.sqlite3" not in snapshot_text
     snapshot_bytes = b"".join(
@@ -154,6 +175,8 @@ def test_nightly_backup_and_isolated_restore_cover_every_authoritative_store(
             assert connection.execute(f"SELECT * FROM {table}").fetchone()[0] == name
         if os.name == "posix":
             assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    assert (restored / "metadata" / "compose.yaml").is_file()
+    assert (restored / "metadata" / "image-digests.json").is_file()
 
 
 def test_pre_change_backup_uses_sqlite_online_snapshot_for_wal_data(
@@ -474,4 +497,60 @@ def test_bundle_rejects_effective_backup_unit_overrides(tmp_path: Path) -> None:
     )
 
     with pytest.raises(BundleValidationError, match="nightly backup service"):
+        verify_bundle(bundle, source_root=repository)
+
+
+def test_bundle_rejects_extra_backup_unit_directives(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[1]
+    bundle = tmp_path / "deployment"
+    administrative_backup.shutil.copytree(repository / "deployment", bundle)
+    service = bundle / "systemd" / "jarvis-backup.service"
+    service.write_text(
+        service.read_text(encoding="utf-8") + "\nExecStartPost=/bin/true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleValidationError, match="nightly backup service"):
+        verify_bundle(bundle, source_root=repository)
+
+
+def test_backup_rejects_a_destination_not_owned_by_the_effective_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    destination = (tmp_path / "backups").resolve()
+    destination.mkdir()
+    original_stat = Path.stat
+
+    def stat_with_other_owner(path: Path, *args: object, **kwargs: object) -> object:
+        result = original_stat(path, *args, **kwargs)
+        if path == destination:
+            return SimpleNamespace(st_uid=12345, st_mode=result.st_mode)
+        return result
+
+    monkeypatch.setattr(Path, "stat", stat_with_other_owner)
+    monkeypatch.setattr(administrative_backup.os, "geteuid", lambda: 0, raising=False)
+
+    with pytest.raises(BackupError, match="owner and mode"):
+        create_backup(
+            destination=destination,
+            kind="nightly",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+            roots=roots,
+        )
+
+
+def test_bundle_rejects_unreviewed_database_schema_fingerprints(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).parents[1]
+    bundle = tmp_path / "deployment"
+    administrative_backup.shutil.copytree(repository / "deployment", bundle)
+    lock_path = bundle / "artifacts.lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["database_schemas"]["state"] = "0" * 64
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError, match="schema fingerprints"):
         verify_bundle(bundle, source_root=repository)

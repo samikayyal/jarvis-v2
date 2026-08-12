@@ -48,6 +48,18 @@ REQUIRED_FILES = (
     "systemd/jarvis-backup.timer",
 )
 
+DATABASE_SCHEMAS = MappingProxyType(
+    {
+        "state": "4c4e03d8f879ad235051543caa4ef7782f408c05953087d5cf0201c261a59c43",
+        "sessions": "702f19c90b7c336532f4a7e598801150ac9f68bc3471b5d2b0e69317eb974470",
+        "audit": "07918a1e796be9ed5f0c720fd490ca59354e39742eee2b9e77769f6ec1702648",
+        "traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
+        "codex_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
+        "google_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
+        "deleted_conversations": "fb1b292ce25216b5f697aba99a90a83f77dbc6aba755c61ce69488748bef066d",
+    }
+)
+
 RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
     {
         "inbound_receiver": ServiceResourceLimits("64M", Decimal("0.10"), 32),
@@ -564,23 +576,7 @@ def _validate_artifacts(
     ):
         errors.append("application source differs from the pinned artifact")
     schemas = lock.get("database_schemas")
-    expected_schemas = {
-        "state",
-        "sessions",
-        "audit",
-        "traces",
-        "codex_traces",
-        "google_traces",
-        "deleted_conversations",
-    }
-    if (
-        not isinstance(schemas, Mapping)
-        or set(schemas) != expected_schemas
-        or any(
-            not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
-            for value in schemas.values()
-        )
-    ):
+    if schemas != DATABASE_SCHEMAS:
         errors.append("database schema fingerprints must be complete and pinned")
     base = lock.get("python_base_image")
     reference = base.get("reference") if isinstance(base, Mapping) else None
@@ -1065,6 +1061,7 @@ def _validate_backup_units(root: Path, errors: list[str]) -> None:
     )
     timer = _unit_directives((root / "jarvis-backup.timer").read_text(encoding="utf-8"))
     expected_service = {
+        ("Unit", "Description"): ("Create the nightly Jarvis administrative backup",),
         ("Service", "Type"): ("oneshot",),
         ("Service", "User"): ("root",),
         ("Service", "UMask"): ("0077",),
@@ -1079,14 +1076,16 @@ def _validate_backup_units(root: Path, errors: list[str]) -> None:
         ),
     }
     expected_timer = {
+        ("Unit", "Description"): ("Run the Jarvis administrative backup nightly",),
         ("Timer", "OnCalendar"): ("*-*-* 02:00:00 UTC",),
         ("Timer", "Persistent"): ("true",),
         ("Timer", "RandomizedDelaySec"): ("15m",),
         ("Timer", "Unit"): ("jarvis-backup.service",),
+        ("Install", "WantedBy"): ("timers.target",),
     }
-    if any(service.get(key) != value for key, value in expected_service.items()):
+    if service != expected_service:
         errors.append("nightly backup service differs from the reviewed directives")
-    if any(timer.get(key) != value for key, value in expected_timer.items()):
+    if timer != expected_timer:
         errors.append("nightly backup timer differs from the reviewed directives")
 
 

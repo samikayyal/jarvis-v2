@@ -144,7 +144,9 @@ transactionally consistent copies and the restore can preserve the original
 owners and modes. The fixed database inventory covers Jarvis state and sessions,
 append-only audit, broker/Codex/Google diagnostic traces, and the deleted-
 conversation archive. The reviewed configuration, SQLite schema hashes, and
-artifact release metadata travel with every snapshot. Credentials, private keys,
+artifact release metadata travel with every snapshot. The active `compose.yaml`
+and adjacent `image-digests.json` also travel with it; the digest file maps every
+Compose service name to its activated `image@sha256:...` reference. Credentials, private keys,
 OpenWA state, caches, the knowledge-vault clone, and external authoritative
 content cannot enter the snapshot because they are not accepted inputs.
 
