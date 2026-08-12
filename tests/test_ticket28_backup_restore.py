@@ -10,13 +10,18 @@ from pathlib import Path
 
 import pytest
 
+from jarvis_control_plane import administrative_backup
 from jarvis_control_plane.administrative_backup import (
     BackupError,
     _consistent_snapshot,
     create_backup,
     restore_backup,
 )
-from jarvis_control_plane.deployment import _backup_freshness
+from jarvis_control_plane.deployment import (
+    BundleValidationError,
+    _backup_freshness,
+    verify_bundle,
+)
 
 DATABASES = {
     "state": ("state.sqlite3", "CREATE TABLE request_state (request_id TEXT)"),
@@ -177,6 +182,37 @@ def test_pre_change_backup_uses_sqlite_online_snapshot_for_wal_data(
     assert values == ["state", "committed-in-wal"]
 
 
+def test_backup_manifest_uses_the_copied_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    original_copyfile = administrative_backup.shutil.copyfile
+
+    def replace_lock_before_copy(source: str | Path, target: str | Path) -> str:
+        if Path(source) == artifact_lock:
+            artifact_lock.write_text(
+                artifact_lock.read_text(encoding="utf-8").replace(
+                    '"revision-28"', '"replacement-revision"'
+                ),
+                encoding="utf-8",
+            )
+        return original_copyfile(source, target)
+
+    monkeypatch.setattr(
+        administrative_backup.shutil, "copyfile", replace_lock_before_copy
+    )
+    snapshot = create_backup(
+        destination=tmp_path / "backups",
+        kind="nightly",
+        configuration=configuration,
+        artifact_lock=artifact_lock,
+        roots=roots,
+    )
+
+    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["release"]["revision"] == "replacement-revision"
+
+
 def test_consistent_snapshot_holds_one_write_barrier_across_all_stores(
     tmp_path: Path,
 ) -> None:
@@ -316,12 +352,14 @@ def test_bundle_ships_nightly_timer_and_reports_backup_freshness(
     timer = (deployment / "systemd" / "jarvis-backup.timer").read_text(encoding="utf-8")
     assert "--kind nightly" in service
     assert "User=root" in service
+    assert "/opt/jarvis/current/.venv/bin/python" in service
+    assert "uv run" not in service
     assert "OnCalendar=" in timer
     assert "Persistent=true" in timer
 
     now = datetime(2026, 8, 12, 12, tzinfo=UTC)
     assert _backup_freshness(tmp_path, now=now) == "missing"
-    snapshot = tmp_path / "snapshot"
+    snapshot = tmp_path / "20260812T110000.000000Z-nightly"
     snapshot.mkdir()
     (snapshot / "manifest.json").write_text(
         json.dumps({"created_at": (now - timedelta(hours=1)).isoformat()}),
@@ -332,4 +370,25 @@ def test_bundle_ships_nightly_timer_and_reports_backup_freshness(
         json.dumps({"created_at": (now - timedelta(hours=48)).isoformat()}),
         encoding="utf-8",
     )
+    partial = tmp_path / ".partial-interrupted"
+    partial.mkdir()
+    (partial / "manifest.json").write_text(
+        json.dumps({"created_at": (now - timedelta(hours=1)).isoformat()}),
+        encoding="utf-8",
+    )
     assert _backup_freshness(tmp_path, now=now) == "stale"
+
+
+def test_bundle_rejects_effective_backup_unit_overrides(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[1]
+    bundle = tmp_path / "deployment"
+    administrative_backup.shutil.copytree(repository / "deployment", bundle)
+    service = bundle / "systemd" / "jarvis-backup.service"
+    service.write_text(
+        service.read_text(encoding="utf-8")
+        + "\nUser=nobody\nExecStart=\nExecStart=/bin/true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleValidationError, match="nightly backup service"):
+        verify_bundle(bundle, source_root=repository)

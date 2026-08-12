@@ -5,4 +5,6 @@ Description=Create the nightly Jarvis administrative backup
 Type=oneshot
 User=root
 UMask=0077
-ExecStart=/usr/local/bin/uv run --project /opt/jarvis/current python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+WorkingDirectory=/opt/jarvis/current
+Environment=PYTHONPATH=/opt/jarvis/current/src
+ExecStart=/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json

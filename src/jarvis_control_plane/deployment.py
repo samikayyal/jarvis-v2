@@ -1060,18 +1060,55 @@ def _validate_handoff_description(path: Path, errors: list[str]) -> None:
 
 
 def _validate_backup_units(root: Path, errors: list[str]) -> None:
-    service = (root / "jarvis-backup.service").read_text(encoding="utf-8")
-    timer = (root / "jarvis-backup.timer").read_text(encoding="utf-8")
-    for phrase in (
-        "User=root",
-        "UMask=0077",
-        "jarvis_control_plane.administrative_backup create --kind nightly",
-    ):
-        if phrase not in service:
-            errors.append(f"nightly backup service is missing: {phrase}")
-    for phrase in ("OnCalendar=", "Persistent=true", "Unit=jarvis-backup.service"):
-        if phrase not in timer:
-            errors.append(f"nightly backup timer is missing: {phrase}")
+    service = _unit_directives(
+        (root / "jarvis-backup.service").read_text(encoding="utf-8")
+    )
+    timer = _unit_directives((root / "jarvis-backup.timer").read_text(encoding="utf-8"))
+    expected_service = {
+        ("Service", "Type"): ("oneshot",),
+        ("Service", "User"): ("root",),
+        ("Service", "UMask"): ("0077",),
+        ("Service", "WorkingDirectory"): ("/opt/jarvis/current",),
+        ("Service", "Environment"): ("PYTHONPATH=/opt/jarvis/current/src",),
+        ("Service", "ExecStart"): (
+            (
+                "/opt/jarvis/current/.venv/bin/python -m "
+                "jarvis_control_plane.administrative_backup create --kind nightly "
+                "--artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json"
+            ),
+        ),
+    }
+    expected_timer = {
+        ("Timer", "OnCalendar"): ("*-*-* 02:00:00 UTC",),
+        ("Timer", "Persistent"): ("true",),
+        ("Timer", "RandomizedDelaySec"): ("15m",),
+        ("Timer", "Unit"): ("jarvis-backup.service",),
+    }
+    if any(service.get(key) != value for key, value in expected_service.items()):
+        errors.append("nightly backup service differs from the reviewed directives")
+    if any(timer.get(key) != value for key, value in expected_timer.items()):
+        errors.append("nightly backup timer differs from the reviewed directives")
+
+
+def _unit_directives(text: str) -> dict[tuple[str, str], tuple[str, ...]]:
+    section = ""
+    values: dict[tuple[str, str], list[str]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        directive = values.setdefault((section, key), [])
+        if not value:
+            directive.clear()
+        else:
+            directive.append(value)
+    return {key: tuple(value) for key, value in values.items()}
 
 
 def _memory_mib(value: str) -> int:
@@ -1166,7 +1203,11 @@ def administrative_status(
 
 def _backup_freshness(root: Path, *, now: datetime | None = None) -> str:
     try:
-        manifests = list(root.glob("*/manifest.json"))
+        manifests = [
+            manifest
+            for manifest in root.glob("*/manifest.json")
+            if not manifest.parent.name.startswith(".partial-")
+        ]
         if not manifests:
             return "missing"
         created = max(

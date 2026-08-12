@@ -150,13 +150,21 @@ content cannot enter the snapshot because they are not accepted inputs.
 
 The unactivated bundle ships reviewed `jarvis-backup.service` and
 `jarvis-backup.timer` units for a persistent nightly run. Installing and enabling
-those units remains a manual activation step. Run the same command immediately
-before an upgrade, active-configuration change, or migration, varying only the
-required kind:
+those units remains a manual activation step. Before installing them, create the
+service environment from the shipped hash-locked requirements; the timer never
+resolves or downloads dependencies:
 
 ```console
-uv run python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
-uv run python -m jarvis_control_plane.administrative_backup create --kind pre-change --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+uv venv --python 3.13 /opt/jarvis/current/.venv
+uv pip install --python /opt/jarvis/current/.venv/bin/python --require-hashes -r /opt/jarvis/current/deployment/requirements.lock
+```
+
+Run the same installed Python immediately before an upgrade, active-
+configuration change, or migration, varying only the required kind:
+
+```console
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind nightly --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup create --kind pre-change --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
 ```
 
 Both commands create a new mode-`0700` versioned directory under
@@ -171,7 +179,7 @@ owners and modes, and compatible configuration/release metadata before publishin
 the isolated result:
 
 ```console
-uv run python -m jarvis_control_plane.administrative_backup restore /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-restore/rehearsal --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
+/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.administrative_backup restore /var/backups/jarvis/SNAPSHOT /var/lib/jarvis-restore/rehearsal --artifact-lock /opt/jarvis/current/deployment/artifacts.lock.json
 ```
 
 The restored tree is rehearsal material only. The command does not stop, start,

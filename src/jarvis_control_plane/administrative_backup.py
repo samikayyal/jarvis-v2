@@ -72,8 +72,8 @@ def create_backup(
         raise BackupError("backup kind must be nightly or pre-change")
     config_path = _regular_file(configuration, "configuration")
     lock_path = _regular_file(artifact_lock, "artifact lock")
-    config, lock, release = _metadata(config_path, lock_path)
-    del config
+    config_ownership = _ownership(config_path)
+    lock_ownership = _ownership(lock_path)
 
     resolved_roots: dict[str, Path] = {}
     for root_name in DEFAULT_ROOTS:
@@ -107,6 +107,10 @@ def create_backup(
         shutil.copyfile(lock_path, metadata_dir / "artifacts.lock.json")
         _private_file(metadata_dir / "configuration.toml")
         _private_file(metadata_dir / "artifacts.lock.json")
+        _config, lock, release = _metadata(
+            metadata_dir / "configuration.toml",
+            metadata_dir / "artifacts.lock.json",
+        )
 
         root_metadata = {
             name: _ownership(root) for name, root in resolved_roots.items()
@@ -154,12 +158,12 @@ def create_backup(
                 "configuration": {
                     "path": "metadata/configuration.toml",
                     "sha256": _sha256(metadata_dir / "configuration.toml"),
-                    **_ownership(config_path),
+                    **config_ownership,
                 },
                 "artifact_lock": {
                     "path": "metadata/artifacts.lock.json",
                     "sha256": _sha256(metadata_dir / "artifacts.lock.json"),
-                    **_ownership(lock_path),
+                    **lock_ownership,
                 },
             },
             "databases": databases,
