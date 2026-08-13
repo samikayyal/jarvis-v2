@@ -111,7 +111,7 @@ Do not schedule activation until every row passes.
 - [ ] The rollback owner has reviewed the rollback commands and decision points.
 
 The pinned application revision in the current reviewed lock is
-`5a07af1582098875adf0a6ddd70b905b147ab3b6`. Verify it from the installed lock;
+`cc52aaa976e7be4f2de76fc6295e2a3baf1f68fb`. Verify it from the installed lock;
 do not update the pin merely because the release bundle was merged by a later
 commit.
 
