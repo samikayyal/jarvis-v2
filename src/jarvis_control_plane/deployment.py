@@ -1030,6 +1030,7 @@ def _validate_service_resources(
     limits = resources.get("limits") if isinstance(resources, Mapping) else None
     actual_memory = limits.get("memory") if isinstance(limits, Mapping) else None
     actual_cpus = limits.get("cpus") if isinstance(limits, Mapping) else None
+    actual_pids = limits.get("pids") if isinstance(limits, Mapping) else None
     try:
         actual_cpu_decimal = Decimal(str(actual_cpus))
     except InvalidOperation:
@@ -1038,6 +1039,8 @@ def _validate_service_resources(
         errors.append(f"{service} memory limit must be {expected.memory}")
     if actual_cpu_decimal != expected.cpus:
         errors.append(f"{service} CPU limit must be {expected.cpus}")
+    if actual_pids != expected.pids:
+        errors.append(f"{service} deploy PID limit must be {expected.pids}")
     if raw.get("pids_limit") != expected.pids:
         errors.append(f"{service} PID limit must be {expected.pids}")
 
