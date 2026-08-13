@@ -1,0 +1,13 @@
+# Reviewed example only. Install an independently reviewed, root-owned copy at
+# /etc/jarvis/activation.compose.yaml during supervised activation. Do not use
+# this file to activate the repository checkout directly.
+services:
+  inbound_receiver:
+    networks:
+      - ingress_broker
+      - openwa_handoff
+
+networks:
+  openwa_handoff:
+    external: true
+    name: jarvis-openwa-handoff
