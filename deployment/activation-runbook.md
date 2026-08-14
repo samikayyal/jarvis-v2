@@ -98,8 +98,9 @@ Do not schedule activation until every row passes.
   `--no-build --pull never`.
 - [ ] The previous compatible Jarvis release and its compatible state are
   available for rollback.
-- [ ] Root-owned native Ubuntu and Windows worker service definitions have been
-  separately reviewed. Do not invent service definitions during the window.
+- [ ] The reviewed native Ubuntu systemd unit and Windows SCM service are
+  installed with manual activation state. The Ubuntu service must be disabled
+  and inactive; the Windows service must use Manual startup and be stopped.
 - [ ] A host TLS reverse-proxy configuration exposes only the exact public Google
   OAuth `/callback` path and routes it to `127.0.0.1:8080`.
 - [ ] The OpenWA administrator has a reviewed persistent Compose change that adds
@@ -123,17 +124,19 @@ for independent review. Their presence is not activation authorization:
 | `/etc/jarvis/credentials/openwa-inbound` and `broker` | One generated webhook HMAC shared only across the signed inbound boundary |
 | `/etc/jarvis/credentials/openwa` | Existing OpenWA API credential copied internally without displaying it |
 | `/etc/jarvis/credentials/vault` | Dedicated GitHub deploy key, pinned `known_hosts`, and SSH configuration; the public key still requires human registration |
-| `/etc/jarvis/credentials/windows-worker` | Dedicated CA and gateway certificate/key; registration remains pending until the reviewed native worker UID is fixed |
+| `/etc/jarvis/credentials/windows-worker` | Dedicated CA, gateway certificate/key, and closed registration using reviewed native worker UID `10008` |
 | `/var/backups/jarvis-ticket30-windows-worker` | Root-only staged Windows client certificate/key and private CA recovery material, outside Jarvis-readable paths |
-| `/opt/openwa/compose.jarvis.pending.yaml` | Validated persistent OpenWA Compose candidate adding only the exact API and handoff networks; the running OpenWA Compose file remains unchanged until supervised installation |
+| `/etc/jarvis/native/ubuntu-worker.json` | Root-owned mode-`0600` Ubuntu listener identity and exact gateway UID; no secret values |
+| `jarvis-ubuntu-worker.service` | Installed, disabled, and inactive systemd unit for the UID-`10008` host worker |
+| `JarvisWindowsWorker` | Installed, Manual, and stopped Windows SCM service under `LocalService`; credentials are ACL-restricted under `%ProgramData%\Jarvis\worker` |
+| `/opt/openwa/compose.jarvis.pending.yaml` | Validated persistent OpenWA Compose candidate adding only the exact API and handoff networks plus `SSRF_ALLOWED_HOSTS=inbound_receiver`; the SSRF guard remains enabled and running OpenWA remains unchanged until supervised installation |
 
 Preparation must leave `/etc/jarvis/jarvis.toml` absent, all Jarvis containers
 and `jarvis-*` networks absent, and OpenWA unchanged and healthy.
 
-The pinned application revision in the current reviewed lock is
-`cc52aaa976e7be4f2de76fc6295e2a3baf1f68fb`. Verify it from the installed lock;
-do not update the pin merely because the release bundle was merged by a later
-commit.
+Read the full pinned application revision from the installed artifact lock and
+compare it with the wizard's `LOCKED_REVISION`. Do not substitute the bundle
+commit or a mutable branch head.
 
 ## Phase 1: verify the unactivated release
 
@@ -227,6 +230,27 @@ find /etc/jarvis/protocol -xdev -type f -printf '%M %U %G %s %p\n'
 
 The reviewer compares the paths and metadata with the Compose mounts. Evidence
 records only the number of conforming files and the pass/fail outcome.
+
+### Native workers prepared before the window
+
+The Ubuntu service runs as the dedicated system account `jarvis-worker` with
+numeric UID `10008`. Its root-owned config is
+`/etc/jarvis/native/ubuntu-worker.json`; its listener is
+`/run/jarvis-worker/ubuntu.sock`, owned by UID `10008` with mode `0600`. The
+gateway container also runs as UID `10008`, so Linux `SO_PEERCRED`, socket owner,
+mode, canonical path, and the closed connection ID all have to match before an
+action can execute. The service uses a lingering per-user systemd manager only
+to create bounded transient action scopes. Preparation enables neither the unit
+nor its listener.
+
+The Windows worker is the `JarvisWindowsWorker` SCM service under
+`NT AUTHORITY\LocalService`, with startup type Manual. Its private key, client
+certificate, CA, closed identity config, immutable wheel, and virtual
+environment live below `%ProgramData%\Jarvis\worker` with inheritance removed
+and access limited to SYSTEM, Administrators, and LocalService. It opens an
+outbound TLS 1.3 connection to `100.106.206.88:9443` using server name
+`sami-lenovo.tailb09c76.ts.net`; Windows has no new inbound listener. Preparation
+does not start the service.
 
 Create and review these persistent boundaries before activation:
 
@@ -382,6 +406,9 @@ still show:
 - `stop_grace_period: 45s`;
 - port 2785 bound only to the exact private LAN address;
 - no public bind and no new published port.
+- the SSRF guard remains enabled and `SSRF_ALLOWED_HOSTS` contains exactly
+  `inbound_receiver`, allowing the reviewed internal webhook hostname without a
+  general SSRF bypass.
 
 Validate the changed OpenWA Compose model before recreating anything:
 
@@ -399,7 +426,10 @@ change.
 2. Confirm both pre-change backups and the rollback release. On a true first
    activation, confirm the recorded no-prior-Jarvis-state condition instead.
 3. Re-run the base bundle verifier and combined Compose parse.
-4. Start the native Ubuntu worker and verify its socket.
+4. Start `jarvis-ubuntu-worker.service`, require it to be active, and verify
+   `/run/jarvis-worker/ubuntu.sock` is a socket owned by UID `10008` at mode
+   `0600`. Start the Windows `JarvisWindowsWorker` service from the Windows host;
+   it will reconnect until the gateway listener becomes available.
 5. Activate the exact Jarvis profile using both Compose files:
 
 ```bash
@@ -463,6 +493,21 @@ labels rather than accepting a textual suffix. Any third member fails the gate.
 Confirm the OpenWA host still publishes port 2785 only on its exact private LAN
 address and that UFW remains active, default-deny inbound, with only the reviewed
 trusted private source. Confirm there is no router forwarding or public bind.
+
+Provision the signed inbound subscriber only after the exact handoff members are
+attached:
+
+```bash
+PYTHONPATH="$JARVIS_RELEASE/src" \
+  sudo -n "$JARVIS_RELEASE/.venv/bin/python" \
+  -m jarvis_control_plane.openwa_webhook
+```
+
+The command is idempotent. It reads credentials without printing them, updates
+or creates exactly one active `message.received` subscriber to
+`http://inbound_receiver:9011/webhook`, sets retry count three, and fails closed
+if another subscriber competes for the same event. Require its sanitized
+`count=1` verification before message admission.
 
 ## Phase 7: messaging and persistence acceptance
 
