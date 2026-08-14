@@ -587,7 +587,11 @@ def _activated_image_ids(
             capture_output=True,
             text=True,
         )
-        rows = json.loads(str(getattr(observed, "stdout", "")) or "[]")
+        output = str(getattr(observed, "stdout", ""))
+        try:
+            rows = json.loads(output or "[]")
+        except json.JSONDecodeError:
+            rows = [json.loads(line) for line in output.splitlines() if line.strip()]
         if isinstance(rows, Mapping):
             rows = [rows]
         containers = {

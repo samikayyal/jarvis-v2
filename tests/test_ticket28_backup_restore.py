@@ -14,6 +14,7 @@ import pytest
 from jarvis_control_plane import administrative_backup, deployment
 from jarvis_control_plane.administrative_backup import (
     BackupError,
+    _activated_image_ids,
     _consistent_snapshot,
     create_backup,
     restore_backup,
@@ -579,6 +580,111 @@ def test_backup_rejects_image_digests_that_do_not_match_activated_containers(
             roots=roots,
             runner=run,
         )
+
+
+@pytest.mark.parametrize(
+    ("output", "rows"),
+    (
+        (
+            json.dumps(
+                [
+                    {"Service": "broker", "ID": "container-1"},
+                    {"Service": "audit", "ID": "container-2"},
+                ]
+            ),
+            ("broker", "audit"),
+        ),
+        (json.dumps({"Service": "broker", "ID": "container-1"}), ("broker",)),
+        (
+            "\n".join(
+                json.dumps(row)
+                for row in (
+                    {"Service": "broker", "ID": "container-1"},
+                    {"Service": "audit", "ID": "container-2"},
+                )
+            ),
+            ("broker", "audit"),
+        ),
+    ),
+    ids=("array", "single-object", "json-lines"),
+)
+def test_activated_images_accept_compose_json_shapes(
+    output: str, rows: tuple[str, ...]
+) -> None:
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        if command[1] == "compose":
+            return SimpleNamespace(stdout=output)
+        return SimpleNamespace(
+            stdout="".join(
+                f"sha256:{index}" + str(index) * 63 + "\n"
+                for index in range(1, len(rows) + 1)
+            )
+        )
+
+    assert _activated_image_ids(Path("compose.yaml"), run) == {
+        service: f"sha256:{index}" + str(index) * 63
+        for index, service in enumerate(rows, start=1)
+    }
+
+
+@pytest.mark.parametrize(
+    "output",
+    (
+        "not-json",
+        json.dumps({"Service": "broker"}),
+        "\n".join(
+            json.dumps({"Service": "broker", "ID": container})
+            for container in ("container-1", "container-2")
+        ),
+    ),
+    ids=("malformed", "missing-id", "duplicate-service"),
+)
+def test_activated_images_reject_malformed_or_incomplete_rows(output: str) -> None:
+    def run(command: list[str], **_kwargs: object) -> object:
+        if command[1] == "compose":
+            return SimpleNamespace(stdout=output)
+        return SimpleNamespace(stdout="sha256:" + "1" * 64 + "\n")
+
+    with pytest.raises(BackupError, match="activated images are unavailable"):
+        _activated_image_ids(Path("compose.yaml"), run)
+
+
+def test_backup_rejects_incomplete_compose_container_output(tmp_path: Path) -> None:
+    roots, configuration, artifact_lock = _inputs(tmp_path)
+    (tmp_path / "compose.yaml").write_text(
+        "name: jarvis-assistant-v1\nservices:\n"
+        "  broker:\n    image: jarvis-broker\n"
+        "  audit:\n    image: jarvis-audit\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "image-digests.json").write_text(
+        json.dumps(
+            {
+                "broker": "jarvis-broker@sha256:" + "1" * 64,
+                "audit": "jarvis-audit@sha256:" + "2" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        if command[1] == "compose":
+            return SimpleNamespace(
+                stdout=json.dumps({"Service": "broker", "ID": "container-1"})
+            )
+        return SimpleNamespace(stdout="sha256:" + "1" * 64 + "\n")
+
+    with pytest.raises(BackupError, match="image digests do not match"):
+        create_backup(
+            destination=tmp_path / "backups",
+            kind="pre-change",
+            configuration=configuration,
+            artifact_lock=artifact_lock,
+            roots=roots,
+            runner=run,
+        )
+    assert not any((tmp_path / "backups").iterdir())
 
 
 def test_backup_rejects_an_audit_row_the_safe_reader_cannot_parse(
