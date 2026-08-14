@@ -140,9 +140,11 @@ the broker protocol.
 
 For a content-free aggregate view after activation, a local administrator can
 run `uv run python -m jarvis_control_plane.deployment deployment
---administrative-status [--backup-root /configured/backup/root]`. The host-side command reads Compose health locally and
-uses a one-off broker-identity process only for authenticated messaging, audit,
-and worker readiness. It reports no credentials or personal identifiers. Backup
+--administrative-status --activation-override /etc/jarvis/activation.compose.yaml
+[--backup-root /configured/backup/root]`. The host-side command reads the exact
+combined active Compose model and executes a read-only status probe inside the
+active broker for authenticated messaging, audit, and worker readiness. It
+reports no credentials or personal identifiers. Backup
 freshness is calculated on the host as `missing`, `current`, `stale`, or `invalid`
 from the local snapshot manifests without exposing backup contents.
 
