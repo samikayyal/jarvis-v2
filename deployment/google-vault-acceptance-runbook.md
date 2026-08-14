@@ -188,8 +188,9 @@ acceptance data without anyone else's data.
 
 First prove altered approval cannot dispatch:
 
-1. Ask Jarvis to prepare the labeled email and compare the complete recipient,
-   subject, body, action reference, and digest.
+1. Ask Jarvis to prepare the labeled email and compare complete To, Cc, Bcc,
+   subject, body, MIME type, attachments/other send fields, thread binding,
+   action reference, and digest.
 2. Reply `yes please`. Whole-message grammar must not dispatch; the pending
    action remains blocked.
 3. Reply exactly `reject`. Verify no matching sent message exists.
@@ -197,8 +198,8 @@ First prove altered approval cannot dispatch:
 Create a fresh proposal with a new UTC label. Compare every field and reply
 exactly `yes` only after both humans agree. Require one sent message and one
 terminal action outcome. Open the sent message in Gmail and compare its actual
-recipient, subject, body, and thread binding with the frozen proposal; every
-material field must match.
+To, Cc, Bcc, subject, body, MIME type, attachments/other send fields, and thread
+binding with the frozen proposal; every material field must match.
 
 After completion, send `yes` once as an old-approval replay check. It must not
 redispatch the completed action. If treated as a new ordinary request, finish or
@@ -211,7 +212,8 @@ Exercise unknown outcome only if the operator separately authorizes the exact
 labeled test and the reviewer has a previously reviewed post-dispatch transport
 interruption method. Require an unknown result, no automatic retry, and direct
 Gmail reconciliation showing zero or one send. Record reconciliation before a
-fresh request. If no method can prove post-dispatch interruption without new
+fresh request. If one send exists, compare the same complete material-field set
+with the frozen proposal. If no method can prove post-dispatch interruption without new
 authority, mark the row `blocked`; do not improvise with container kills,
 firewall edits, or proxy replacement.
 
@@ -237,9 +239,10 @@ calendar with summary `[JARVIS T31 ACCEPTANCE] ...`, a reviewed near-future
 time, explicit timezone, no attendees, and notifications disabled. Compare the
 complete frozen event, calendar target, action reference, and digest. Reply
 exactly `yes` only after both humans agree. Verify exactly one event externally.
-Open the event in Calendar and compare its actual calendar, summary, start/end,
-timezone, attendees, notification setting, and description with the frozen
-proposal; every material field must match.
+Open the event in Calendar and compare its actual event identity, calendar,
+summary, description, location, start/end, timezone, attendees, recurrence,
+visibility, reminders, and notification choice with the frozen proposal; every
+material field must match.
 
 First prove altered approval cannot dispatch: prepare a fresh labeled event,
 reply `yes please`, require the pending action to remain blocked, then reply
@@ -253,7 +256,9 @@ fresh pending action or dispatch remains.
 Exercise a Calendar unknown outcome only with separate authorization for the
 exact labeled test and a previously reviewed post-dispatch interruption method.
 Require an unknown result, no automatic retry, and direct Calendar
-reconciliation showing zero or one mutation before any fresh request. If no
+reconciliation showing zero or one mutation before any fresh request. If one
+mutation exists, compare the same complete material-field set with the frozen
+proposal. If no
 method can prove the interruption without new authority, mark the row `blocked`;
 do not improvise with container kills, firewall edits, or proxy replacement.
 
@@ -296,8 +301,11 @@ one commit and one normal push. Reply exactly `yes` only after both humans
 compare every field.
 
 Verify matching local and remote heads, a clean clone, exactly one approved path,
-and a committed diff equal to the frozen diff. Record commit prefixes and hashes
-of protected evidence, not remote URL, full note, or author address.
+and a committed diff equal to the frozen diff. Verify the actual local and remote
+commit subject is the fixed `jarvis:` subject and its author identity equals the
+configured identity from the frozen proposal. Record only commit prefixes,
+subject conformance, identity match, and hashes of protected evidence, not the
+remote URL, full note, author name, or author address.
 
 Do not run a manual `git push` to rescue a failed/unknown Jarvis push. Reconcile
 against the private remote before a fresh instruction. Exercise dirty clone,

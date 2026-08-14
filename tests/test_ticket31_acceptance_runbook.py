@@ -42,8 +42,11 @@ def test_runbook_covers_every_ticket31_real_system_gate() -> None:
     )
     assert all(row in runbook for row in required_rows)
     assert "one normal push" in runbook
-    assert "actual\nrecipient, subject, body, and thread binding" in runbook
-    assert "actual calendar, summary, start/end,\ntimezone, attendees" in runbook
+    assert "actual\nTo, Cc, Bcc, subject, body, MIME type" in runbook
+    assert "actual event identity, calendar,\nsummary, description, location" in runbook
+    assert runbook.count("same complete material-field set") == 2
+    assert "actual local and remote\ncommit subject is the fixed `jarvis:` subject" in runbook
+    assert "author identity equals the\nconfigured identity" in runbook
     assert "finish\nor cancel it without approving a side effect" in runbook
     assert "use this dedicated negative sequence instead\nof section 3" in runbook
     assert "must never create a proposal or connector\ndispatch" in runbook
