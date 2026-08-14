@@ -29,7 +29,10 @@ def test_runbook_covers_every_ticket31_real_system_gate() -> None:
         "| Gmail exact approval |",
         "| Gmail replay |",
         "| Gmail unknown outcome |",
+        "| Calendar altered approval |",
         "| Calendar exact approval |",
+        "| Calendar replay |",
+        "| Calendar unknown outcome |",
         "| Calendar stale generation |",
         "| Vault read |",
         "| Vault exact write |",
@@ -39,6 +42,7 @@ def test_runbook_covers_every_ticket31_real_system_gate() -> None:
     )
     assert all(row in runbook for row in required_rows)
     assert "one normal push" in runbook
+    assert runbook.count("actual material fields match the frozen proposal") == 2
     assert "must never create a proposal or connector\ndispatch" in runbook
 
 

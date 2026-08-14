@@ -196,7 +196,9 @@ First prove altered approval cannot dispatch:
 
 Create a fresh proposal with a new UTC label. Compare every field and reply
 exactly `yes` only after both humans agree. Require one sent message and one
-terminal action outcome.
+terminal action outcome. Open the sent message in Gmail and compare its actual
+recipient, subject, body, and thread binding with the frozen proposal; every
+material field must match.
 
 After completion, send `yes` once as an old-approval replay check. It must not
 redispatch the completed action. If treated as a new ordinary request, finish or
@@ -217,7 +219,7 @@ A Gmail reply may additionally use an operator-owned acceptance thread. Verify
 frozen source message/thread/recipient/header binding and the returned thread.
 It does not replace the required new-send row.
 
-## 5. Calendar exact approval and stale generation
+## 5. Calendar exact approval, alteration, replay, uncertainty, and stale generation
 
 Add only the named incremental Calendar write capability:
 
@@ -235,6 +237,23 @@ calendar with summary `[JARVIS T31 ACCEPTANCE] ...`, a reviewed near-future
 time, explicit timezone, no attendees, and notifications disabled. Compare the
 complete frozen event, calendar target, action reference, and digest. Reply
 exactly `yes` only after both humans agree. Verify exactly one event externally.
+Open the event in Calendar and compare its actual calendar, summary, start/end,
+timezone, attendees, notification setting, and description with the frozen
+proposal; every material field must match.
+
+First prove altered approval cannot dispatch: prepare a fresh labeled event,
+reply `yes please`, require the pending action to remain blocked, then reply
+exactly `reject` and verify no matching event exists. After the successful exact
+approval above, send `yes` once as an old-approval replay check. It must not
+redispatch the completed action; reconcile Calendar directly and require the
+labeled event count to remain one.
+
+Exercise a Calendar unknown outcome only with separate authorization for the
+exact labeled test and a previously reviewed post-dispatch interruption method.
+Require an unknown result, no automatic retry, and direct Calendar
+reconciliation showing zero or one mutation before any fresh request. If no
+method can prove the interruption without new authority, mark the row `blocked`;
+do not improvise with container kills, firewall edits, or proxy replacement.
 
 For stale-generation rejection, prepare a labeled event update and leave it
 pending. Disconnect and reconnect Google using section 3. Confirm the proposal
@@ -316,10 +335,13 @@ never copy them into the worksheet.
 | Drive reads | Real bounded list/get/export and binary refusal, no mutation | |
 | Disconnect/reconnect | Failed stale read, new bound generation, successful fresh read | |
 | Gmail altered approval | No dispatch and no sent message | |
-| Gmail exact approval | One labeled send and one terminal outcome | |
+| Gmail exact approval | One labeled send; actual material fields match the frozen proposal; one terminal outcome | |
 | Gmail replay | No second dispatch or message | |
 | Gmail unknown outcome | Separately approved, no retry, authoritative reconciliation | |
-| Calendar exact approval | One labeled event mutation and one terminal outcome | |
+| Calendar altered approval | No dispatch and no matching event | |
+| Calendar exact approval | One labeled event; actual material fields match the frozen proposal; one terminal outcome | |
+| Calendar replay | No second dispatch or event | |
+| Calendar unknown outcome | Separately approved, no retry, authoritative reconciliation | |
 | Calendar stale generation | Old proposal rejected before dispatch; event unchanged | |
 | Vault read | Synchronized deterministic read and bounded search | |
 | Vault exact write | Exact diff, one commit, one normal push, clean matching heads | |
