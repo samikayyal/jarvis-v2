@@ -1212,6 +1212,8 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "requirements.lock",
         "systemd/jarvis-backup.service",
         "systemd/jarvis-backup.timer",
+        "systemd/jarvis-ubuntu-worker.service",
+        "windows/install-jarvis-worker.ps1",
     )
     assert report.host_mutations == ()
 
