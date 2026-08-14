@@ -245,8 +245,10 @@ First prove altered approval cannot dispatch: prepare a fresh labeled event,
 reply `yes please`, require the pending action to remain blocked, then reply
 exactly `reject` and verify no matching event exists. After the successful exact
 approval above, send `yes` once as an old-approval replay check. It must not
-redispatch the completed action; reconcile Calendar directly and require the
-labeled event count to remain one.
+redispatch the completed action. If treated as a new ordinary request, finish
+or cancel it without approving a side effect. Reconcile Calendar directly,
+require the labeled event count and fields to remain unchanged, and confirm no
+fresh pending action or dispatch remains.
 
 Exercise a Calendar unknown outcome only with separate authorization for the
 exact labeled test and a previously reviewed post-dispatch interruption method.
@@ -255,12 +257,16 @@ reconciliation showing zero or one mutation before any fresh request. If no
 method can prove the interruption without new authority, mark the row `blocked`;
 do not improvise with container kills, firewall edits, or proxy replacement.
 
-For stale-generation rejection, prepare a labeled event update and leave it
-pending. Disconnect and reconnect Google using section 3. Confirm the proposal
-is the intentional test, then reply `yes`; the old generation must fail before
-dispatch and the event must remain unchanged. Do not create a replacement just
-to make this negative row green. Calendar deletion is excluded; cleanup is a
-separate manual UI action or separately approved reversible update.
+For stale-generation rejection, use this dedicated negative sequence instead
+of section 3's ordinary reconnect procedure: begin with no pending action,
+prepare one labeled event update, record its action reference and credential
+generation, and leave only that intentional proposal pending. Disconnect and
+reconnect Google without attempting or approving any other request. Confirm the
+same proposal remains the intentional test, then reply `yes`; its old generation
+must fail before dispatch and the event must remain unchanged. Confirm no pending
+action remains. Do not create a replacement just to make this negative row
+green. Calendar deletion is excluded; cleanup is a separate manual UI action or
+separately approved reversible update.
 
 ## 6. Deterministic vault read and exact normal push
 
