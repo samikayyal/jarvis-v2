@@ -903,8 +903,10 @@ def test_configuration_allows_lower_bounds_and_requires_https_callback() -> None
     )
 
 
+@pytest.mark.parametrize("compose_json_lines", (False, True))
 def test_administrative_status_reports_safe_operational_state(
     monkeypatch: pytest.MonkeyPatch,
+    compose_json_lines: bool,
 ) -> None:
     config = tomllib.loads(
         (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
@@ -944,12 +946,15 @@ def test_administrative_status_reports_safe_operational_state(
         nonlocal calls
         calls += 1
         if calls == 1:
+            rows = [
+                {"Service": service, "State": "running", "Health": "healthy"}
+                for service in services
+            ]
             return SimpleNamespace(
-                stdout=json.dumps(
-                    [
-                        {"Service": service, "State": "running", "Health": "healthy"}
-                        for service in services
-                    ]
+                stdout=(
+                    "\n".join(json.dumps(row) for row in rows)
+                    if compose_json_lines
+                    else json.dumps(rows)
                 )
             )
         return SimpleNamespace(stdout=json.dumps(dependency_status))
