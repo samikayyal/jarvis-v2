@@ -14,6 +14,7 @@ import pytest
 from jarvis_control_plane import administrative_backup, deployment
 from jarvis_control_plane.administrative_backup import (
     BackupError,
+    _activated_image_ids,
     _consistent_snapshot,
     create_backup,
     restore_backup,
@@ -579,6 +580,25 @@ def test_backup_rejects_image_digests_that_do_not_match_activated_containers(
             roots=roots,
             runner=run,
         )
+
+
+def test_activated_images_accept_compose_json_lines() -> None:
+    rows = (
+        {"Service": "broker", "ID": "container-1"},
+        {"Service": "audit", "ID": "container-2"},
+    )
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        if command[1] == "compose":
+            return SimpleNamespace(stdout="\n".join(json.dumps(row) for row in rows))
+        return SimpleNamespace(
+            stdout="sha256:" + "1" * 64 + "\nsha256:" + "2" * 64 + "\n"
+        )
+
+    assert _activated_image_ids(Path("compose.yaml"), run) == {
+        "broker": "sha256:" + "1" * 64,
+        "audit": "sha256:" + "2" * 64,
+    }
 
 
 def test_backup_rejects_an_audit_row_the_safe_reader_cannot_parse(
