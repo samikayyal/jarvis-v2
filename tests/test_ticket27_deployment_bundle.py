@@ -24,8 +24,8 @@ from jarvis_control_plane.codex_specialist import (
     CodexVerificationError,
 )
 from jarvis_control_plane.deployment import (
-    BundleValidationError,
     RESOURCE_LIMITS,
+    BundleValidationError,
     validate_configuration,
     verify_bundle,
 )
