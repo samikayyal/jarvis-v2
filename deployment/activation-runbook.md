@@ -110,6 +110,25 @@ Do not schedule activation until every row passes.
 - [ ] The backup roots and evidence path are outside all Jarvis-readable paths.
 - [ ] The rollback owner has reviewed the rollback commands and decision points.
 
+### Prepared pre-wizard state for `sami-lenovo`
+
+The non-activating preparation pass may leave the following root-only artifacts
+for independent review. Their presence is not activation authorization:
+
+| Prepared artifact | Purpose |
+| --- | --- |
+| `/etc/jarvis/jarvis.toml.pending` | Real OpenWA, callback, vault, and host values; remains `configuration_kind = "prepared"` until the Google subject is supplied and all identities are reviewed |
+| `/etc/jarvis/activation.compose.yaml.pending` | Exact reviewed activation override, not yet installed at the active path |
+| `/etc/jarvis/image-digests.json.prepared` | The 13 immutable prebuilt image IDs for pre-window comparison; activation still records the running IDs |
+| `/etc/jarvis/credentials/openwa-inbound` and `broker` | One generated webhook HMAC shared only across the signed inbound boundary |
+| `/etc/jarvis/credentials/openwa` | Existing OpenWA API credential copied internally without displaying it |
+| `/etc/jarvis/credentials/vault` | Dedicated GitHub deploy key, pinned `known_hosts`, and SSH configuration; the public key still requires human registration |
+| `/etc/jarvis/credentials/windows-worker` | Dedicated CA and gateway certificate/key; registration remains pending until the reviewed native worker UID is fixed |
+| `/var/backups/jarvis-ticket30-windows-worker` | Root-only staged Windows client certificate/key and private CA recovery material, outside Jarvis-readable paths |
+
+Preparation must leave `/etc/jarvis/jarvis.toml` absent, all Jarvis containers
+and `jarvis-*` networks absent, and OpenWA unchanged and healthy.
+
 The pinned application revision in the current reviewed lock is
 `cc52aaa976e7be4f2de76fc6295e2a3baf1f68fb`. Verify it from the installed lock;
 do not update the pin merely because the release bundle was merged by a later
@@ -328,6 +347,17 @@ bundle. Render the combined Jarvis model and confirm:
   `127.0.0.1:8080:8080`;
 - `worker_gateway` exposes but does not publish `9443`;
 - `deleted_conversation_archive` remains networkless.
+
+For this host, the separately reviewed TLS route is Tailscale Funnel at exactly
+`https://sami-lenovo.tailb09c76.ts.net/callback`, forwarding only that path to
+`http://127.0.0.1:8080`. Activate it only after the callback container is healthy:
+
+```bash
+tailscale funnel --bg --yes --https=443 --set-path=/callback http://127.0.0.1:8080
+tailscale funnel status
+```
+
+Rollback resets the Funnel route before stopping the new Compose release.
 
 ```bash
 docker compose \
