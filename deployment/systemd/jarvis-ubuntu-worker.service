@@ -12,6 +12,7 @@ RuntimeDirectory=jarvis-worker
 RuntimeDirectoryMode=0700
 Environment=XDG_RUNTIME_DIR=/run/user/10008
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/10008/bus
+Environment=PYTHONPATH=/opt/jarvis/current/src
 WorkingDirectory=/opt/jarvis/current
 ExecStart=/opt/jarvis/current/.venv/bin/python -m jarvis_control_plane.native_worker_runtime ubuntu --config /etc/jarvis/native/ubuntu-worker.json
 Restart=on-failure

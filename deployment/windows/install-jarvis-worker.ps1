@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Wheel,
+    [Parameter(Mandatory = $true)][string]$Requirements,
     [Parameter(Mandatory = $true)][string]$Config,
     [Parameter(Mandatory = $true)][string]$CaCertificate,
     [Parameter(Mandatory = $true)][string]$ClientCertificate,
@@ -24,7 +25,8 @@ Copy-Item -LiteralPath $ClientCertificate -Destination (Join-Path $credentials '
 Copy-Item -LiteralPath $ClientPrivateKey -Destination (Join-Path $credentials 'worker-private-key.pem')
 
 uv venv --python 3.13 $venv
-uv pip install --python (Join-Path $venv 'Scripts\python.exe') $Wheel
+uv pip install --python (Join-Path $venv 'Scripts\python.exe') --require-hashes -r $Requirements
+uv pip install --python (Join-Path $venv 'Scripts\python.exe') --no-deps $Wheel
 
 $acl = Get-Acl -LiteralPath $root
 $acl.SetAccessRuleProtection($true, $false)
@@ -39,5 +41,6 @@ Set-Acl -LiteralPath $root -AclObject $acl
 $python = Join-Path $venv 'Scripts\python.exe'
 $serviceArgs = "`"$python`" -m jarvis_control_plane.native_worker_runtime windows-service --config `"$(Join-Path $credentials 'worker.json')`""
 New-Service -Name $serviceName -BinaryPathName $serviceArgs -DisplayName 'Jarvis native Windows worker' -Description 'Outbound mTLS Jarvis worker over the private Tailscale overlay' -StartupType Manual | Out-Null
+sc.exe config $serviceName obj= 'NT AUTHORITY\LocalService' password= '' | Out-Null
 sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/15000/none/0 | Out-Null
 Write-Output "Installed $serviceName with Manual startup; the service was not started."

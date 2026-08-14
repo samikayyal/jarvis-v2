@@ -126,7 +126,7 @@ for independent review. Their presence is not activation authorization:
 | `/etc/jarvis/credentials/vault` | Dedicated GitHub deploy key, pinned `known_hosts`, and SSH configuration; the public key still requires human registration |
 | `/etc/jarvis/credentials/windows-worker` | Dedicated CA, gateway certificate/key, and closed registration using reviewed native worker UID `10008` |
 | `/var/backups/jarvis-ticket30-windows-worker` | Root-only staged Windows client certificate/key and private CA recovery material, outside Jarvis-readable paths |
-| `/etc/jarvis/native/ubuntu-worker.json` | Root-owned mode-`0600` Ubuntu listener identity and exact gateway UID; no secret values |
+| `/etc/jarvis/native/ubuntu-worker.json` | Worker-owned mode-`0400` Ubuntu listener identity and exact gateway UID, inside a root-owned restricted directory |
 | `jarvis-ubuntu-worker.service` | Installed, disabled, and inactive systemd unit for the UID-`10008` host worker |
 | `JarvisWindowsWorker` | Installed, Manual, and stopped Windows SCM service under `LocalService`; credentials are ACL-restricted under `%ProgramData%\Jarvis\worker` |
 | `/opt/openwa/compose.jarvis.pending.yaml` | Validated persistent OpenWA Compose candidate adding only the exact API and handoff networks plus `SSRF_ALLOWED_HOSTS=inbound_receiver`; the SSRF guard remains enabled and running OpenWA remains unchanged until supervised installation |
@@ -234,7 +234,7 @@ records only the number of conforming files and the pass/fail outcome.
 ### Native workers prepared before the window
 
 The Ubuntu service runs as the dedicated system account `jarvis-worker` with
-numeric UID `10008`. Its root-owned config is
+numeric UID `10008`. Its worker-owned mode-`0400` config is
 `/etc/jarvis/native/ubuntu-worker.json`; its listener is
 `/run/jarvis-worker/ubuntu.sock`, owned by UID `10008` with mode `0600`. The
 gateway container also runs as UID `10008`, so Linux `SO_PEERCRED`, socket owner,
@@ -498,9 +498,10 @@ Provision the signed inbound subscriber only after the exact handoff members are
 attached:
 
 ```bash
-PYTHONPATH="$JARVIS_RELEASE/src" \
-  sudo -n "$JARVIS_RELEASE/.venv/bin/python" \
-  -m jarvis_control_plane.openwa_webhook
+sudo -n env PYTHONPATH="$JARVIS_RELEASE/src" \
+  "$JARVIS_RELEASE/.venv/bin/python" \
+  -m jarvis_control_plane.openwa_webhook \
+  --api-base-url http://192.168.1.250:2785/api
 ```
 
 The command is idempotent. It reads credentials without printing them, updates

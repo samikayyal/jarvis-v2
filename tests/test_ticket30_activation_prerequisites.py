@@ -154,7 +154,9 @@ def test_deployment_contains_reviewed_native_service_definitions() -> None:
     handoff = (root / "deployment/openwa-handoff.md").read_text()
     assert "User=jarvis-worker" in unit
     assert "XDG_RUNTIME_DIR=/run/user/10008" in unit
+    assert "PYTHONPATH=/opt/jarvis/current/src" in unit
     assert "RestrictAddressFamilies=AF_UNIX" in unit
     assert "StartupType Manual" in installer
     assert "NT AUTHORITY\\LOCAL SERVICE" in installer
+    assert "obj= 'NT AUTHORITY\\LocalService'" in installer
     assert "SSRF_ALLOWED_HOSTS" in handoff
