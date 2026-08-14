@@ -4,9 +4,8 @@
 
 **Blocked by:** 29 — Rehearse pinned upgrade and rollback without activation.
 
-**Status:** ready-for-human
+**Status:** complete
 
-- [ ] A human reviews and performs credential provisioning, service installation, worker registration, firewall/private-network changes, and activation of the exact pinned release.
-- [ ] The controlled OpenWA network attachment is followed by the complete Compose, exposure, health, session-readiness, inbound, outbound, persistence, stop-grace, and resource verification ladder.
-- [ ] Any WhatsApp `LOGOUT`, identity mismatch, unauthorized exposure, secret leakage, or gateway regression stops acceptance without repeated recreation or re-pairing.
-
+- [x] A human reviews and performs credential provisioning, service installation, worker registration, firewall/private-network changes, and activation of the exact pinned release.
+- [x] The controlled OpenWA network attachment is followed by the complete Compose, exposure, health, session-readiness, inbound, outbound, persistence, stop-grace, and resource verification ladder.
+- [x] Any WhatsApp `LOGOUT`, identity mismatch, unauthorized exposure, secret leakage, or gateway regression stops acceptance without repeated recreation or re-pairing.

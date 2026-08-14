@@ -360,6 +360,8 @@ class AgentsSdkOrchestrationAdapter:
                 stale_vault_read = (synchronized_at, warning)
 
         try:
+            from agents import AgentOutputSchema
+
             tools = self._build_tools(
                 request,
                 milestones,
@@ -382,7 +384,7 @@ class AgentsSdkOrchestrationAdapter:
                     store=False,
                 ),
                 tools=tools,
-                output_type=AgentsSdkPlan,
+                output_type=AgentOutputSchema(AgentsSdkPlan, strict_json_schema=False),
             )
             run_config = self._run_config_factory(
                 tracing_disabled=True,

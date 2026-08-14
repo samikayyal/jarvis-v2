@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from threading import Event
 from typing import Self
+from urllib.parse import urlsplit
 from urllib.request import Request
 
 import pytest
@@ -123,6 +124,18 @@ def test_webhook_provision_creates_and_verifies_without_secret_output() -> None:
     assert requests[0].full_url.endswith("/internal%2Fsession/webhooks")
     assert requests[0].get_header("X-api-key") == "api-super-secret"
     assert b"hmac-super-secret" in (requests[1].data or b"")
+
+
+def test_webhook_target_uses_openwa_valid_network_alias() -> None:
+    hostname = urlsplit(TARGET_URL).hostname
+    assert hostname == "inbound-receiver"
+    assert hostname is not None and "_" not in hostname
+
+    root = Path(__file__).parents[1]
+    activation = (root / "deployment/activation.compose.example.yaml").read_text()
+    handoff = (root / "deployment/openwa-handoff.md").read_text()
+    assert "aliases: [inbound-receiver]" in activation
+    assert "SSRF_ALLOWED_HOSTS=inbound-receiver" in handoff
 
 
 def test_webhook_provision_fails_closed_on_competing_receiver() -> None:

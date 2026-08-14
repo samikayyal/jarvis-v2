@@ -393,6 +393,7 @@ def run_windows_worker_client(
     connection_closed = Event()
     try:
         if stop is not None:
+
             def close_when_stopped() -> None:
                 while not connection_closed.is_set() and not stop.wait(0.25):
                     pass

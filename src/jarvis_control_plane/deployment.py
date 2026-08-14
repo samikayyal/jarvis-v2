@@ -1132,7 +1132,9 @@ def _validate_native_worker_artifacts(root: Path, errors: list[str]) -> None:
         ("Service", "Restart"): ("on-failure",),
     }
     if any(unit.get(key) != value for key, value in required_unit.items()):
-        errors.append("native Ubuntu worker unit differs from reviewed security directives")
+        errors.append(
+            "native Ubuntu worker unit differs from reviewed security directives"
+        )
     exec_start = unit.get(("Service", "ExecStart"), ())
     expected_exec_start = (
         "/opt/jarvis/current/.venv/bin/python -m "
@@ -1140,11 +1142,11 @@ def _validate_native_worker_artifacts(root: Path, errors: list[str]) -> None:
         "/etc/jarvis/native/ubuntu-worker.json"
     )
     if exec_start != (expected_exec_start,):
-        errors.append("native Ubuntu worker command differs from the reviewed entrypoint")
+        errors.append(
+            "native Ubuntu worker command differs from the reviewed entrypoint"
+        )
 
-    installer = (root / "windows/install-jarvis-worker.ps1").read_text(
-        encoding="utf-8"
-    )
+    installer = (root / "windows/install-jarvis-worker.ps1").read_text(encoding="utf-8")
     required_windows_markers = (
         "$serviceName = 'JarvisWindowsWorker'",
         "'NT AUTHORITY\\LOCAL SERVICE'",
@@ -1152,7 +1154,9 @@ def _validate_native_worker_artifacts(root: Path, errors: list[str]) -> None:
         "-StartupType Manual",
     )
     if any(marker not in installer for marker in required_windows_markers):
-        errors.append("native Windows worker installer differs from reviewed boundaries")
+        errors.append(
+            "native Windows worker installer differs from reviewed boundaries"
+        )
 
 
 def _memory_mib(value: str) -> int:

@@ -129,7 +129,7 @@ for independent review. Their presence is not activation authorization:
 | `/etc/jarvis/native/ubuntu-worker.json` | Worker-owned mode-`0400` Ubuntu listener identity and exact gateway UID, inside a root-owned restricted directory |
 | `jarvis-ubuntu-worker.service` | Installed, disabled, and inactive systemd unit for the UID-`10008` host worker |
 | `JarvisWindowsWorker` | Installed, Manual, and stopped Windows SCM service under `LocalService`; credentials are ACL-restricted under `%ProgramData%\Jarvis\worker` |
-| `/opt/openwa/compose.jarvis.pending.yaml` | Validated persistent OpenWA Compose candidate adding only the exact API and handoff networks plus `SSRF_ALLOWED_HOSTS=inbound_receiver`; the SSRF guard remains enabled and running OpenWA remains unchanged until supervised installation |
+| `/opt/openwa/compose.jarvis.pending.yaml` | Validated persistent OpenWA Compose candidate adding only the exact API and handoff networks plus `SSRF_ALLOWED_HOSTS=inbound-receiver`; the SSRF guard remains enabled and running OpenWA remains unchanged until supervised installation |
 
 Preparation must leave `/etc/jarvis/jarvis.toml` absent, all Jarvis containers
 and `jarvis-*` networks absent, and OpenWA unchanged and healthy.
@@ -325,7 +325,7 @@ There are two distinct OpenWA routes:
 1. `jarvis-openwa-api` permits only the Jarvis OpenWA outbound connector to call
    the independently operated OpenWA API.
 2. `jarvis-openwa-handoff` permits only OpenWA to deliver signed inbound events
-   to `inbound_receiver` on `http://inbound_receiver:9011/webhook`.
+   to `inbound_receiver` through its `inbound-receiver` network alias on `http://inbound-receiver:9011/webhook`.
 
 Do not collapse these routes into a general shared network.
 
@@ -353,8 +353,9 @@ at `/etc/jarvis/activation.compose.yaml`. Its reviewed content is:
 services:
   inbound_receiver:
     networks:
-      - ingress_broker
-      - openwa_handoff
+      ingress_broker: {}
+      openwa_handoff:
+        aliases: [inbound-receiver]
 
 networks:
   openwa_handoff:
@@ -407,7 +408,7 @@ still show:
 - port 2785 bound only to the exact private LAN address;
 - no public bind and no new published port.
 - the SSRF guard remains enabled and `SSRF_ALLOWED_HOSTS` contains exactly
-  `inbound_receiver`, allowing the reviewed internal webhook hostname without a
+  `inbound-receiver`, allowing the reviewed internal webhook hostname without a
   general SSRF bypass.
 
 Validate the changed OpenWA Compose model before recreating anything:
@@ -506,7 +507,7 @@ sudo -n env PYTHONPATH="$JARVIS_RELEASE/src" \
 
 The command is idempotent. It reads credentials without printing them, updates
 or creates exactly one active `message.received` subscriber to
-`http://inbound_receiver:9011/webhook`, sets retry count three, and fails closed
+`http://inbound-receiver:9011/webhook`, sets retry count three, and fails closed
 if another subscriber competes for the same event. Require its sanitized
 `count=1` verification before message admission.
 

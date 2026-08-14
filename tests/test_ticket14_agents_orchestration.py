@@ -118,7 +118,9 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert settings.reasoning is not None
     assert settings.reasoning.effort == "high"
     assert captured["model"] == "gpt-5.6-terra"
-    assert captured["output_type"] is AgentsSdkPlan
+    output_type = captured["output_type"]
+    assert output_type.output_type is AgentsSdkPlan
+    assert output_type.is_strict_json_schema() is False
     assert captured["run_text"] == "inspect the repository"
     assert captured["run_kwargs"] == {
         "max_turns": 4,

@@ -115,7 +115,11 @@ def _canonical_text(value: object, label: str) -> str:
 
 
 def _bounded_int(value: object, label: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
         raise ValueError(f"{label} must be between {minimum} and {maximum}")
     return value
 
@@ -133,7 +137,13 @@ def _load_object(path: str | Path) -> Mapping[str, object]:
 
 def load_ubuntu_config(path: str | Path) -> UbuntuWorkerRuntimeConfig:
     value = _load_object(path)
-    required = {"worker_id", "connection_id", "socket_path", "gateway_uid", "process_limit"}
+    required = {
+        "worker_id",
+        "connection_id",
+        "socket_path",
+        "gateway_uid",
+        "process_limit",
+    }
     if set(value) != required:
         raise ValueError("Ubuntu worker config schema mismatch")
     return UbuntuWorkerRuntimeConfig(**value)  # type: ignore[arg-type]
@@ -142,9 +152,17 @@ def load_ubuntu_config(path: str | Path) -> UbuntuWorkerRuntimeConfig:
 def load_windows_config(path: str | Path) -> WindowsWorkerRuntimeConfig:
     value = _load_object(path)
     required = {
-        "worker_id", "connection_id", "application_identity", "overlay_host",
-        "overlay_port", "server_name", "ca_file", "certificate_file",
-        "private_key_file", "heartbeat_interval_seconds", "reconnect_seconds",
+        "worker_id",
+        "connection_id",
+        "application_identity",
+        "overlay_host",
+        "overlay_port",
+        "server_name",
+        "ca_file",
+        "certificate_file",
+        "private_key_file",
+        "heartbeat_interval_seconds",
+        "reconnect_seconds",
         "process_limit",
     }
     if set(value) != required:
@@ -154,7 +172,9 @@ def load_windows_config(path: str | Path) -> WindowsWorkerRuntimeConfig:
     return WindowsWorkerRuntimeConfig(**value)  # type: ignore[arg-type]
 
 
-def run_ubuntu_worker(config: UbuntuWorkerRuntimeConfig, stop: Event | None = None) -> None:
+def run_ubuntu_worker(
+    config: UbuntuWorkerRuntimeConfig, stop: Event | None = None
+) -> None:
     if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
         raise RuntimeError("native Ubuntu worker requires Linux")
     stop = stop or Event()
@@ -222,7 +242,12 @@ def run_windows_worker_loop(
     executor = SubprocessWindowsJobObjectExecutor(process_limit=config.process_limit)
     while not stop.is_set():
         try:
-            client(config=config.mtls, application_hello=config.hello, executor=executor, stop=stop)
+            client(
+                config=config.mtls,
+                application_hello=config.hello,
+                executor=executor,
+                stop=stop,
+            )
         except (ActionDispatcherError, OSError):
             pass
         if not stop.is_set():
@@ -248,14 +273,21 @@ def run_windows_service(config: WindowsWorkerRuntimeConfig) -> None:
 
     class ServiceStatus(ctypes.Structure):
         _fields_ = [
-            ("dwServiceType", wintypes.DWORD), ("dwCurrentState", wintypes.DWORD),
-            ("dwControlsAccepted", wintypes.DWORD), ("dwWin32ExitCode", wintypes.DWORD),
-            ("dwServiceSpecificExitCode", wintypes.DWORD), ("dwCheckPoint", wintypes.DWORD),
+            ("dwServiceType", wintypes.DWORD),
+            ("dwCurrentState", wintypes.DWORD),
+            ("dwControlsAccepted", wintypes.DWORD),
+            ("dwWin32ExitCode", wintypes.DWORD),
+            ("dwServiceSpecificExitCode", wintypes.DWORD),
+            ("dwCheckPoint", wintypes.DWORD),
             ("dwWaitHint", wintypes.DWORD),
         ]
 
-    handler_type = ctypes.WINFUNCTYPE(wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID)
-    main_type = ctypes.WINFUNCTYPE(None, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR))
+    handler_type = ctypes.WINFUNCTYPE(
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID
+    )
+    main_type = ctypes.WINFUNCTYPE(
+        None, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR)
+    )
     status_handle = wintypes.HANDLE()
 
     advapi32.RegisterServiceCtrlHandlerExW.argtypes = [
@@ -264,11 +296,16 @@ def run_windows_service(config: WindowsWorkerRuntimeConfig) -> None:
         wintypes.LPVOID,
     ]
     advapi32.RegisterServiceCtrlHandlerExW.restype = wintypes.HANDLE
-    advapi32.SetServiceStatus.argtypes = [wintypes.HANDLE, ctypes.POINTER(ServiceStatus)]
+    advapi32.SetServiceStatus.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ServiceStatus),
+    ]
     advapi32.SetServiceStatus.restype = wintypes.BOOL
 
     def set_status(state: int, accepted: int = 0, exit_code: int = 0) -> None:
-        status = ServiceStatus(0x10, state, accepted, exit_code, 0, 0, 30000 if state in {2, 3} else 0)
+        status = ServiceStatus(
+            0x10, state, accepted, exit_code, 0, 0, 30000 if state in {2, 3} else 0
+        )
         if not advapi32.SetServiceStatus(status_handle, ctypes.byref(status)):
             raise ctypes.WinError(ctypes.get_last_error())
 
@@ -282,7 +319,9 @@ def run_windows_service(config: WindowsWorkerRuntimeConfig) -> None:
     @main_type
     def service_main(_argc: int, _argv: object) -> None:
         nonlocal status_handle
-        status_handle = advapi32.RegisterServiceCtrlHandlerExW(service_name, handler, None)
+        status_handle = advapi32.RegisterServiceCtrlHandlerExW(
+            service_name, handler, None
+        )
         if not status_handle:
             return
         set_status(2)
@@ -295,7 +334,10 @@ def run_windows_service(config: WindowsWorkerRuntimeConfig) -> None:
         set_status(1, exit_code=exit_code)
 
     class ServiceTableEntry(ctypes.Structure):
-        _fields_ = [("lpServiceName", wintypes.LPWSTR), ("lpServiceProc", ctypes.c_void_p)]
+        _fields_ = [
+            ("lpServiceName", wintypes.LPWSTR),
+            ("lpServiceProc", ctypes.c_void_p),
+        ]
 
     advapi32.StartServiceCtrlDispatcherW.argtypes = [ctypes.POINTER(ServiceTableEntry)]
     advapi32.StartServiceCtrlDispatcherW.restype = wintypes.BOOL

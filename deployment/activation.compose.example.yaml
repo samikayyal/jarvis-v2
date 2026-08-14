@@ -4,8 +4,9 @@
 services:
   inbound_receiver:
     networks:
-      - ingress_broker
-      - openwa_handoff
+      ingress_broker: {}
+      openwa_handoff:
+        aliases: [inbound-receiver]
 
 networks:
   openwa_handoff:
