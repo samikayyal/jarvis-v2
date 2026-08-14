@@ -125,6 +125,7 @@ for independent review. Their presence is not activation authorization:
 | `/etc/jarvis/credentials/vault` | Dedicated GitHub deploy key, pinned `known_hosts`, and SSH configuration; the public key still requires human registration |
 | `/etc/jarvis/credentials/windows-worker` | Dedicated CA and gateway certificate/key; registration remains pending until the reviewed native worker UID is fixed |
 | `/var/backups/jarvis-ticket30-windows-worker` | Root-only staged Windows client certificate/key and private CA recovery material, outside Jarvis-readable paths |
+| `/opt/openwa/compose.jarvis.pending.yaml` | Validated persistent OpenWA Compose candidate adding only the exact API and handoff networks; the running OpenWA Compose file remains unchanged until supervised installation |
 
 Preparation must leave `/etc/jarvis/jarvis.toml` absent, all Jarvis containers
 and `jarvis-*` networks absent, and OpenWA unchanged and healthy.
