@@ -239,10 +239,13 @@ calendar with summary `[JARVIS T31 ACCEPTANCE] ...`, a reviewed near-future
 time, explicit timezone, no attendees, and notifications disabled. Compare the
 complete frozen event, calendar target, action reference, and digest. Reply
 exactly `yes` only after both humans agree. Verify exactly one event externally.
-Open the event in Calendar and compare its actual event identity, calendar,
-summary, description, location, start/end, timezone, attendees, recurrence,
-visibility, reminders, and notification choice with the frozen proposal; every
-material field must match.
+Open the event in Calendar, record the event ID returned by the create, and bind
+that ID to reconciliation; compare an event ID with the frozen proposal only for
+an update that supplied one. Compare the actual calendar, summary, description,
+location, start/end, timezone, attendees, recurrence, visibility, and reminders
+with the frozen proposal. Verify the exact notification choice from the
+protected provider request/audit trace because it is not an event-resource/UI
+field. Every material field must match without copying the trace into evidence.
 
 First prove altered approval cannot dispatch: prepare a fresh labeled event,
 reply `yes please`, require the pending action to remain blocked, then reply
