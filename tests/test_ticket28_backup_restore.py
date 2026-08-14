@@ -739,19 +739,26 @@ def test_administrative_status_cli_accepts_a_custom_backup_root(
 
     monkeypatch.setattr(deployment, "administrative_status", status)
     backup_root = tmp_path / "backups"
+    activation_override = tmp_path / "activation.compose.yaml"
+    activation_override.write_text("services: {}\n", encoding="utf-8")
 
     assert (
         deployment.main(
             [
                 str(tmp_path),
                 "--administrative-status",
+                "--activation-override",
+                str(activation_override),
                 "--backup-root",
                 str(backup_root),
             ]
         )
         == 0
     )
-    assert observed == {"backup_root": backup_root}
+    assert observed == {
+        "activation_override": activation_override,
+        "backup_root": backup_root,
+    }
 
 
 def test_bundle_rejects_effective_backup_unit_overrides(tmp_path: Path) -> None:

@@ -3,8 +3,8 @@
   "application": {
     "name": "jarvis-v2",
     "version": "0.1.0",
-    "git_revision": "16167776176079a741e370ac90894549e9fa8c09",
-    "source_sha256": "6ac7d7cdee9168096c4267ab65312e8cc0cf65aa803a2673496eec8deb9cdcec"
+    "git_revision": "97e2572daa9a6c93be7aa5bca6fa6e3ac7e40496",
+    "source_sha256": "7142fd18c0b9ad92182f41bb204d074734eaa95e9fb4f64451bcbb92bd0dab85"
   },
   "database_schemas": {
     "state": "4c4e03d8f879ad235051543caa4ef7782f408c05953087d5cf0201c261a59c43",

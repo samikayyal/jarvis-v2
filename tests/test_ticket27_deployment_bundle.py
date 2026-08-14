@@ -942,10 +942,12 @@ def test_administrative_status_reports_safe_operational_state(
 
     services = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT).services
     calls = 0
+    commands: list[list[str]] = []
 
-    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
         nonlocal calls
         calls += 1
+        commands.append(command)
         if calls == 1:
             rows = [
                 {"Service": service, "State": "running", "Health": "healthy"}
@@ -960,7 +962,10 @@ def test_administrative_status_reports_safe_operational_state(
             )
         return SimpleNamespace(stdout=json.dumps(dependency_status))
 
-    status = deployment_administrative_status(SHIPPED_BUNDLE, runner=run)
+    override = SHIPPED_BUNDLE / "activation.compose.example.yaml"
+    status = deployment_administrative_status(
+        SHIPPED_BUNDLE, activation_override=override, runner=run
+    )
 
     assert set(status) == {
         "components",
@@ -977,6 +982,31 @@ def test_administrative_status_reports_safe_operational_state(
     assert status["audit_writable"] is True
     assert status["backup_freshness"] == "missing"
     assert status["resource_pressure"] == "ok"
+    expected_prefix = [
+        "docker",
+        "compose",
+        "--file",
+        str((SHIPPED_BUNDLE / "compose.yaml").resolve()),
+        "--file",
+        str(override.resolve()),
+        "--profile",
+        "manual-activation",
+    ]
+    assert commands[0][:-4] == expected_prefix
+    assert commands[0][-4:] == ["ps", "--all", "--format", "json"]
+    assert commands[1] == [
+        *expected_prefix,
+        "exec",
+        "-T",
+        "capability_broker",
+        "uv",
+        "run",
+        "--no-project",
+        "python",
+        "-m",
+        "jarvis_control_plane.service_runtime",
+        "admin-status",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1016,7 +1046,11 @@ def test_administrative_status_rejects_ambiguous_compose_inventory(
         return SimpleNamespace(stdout=json.dumps(rows))
 
     with pytest.raises(RuntimeError, match="administrative status is unavailable"):
-        deployment_administrative_status(SHIPPED_BUNDLE, runner=run)
+        deployment_administrative_status(
+            SHIPPED_BUNDLE,
+            activation_override=SHIPPED_BUNDLE / "activation.compose.example.yaml",
+            runner=run,
+        )
     assert calls == 1
 
 

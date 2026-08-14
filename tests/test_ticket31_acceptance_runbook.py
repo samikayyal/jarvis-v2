@@ -45,9 +45,15 @@ def test_runbook_covers_every_ticket31_real_system_gate() -> None:
     assert "actual\nTo, Cc, Bcc, subject, body, MIME type" in runbook
     assert "event ID returned by the create" in runbook
     assert "compare an event ID with the frozen proposal only for\nan update" in runbook
-    assert "notification choice from the\nprotected provider request/audit trace" in runbook
+    assert (
+        "notification choice from the\nprotected provider request/audit trace"
+        in runbook
+    )
     assert runbook.count("same complete material-field set") == 2
-    assert "actual local and remote\ncommit subject is the fixed `jarvis:` subject" in runbook
+    assert (
+        "actual local and remote\ncommit subject is the fixed `jarvis:` subject"
+        in runbook
+    )
     assert "author identity equals the\nconfigured identity" in runbook
     assert "finish\nor cancel it without approving a side effect" in runbook
     assert "use this dedicated negative sequence instead\nof section 3" in runbook

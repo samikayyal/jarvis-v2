@@ -73,7 +73,8 @@ docker compose --file deployment/compose.yaml \
   --file "$JARVIS_ACTIVE_OVERRIDE" --profile manual-activation ps
 docker compose --file deployment/compose.yaml \
   --file "$JARVIS_ACTIVE_OVERRIDE" --profile manual-activation \
-  run --rm capability_broker admin-status
+  exec -T capability_broker uv run --no-project python -m \
+  jarvis_control_plane.service_runtime admin-status
 ```
 
 Compare the commit, artifact lock, override hash, and image map with protected

@@ -453,6 +453,7 @@ PYTHONPATH="$JARVIS_RELEASE/src" \
   "$JARVIS_RELEASE/.venv/bin/python" -m jarvis_control_plane.deployment \
   "$JARVIS_RELEASE/deployment" \
   --configuration "$JARVIS_CONFIG" \
+  --activation-override "$JARVIS_ACTIVATION_OVERRIDE" \
   --administrative-status --backup-root /var/backups/jarvis
 ```
 

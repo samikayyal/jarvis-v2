@@ -1196,6 +1196,7 @@ def _compose_json_rows(output: str) -> list[object]:
 def administrative_status(
     bundle: str | Path,
     *,
+    activation_override: str | Path,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     backup_root: str | Path = "/var/backups/jarvis",
     now: datetime | None = None,
@@ -1203,11 +1204,16 @@ def administrative_status(
     """Combine local Compose health with authenticated dependency status."""
 
     compose = Path(bundle).resolve() / "compose.yaml"
+    override = Path(activation_override).resolve()
+    if not override.is_file():
+        raise RuntimeError("administrative status activation override is unavailable")
     base = [
         "docker",
         "compose",
         "--file",
         str(compose),
+        "--file",
+        str(override),
         "--profile",
         "manual-activation",
     ]
@@ -1241,7 +1247,19 @@ def administrative_status(
             for service in RESOURCE_LIMITS
         }
         dependency = runner(
-            [*base, "run", "--rm", "capability_broker", "admin-status"],
+            [
+                *base,
+                "exec",
+                "-T",
+                "capability_broker",
+                "uv",
+                "run",
+                "--no-project",
+                "python",
+                "-m",
+                "jarvis_control_plane.service_runtime",
+                "admin-status",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -1295,6 +1313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--configuration", type=Path)
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--administrative-status", action="store_true")
+    parser.add_argument("--activation-override", type=Path)
     parser.add_argument("--backup-root", type=Path, default=Path("/var/backups/jarvis"))
     args = parser.parse_args(argv)
     try:
@@ -1308,9 +1327,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"ERROR: {error}")
         return 1
     if args.administrative_status:
+        if args.activation_override is None:
+            parser.error(
+                "--activation-override is required with --administrative-status"
+            )
         print(
             json.dumps(
-                administrative_status(args.bundle, backup_root=args.backup_root),
+                administrative_status(
+                    args.bundle,
+                    activation_override=args.activation_override,
+                    backup_root=args.backup_root,
+                ),
                 sort_keys=True,
             )
         )
