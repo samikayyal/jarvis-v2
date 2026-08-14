@@ -1241,7 +1241,19 @@ def administrative_status(
             for service in RESOURCE_LIMITS
         }
         dependency = runner(
-            [*base, "run", "--rm", "capability_broker", "admin-status"],
+            [
+                *base,
+                "exec",
+                "-T",
+                "capability_broker",
+                "uv",
+                "run",
+                "--no-project",
+                "python",
+                "-m",
+                "jarvis_control_plane.service_runtime",
+                "admin-status",
+            ],
             check=True,
             capture_output=True,
             text=True,

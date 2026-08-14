@@ -942,10 +942,12 @@ def test_administrative_status_reports_safe_operational_state(
 
     services = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT).services
     calls = 0
+    commands: list[list[str]] = []
 
-    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
         nonlocal calls
         calls += 1
+        commands.append(command)
         if calls == 1:
             rows = [
                 {"Service": service, "State": "running", "Health": "healthy"}
@@ -977,6 +979,18 @@ def test_administrative_status_reports_safe_operational_state(
     assert status["audit_writable"] is True
     assert status["backup_freshness"] == "missing"
     assert status["resource_pressure"] == "ok"
+    assert commands[1][-10:] == [
+        "exec",
+        "-T",
+        "capability_broker",
+        "uv",
+        "run",
+        "--no-project",
+        "python",
+        "-m",
+        "jarvis_control_plane.service_runtime",
+        "admin-status",
+    ]
 
 
 @pytest.mark.parametrize(
