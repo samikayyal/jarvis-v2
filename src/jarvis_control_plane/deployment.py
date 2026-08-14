@@ -1250,6 +1250,7 @@ def administrative_status(
             [
                 *base,
                 "exec",
+                "--interactive=false",
                 "-T",
                 "capability_broker",
                 "uv",
