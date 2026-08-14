@@ -73,7 +73,7 @@ docker compose --file deployment/compose.yaml \
   --file "$JARVIS_ACTIVE_OVERRIDE" --profile manual-activation ps
 docker compose --file deployment/compose.yaml \
   --file "$JARVIS_ACTIVE_OVERRIDE" --profile manual-activation \
-  exec -T capability_broker uv run --no-project python -m \
+  exec --interactive=false -T capability_broker uv run --no-project python -m \
   jarvis_control_plane.service_runtime admin-status
 ```
 

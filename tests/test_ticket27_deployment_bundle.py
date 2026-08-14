@@ -127,6 +127,9 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         )
         for name in report.services
     }
+    assert compose["services"]["capability_broker"]["depends_on"] == {
+        "deleted_conversation_archive": {"condition": "service_healthy"}
+    }
 
 
 def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
@@ -997,6 +1000,7 @@ def test_administrative_status_reports_safe_operational_state(
     assert commands[1] == [
         *expected_prefix,
         "exec",
+        "--interactive=false",
         "-T",
         "capability_broker",
         "uv",

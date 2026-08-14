@@ -47,6 +47,9 @@ services:
     environment:
       JARVIS_SERVICE_IDENTITY: jarvis-broker
     command: [serve, capability_broker]
+    depends_on:
+      deleted_conversation_archive:
+        condition: service_healthy
     volumes:
       - /etc/jarvis/jarvis.toml:/run/jarvis/config.toml:ro
       - /etc/jarvis/credentials/broker:/run/credentials/broker:ro
