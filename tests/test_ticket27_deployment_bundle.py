@@ -130,6 +130,15 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     assert compose["services"]["capability_broker"]["depends_on"] == {
         "deleted_conversation_archive": {"condition": "service_healthy"}
     }
+    assert {
+        service: compose["services"][service]["healthcheck"]["start_period"]
+        for service in report.services
+        if service.endswith("_egress_proxy")
+    } == {
+        "google_egress_proxy": "10m",
+        "orchestration_egress_proxy": "10m",
+        "vault_egress_proxy": "10m",
+    }
 
 
 def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:

@@ -444,8 +444,9 @@ docker compose \
   --profile manual-activation up -d --no-build --pull never
 ```
 
-6. Require every Jarvis container to be running and healthy. A restart or health
-   failure stops activation.
+6. Require every Jarvis container to be running and healthy. Allow the three
+   0.03-CPU egress proxies their reviewed 10-minute cold-start health period; a
+   restart or health failure after its applicable start period stops activation.
 7. Verify the host-side aggregate status without exposing personal identifiers:
 
 ```bash
