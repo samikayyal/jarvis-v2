@@ -39,7 +39,7 @@ services:
     pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 64M, cpus: "0.10"}
+        limits: {memory: 64M, cpus: "0.10", pids: 32}
 
   capability_broker:
     <<: *service-defaults
@@ -72,7 +72,7 @@ services:
     pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 144M, cpus: "0.25"}
+        limits: {memory: 144M, cpus: "0.25", pids: 32}
 
   orchestration_agent:
     <<: *service-defaults
@@ -95,7 +95,7 @@ services:
     pids_limit: 112
     deploy:
       resources:
-        limits: {memory: 224M, cpus: "0.42"}
+        limits: {memory: 224M, cpus: "0.42", pids: 112}
 
   audit_service:
     <<: *service-defaults
@@ -112,7 +112,7 @@ services:
     pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 64M, cpus: "0.10"}
+        limits: {memory: 64M, cpus: "0.10", pids: 32}
 
   google_connector:
     <<: *service-defaults
@@ -135,7 +135,7 @@ services:
     pids_limit: 48
     deploy:
       resources:
-        limits: {memory: 64M, cpus: "0.12"}
+        limits: {memory: 64M, cpus: "0.12", pids: 48}
 
   knowledge_vault_connector:
     <<: *service-defaults
@@ -153,7 +153,7 @@ services:
     pids_limit: 48
     deploy:
       resources:
-        limits: {memory: 96M, cpus: "0.17"}
+        limits: {memory: 96M, cpus: "0.17", pids: 48}
 
   openwa_outbound_connector:
     <<: *service-defaults
@@ -169,7 +169,7 @@ services:
     pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 64M, cpus: "0.10"}
+        limits: {memory: 64M, cpus: "0.10", pids: 32}
 
   worker_gateway:
     <<: *service-defaults
@@ -187,7 +187,7 @@ services:
     pids_limit: 64
     deploy:
       resources:
-        limits: {memory: 96M, cpus: "0.25"}
+        limits: {memory: 96M, cpus: "0.25", pids: 64}
 
   public_oauth_callback:
     <<: *service-defaults
@@ -203,7 +203,7 @@ services:
     pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 48M, cpus: "0.10"}
+        limits: {memory: 48M, cpus: "0.10", pids: 32}
 
   deleted_conversation_archive:
     <<: *service-defaults
@@ -220,7 +220,7 @@ services:
     pids_limit: 32
     deploy:
       resources:
-        limits: {memory: 48M, cpus: "0.10"}
+        limits: {memory: 48M, cpus: "0.10", pids: 32}
 
   orchestration_egress_proxy:
     <<: *service-defaults
@@ -237,7 +237,7 @@ services:
     pids_limit: 16
     deploy:
       resources:
-        limits: {memory: 32M, cpus: "0.03"}
+        limits: {memory: 32M, cpus: "0.03", pids: 16}
 
   google_egress_proxy:
     <<: *service-defaults
@@ -254,7 +254,7 @@ services:
     pids_limit: 16
     deploy:
       resources:
-        limits: {memory: 32M, cpus: "0.03"}
+        limits: {memory: 32M, cpus: "0.03", pids: 16}
 
   vault_egress_proxy:
     <<: *service-defaults
@@ -271,7 +271,7 @@ services:
     pids_limit: 16
     deploy:
       resources:
-        limits: {memory: 32M, cpus: "0.03"}
+        limits: {memory: 32M, cpus: "0.03", pids: 16}
 
 networks:
   ingress_broker: {internal: true}

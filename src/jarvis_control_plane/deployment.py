@@ -46,6 +46,8 @@ REQUIRED_FILES = (
     "requirements.lock",
     "systemd/jarvis-backup.service",
     "systemd/jarvis-backup.timer",
+    "systemd/jarvis-ubuntu-worker.service",
+    "windows/install-jarvis-worker.ps1",
 )
 
 DATABASE_SCHEMAS = MappingProxyType(
@@ -287,6 +289,7 @@ def verify_bundle(
     handoff_active = _validate_compose(compose, config, errors)
     _validate_handoff_description(root / "openwa-handoff.md", errors)
     _validate_backup_units(root / "systemd", errors)
+    _validate_native_worker_artifacts(root, errors)
 
     if errors:
         raise BundleValidationError(tuple(dict.fromkeys(errors)))
@@ -1030,6 +1033,7 @@ def _validate_service_resources(
     limits = resources.get("limits") if isinstance(resources, Mapping) else None
     actual_memory = limits.get("memory") if isinstance(limits, Mapping) else None
     actual_cpus = limits.get("cpus") if isinstance(limits, Mapping) else None
+    actual_pids = limits.get("pids") if isinstance(limits, Mapping) else None
     try:
         actual_cpu_decimal = Decimal(str(actual_cpus))
     except InvalidOperation:
@@ -1038,6 +1042,8 @@ def _validate_service_resources(
         errors.append(f"{service} memory limit must be {expected.memory}")
     if actual_cpu_decimal != expected.cpus:
         errors.append(f"{service} CPU limit must be {expected.cpus}")
+    if actual_pids != expected.pids:
+        errors.append(f"{service} deploy PID limit must be {expected.pids}")
     if raw.get("pids_limit") != expected.pids:
         errors.append(f"{service} PID limit must be {expected.pids}")
 
@@ -1110,6 +1116,47 @@ def _unit_directives(text: str) -> dict[tuple[str, str], tuple[str, ...]]:
         else:
             directive.append(value)
     return {key: tuple(value) for key, value in values.items()}
+
+
+def _validate_native_worker_artifacts(root: Path, errors: list[str]) -> None:
+    unit = _unit_directives(
+        (root / "systemd/jarvis-ubuntu-worker.service").read_text(encoding="utf-8")
+    )
+    required_unit = {
+        ("Service", "User"): ("jarvis-worker",),
+        ("Service", "Group"): ("jarvis-worker",),
+        ("Service", "UMask"): ("0077",),
+        ("Service", "RuntimeDirectory"): ("jarvis-worker",),
+        ("Service", "NoNewPrivileges"): ("yes",),
+        ("Service", "RestrictAddressFamilies"): ("AF_UNIX",),
+        ("Service", "Restart"): ("on-failure",),
+    }
+    if any(unit.get(key) != value for key, value in required_unit.items()):
+        errors.append(
+            "native Ubuntu worker unit differs from reviewed security directives"
+        )
+    exec_start = unit.get(("Service", "ExecStart"), ())
+    expected_exec_start = (
+        "/opt/jarvis/current/.venv/bin/python -m "
+        "jarvis_control_plane.native_worker_runtime ubuntu --config "
+        "/etc/jarvis/native/ubuntu-worker.json"
+    )
+    if exec_start != (expected_exec_start,):
+        errors.append(
+            "native Ubuntu worker command differs from the reviewed entrypoint"
+        )
+
+    installer = (root / "windows/install-jarvis-worker.ps1").read_text(encoding="utf-8")
+    required_windows_markers = (
+        "$serviceName = 'JarvisWindowsWorker'",
+        "'NT AUTHORITY\\LOCAL SERVICE'",
+        "windows-service --config",
+        "-StartupType Manual",
+    )
+    if any(marker not in installer for marker in required_windows_markers):
+        errors.append(
+            "native Windows worker installer differs from reviewed boundaries"
+        )
 
 
 def _memory_mib(value: str) -> int:

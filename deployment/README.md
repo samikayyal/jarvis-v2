@@ -1,5 +1,10 @@
 # Jarvis Assistant V1 unactivated bundle
 
+The supervised production procedure is documented in
+[`activation-runbook.md`](activation-runbook.md). Do not use that runbook until
+this unactivated bundle, its exact release pins, and every manual trust boundary
+have been independently reviewed.
+
 This directory is a reviewed, offline-verifiable deployment description. Every
 container is behind the `manual-activation` Compose profile. Running the verifier
 does not build or start a container, install either native worker, provision a

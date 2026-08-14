@@ -107,7 +107,9 @@ def open_windows_worker_mtls_session(
         (config.overlay_host, config.overlay_port), timeout=timeout_seconds
     )
     try:
-        return context.wrap_socket(raw, server_hostname=config.server_name)
+        tls = context.wrap_socket(raw, server_hostname=config.server_name)
+        tls.settimeout(None)
+        return tls
     except BaseException:
         raw.close()
         raise

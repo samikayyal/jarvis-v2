@@ -389,8 +389,24 @@ def run_windows_worker_client(
     if stop is not None and stop.is_set():
         return
     connection = open_windows_worker_mtls_session(config)
+    stop_watcher: Thread | None = None
+    connection_closed = Event()
     try:
+        if stop is not None:
+
+            def close_when_stopped() -> None:
+                while not connection_closed.is_set() and not stop.wait(0.25):
+                    pass
+                if stop.is_set() and not connection_closed.is_set():
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+            stop_watcher = Thread(target=close_when_stopped, daemon=True)
+            stop_watcher.start()
         _send_frame(connection, {"hello": application_hello.decode("utf-8")})
         serve_windows_worker_session(connection, executor)
     finally:
+        connection_closed.set()
         connection.close()

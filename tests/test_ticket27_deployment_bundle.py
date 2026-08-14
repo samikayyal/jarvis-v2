@@ -1015,6 +1015,7 @@ def test_bundle_rejects_security_network_and_resource_regressions(
     receiver["privileged"] = True
     receiver["networks"].append("openwa-handoff")
     receiver["deploy"]["resources"]["limits"]["memory"] = "2G"
+    receiver["deploy"]["resources"]["limits"]["pids"] = 31
     compose["networks"]["openwa-handoff"] = {"external": True}
     compose_path.write_text(yaml.safe_dump(compose), encoding="utf-8")
 
@@ -1026,6 +1027,7 @@ def test_bundle_rejects_security_network_and_resource_regressions(
         "production OpenWA handoff network must not be activated" in raised.value.errors
     )
     assert "inbound_receiver memory limit must be 64M" in raised.value.errors
+    assert "inbound_receiver deploy PID limit must be 32" in raised.value.errors
 
 
 def test_bundle_routes_credentialed_egress_only_through_allowlisted_proxies(
@@ -1210,6 +1212,8 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "requirements.lock",
         "systemd/jarvis-backup.service",
         "systemd/jarvis-backup.timer",
+        "systemd/jarvis-ubuntu-worker.service",
+        "windows/install-jarvis-worker.ps1",
     )
     assert report.host_mutations == ()
 

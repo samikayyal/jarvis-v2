@@ -25,7 +25,9 @@ from jarvis_control_plane import (
     WorkerIdentity,
     WorkerInvocation,
     authenticate_windows_worker_session,
+    open_windows_worker_mtls_session,
 )
+from jarvis_control_plane import windows_worker as windows_worker_module
 from jarvis_control_plane.terminal_policy import TerminalAction
 from jarvis_control_plane.windows_worker_session import SocketWindowsWorkerSession
 
@@ -155,6 +157,62 @@ def test_mtls_configuration_requires_absolute_credentials_and_bounded_endpoint()
             certificate_file=config.certificate_file,
             private_key_file=config.private_key_file,
         )
+
+
+def test_mtls_connect_timeout_is_cleared_after_the_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRawSocket:
+        def close(self) -> None:
+            raise AssertionError("successful handshake must not close the raw socket")
+
+    class FakeTlsSocket:
+        def __init__(self) -> None:
+            self.timeouts: list[float | None] = []
+
+        def settimeout(self, value: float | None) -> None:
+            self.timeouts.append(value)
+
+    tls = FakeTlsSocket()
+
+    class FakeContext:
+        minimum_version: object
+        maximum_version: object
+        verify_mode: object
+        check_hostname: bool
+
+        def load_verify_locations(self, *, cafile: str) -> None:
+            assert cafile.endswith("ca.pem")
+
+        def load_cert_chain(self, *, certfile: str, keyfile: str) -> None:
+            assert certfile.endswith("worker.pem")
+            assert keyfile.endswith("worker.key")
+
+        def wrap_socket(
+            self, raw: FakeRawSocket, *, server_hostname: str
+        ) -> FakeTlsSocket:
+            assert server_hostname == "worker-gateway.jarvis.internal"
+            return tls
+
+    monkeypatch.setattr(
+        windows_worker_module.ssl, "SSLContext", lambda _: FakeContext()
+    )
+    monkeypatch.setattr(
+        windows_worker_module.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: FakeRawSocket(),
+    )
+    config = WindowsMtlsClientConfig(
+        overlay_host="100.64.0.10",
+        overlay_port=8443,
+        server_name="worker-gateway.jarvis.internal",
+        ca_file=Path("C:/Jarvis/credentials/ca.pem"),
+        certificate_file=Path("C:/Jarvis/credentials/worker.pem"),
+        private_key_file=Path("C:/Jarvis/credentials/worker.key"),
+    )
+
+    assert open_windows_worker_mtls_session(config) is tls
+    assert tls.timeouts == [None]
 
 
 def test_production_transport_accepts_only_certificate_bound_application_hello() -> (
