@@ -52,8 +52,19 @@ GOOGLE_OAUTH_SCOPES = GOOGLE_OAUTH_BASELINE_SCOPES | frozenset(
     }
 )
 _CALLBACK_FIELDS = frozenset(
-    {"state", "code", "scope", "error", "error_description", "error_uri"}
+    {
+        "state",
+        "code",
+        "scope",
+        "error",
+        "error_description",
+        "error_uri",
+        "iss",
+        "authuser",
+        "prompt",
+    }
 )
+_GOOGLE_AUTHORIZATION_ISSUER = "https://accounts.google.com"
 
 
 class GoogleOAuthError(RuntimeError):
@@ -1270,6 +1281,17 @@ class GoogleOAuthLifecycle:
             return False
         state = query.get("state")
         if state is None:
+            return False
+        issuer = query.get("iss")
+        if issuer is not None and issuer != _GOOGLE_AUTHORIZATION_ISSUER:
+            return False
+        authuser = query.get("authuser")
+        if authuser is not None and (
+            len(authuser) > 3 or not authuser.isascii() or not authuser.isdecimal()
+        ):
+            return False
+        prompt = query.get("prompt")
+        if prompt is not None and prompt != "consent":
             return False
         has_code = "code" in query
         has_error = "error" in query

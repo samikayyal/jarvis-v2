@@ -147,6 +147,64 @@ def test_callback_consumes_state_once_and_replaces_connector_credential() -> Non
         trace_store._close_writer_service()
 
 
+def test_callback_accepts_google_authorization_response_metadata() -> None:
+    credentials = InMemoryGoogleCredentialStore()
+    lifecycle, trace_store = build_lifecycle(credentials=credentials)
+    try:
+        authorization = lifecycle.start_authorization(
+            operation_id="connect-google-live-shape", requested_scopes=READ_SCOPES
+        )
+
+        accepted = lifecycle.handle_callback(
+            method="GET",
+            query={
+                "state": authorization.state,
+                "code": "code-1",
+                "scope": " ".join(sorted(authorization.requested_scopes)),
+                "iss": "https://accounts.google.com",
+                "authuser": "0",
+                "prompt": "consent",
+            },
+        )
+
+        assert accepted.status_code == 204
+        assert lifecycle.connection.connected
+        assert credentials.current is not None
+    finally:
+        trace_store._close_writer_service()
+
+
+def test_callback_rejects_invalid_google_response_metadata_without_consuming_state(
+) -> None:
+    lifecycle, trace_store = build_lifecycle()
+    try:
+        authorization = lifecycle.start_authorization(
+            operation_id="connect-google-invalid-metadata",
+            requested_scopes=READ_SCOPES,
+        )
+        base = {
+            "state": authorization.state,
+            "code": "code-1",
+            "scope": " ".join(sorted(authorization.requested_scopes)),
+            "iss": "https://accounts.google.com",
+            "authuser": "0",
+            "prompt": "consent",
+        }
+
+        assert lifecycle.handle_callback(
+            method="GET", query={**base, "iss": "https://issuer.invalid"}
+        ).status_code == 400
+        assert lifecycle.handle_callback(
+            method="GET", query={**base, "authuser": "-1"}
+        ).status_code == 400
+        assert lifecycle.handle_callback(
+            method="GET", query={**base, "prompt": "select_account"}
+        ).status_code == 400
+        assert lifecycle.handle_callback(method="GET", query=base).status_code == 204
+    finally:
+        trace_store._close_writer_service()
+
+
 def test_incremental_authorization_retains_existing_scopes_and_adds_one_write_scope() -> (
     None
 ):
