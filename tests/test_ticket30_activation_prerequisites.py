@@ -173,3 +173,12 @@ def test_deployment_contains_reviewed_native_service_definitions() -> None:
     assert "NT AUTHORITY\\LOCAL SERVICE" in installer
     assert "obj= 'NT AUTHORITY\\LocalService'" in installer
     assert "SSRF_ALLOWED_HOSTS" in handoff
+
+
+def test_oauth_funnel_preserves_the_closed_callback_path() -> None:
+    root = Path(__file__).parents[1]
+    runbook = (root / "deployment/activation-runbook.md").read_text()
+    assert (
+        "--set-path=/callback http://127.0.0.1:8080/callback" in runbook
+    )
+    assert "--set-path=/callback http://127.0.0.1:8080\n" not in runbook

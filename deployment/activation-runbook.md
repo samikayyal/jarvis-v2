@@ -379,9 +379,13 @@ For this host, the separately reviewed TLS route is Tailscale Funnel at exactly
 `http://127.0.0.1:8080`. Activate it only after the callback container is healthy:
 
 ```bash
-tailscale funnel --bg --yes --https=443 --set-path=/callback http://127.0.0.1:8080
+tailscale funnel --bg --yes --https=443 --set-path=/callback http://127.0.0.1:8080/callback
 tailscale funnel status
 ```
+
+Tailscale strips the public mount prefix before proxying. The target therefore
+retains `/callback` so the loopback handler receives its exact closed route;
+targeting only port `8080` would forward the request as `/` and fail closed.
 
 Rollback resets the Funnel route before stopping the new Compose release.
 
