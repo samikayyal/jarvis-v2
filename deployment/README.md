@@ -5,6 +5,10 @@ The supervised production procedure is documented in
 this unactivated bundle, its exact release pins, and every manual trust boundary
 have been independently reviewed.
 
+After activation is complete, use the separately supervised
+[`google-vault-acceptance-runbook.md`](google-vault-acceptance-runbook.md) for
+the real-system checks required by implementation ticket 31.
+
 This directory is a reviewed, offline-verifiable deployment description. Every
 container is behind the `manual-activation` Compose profile. Running the verifier
 does not build or start a container, install either native worker, provision a
