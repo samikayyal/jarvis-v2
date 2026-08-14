@@ -25,6 +25,7 @@ from jarvis_control_plane.codex_specialist import (
 )
 from jarvis_control_plane.deployment import (
     BundleValidationError,
+    RESOURCE_LIMITS,
     validate_configuration,
     verify_bundle,
 )
@@ -976,6 +977,47 @@ def test_administrative_status_reports_safe_operational_state(
     assert status["audit_writable"] is True
     assert status["backup_freshness"] == "missing"
     assert status["resource_pressure"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "rows",
+    (
+        [],
+        ["not-an-object"],
+        [
+            {"Service": service, "State": "running", "Health": "healthy"}
+            for service in tuple(RESOURCE_LIMITS)[:-1]
+        ],
+        [
+            *(
+                {"Service": service, "State": "running", "Health": "healthy"}
+                for service in RESOURCE_LIMITS
+            ),
+            {"Service": next(iter(RESOURCE_LIMITS)), "State": "running"},
+        ],
+        [
+            {"Service": "unknown", "State": "running", "Health": "healthy"},
+            *(
+                {"Service": service, "State": "running", "Health": "healthy"}
+                for service in tuple(RESOURCE_LIMITS)[1:]
+            ),
+        ],
+    ),
+    ids=("empty", "non-object", "missing", "duplicate", "unknown"),
+)
+def test_administrative_status_rejects_ambiguous_compose_inventory(
+    rows: list[object],
+) -> None:
+    calls = 0
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(stdout=json.dumps(rows))
+
+    with pytest.raises(RuntimeError, match="administrative status is unavailable"):
+        deployment_administrative_status(SHIPPED_BUNDLE, runner=run)
+    assert calls == 1
 
 
 def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:

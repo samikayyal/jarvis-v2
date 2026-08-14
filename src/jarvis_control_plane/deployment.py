@@ -1219,6 +1219,15 @@ def administrative_status(
             text=True,
         )
         rows = _compose_json_rows(observed.stdout)
+        if not rows or any(not isinstance(row, Mapping) for row in rows):
+            raise TypeError("Compose status inventory is invalid")
+        service_names = [row.get("Service") for row in rows]
+        if (
+            any(not isinstance(service, str) for service in service_names)
+            or len(service_names) != len(set(service_names))
+            or set(service_names) != set(RESOURCE_LIMITS)
+        ):
+            raise TypeError("Compose status inventory is incomplete or ambiguous")
         by_service = {
             row.get("Service"): row for row in rows if isinstance(row, Mapping)
         }
