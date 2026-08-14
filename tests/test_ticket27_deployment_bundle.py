@@ -24,6 +24,7 @@ from jarvis_control_plane.codex_specialist import (
     CodexVerificationError,
 )
 from jarvis_control_plane.deployment import (
+    RESOURCE_LIMITS,
     BundleValidationError,
     validate_configuration,
     verify_bundle,
@@ -903,8 +904,10 @@ def test_configuration_allows_lower_bounds_and_requires_https_callback() -> None
     )
 
 
+@pytest.mark.parametrize("compose_json_lines", (False, True))
 def test_administrative_status_reports_safe_operational_state(
     monkeypatch: pytest.MonkeyPatch,
+    compose_json_lines: bool,
 ) -> None:
     config = tomllib.loads(
         (SHIPPED_BUNDLE / "config.example.toml").read_text(encoding="utf-8")
@@ -944,12 +947,15 @@ def test_administrative_status_reports_safe_operational_state(
         nonlocal calls
         calls += 1
         if calls == 1:
+            rows = [
+                {"Service": service, "State": "running", "Health": "healthy"}
+                for service in services
+            ]
             return SimpleNamespace(
-                stdout=json.dumps(
-                    [
-                        {"Service": service, "State": "running", "Health": "healthy"}
-                        for service in services
-                    ]
+                stdout=(
+                    "\n".join(json.dumps(row) for row in rows)
+                    if compose_json_lines
+                    else json.dumps(rows)
                 )
             )
         return SimpleNamespace(stdout=json.dumps(dependency_status))
@@ -971,6 +977,47 @@ def test_administrative_status_reports_safe_operational_state(
     assert status["audit_writable"] is True
     assert status["backup_freshness"] == "missing"
     assert status["resource_pressure"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "rows",
+    (
+        [],
+        ["not-an-object"],
+        [
+            {"Service": service, "State": "running", "Health": "healthy"}
+            for service in tuple(RESOURCE_LIMITS)[:-1]
+        ],
+        [
+            *(
+                {"Service": service, "State": "running", "Health": "healthy"}
+                for service in RESOURCE_LIMITS
+            ),
+            {"Service": next(iter(RESOURCE_LIMITS)), "State": "running"},
+        ],
+        [
+            {"Service": "unknown", "State": "running", "Health": "healthy"},
+            *(
+                {"Service": service, "State": "running", "Health": "healthy"}
+                for service in tuple(RESOURCE_LIMITS)[1:]
+            ),
+        ],
+    ),
+    ids=("empty", "non-object", "missing", "duplicate", "unknown"),
+)
+def test_administrative_status_rejects_ambiguous_compose_inventory(
+    rows: list[object],
+) -> None:
+    calls = 0
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(stdout=json.dumps(rows))
+
+    with pytest.raises(RuntimeError, match="administrative status is unavailable"):
+        deployment_administrative_status(SHIPPED_BUNDLE, runner=run)
+    assert calls == 1
 
 
 def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:

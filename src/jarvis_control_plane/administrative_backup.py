@@ -22,7 +22,11 @@ from urllib.parse import quote
 
 import yaml
 
-from .deployment import BundleValidationError, validate_configuration
+from .deployment import (
+    BundleValidationError,
+    _compose_json_rows,
+    validate_configuration,
+)
 
 BACKUP_SCHEMA_VERSION = 1
 DATABASES = (
@@ -587,13 +591,7 @@ def _activated_image_ids(
             capture_output=True,
             text=True,
         )
-        output = str(getattr(observed, "stdout", ""))
-        try:
-            rows = json.loads(output or "[]")
-        except json.JSONDecodeError:
-            rows = [json.loads(line) for line in output.splitlines() if line.strip()]
-        if isinstance(rows, Mapping):
-            rows = [rows]
+        rows = _compose_json_rows(str(getattr(observed, "stdout", "")))
         containers = {
             row["Service"]: row["ID"]
             for row in rows

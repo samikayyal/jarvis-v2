@@ -1181,6 +1181,18 @@ def _application_source_sha256(source_root: Path, errors: list[str]) -> str:
     return digest.hexdigest()
 
 
+def _compose_json_rows(output: str) -> list[object]:
+    try:
+        rows = json.loads(output or "[]")
+    except json.JSONDecodeError:
+        rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+    if isinstance(rows, Mapping):
+        return [rows]
+    if not isinstance(rows, list):
+        raise TypeError("Compose output is not a list")
+    return rows
+
+
 def administrative_status(
     bundle: str | Path,
     *,
@@ -1206,11 +1218,16 @@ def administrative_status(
             capture_output=True,
             text=True,
         )
-        rows = json.loads(observed.stdout or "[]")
-        if isinstance(rows, Mapping):
-            rows = [rows]
-        if not isinstance(rows, list):
-            raise TypeError("Compose status is not a list")
+        rows = _compose_json_rows(observed.stdout)
+        if not rows or any(not isinstance(row, Mapping) for row in rows):
+            raise TypeError("Compose status inventory is invalid")
+        service_names = [row.get("Service") for row in rows]
+        if (
+            any(not isinstance(service, str) for service in service_names)
+            or len(service_names) != len(set(service_names))
+            or set(service_names) != set(RESOURCE_LIMITS)
+        ):
+            raise TypeError("Compose status inventory is incomplete or ambiguous")
         by_service = {
             row.get("Service"): row for row in rows if isinstance(row, Mapping)
         }
