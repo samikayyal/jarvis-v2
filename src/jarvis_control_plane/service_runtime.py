@@ -923,8 +923,7 @@ def _vault_operations(
         proxy_command=(
             "/usr/local/bin/python",
             "-m",
-            "jarvis_control_plane.service_runtime",
-            "egress-connect",
+            "jarvis_control_plane.egress_proxy",
             "%h",
             "%p",
             "--proxy-host",
