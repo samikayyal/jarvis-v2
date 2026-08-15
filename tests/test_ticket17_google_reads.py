@@ -238,6 +238,28 @@ def test_invalid_grant_discards_the_credential_before_reporting_disconnection() 
     assert invalidations == ["invalidated"]
 
 
+def test_disconnected_read_records_attempt_and_failed_audit_evidence() -> None:
+    audit = InMemoryAuditBoundary()
+    connector = _connector(
+        audit=audit,
+        credential_store=InMemoryGoogleCredentialStore(),
+    )
+
+    with pytest.raises(GoogleReadError, match="google_read_disconnected"):
+        connector.drive_files_list(
+            request_id="request-disconnected",
+            query="name = 'fixture'",
+            max_results=1,
+        )
+
+    evidence = audit.safe_view()
+    assert [(item.outcome, item.execution_status) for item in evidence] == [
+        ("attempted", "attempted"),
+        ("failed", "failed"),
+    ]
+    assert all(item.request_id == "request-disconnected" for item in evidence)
+
+
 @pytest.mark.parametrize(
     ("read_request", "response_payload", "expected_path", "page_size_key"),
     (

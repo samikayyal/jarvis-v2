@@ -26,6 +26,7 @@ from jarvis_control_plane.orchestration import (
     BoundedReadTool,
 )
 from jarvis_control_plane.ports import OrchestrationAdapterError
+from jarvis_control_plane.service_protocol import RemoteServiceError
 from jarvis_control_plane.sessions import ReadinessState
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
@@ -179,6 +180,55 @@ def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_a
     assert [milestone.stage for milestone in result.milestones] == [
         "orchestration_started",
         "bounded_read",
+    ]
+
+
+def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable() -> (
+    None
+):
+    captured: dict[str, object] = {}
+
+    def unavailable_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        raise RemoteServiceError("GoogleReadError", "google_read_disconnected")
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        captured["tool_result"] = asyncio.run(
+            agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="Google is not connected, so I could not complete the read.",
+            )
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=BoundedReadTool(
+            "read_request_context",
+            "A remote read that is deliberately unavailable.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            unavailable_read,
+        ),
+    ).run(_request("read disconnected data"))
+
+    assert captured["tool_result"] == (
+        "The connected service is unavailable or not authorized. "
+        "Explain that the requested read could not be completed, "
+        "do not claim any retrieved data, and do not retry."
+    )
+    assert result.reply_text == (
+        "Google is not connected, so I could not complete the read."
+    )
+    assert [milestone.stage for milestone in result.milestones] == [
+        "orchestration_started",
+        "bounded_read_unavailable",
     ]
 
 

@@ -547,19 +547,19 @@ class GoogleReadConnector:
     ) -> GoogleReadResult:
         request_id = _non_blank(request_id, "request_id")
         requested_count = min(_requested_count(max_results), self._max_result_items)
-        credential = self._credential(operation)
         self._append_audit(
             request_id=request_id,
             operation=operation,
             outcome="attempted",
             execution_status="attempted",
         )
-        provider_request = GoogleReadRequest(
-            operation=operation,
-            arguments=dict(arguments),
-            max_results=requested_count,
-        )
         try:
+            credential = self._credential(operation)
+            provider_request = GoogleReadRequest(
+                operation=operation,
+                arguments=dict(arguments),
+                max_results=requested_count,
+            )
             trace_payload = self._trace.execute(
                 # The broker owns the parent request's full trace reservation
                 # while the model is running.  A deterministic child key gives
