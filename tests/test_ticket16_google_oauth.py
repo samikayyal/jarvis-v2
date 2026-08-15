@@ -174,8 +174,9 @@ def test_callback_accepts_google_authorization_response_metadata() -> None:
         trace_store._close_writer_service()
 
 
-def test_callback_rejects_invalid_google_response_metadata_without_consuming_state(
-) -> None:
+def test_callback_rejects_invalid_google_response_metadata_without_consuming_state() -> (
+    None
+):
     lifecycle, trace_store = build_lifecycle()
     try:
         authorization = lifecycle.start_authorization(
@@ -191,15 +192,24 @@ def test_callback_rejects_invalid_google_response_metadata_without_consuming_sta
             "prompt": "consent",
         }
 
-        assert lifecycle.handle_callback(
-            method="GET", query={**base, "iss": "https://issuer.invalid"}
-        ).status_code == 400
-        assert lifecycle.handle_callback(
-            method="GET", query={**base, "authuser": "-1"}
-        ).status_code == 400
-        assert lifecycle.handle_callback(
-            method="GET", query={**base, "prompt": "select_account"}
-        ).status_code == 400
+        assert (
+            lifecycle.handle_callback(
+                method="GET", query={**base, "iss": "https://issuer.invalid"}
+            ).status_code
+            == 400
+        )
+        assert (
+            lifecycle.handle_callback(
+                method="GET", query={**base, "authuser": "-1"}
+            ).status_code
+            == 400
+        )
+        assert (
+            lifecycle.handle_callback(
+                method="GET", query={**base, "prompt": "select_account"}
+            ).status_code
+            == 400
+        )
         assert lifecycle.handle_callback(method="GET", query=base).status_code == 204
     finally:
         trace_store._close_writer_service()
