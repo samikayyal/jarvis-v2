@@ -420,7 +420,7 @@ def test_broker_rejects_unavailable_result_with_execution_authority() -> None:
     assert components.outbound.sent == []
 
 
-def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> None:
+def test_agents_adapter_classifies_a_whole_tool_timeout_as_unavailable() -> None:
     def delayed_read(
         _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
     ) -> BoundedReadOutput:
@@ -437,8 +437,7 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
     )
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
-        with pytest.raises(OrchestrationAdapterError, match="overall deadline"):
-            asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+        asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The late read was ignored.",
@@ -454,7 +453,45 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
         read_tool=read_tool,
     ).run(_request("read the current request context"))
 
-    assert result.reply_text.endswith("The late read was ignored.")
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested request context read could not be completed because the "
+        "service timed out. I did not retry the unavailable read."
+    )
+
+
+def test_agents_adapter_returns_unavailable_when_service_identity_is_rejected() -> None:
+    def rejected_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        from jarvis_control_plane.service_protocol import ServiceAuthenticationError
+
+        raise ServiceAuthenticationError("service response identity did not match")
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+        return SimpleNamespace(final_output=AgentsSdkPlan(reply_text="unreachable"))
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=BoundedReadTool(
+            "read_request_context",
+            "A read with a rejected service identity.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            rejected_read,
+        ),
+    ).run(_request("read through the rejected service"))
+
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested request context read could not be completed because the "
+        "service identity could not be verified. I did not retry the unavailable read."
+    )
 
 
 def test_agents_adapter_cancels_the_async_model_turn_at_its_deadline() -> None:

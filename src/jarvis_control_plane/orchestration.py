@@ -73,7 +73,11 @@ def _safe_unavailable_read_reason(exc: Exception) -> str | None:
     ):
         code = str(exc)
         return _GOOGLE_READ_FAILURE_REASONS.get(code)
-    from .service_protocol import RemoteServiceError, ServiceProtocolError
+    from .service_protocol import (
+        RemoteServiceError,
+        ServiceAuthenticationError,
+        ServiceProtocolError,
+    )
 
     if isinstance(exc, RemoteServiceError):
         if exc.error_type == "GoogleReadError":
@@ -84,6 +88,8 @@ def _safe_unavailable_read_reason(exc: Exception) -> str | None:
         ):
             return "the knowledge vault has no clean synchronized snapshot"
         return None
+    if isinstance(exc, ServiceAuthenticationError):
+        return "the service identity could not be verified"
     if type(exc) is ServiceProtocolError and str(exc) == _SERVICE_UNAVAILABLE_MESSAGE:
         return "the service could not be reached"
     return None
@@ -661,10 +667,16 @@ class AgentsSdkOrchestrationAdapter:
                             synchronized_at, datetime
                         ):
                             record_stale_vault_read(synchronized_at, warning)
-                except TimeoutError as exc:
-                    raise OrchestrationAdapterError(
-                        "bounded read tool exceeded its overall deadline"
-                    ) from exc
+                except TimeoutError:
+                    unavailable_reason = "the service timed out"
+                    unavailable_reads.append((tool.name, unavailable_reason))
+                    milestones.append(
+                        OrchestrationMilestone(
+                            stage="bounded_read_unavailable",
+                            message=f"Bounded read with {tool.name} was unavailable.",
+                        )
+                    )
+                    return _READ_UNAVAILABLE_RESULT
                 except Exception as exc:
                     unavailable_reason = _safe_unavailable_read_reason(exc)
                     if unavailable_reason is None:
