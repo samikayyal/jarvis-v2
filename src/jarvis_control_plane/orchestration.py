@@ -31,7 +31,6 @@ from .models import (
     OrchestrationResult,
 )
 from .ports import OrchestrationAdapterError
-from .service_protocol import RemoteServiceError
 from .terminal_policy import terminal_action_from_proposal
 
 _MAX_TURNS = 4
@@ -47,19 +46,36 @@ _READ_UNAVAILABLE_RESULT = (
     "do not claim any retrieved data, and do not retry."
 )
 _READ_UNAVAILABLE_REPLY = (
-    "The connected service is unavailable or not authorized, so I could not "
-    "complete the requested read. No data was retrieved and I did not retry."
+    "The requested read could not be completed because a connected service is "
+    "unavailable or not authorized. I did not retry the unavailable read."
 )
-_SAFE_REMOTE_READ_FAILURES = frozenset(
+_SAFE_GOOGLE_READ_FAILURES = frozenset(
     {
-        ("GoogleReadError", "google_read_disconnected"),
-        ("GoogleReadError", "google_read_unavailable"),
-        ("GoogleReadError", "google_read_timeout"),
-        ("GoogleReadError", "google_read_rate_limited"),
-        ("GoogleReadError", "missing_scope"),
-        ("GoogleReadError", "wrong_identity"),
+        "google_read_disconnected",
+        "google_read_unavailable",
+        "google_read_timeout",
+        "google_read_rate_limited",
+        "missing_scope",
+        "wrong_identity",
     }
 )
+
+
+def _is_safe_unavailable_read_error(exc: Exception) -> bool:
+    if (
+        type(exc).__module__ == "jarvis_control_plane.google_reads"
+        and type(exc).__name__ == "GoogleReadError"
+    ):
+        return str(exc) in _SAFE_GOOGLE_READ_FAILURES
+    from .service_protocol import RemoteServiceError
+
+    return (
+        isinstance(exc, RemoteServiceError)
+        and exc.error_type == "GoogleReadError"
+        and str(exc) in _SAFE_GOOGLE_READ_FAILURES
+    )
+
+
 _CLOSED_READ_TOOL_NAMES = frozenset(
     {
         "read_request_context",
@@ -623,12 +639,16 @@ class AgentsSdkOrchestrationAdapter:
                             synchronized_at, datetime
                         ):
                             record_stale_vault_read(synchronized_at, warning)
-                except OrchestrationAdapterError:
-                    raise
-                except RemoteServiceError as exc:
-                    if (exc.error_type, str(exc)) not in _SAFE_REMOTE_READ_FAILURES:
+                except TimeoutError as exc:
+                    raise OrchestrationAdapterError(
+                        "bounded read tool exceeded its overall deadline"
+                    ) from exc
+                except Exception as exc:
+                    if not _is_safe_unavailable_read_error(exc):
+                        if isinstance(exc, OrchestrationAdapterError):
+                            raise
                         raise OrchestrationAdapterError(
-                            "bounded read service rejected the request"
+                            "bounded read tool returned malformed data"
                         ) from exc
                     unavailable_reads.append(tool.name)
                     milestones.append(
@@ -638,14 +658,6 @@ class AgentsSdkOrchestrationAdapter:
                         )
                     )
                     return _READ_UNAVAILABLE_RESULT
-                except TimeoutError as exc:
-                    raise OrchestrationAdapterError(
-                        "bounded read tool exceeded its overall deadline"
-                    ) from exc
-                except Exception as exc:
-                    raise OrchestrationAdapterError(
-                        "bounded read tool returned malformed data"
-                    ) from exc
                 milestones.append(
                     OrchestrationMilestone(
                         stage="bounded_read",
@@ -668,7 +680,9 @@ class AgentsSdkOrchestrationAdapter:
             )
         if self._codex_specialist is not None:
 
-            async def invoke_codex(_context: Any, raw_input: str) -> dict[str, object]:
+            async def invoke_codex(_context: Any, raw_input: str) -> object:
+                if unavailable_reads:
+                    return _READ_UNAVAILABLE_RESULT
                 budget.consume()
                 try:
                     typed_input = CodexToolInput.model_validate_json(raw_input)

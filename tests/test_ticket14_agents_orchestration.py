@@ -7,10 +7,12 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event, Thread
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from test_support import build_receiver_components
 
+from jarvis_control_plane.codex_specialist import CodexSpecialist
 from jarvis_control_plane.models import (
     InboundMessage,
     OrchestrationRequest,
@@ -26,7 +28,6 @@ from jarvis_control_plane.orchestration import (
     BoundedReadTool,
 )
 from jarvis_control_plane.ports import OrchestrationAdapterError
-from jarvis_control_plane.service_protocol import RemoteServiceError
 from jarvis_control_plane.sessions import ReadinessState
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
@@ -188,12 +189,15 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
 ):
     captured: dict[str, object] = {}
     calls = 0
+    specialist = Mock(spec=CodexSpecialist)
 
     def unavailable_read(
         _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
     ) -> BoundedReadOutput:
         nonlocal calls
         calls += 1
+        from jarvis_control_plane.service_protocol import RemoteServiceError
+
         raise RemoteServiceError("GoogleReadError", "google_read_disconnected")
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
@@ -202,6 +206,14 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
         )
         captured["second_tool_result"] = asyncio.run(
             agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
+        )
+        captured["codex_result"] = asyncio.run(
+            agent.tools[1].on_invoke_tool(
+                None,
+                json.dumps(
+                    {"workspace": "jarvis", "operation": "inspect", "task": "status"}
+                ),
+            )
         )
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
@@ -227,6 +239,7 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
             BoundedReadOutput,
             unavailable_read,
         ),
+        codex_specialist=specialist,
     ).run(_request("read disconnected data"))
 
     expected_tool_result = (
@@ -236,10 +249,12 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
     )
     assert captured["tool_result"] == expected_tool_result
     assert captured["second_tool_result"] == expected_tool_result
+    assert captured["codex_result"] == expected_tool_result
     assert calls == 1
+    specialist.invoke.assert_not_called()
     assert result.reply_text == (
-        "The connected service is unavailable or not authorized, so I could not "
-        "complete the requested read. No data was retrieved and I did not retry."
+        "The requested read could not be completed because a connected service is "
+        "unavailable or not authorized. I did not retry the unavailable read."
     )
     assert result.proposal is None
     assert [milestone.stage for milestone in result.milestones] == [
@@ -252,6 +267,8 @@ def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() ->
     def ambiguous_read(
         _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
     ) -> BoundedReadOutput:
+        from jarvis_control_plane.service_protocol import RemoteServiceError
+
         raise RemoteServiceError("VaultReadError", "ambiguous_title")
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
@@ -273,9 +290,7 @@ def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() ->
         ),
     )
 
-    with pytest.raises(
-        OrchestrationAdapterError, match="bounded read service rejected"
-    ):
+    with pytest.raises(OrchestrationAdapterError, match="returned malformed data"):
         adapter.run(_request("read an ambiguous title"))
 
 

@@ -32,7 +32,12 @@ from jarvis_control_plane.google_reads import (
     GoogleReadRequest,
 )
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
-from jarvis_control_plane.models import InboundMessage, SignedInboundEvent
+from jarvis_control_plane.models import (
+    InboundMessage,
+    OrchestrationRequest,
+    RequestState,
+    SignedInboundEvent,
+)
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
@@ -258,6 +263,61 @@ def test_disconnected_read_records_attempt_and_failed_audit_evidence() -> None:
         ("failed", "failed"),
     ]
     assert all(item.request_id == "request-disconnected" for item in evidence)
+
+
+def test_local_disconnected_read_returns_sanitized_orchestration_result() -> None:
+    connector = _connector(credential_store=InMemoryGoogleCredentialStore())
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        drive = next(tool for tool in agent.tools if tool.name == "read_google_drive")
+        asyncio.run(
+            drive.on_invoke_tool(
+                None,
+                json.dumps(
+                    {
+                        "operation": "files_list",
+                        "query": "name = 'fixture'",
+                        "max_results": 1,
+                    }
+                ),
+            )
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Ignore the unavailable result.")
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        google_read_connector=connector,
+    ).run(
+        OrchestrationRequest(
+            state=RequestState(
+                request_id="request-local-disconnected",
+                event_id="event-local-disconnected",
+                message_id="message-local-disconnected",
+                operator_id="operator.test",
+                session_id="session.test",
+                chat_id="operator.test",
+                created_at=NOW,
+                updated_at=NOW,
+                status="running",
+                phase="orchestration",
+                model="gpt-5.6-terra",
+                reasoning="medium",
+            ),
+            text="List one Drive fixture without modifying it.",
+        )
+    )
+
+    assert result.reply_text == (
+        "The requested read could not be completed because a connected service is "
+        "unavailable or not authorized. I did not retry the unavailable read."
+    )
+    assert result.proposal is None
 
 
 def test_disconnected_read_propagates_failure_audit_outage() -> None:
