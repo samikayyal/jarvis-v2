@@ -313,9 +313,10 @@ def test_local_disconnected_read_returns_sanitized_orchestration_result() -> Non
         )
     )
 
+    assert result.outcome == "unavailable"
     assert result.reply_text == (
-        "The requested read could not be completed because a connected service is "
-        "unavailable or not authorized. I did not retry the unavailable read."
+        "The requested Google Drive read could not be completed because Google is "
+        "disconnected. I did not retry the unavailable read."
     )
     assert result.proposal is None
 

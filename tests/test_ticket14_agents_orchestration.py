@@ -16,6 +16,7 @@ from jarvis_control_plane.codex_specialist import CodexSpecialist
 from jarvis_control_plane.models import (
     InboundMessage,
     OrchestrationRequest,
+    OrchestrationResult,
     RequestState,
     SignedInboundEvent,
 )
@@ -252,9 +253,10 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
     assert captured["codex_result"] == expected_tool_result
     assert calls == 1
     specialist.invoke.assert_not_called()
+    assert result.outcome == "unavailable"
     assert result.reply_text == (
-        "The requested read could not be completed because a connected service is "
-        "unavailable or not authorized. I did not retry the unavailable read."
+        "The requested request context read could not be completed because Google is "
+        "disconnected. I did not retry the unavailable read."
     )
     assert result.proposal is None
     assert [milestone.stage for milestone in result.milestones] == [
@@ -292,6 +294,130 @@ def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() ->
 
     with pytest.raises(OrchestrationAdapterError, match="returned malformed data"):
         adapter.run(_request("read an ambiguous title"))
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (
+            "transport",
+            "the service could not be reached",
+        ),
+        (
+            "vault_snapshot",
+            "the knowledge vault has no clean synchronized snapshot",
+        ),
+    ],
+)
+def test_agents_adapter_returns_named_unavailable_vault_read(
+    failure: str, reason: str
+) -> None:
+    def unavailable_vault_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        from jarvis_control_plane.service_protocol import (
+            RemoteServiceError,
+            ServiceProtocolError,
+        )
+
+        if failure == "transport":
+            raise ServiceProtocolError("owned service is unavailable")
+        raise RemoteServiceError(
+            "VaultReadError",
+            "knowledge-vault reads require a clean synchronized clone",
+        )
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(agent.tools[1].on_invoke_tool(None, '{"max_chars": 8}'))
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Ignore the unavailable result.")
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        vault_read_tool=BoundedReadTool(
+            "read_knowledge_vault",
+            "A deliberately unavailable vault read.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            unavailable_vault_read,
+        ),
+    ).run(_request("read the knowledge vault"))
+
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested knowledge vault read could not be completed because "
+        f"{reason}. I did not retry the unavailable read."
+    )
+
+
+def test_broker_persists_unavailable_read_as_distinct_terminal_outcome() -> None:
+    class UnavailableOrchestrationAdapter:
+        def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+            return OrchestrationResult(
+                request_id=request.state.request_id,
+                outcome="unavailable",
+                reply_text=(
+                    "The requested Google Drive read could not be completed because "
+                    "Google is disconnected. I did not retry the unavailable read."
+                ),
+                adapter="agents_sdk_responses",
+            )
+
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-unavailable",
+        orchestration=UnavailableOrchestrationAdapter(),  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("read the Drive fixture"))
+
+    assert result.disposition == "unavailable", result.reason
+    assert result.request is not None
+    assert result.request.status == "completed"
+    assert result.request.outcome == "read_unavailable"
+    assert result.reply is not None
+    assert "Google Drive" in result.reply.body
+    assert any(
+        record.kind == "request_lifecycle" and record.outcome == "read_unavailable"
+        for record in components.audit.records
+    )
+
+
+def test_broker_rejects_unavailable_result_with_execution_authority() -> None:
+    class InvalidUnavailableOrchestrationAdapter:
+        def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+            return OrchestrationResult(
+                request_id=request.state.request_id,
+                outcome="unavailable",
+                reply_text="The read is unavailable.",
+                adapter="agents_sdk_responses",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-invalid-unavailable",
+        orchestration=InvalidUnavailableOrchestrationAdapter(),  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("read the Drive fixture"))
+
+    assert result.disposition == "failed"
+    assert result.reason is not None
+    assert "action authority" in result.reason
+    assert components.outbound.sent == []
 
 
 def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> None:

@@ -1523,7 +1523,7 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
         "orchestration",
         "control_plane",
         "controlled_orchestration",
-        frozenset({"completed", "failed"}),
+        frozenset({"completed", "failed", "unavailable"}),
         frozenset({"completed", "failed"}),
     ),
     "outbound_attempt": (
@@ -1577,6 +1577,7 @@ _AUDIT_EVENT_RULES: dict[str, tuple[str, str, str, frozenset[str], frozenset[str
                 "orchestration_failed",
                 "outbound_failed",
                 "outbound_unknown",
+                "read_unavailable",
                 "reply_sent",
                 "replying",
                 "trace_unavailable",
@@ -1798,13 +1799,17 @@ def _validate_audit_event_semantics(
         expected_outcomes = {
             "accepted": "accepted",
             "blocked": "audit_unavailable",
-            "completed": "reply_sent",
             "failed": None,
             "replying": "replying",
             "unknown": "outbound_unknown",
         }
         expected_outcome = expected_outcomes.get(status)
         if expected_outcome is not None and outcome != expected_outcome:
+            raise ValueError("request lifecycle outcome does not match its status")
+        if status == "completed" and outcome not in {
+            "read_unavailable",
+            "reply_sent",
+        }:
             raise ValueError("request lifecycle outcome does not match its status")
         if status == "failed" and outcome not in {
             "failed",

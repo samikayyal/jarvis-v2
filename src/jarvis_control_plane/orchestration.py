@@ -45,34 +45,55 @@ _READ_UNAVAILABLE_RESULT = (
     "Explain that the requested read could not be completed, "
     "do not claim any retrieved data, and do not retry."
 )
-_READ_UNAVAILABLE_REPLY = (
-    "The requested read could not be completed because a connected service is "
-    "unavailable or not authorized. I did not retry the unavailable read."
-)
-_SAFE_GOOGLE_READ_FAILURES = frozenset(
-    {
-        "google_read_disconnected",
-        "google_read_unavailable",
-        "google_read_timeout",
-        "google_read_rate_limited",
-        "missing_scope",
-        "wrong_identity",
-    }
+_READ_DEPENDENCY_NAMES = {
+    "read_request_context": "request context",
+    "read_gmail": "Gmail",
+    "read_google_calendar": "Google Calendar",
+    "read_google_drive": "Google Drive",
+    "read_knowledge_vault": "knowledge vault",
+}
+_GOOGLE_READ_FAILURE_REASONS = {
+    "google_read_disconnected": "Google is disconnected",
+    "google_read_unavailable": "Google is unavailable",
+    "google_read_timeout": "Google timed out",
+    "google_read_rate_limited": "Google rate limiting prevented the read",
+    "missing_scope": "Google authorization is missing the required scope",
+    "wrong_identity": "Google authorization uses the wrong identity",
+}
+_SERVICE_UNAVAILABLE_MESSAGE = "owned service is unavailable"
+_VAULT_SNAPSHOT_UNAVAILABLE_MESSAGE = (
+    "knowledge-vault reads require a clean synchronized clone"
 )
 
 
-def _is_safe_unavailable_read_error(exc: Exception) -> bool:
+def _safe_unavailable_read_reason(exc: Exception) -> str | None:
     if (
         type(exc).__module__ == "jarvis_control_plane.google_reads"
         and type(exc).__name__ == "GoogleReadError"
     ):
-        return str(exc) in _SAFE_GOOGLE_READ_FAILURES
-    from .service_protocol import RemoteServiceError
+        code = str(exc)
+        return _GOOGLE_READ_FAILURE_REASONS.get(code)
+    from .service_protocol import RemoteServiceError, ServiceProtocolError
 
+    if isinstance(exc, RemoteServiceError):
+        if exc.error_type == "GoogleReadError":
+            return _GOOGLE_READ_FAILURE_REASONS.get(str(exc))
+        if (
+            exc.error_type == "VaultReadError"
+            and str(exc) == _VAULT_SNAPSHOT_UNAVAILABLE_MESSAGE
+        ):
+            return "the knowledge vault has no clean synchronized snapshot"
+        return None
+    if type(exc) is ServiceProtocolError and str(exc) == _SERVICE_UNAVAILABLE_MESSAGE:
+        return "the service could not be reached"
+    return None
+
+
+def _unavailable_read_reply(tool_name: str, reason: str) -> str:
+    dependency = _READ_DEPENDENCY_NAMES[tool_name]
     return (
-        isinstance(exc, RemoteServiceError)
-        and exc.error_type == "GoogleReadError"
-        and str(exc) in _SAFE_GOOGLE_READ_FAILURES
+        f"The requested {dependency} read could not be completed because {reason}. "
+        "I did not retry the unavailable read."
     )
 
 
@@ -389,7 +410,7 @@ class AgentsSdkOrchestrationAdapter:
         ]
         budget = _ToolInvocationBudget(self._max_tool_invocations)
         stale_vault_read: tuple[datetime, str] | None = None
-        unavailable_reads: list[str] = []
+        unavailable_reads: list[tuple[str, str]] = []
 
         def record_stale_vault_read(synchronized_at: datetime, warning: str) -> None:
             nonlocal stale_vault_read
@@ -441,10 +462,11 @@ class AgentsSdkOrchestrationAdapter:
             raise OrchestrationAdapterError("Agents SDK run was unavailable") from exc
 
         if unavailable_reads:
+            tool_name, reason = unavailable_reads[0]
             return OrchestrationResult(
                 request_id=request.state.request_id,
-                outcome="completed",
-                reply_text=_READ_UNAVAILABLE_REPLY,
+                outcome="unavailable",
+                reply_text=_unavailable_read_reply(tool_name, reason),
                 adapter="agents_sdk_responses",
                 milestones=tuple(milestones),
             )
@@ -604,7 +626,7 @@ class AgentsSdkOrchestrationAdapter:
         request: OrchestrationRequest,
         milestones: list[OrchestrationMilestone],
         budget: _ToolInvocationBudget,
-        unavailable_reads: list[str],
+        unavailable_reads: list[tuple[str, str]],
         record_stale_vault_read: Callable[[datetime, str], None],
     ) -> list[Any]:
         """Build the closed tool list anew for each request and invocation budget."""
@@ -644,13 +666,14 @@ class AgentsSdkOrchestrationAdapter:
                         "bounded read tool exceeded its overall deadline"
                     ) from exc
                 except Exception as exc:
-                    if not _is_safe_unavailable_read_error(exc):
+                    unavailable_reason = _safe_unavailable_read_reason(exc)
+                    if unavailable_reason is None:
                         if isinstance(exc, OrchestrationAdapterError):
                             raise
                         raise OrchestrationAdapterError(
                             "bounded read tool returned malformed data"
                         ) from exc
-                    unavailable_reads.append(tool.name)
+                    unavailable_reads.append((tool.name, unavailable_reason))
                     milestones.append(
                         OrchestrationMilestone(
                             stage="bounded_read_unavailable",
