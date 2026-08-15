@@ -205,6 +205,7 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
         captured["tool_result"] = asyncio.run(
             agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
         )
+        captured["output_schema"] = agent.tools[0].output_json_schema
         captured["second_tool_result"] = asyncio.run(
             agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
         )
@@ -243,14 +244,31 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
         codex_specialist=specialist,
     ).run(_request("read disconnected data"))
 
-    expected_tool_result = (
-        "The connected service is unavailable or not authorized. "
-        "Explain that the requested read could not be completed, "
-        "do not claim any retrieved data, and do not retry."
-    )
+    expected_tool_result = {
+        "unavailable": True,
+        "message": (
+            "The connected service is unavailable or not authorized. "
+            "Explain that the requested read could not be completed, "
+            "do not claim any retrieved data, and do not retry."
+        ),
+    }
     assert captured["tool_result"] == expected_tool_result
     assert captured["second_tool_result"] == expected_tool_result
     assert captured["codex_result"] == expected_tool_result
+    from agents.items import ItemHelpers
+    from openai.types.responses import ResponseFunctionToolCall
+
+    sdk_output = ItemHelpers.tool_call_output_item(
+        ResponseFunctionToolCall(
+            arguments='{"max_chars":8}',
+            call_id="call-unavailable-read",
+            name="read_request_context",
+            type="function_call",
+        ),
+        captured["tool_result"],
+        output_json_schema=captured["output_schema"],
+    )
+    assert json.loads(sdk_output["output"]) == expected_tool_result
     assert calls == 1
     specialist.invoke.assert_not_called()
     assert result.outcome == "unavailable"
