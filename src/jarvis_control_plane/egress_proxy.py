@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import select
 import socket
 import sys
@@ -13,7 +14,9 @@ from urllib.parse import urlsplit
 MAX_PROXY_HEADER_BYTES = 8192
 
 
-def _read_headers(connection: socket.socket) -> bytes:
+def _read_headers(
+    connection: socket.socket, *, allow_remainder: bool = False
+) -> tuple[bytes, bytes]:
     payload = bytearray()
     while b"\r\n\r\n" not in payload:
         chunk = connection.recv(1024)
@@ -23,9 +26,9 @@ def _read_headers(connection: socket.socket) -> bytes:
         if len(payload) > MAX_PROXY_HEADER_BYTES:
             raise ValueError("egress proxy headers are oversized")
     head, remainder = bytes(payload).split(b"\r\n\r\n", 1)
-    if remainder:
+    if remainder and not allow_remainder:
         raise ValueError("egress proxy CONNECT request contained a body")
-    return head
+    return head, remainder
 
 
 def _connect_target(
@@ -95,7 +98,7 @@ def serve_egress_proxy(
             client = self.request
             client.settimeout(10)
             try:
-                request_head = _read_headers(client)
+                request_head, _remainder = _read_headers(client)
                 if (
                     request_head == b"GET /health HTTP/1.1\r\nHost: localhost"
                     and self.client_address[0] in {"127.0.0.1", "::1"}
@@ -144,7 +147,7 @@ def connect_through_proxy(
             f"Host: {target_host}:{target_port}\r\n\r\n"
         ).encode("ascii")
         connection.sendall(request)
-        response = _read_headers(connection)
+        response, remainder = _read_headers(connection, allow_remainder=True)
         if not response.startswith(b"HTTP/1.1 200 "):
             raise OSError("vault egress proxy rejected the configured remote")
         connection.settimeout(None)
@@ -156,7 +159,32 @@ def connect_through_proxy(
 
         uploader = Thread(target=upload, daemon=True)
         uploader.start()
+        if remainder:
+            sys.stdout.buffer.write(remainder)
+            sys.stdout.buffer.flush()
         while chunk := connection.recv(64 * 1024):
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
         uploader.join(timeout=1)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the lightweight OpenSSH ProxyCommand without importing service roots."""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target_host")
+    parser.add_argument("target_port", type=int)
+    parser.add_argument("--proxy-host", required=True)
+    parser.add_argument("--proxy-port", type=int, default=9080)
+    arguments = parser.parse_args(argv)
+    connect_through_proxy(
+        proxy_host=arguments.proxy_host,
+        proxy_port=arguments.proxy_port,
+        target_host=arguments.target_host,
+        target_port=arguments.target_port,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
