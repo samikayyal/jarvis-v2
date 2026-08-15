@@ -922,8 +922,7 @@ def _vault_operations(
         known_hosts_path=Path("/run/credentials/vault/known_hosts"),
         proxy_command=(
             "/usr/local/bin/python",
-            "-m",
-            "jarvis_control_plane.egress_proxy",
+            "/opt/jarvis/src/jarvis_control_plane/egress_proxy.py",
             "%h",
             "%p",
             "--proxy-host",
