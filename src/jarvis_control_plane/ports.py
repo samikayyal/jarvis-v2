@@ -455,6 +455,7 @@ class ModelAvailabilityProvider(Protocol):
     def current(self) -> ModelAvailability: ...
 
 
+@runtime_checkable
 class MessagingGatewayReadiness(Protocol):
     """Safe aggregate derived from separate gateway/session observations."""
 
