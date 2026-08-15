@@ -131,13 +131,19 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "deleted_conversation_archive": {"condition": "service_healthy"}
     }
     assert {
-        service: compose["services"][service]["healthcheck"]["start_period"]
+        service: {
+            key: compose["services"][service]["healthcheck"][key]
+            for key in ("start_period", "start_interval")
+        }
         for service in report.services
         if service.endswith("_egress_proxy")
     } == {
-        "google_egress_proxy": "10m",
-        "orchestration_egress_proxy": "10m",
-        "vault_egress_proxy": "10m",
+        "google_egress_proxy": {"start_period": "10m", "start_interval": "30s"},
+        "orchestration_egress_proxy": {
+            "start_period": "10m",
+            "start_interval": "30s",
+        },
+        "vault_egress_proxy": {"start_period": "10m", "start_interval": "30s"},
     }
 
 
