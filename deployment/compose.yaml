@@ -237,6 +237,8 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+      start_period: 10m
+      start_interval: 30s
     pids_limit: 16
     deploy:
       resources:
@@ -254,6 +256,8 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+      start_period: 10m
+      start_interval: 30s
     pids_limit: 16
     deploy:
       resources:
@@ -271,6 +275,8 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+      start_period: 10m
+      start_interval: 30s
     pids_limit: 16
     deploy:
       resources:
