@@ -1199,9 +1199,12 @@ def test_openwa_route_worker_overlay_and_docker_context_are_reviewed() -> None:
     dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text("utf-8").splitlines()
     assert "deployment/credentials" in dockerignore
     assert "deployment/credentials/**" in dockerignore
-    assert "RUN npm ci --omit=dev --ignore-scripts" in (
-        SHIPPED_BUNDLE / "Dockerfile"
-    ).read_text("utf-8")
+    dockerfile = (SHIPPED_BUNDLE / "Dockerfile").read_text("utf-8")
+    assert "RUN npm ci --omit=dev --ignore-scripts" in dockerfile
+    assert (
+        "useradd --uid 10006 --gid 20000 --home-dir /var/lib/jarvis/vault"
+        in dockerfile
+    )
 
     active = tomllib.loads((SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8"))
     active["configuration_kind"] = "active"

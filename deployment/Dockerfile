@@ -12,6 +12,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         "git=${GIT_VERSION}" \
         "openssh-client=${OPENSSH_CLIENT_VERSION}" \
+    && groupadd --gid 20000 jarvis-protocol \
+    && useradd --uid 10006 --gid 20000 --home-dir /var/lib/jarvis/vault \
+        --shell /usr/sbin/nologin --no-create-home jarvis-vault \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
