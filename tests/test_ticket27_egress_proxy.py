@@ -11,6 +11,7 @@ import pytest
 
 from jarvis_control_plane.egress_proxy import (
     _connect_target,
+    _read_available,
     _read_headers,
     main,
     serve_egress_proxy,
@@ -82,6 +83,18 @@ def test_proxy_command_preserves_coalesced_tunnel_bytes() -> None:
 
     assert head.startswith(b"HTTP/1.1 200 ")
     assert remainder == b"SSH-2.0-upstream\r\n"
+
+
+def test_proxy_command_forwards_a_short_live_pipe_chunk_without_fill_wait() -> None:
+    class Stream:
+        def read(self, _size: int) -> bytes:
+            raise AssertionError("buffer-filling read must not be used")
+
+        def read1(self, size: int) -> bytes:
+            assert size == 64 * 1024
+            return b"short SSH handshake packet"
+
+    assert _read_available(Stream()) == b"short SSH handshake packet"
 
 
 def test_lightweight_proxy_command_parses_the_reviewed_boundary(

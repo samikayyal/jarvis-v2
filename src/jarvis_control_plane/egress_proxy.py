@@ -12,6 +12,13 @@ from threading import Thread
 from urllib.parse import urlsplit
 
 MAX_PROXY_HEADER_BYTES = 8192
+_PROXY_CHUNK_BYTES = 64 * 1024
+
+
+def _read_available(stream: object) -> bytes:
+    """Read one currently available pipe chunk without waiting to fill the buffer."""
+
+    return stream.read1(_PROXY_CHUNK_BYTES)  # type: ignore[attr-defined,no-any-return]
 
 
 def _read_headers(
@@ -153,7 +160,7 @@ def connect_through_proxy(
         connection.settimeout(None)
 
         def upload() -> None:
-            while chunk := sys.stdin.buffer.read(64 * 1024):
+            while chunk := _read_available(sys.stdin.buffer):
                 connection.sendall(chunk)
             connection.shutdown(socket.SHUT_WR)
 
@@ -162,7 +169,7 @@ def connect_through_proxy(
         if remainder:
             sys.stdout.buffer.write(remainder)
             sys.stdout.buffer.flush()
-        while chunk := connection.recv(64 * 1024):
+        while chunk := connection.recv(_PROXY_CHUNK_BYTES):
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
         uploader.join(timeout=1)
