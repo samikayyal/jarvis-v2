@@ -40,11 +40,14 @@ _MAX_READ_CHARS = 1_000
 _READ_TOOL_TIMEOUT_SECONDS = 20.0
 _MAX_READ_TOOL_SECONDS = _READ_TOOL_TIMEOUT_SECONDS
 _MODEL_CANCELLATION_GRACE_SECONDS = 5.0
-_READ_UNAVAILABLE_RESULT = (
-    "The connected service is unavailable or not authorized. "
-    "Explain that the requested read could not be completed, "
-    "do not claim any retrieved data, and do not retry."
-)
+_READ_UNAVAILABLE_RESULT = {
+    "unavailable": True,
+    "message": (
+        "The connected service is unavailable or not authorized. "
+        "Explain that the requested read could not be completed, "
+        "do not claim any retrieved data, and do not retry."
+    ),
+}
 _READ_DEPENDENCY_NAMES = {
     "read_request_context": "request context",
     "read_gmail": "Gmail",
