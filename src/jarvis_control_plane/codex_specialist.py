@@ -17,7 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from itertools import pairwise
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from typing import Literal, Protocol
 
@@ -1045,8 +1045,10 @@ class CodexSpecialist:
         if is_cancelled is not None and is_cancelled():
             executor.shutdown(wait=False, cancel_futures=True)
             raise CodexPolicyError("Codex specialist request was cancelled")
+        registered = Event()
         future = executor.submit(
-            self._invoke_adapter,
+            self._invoke_registered_adapter,
+            registered,
             envelope,
             invocation.approval,
             deadline=deadline,
@@ -1054,6 +1056,7 @@ class CodexSpecialist:
         with self._active_lock:
             self._active_deadlines[invocation.request_id] = deadline
             self._active_futures[invocation.request_id] = future
+            registered.set()
         try:
             if is_cancelled is not None and is_cancelled():
                 if future.cancel():
@@ -1171,6 +1174,19 @@ class CodexSpecialist:
             result_limit_bytes=_MAX_TRACE_RESULT_BYTES,
             error_limit_bytes=_MAX_TRACE_ERROR_BYTES,
         )
+
+    def _invoke_registered_adapter(
+        self,
+        registered: Event,
+        envelope: CodexExecutionEnvelope,
+        approval: CodexWorkspaceApproval | None,
+        *,
+        deadline: float,
+    ) -> CodexAdapterResult:
+        """Do not expose running adapter work before cancellation can find it."""
+
+        registered.wait()
+        return self._invoke_adapter(envelope, approval, deadline=deadline)
 
     def _interrupt(self, request_id: str, *, deadline: float) -> CodexInterruption:
         with self._interrupt_lock:
