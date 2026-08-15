@@ -19,6 +19,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from jarvis_control_plane.adapters import SQLiteAuditBoundary
 from jarvis_control_plane.models import AuditEvidence, AuditFilter
+from jarvis_control_plane.openwa import OpenWAReadiness
 from jarvis_control_plane.ports import (
     ActionCancellationResult,
     ActionCancellationStatus,
@@ -32,6 +33,7 @@ from jarvis_control_plane.service_protocol import (
     OwnedActionService,
     RemoteActionDispatcher,
     RemoteAuditBoundary,
+    RemoteMessagingReadinessProvider,
     RemoteOrchestrationAdapter,
     ServiceAuthenticationError,
     ServiceProtocolError,
@@ -62,6 +64,21 @@ from jarvis_control_plane.worker_gateway import (
 
 SECRET = b"ticket-27-test-secret-with-enough-entropy"
 ORCHESTRATION_SECRET = b"ticket-27-orchestration-link-secret!!"
+
+
+class _ReadinessClient:
+    def call(self, operation: str) -> OpenWAReadiness:
+        assert operation == "current"
+        return OpenWAReadiness(
+            container_healthy=True,
+            named_session_status="ready",
+        )
+
+
+def test_remote_messaging_readiness_accepts_the_openwa_readiness_contract() -> None:
+    readiness = RemoteMessagingReadinessProvider(_ReadinessClient()).current()  # type: ignore[arg-type]
+
+    assert readiness.messaging_ready is True
 
 
 def _evidence(identifier: str) -> AuditEvidence:
