@@ -7,13 +7,16 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event, Thread
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from test_support import build_receiver_components
 
+from jarvis_control_plane.codex_specialist import CodexSpecialist
 from jarvis_control_plane.models import (
     InboundMessage,
     OrchestrationRequest,
+    OrchestrationResult,
     RequestState,
     SignedInboundEvent,
 )
@@ -182,7 +185,242 @@ def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_a
     ]
 
 
-def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> None:
+def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable() -> (
+    None
+):
+    captured: dict[str, object] = {}
+    calls = 0
+    specialist = Mock(spec=CodexSpecialist)
+
+    def unavailable_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        nonlocal calls
+        calls += 1
+        from jarvis_control_plane.service_protocol import RemoteServiceError
+
+        raise RemoteServiceError("GoogleReadError", "google_read_disconnected")
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        captured["tool_result"] = asyncio.run(
+            agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
+        )
+        captured["second_tool_result"] = asyncio.run(
+            agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
+        )
+        captured["codex_result"] = asyncio.run(
+            agent.tools[1].on_invoke_tool(
+                None,
+                json.dumps(
+                    {"workspace": "jarvis", "operation": "inspect", "task": "status"}
+                ),
+            )
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="Ignore the unavailable result.",
+                proposal=AgentsSdkProposal(
+                    kind="gmail_send",
+                    preview="This proposal must be discarded.",
+                    payload={},
+                ),
+            )
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=BoundedReadTool(
+            "read_request_context",
+            "A remote read that is deliberately unavailable.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            unavailable_read,
+        ),
+        codex_specialist=specialist,
+    ).run(_request("read disconnected data"))
+
+    expected_tool_result = (
+        "The connected service is unavailable or not authorized. "
+        "Explain that the requested read could not be completed, "
+        "do not claim any retrieved data, and do not retry."
+    )
+    assert captured["tool_result"] == expected_tool_result
+    assert captured["second_tool_result"] == expected_tool_result
+    assert captured["codex_result"] == expected_tool_result
+    assert calls == 1
+    specialist.invoke.assert_not_called()
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested request context read could not be completed because Google is "
+        "disconnected. I did not retry the unavailable read."
+    )
+    assert result.proposal is None
+    assert [milestone.stage for milestone in result.milestones] == [
+        "orchestration_started",
+        "bounded_read_unavailable",
+    ]
+
+
+def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() -> None:
+    def ambiguous_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        from jarvis_control_plane.service_protocol import RemoteServiceError
+
+        raise RemoteServiceError("VaultReadError", "ambiguous_title")
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(agent.tools[0].on_invoke_tool(None, '{"max_chars": 8}'))
+        raise AssertionError("unreachable")
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=BoundedReadTool(
+            "read_request_context",
+            "A remote read with a query-specific failure.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            ambiguous_read,
+        ),
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="returned malformed data"):
+        adapter.run(_request("read an ambiguous title"))
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (
+            "transport",
+            "the service could not be reached",
+        ),
+        (
+            "vault_snapshot",
+            "the knowledge vault has no clean synchronized snapshot",
+        ),
+    ],
+)
+def test_agents_adapter_returns_named_unavailable_vault_read(
+    failure: str, reason: str
+) -> None:
+    def unavailable_vault_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        from jarvis_control_plane.service_protocol import (
+            RemoteServiceError,
+            ServiceProtocolError,
+        )
+
+        if failure == "transport":
+            raise ServiceProtocolError("owned service is unavailable")
+        raise RemoteServiceError(
+            "VaultReadError",
+            "knowledge-vault reads require a clean synchronized clone",
+        )
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(agent.tools[1].on_invoke_tool(None, '{"max_chars": 8}'))
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Ignore the unavailable result.")
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        vault_read_tool=BoundedReadTool(
+            "read_knowledge_vault",
+            "A deliberately unavailable vault read.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            unavailable_vault_read,
+        ),
+    ).run(_request("read the knowledge vault"))
+
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested knowledge vault read could not be completed because "
+        f"{reason}. I did not retry the unavailable read."
+    )
+
+
+def test_broker_persists_unavailable_read_as_distinct_terminal_outcome() -> None:
+    class UnavailableOrchestrationAdapter:
+        def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+            return OrchestrationResult(
+                request_id=request.state.request_id,
+                outcome="unavailable",
+                reply_text=(
+                    "The requested Google Drive read could not be completed because "
+                    "Google is disconnected. I did not retry the unavailable read."
+                ),
+                adapter="agents_sdk_responses",
+            )
+
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-unavailable",
+        orchestration=UnavailableOrchestrationAdapter(),  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("read the Drive fixture"))
+
+    assert result.disposition == "unavailable", result.reason
+    assert result.request is not None
+    assert result.request.status == "completed"
+    assert result.request.outcome == "read_unavailable"
+    assert result.reply is not None
+    assert "Google Drive" in result.reply.body
+    assert any(
+        record.kind == "request_lifecycle" and record.outcome == "read_unavailable"
+        for record in components.audit.records
+    )
+
+
+def test_broker_rejects_unavailable_result_with_execution_authority() -> None:
+    class InvalidUnavailableOrchestrationAdapter:
+        def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+            return OrchestrationResult(
+                request_id=request.state.request_id,
+                outcome="unavailable",
+                reply_text="The read is unavailable.",
+                adapter="agents_sdk_responses",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+            )
+
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket14-test-secret",
+        now=NOW,
+        id_prefix="ticket14-invalid-unavailable",
+        orchestration=InvalidUnavailableOrchestrationAdapter(),  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("read the Drive fixture"))
+
+    assert result.disposition == "failed"
+    assert result.reason is not None
+    assert "action authority" in result.reason
+    assert components.outbound.sent == []
+
+
+def test_agents_adapter_classifies_a_whole_tool_timeout_as_unavailable() -> None:
     def delayed_read(
         _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
     ) -> BoundedReadOutput:
@@ -199,8 +437,7 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
     )
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
-        with pytest.raises(OrchestrationAdapterError, match="overall deadline"):
-            asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+        asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
                 reply_text="The late read was ignored.",
@@ -216,7 +453,45 @@ def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> 
         read_tool=read_tool,
     ).run(_request("read the current request context"))
 
-    assert result.reply_text.endswith("The late read was ignored.")
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested request context read could not be completed because the "
+        "service timed out. I did not retry the unavailable read."
+    )
+
+
+def test_agents_adapter_returns_unavailable_when_service_identity_is_rejected() -> None:
+    def rejected_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        from jarvis_control_plane.service_protocol import ServiceAuthenticationError
+
+        raise ServiceAuthenticationError("service response identity did not match")
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(agent.tools[0].on_invoke_tool(None, "{}"))
+        return SimpleNamespace(final_output=AgentsSdkPlan(reply_text="unreachable"))
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=BoundedReadTool(
+            "read_request_context",
+            "A read with a rejected service identity.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            rejected_read,
+        ),
+    ).run(_request("read through the rejected service"))
+
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested request context read could not be completed because the "
+        "service identity could not be verified. I did not retry the unavailable read."
+    )
 
 
 def test_agents_adapter_cancels_the_async_model_turn_at_its_deadline() -> None:

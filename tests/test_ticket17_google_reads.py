@@ -32,7 +32,12 @@ from jarvis_control_plane.google_reads import (
     GoogleReadRequest,
 )
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
-from jarvis_control_plane.models import InboundMessage, SignedInboundEvent
+from jarvis_control_plane.models import (
+    InboundMessage,
+    OrchestrationRequest,
+    RequestState,
+    SignedInboundEvent,
+)
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
@@ -236,6 +241,104 @@ def test_invalid_grant_discards_the_credential_before_reporting_disconnection() 
 
     assert store.current is None
     assert invalidations == ["invalidated"]
+
+
+def test_disconnected_read_records_attempt_and_failed_audit_evidence() -> None:
+    audit = InMemoryAuditBoundary()
+    connector = _connector(
+        audit=audit,
+        credential_store=InMemoryGoogleCredentialStore(),
+    )
+
+    with pytest.raises(GoogleReadError, match="google_read_disconnected"):
+        connector.drive_files_list(
+            request_id="request-disconnected",
+            query="name = 'fixture'",
+            max_results=1,
+        )
+
+    evidence = audit.safe_view()
+    assert [(item.outcome, item.execution_status) for item in evidence] == [
+        ("attempted", "attempted"),
+        ("failed", "failed"),
+    ]
+    assert all(item.request_id == "request-disconnected" for item in evidence)
+
+
+def test_local_disconnected_read_returns_sanitized_orchestration_result() -> None:
+    connector = _connector(credential_store=InMemoryGoogleCredentialStore())
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        drive = next(tool for tool in agent.tools if tool.name == "read_google_drive")
+        asyncio.run(
+            drive.on_invoke_tool(
+                None,
+                json.dumps(
+                    {
+                        "operation": "files_list",
+                        "query": "name = 'fixture'",
+                        "max_results": 1,
+                    }
+                ),
+            )
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Ignore the unavailable result.")
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        google_read_connector=connector,
+    ).run(
+        OrchestrationRequest(
+            state=RequestState(
+                request_id="request-local-disconnected",
+                event_id="event-local-disconnected",
+                message_id="message-local-disconnected",
+                operator_id="operator.test",
+                session_id="session.test",
+                chat_id="operator.test",
+                created_at=NOW,
+                updated_at=NOW,
+                status="running",
+                phase="orchestration",
+                model="gpt-5.6-terra",
+                reasoning="medium",
+            ),
+            text="List one Drive fixture without modifying it.",
+        )
+    )
+
+    assert result.outcome == "unavailable"
+    assert result.reply_text == (
+        "The requested Google Drive read could not be completed because Google is "
+        "disconnected. I did not retry the unavailable read."
+    )
+    assert result.proposal is None
+
+
+def test_disconnected_read_propagates_failure_audit_outage() -> None:
+    audit = InMemoryAuditBoundary(fail_on_append=2)
+    connector = _connector(
+        audit=audit,
+        credential_store=InMemoryGoogleCredentialStore(),
+    )
+
+    with pytest.raises(GoogleReadError, match="google_read_audit_unavailable"):
+        connector.drive_files_list(
+            request_id="request-disconnected-audit-outage",
+            query="name = 'fixture'",
+            max_results=1,
+        )
+
+    evidence = audit.safe_view()
+    assert [(item.outcome, item.execution_status) for item in evidence] == [
+        ("attempted", "attempted"),
+    ]
 
 
 @pytest.mark.parametrize(

@@ -31,7 +31,6 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
 )
-from jarvis_control_plane.ports import OrchestrationAdapterError
 
 NOW = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
 
@@ -411,10 +410,9 @@ def test_vault_tool_enforces_one_deadline_when_process_runner_is_slow(
         loop = asyncio.new_event_loop()
         started = time.monotonic()
         try:
-            with pytest.raises(OrchestrationAdapterError, match="overall deadline"):
-                loop.run_until_complete(
-                    agent.tools[1].on_invoke_tool(None, json.dumps({"query": "Alpha"}))
-                )
+            loop.run_until_complete(
+                agent.tools[1].on_invoke_tool(None, json.dumps({"query": "Alpha"}))
+            )
         finally:
             loop.close()
         invocation_durations.append(time.monotonic() - started)
@@ -433,8 +431,11 @@ def test_vault_tool_enforces_one_deadline_when_process_runner_is_slow(
         vault_read_tool=connector.as_bounded_read_tool(),
     )
 
-    adapter.run(_request())
+    result = adapter.run(_request())
 
+    assert result.outcome == "unavailable"
+    assert "knowledge vault" in result.reply_text
+    assert "service timed out" in result.reply_text
     assert invocation_durations[0] < 0.12
     assert observed_timeouts and observed_timeouts[0] <= 0.05
 

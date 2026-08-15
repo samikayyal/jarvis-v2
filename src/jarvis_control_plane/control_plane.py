@@ -2527,9 +2527,9 @@ class DeterministicCapabilityBroker:
             )
         if result.request_id != request_id:
             raise OrchestrationAdapterError("orchestration result correlation mismatch")
-        if result.outcome != "completed":
+        if result.outcome not in {"completed", "unavailable"}:
             raise OrchestrationAdapterError(
-                "orchestration adapter returned a non-completed outcome"
+                "orchestration adapter returned an unsupported outcome"
             )
         if result.adapter not in {"controlled", "agents_sdk_responses"}:
             raise OrchestrationAdapterError(
@@ -2554,6 +2554,18 @@ class DeterministicCapabilityBroker:
                 raise OrchestrationAdapterError(
                     "orchestration proposal intent is outside the configured boundary"
                 )
+        if result.outcome == "unavailable" and any(
+            value is not None
+            for value in (
+                result.proposal,
+                result.proposal_intent,
+                result.execution_host,
+                result.host_reason_code,
+            )
+        ):
+            raise OrchestrationAdapterError(
+                "unavailable orchestration result included action authority"
+            )
         selected_host = result.execution_host
         if result.proposal is None or result.proposal.kind != "terminal":
             return selected_host
@@ -2859,11 +2871,14 @@ class DeterministicCapabilityBroker:
                         f"reconciliation: {observation_error}"
                     ),
                 )
+            terminal_outcome = (
+                "read_unavailable" if result.outcome == "unavailable" else "reply_sent"
+            )
             completed = self._transition(
                 replying,
                 status="completed",
                 phase="completed",
-                outcome="reply_sent",
+                outcome=terminal_outcome,
                 error_code=None,
                 reply_id=reply.reply_id,
                 audit=False,
@@ -2873,7 +2888,7 @@ class DeterministicCapabilityBroker:
                 event_id=message.event_id,
                 request_id=request.request_id,
                 message_id=message.message_id,
-                outcome="reply_sent",
+                outcome=terminal_outcome,
                 actor="control_plane",
                 operation_type="request_lifecycle",
                 target_category="control_plane",
@@ -3058,7 +3073,9 @@ class DeterministicCapabilityBroker:
 
         return ReceiveResult(
             status_code=202,
-            disposition="completed",
+            disposition=(
+                "unavailable" if result.outcome == "unavailable" else "completed"
+            ),
             request=completed,
             reply=reply,
         )
