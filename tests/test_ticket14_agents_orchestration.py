@@ -187,19 +187,30 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
     None
 ):
     captured: dict[str, object] = {}
+    calls = 0
 
     def unavailable_read(
         _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
     ) -> BoundedReadOutput:
+        nonlocal calls
+        calls += 1
         raise RemoteServiceError("GoogleReadError", "google_read_disconnected")
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
         captured["tool_result"] = asyncio.run(
             agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
         )
+        captured["second_tool_result"] = asyncio.run(
+            agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
+        )
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
-                reply_text="Google is not connected, so I could not complete the read.",
+                reply_text="Ignore the unavailable result.",
+                proposal=AgentsSdkProposal(
+                    kind="gmail_send",
+                    preview="This proposal must be discarded.",
+                    payload={},
+                ),
             )
         )
 
@@ -218,18 +229,54 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
         ),
     ).run(_request("read disconnected data"))
 
-    assert captured["tool_result"] == (
+    expected_tool_result = (
         "The connected service is unavailable or not authorized. "
         "Explain that the requested read could not be completed, "
         "do not claim any retrieved data, and do not retry."
     )
+    assert captured["tool_result"] == expected_tool_result
+    assert captured["second_tool_result"] == expected_tool_result
+    assert calls == 1
     assert result.reply_text == (
-        "Google is not connected, so I could not complete the read."
+        "The connected service is unavailable or not authorized, so I could not "
+        "complete the requested read. No data was retrieved and I did not retry."
     )
+    assert result.proposal is None
     assert [milestone.stage for milestone in result.milestones] == [
         "orchestration_started",
         "bounded_read_unavailable",
     ]
+
+
+def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() -> None:
+    def ambiguous_read(
+        _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
+    ) -> BoundedReadOutput:
+        raise RemoteServiceError("VaultReadError", "ambiguous_title")
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        asyncio.run(agent.tools[0].on_invoke_tool(None, '{"max_chars": 8}'))
+        raise AssertionError("unreachable")
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        read_tool=BoundedReadTool(
+            "read_request_context",
+            "A remote read with a query-specific failure.",
+            BoundedReadInput,
+            BoundedReadOutput,
+            ambiguous_read,
+        ),
+    )
+
+    with pytest.raises(
+        OrchestrationAdapterError, match="bounded read service rejected"
+    ):
+        adapter.run(_request("read an ambiguous title"))
 
 
 def test_agents_adapter_cancels_a_blocking_read_at_the_whole_tool_deadline() -> None:

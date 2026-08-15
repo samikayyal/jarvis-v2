@@ -260,6 +260,26 @@ def test_disconnected_read_records_attempt_and_failed_audit_evidence() -> None:
     assert all(item.request_id == "request-disconnected" for item in evidence)
 
 
+def test_disconnected_read_propagates_failure_audit_outage() -> None:
+    audit = InMemoryAuditBoundary(fail_on_append=2)
+    connector = _connector(
+        audit=audit,
+        credential_store=InMemoryGoogleCredentialStore(),
+    )
+
+    with pytest.raises(GoogleReadError, match="google_read_audit_unavailable"):
+        connector.drive_files_list(
+            request_id="request-disconnected-audit-outage",
+            query="name = 'fixture'",
+            max_results=1,
+        )
+
+    evidence = audit.safe_view()
+    assert [(item.outcome, item.execution_status) for item in evidence] == [
+        ("attempted", "attempted"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("read_request", "response_payload", "expected_path", "page_size_key"),
     (

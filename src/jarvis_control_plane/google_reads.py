@@ -555,6 +555,15 @@ class GoogleReadConnector:
         )
         try:
             credential = self._credential(operation)
+        except GoogleReadError:
+            self._append_audit(
+                request_id=request_id,
+                operation=operation,
+                outcome="failed",
+                execution_status="failed",
+            )
+            raise
+        try:
             provider_request = GoogleReadRequest(
                 operation=operation,
                 arguments=dict(arguments),

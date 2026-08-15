@@ -41,6 +41,25 @@ _MAX_READ_CHARS = 1_000
 _READ_TOOL_TIMEOUT_SECONDS = 20.0
 _MAX_READ_TOOL_SECONDS = _READ_TOOL_TIMEOUT_SECONDS
 _MODEL_CANCELLATION_GRACE_SECONDS = 5.0
+_READ_UNAVAILABLE_RESULT = (
+    "The connected service is unavailable or not authorized. "
+    "Explain that the requested read could not be completed, "
+    "do not claim any retrieved data, and do not retry."
+)
+_READ_UNAVAILABLE_REPLY = (
+    "The connected service is unavailable or not authorized, so I could not "
+    "complete the requested read. No data was retrieved and I did not retry."
+)
+_SAFE_REMOTE_READ_FAILURES = frozenset(
+    {
+        ("GoogleReadError", "google_read_disconnected"),
+        ("GoogleReadError", "google_read_unavailable"),
+        ("GoogleReadError", "google_read_timeout"),
+        ("GoogleReadError", "google_read_rate_limited"),
+        ("GoogleReadError", "missing_scope"),
+        ("GoogleReadError", "wrong_identity"),
+    }
+)
 _CLOSED_READ_TOOL_NAMES = frozenset(
     {
         "read_request_context",
@@ -354,6 +373,7 @@ class AgentsSdkOrchestrationAdapter:
         ]
         budget = _ToolInvocationBudget(self._max_tool_invocations)
         stale_vault_read: tuple[datetime, str] | None = None
+        unavailable_reads: list[str] = []
 
         def record_stale_vault_read(synchronized_at: datetime, warning: str) -> None:
             nonlocal stale_vault_read
@@ -367,6 +387,7 @@ class AgentsSdkOrchestrationAdapter:
                 request,
                 milestones,
                 budget,
+                unavailable_reads,
                 record_stale_vault_read=record_stale_vault_read,
             )
             agent = self._agent_factory(
@@ -402,6 +423,15 @@ class AgentsSdkOrchestrationAdapter:
             raise
         except Exception as exc:
             raise OrchestrationAdapterError("Agents SDK run was unavailable") from exc
+
+        if unavailable_reads:
+            return OrchestrationResult(
+                request_id=request.state.request_id,
+                outcome="completed",
+                reply_text=_READ_UNAVAILABLE_REPLY,
+                adapter="agents_sdk_responses",
+                milestones=tuple(milestones),
+            )
 
         plan = getattr(run_result, "final_output", None)
         if not isinstance(plan, AgentsSdkPlan):
@@ -558,6 +588,7 @@ class AgentsSdkOrchestrationAdapter:
         request: OrchestrationRequest,
         milestones: list[OrchestrationMilestone],
         budget: _ToolInvocationBudget,
+        unavailable_reads: list[str],
         record_stale_vault_read: Callable[[datetime, str], None],
     ) -> list[Any]:
         """Build the closed tool list anew for each request and invocation budget."""
@@ -569,7 +600,9 @@ class AgentsSdkOrchestrationAdapter:
 
             async def invoke(
                 _context: Any, raw_input: str, *, tool: BoundedReadTool = read_tool
-            ) -> dict[str, object]:
+            ) -> object:
+                if unavailable_reads:
+                    return _READ_UNAVAILABLE_RESULT
                 budget.consume()
                 try:
                     typed_input = tool.input_model.model_validate_json(raw_input)
@@ -592,18 +625,19 @@ class AgentsSdkOrchestrationAdapter:
                             record_stale_vault_read(synchronized_at, warning)
                 except OrchestrationAdapterError:
                     raise
-                except RemoteServiceError:
+                except RemoteServiceError as exc:
+                    if (exc.error_type, str(exc)) not in _SAFE_REMOTE_READ_FAILURES:
+                        raise OrchestrationAdapterError(
+                            "bounded read service rejected the request"
+                        ) from exc
+                    unavailable_reads.append(tool.name)
                     milestones.append(
                         OrchestrationMilestone(
                             stage="bounded_read_unavailable",
                             message=f"Bounded read with {tool.name} was unavailable.",
                         )
                     )
-                    return (
-                        "The connected service is unavailable or not authorized. "
-                        "Explain that the requested read could not be completed, "
-                        "do not claim any retrieved data, and do not retry."
-                    )
+                    return _READ_UNAVAILABLE_RESULT
                 except TimeoutError as exc:
                     raise OrchestrationAdapterError(
                         "bounded read tool exceeded its overall deadline"
