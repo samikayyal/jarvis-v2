@@ -26,6 +26,13 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - The Chrome `/status` reconciliation after rejection reported no active request and no pending action. The dedicated vault clone remains clean and equal to its remote base, and no duplicate side effect was observed.
 - The exact Markdown write row therefore remains blocked. The Gmail/Calendar unknown-outcome rows also remain blocked because the runbook requires a separately reviewed post-dispatch interruption method; no container, traffic, firewall, or proxy interruption was attempted.
 
+## Sanitized supervised evidence update — vault dispatch reconciliation — 2026-08-16
+
+- A fresh exact vault proposal passed protected structural comparison: one canonical path, the current content preserved byte-for-byte, one appended marker line, zero removed diff lines, one added diff line, fixed subject, and configured identity shape.
+- The exact one-time approval was sent through the existing Chrome Jarvis chat. The connector committed locally but returned an outcome-unknown push result. Authoritative remote reconciliation shows the remote head unchanged; the local clone is clean but one commit ahead and contains the labeled marker. No remote vault side effect or duplicate commit was established.
+- The connector is now in its documented manual-recovery block. No manual Git push, retry, reset, deletion, or history rewrite was attempted. The session was reconciled to no active request and no pending action.
+- The exact vault row remains blocked, and the ticket remains `ready-for-human`. A human must resolve the isolated local-ahead/manual-recovery state under the vault runbook before any further vault instruction.
+
 - [ ] Real bounded Gmail, Calendar, and Drive reads succeed with the configured identity and fixed scopes, including supervised failure and reconnection cases.
 - [ ] One reversibly labeled Gmail send or reply and one reversibly labeled Calendar mutation execute only through exact approval, with altered/replayed/unknown-outcome behavior checked safely.
 - [ ] A real deterministic vault read and one exact approved Markdown commit and normal push succeed; excluded and destructive capabilities are tested only through rejection.
