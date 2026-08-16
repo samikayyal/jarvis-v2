@@ -100,6 +100,8 @@ class VaultExcerpt(BaseModel):
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
     text: str = Field(min_length=1, max_length=_MAX_EXCERPT_CHARS)
+    complete: bool = False
+    ends_with_newline: bool | None = None
 
 
 class KnowledgeVaultReadResult(BaseModel):
@@ -638,7 +640,8 @@ class KnowledgeVaultConnector:
             name="read_knowledge_vault",
             description=(
                 "Read or search the configured knowledge vault locally. Results are "
-                "bounded excerpts and may include a visible stale-read warning."
+                "bounded excerpts; exact-path small-note results explicitly report "
+                "whether the content is complete and whether it ends with a newline."
             ),
             input_model=VaultReadInput,
             output_model=KnowledgeVaultReadResult,
@@ -651,7 +654,7 @@ class KnowledgeVaultConnector:
     ) -> list[VaultExcerpt]:
         if request.path is not None:
             note = self._ordinary_note_for_path(request.path)
-            return [self._excerpt(note, request.path, budget)]
+            return [self._path_excerpt(note, request.path, budget)]
 
         notes = self._ordinary_notes(budget)
         if request.title is not None:
@@ -766,6 +769,23 @@ class KnowledgeVaultConnector:
             end_line=start + len(selected),
             text=text,
         )
+
+    def _path_excerpt(
+        self, note: Path, path: str, budget: _VaultReadBudget
+    ) -> VaultExcerpt:
+        """Return a complete small exact-path note without widening searches."""
+
+        content = budget.read(note)
+        if content and len(content) <= _MAX_EXCERPT_CHARS:
+            return VaultExcerpt(
+                path=self._relative(note),
+                start_line=1,
+                end_line=max(1, len(content.splitlines())),
+                text=content,
+                complete=True,
+                ends_with_newline=content.endswith("\n"),
+            )
+        return self._excerpt(note, path, budget)
 
     def _link_targets(
         self, note: Path, query: str, budget: _VaultReadBudget

@@ -30,6 +30,7 @@ from jarvis_control_plane.models import OrchestrationRequest, RequestState
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
+    _instructions,
 )
 
 NOW = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
@@ -134,6 +135,28 @@ def test_clean_vault_syncs_before_bounded_path_text_tag_frontmatter_and_link_rea
         for excerpt in by_link.excerpts
     )
     assert all(len(excerpt.text) <= 600 for excerpt in by_link.excerpts)
+
+
+def test_exact_path_read_preserves_complete_small_note_for_exact_write_context(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    content = "one\ntwo\nthree\nfour\nfive\n"
+    exact_path = tmp_path / "Projects" / "Exact.md"
+    exact_path.write_text(content, encoding="utf-8", newline="")
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    result = connector.read(VaultReadInput(path="Projects/Exact.md"))
+
+    assert len(result.excerpts) == 1
+    excerpt = result.excerpts[0]
+    assert excerpt.start_line == 1
+    assert excerpt.end_line == 5
+    assert excerpt.text == content
+    assert excerpt.complete is True
+    assert excerpt.ends_with_newline is True
 
 
 def test_unavailable_sync_permits_only_a_clean_stale_read_with_age_disclosure(
@@ -519,6 +542,18 @@ def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
         "orchestration_started",
         "bounded_read",
     ]
+
+
+def test_vault_write_instructions_require_a_fresh_exact_path_read() -> None:
+    instructions = _instructions(
+        has_vault_read=True,
+        has_vault_write=True,
+    )
+
+    assert "invoke read_knowledge_vault for each exact target path" in instructions
+    assert "require its complete and ends_with_newline metadata" in instructions
+    assert "never reconstruct content from conversation history" in instructions
+    assert "If an exact-path read is not marked complete" in instructions
 
 
 def test_orchestration_deterministically_discloses_a_stale_vault_read(

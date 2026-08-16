@@ -27,6 +27,7 @@ from jarvis_control_plane.orchestration import (
     BoundedReadInput,
     BoundedReadOutput,
     BoundedReadTool,
+    _instructions,
 )
 from jarvis_control_plane.ports import OrchestrationAdapterError
 from jarvis_control_plane.sessions import ReadinessState
@@ -768,6 +769,16 @@ def test_calendar_insert_gets_an_internal_generation_placeholder() -> None:
     assert result.proposal.kind == "calendar_insert"
     assert '"summary":"Design review"' in result.proposal.payload
     assert '"connection_generation":0' in result.proposal.payload
+
+
+def test_calendar_model_contract_describes_the_closed_insert_shape() -> None:
+    instructions = _instructions(has_vault_read=False, has_vault_write=False)
+
+    assert (
+        "calendar_id, complete_event, and notification, with optional event_id"
+        in instructions
+    )
+    assert "Never emit connection_generation, etag, schema" in instructions
 
 
 def test_model_proposed_authority_fields_fail_closed_before_freezing() -> None:
