@@ -30,6 +30,7 @@ from jarvis_control_plane.models import OrchestrationRequest, RequestState
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
+    _instructions,
 )
 
 NOW = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
@@ -539,6 +540,17 @@ def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
         "orchestration_started",
         "bounded_read",
     ]
+
+
+def test_vault_write_instructions_require_a_fresh_exact_path_read() -> None:
+    instructions = _instructions(
+        has_vault_read=True,
+        has_vault_write=True,
+    )
+
+    assert "invoke read_knowledge_vault for each exact target path" in instructions
+    assert "never reconstruct it from conversation history" in instructions
+    assert "If an exact-path read is not complete enough" in instructions
 
 
 def test_orchestration_deterministically_discloses_a_stale_vault_read(

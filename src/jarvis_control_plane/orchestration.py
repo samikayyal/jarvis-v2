@@ -1019,8 +1019,12 @@ def _instructions(
         + (
             "For an approved knowledge-vault note change, emit one complete "
             "knowledge_vault_write proposal containing only a path-to-new-content "
-            "changes mapping; the broker will independently synchronize and freeze "
-            "the exact base and diff. "
+            "changes mapping. Before emitting it, invoke read_knowledge_vault for "
+            "each exact target path in the same turn and use only the returned text "
+            "for existing content; never reconstruct it from conversation history. "
+            "If an exact-path read is not complete enough to preserve the existing "
+            "content, emit no proposal. The broker will independently synchronize "
+            "and freeze the exact base and diff. "
             if has_vault_write
             else ""
         )
