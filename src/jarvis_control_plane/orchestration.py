@@ -118,6 +118,12 @@ _CLOSED_READ_TOOL_NAMES = frozenset(
 _TERMINAL_PAYLOAD_FIELDS = frozenset(
     {"host", "executable", "arguments", "cwd", "components"}
 )
+_GMAIL_MESSAGE_PAYLOAD_FIELDS = frozenset(
+    {"to", "cc", "bcc", "subject", "body", "mime_type"}
+)
+_GMAIL_REPLY_PAYLOAD_FIELDS = frozenset(
+    {"source_message_id", "source_thread_id", "in_reply_to", "references"}
+)
 
 
 class _ModelTurnDeadlineExceeded(TimeoutError):
@@ -821,10 +827,11 @@ class AgentsSdkOrchestrationAdapter:
                 )
                 terminal_action_from_proposal(candidate)
             elif plan.proposal.kind == "gmail_send":
+                gmail_payload = _canonical_gmail_model_payload("gmail_send", payload)
                 candidate = create_gmail_new_send_proposal(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
-                    **payload,
+                    **gmail_payload,
                 )
             elif plan.proposal.kind == "calendar_insert":
                 if "connection_generation" in payload:
@@ -885,16 +892,60 @@ class AgentsSdkOrchestrationAdapter:
                     payload={"changes": dict(changes)},
                 )
             else:
+                gmail_payload = _canonical_gmail_model_payload("gmail_reply", payload)
                 candidate = create_gmail_reply_proposal(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
-                    **payload,
+                    **gmail_payload,
                 )
         except (TypeError, ValueError, KeyError) as exc:
             raise OrchestrationAdapterError(
                 "model returned a malformed action proposal"
             ) from exc
         return candidate
+
+
+def _canonical_gmail_model_payload(
+    kind: Literal["gmail_send", "gmail_reply"],
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Adapt only harmless model metadata to the canonical Gmail factory shape."""
+
+    allowed = _GMAIL_MESSAGE_PAYLOAD_FIELDS
+    if kind == "gmail_reply":
+        allowed |= _GMAIL_REPLY_PAYLOAD_FIELDS | {"thread_id"}
+    allowed |= {"attachments", "threading"}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise OrchestrationAdapterError(
+            "model proposed Gmail fields outside the closed action shape"
+        )
+
+    if "attachments" in payload and payload["attachments"] != []:
+        raise OrchestrationAdapterError("model proposed unsupported Gmail attachments")
+
+    expected_threading = (
+        "new_message" if kind == "gmail_send" else "gmail_threaded_reply"
+    )
+    if "threading" in payload and payload["threading"] != expected_threading:
+        raise OrchestrationAdapterError(
+            "model proposed invalid Gmail threading behavior"
+        )
+
+    if (
+        kind == "gmail_reply"
+        and "thread_id" in payload
+        and payload.get("thread_id") != payload.get("source_thread_id")
+    ):
+        raise OrchestrationAdapterError(
+            "model proposed a Gmail reply thread different from its source"
+        )
+
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"attachments", "thread_id", "threading"}
+    }
 
 
 def _model_input_with_history(request: OrchestrationRequest) -> str:
@@ -944,6 +995,11 @@ def _instructions(
         "terminal action, Gmail send/reply, or Calendar insert/update/patch, emit "
         "one complete typed proposal; Calendar changes must include the exact "
         "ETag-bound snapshot returned by the read tool. "
+        "For Gmail new sends, the payload must contain exactly to, cc, bcc, "
+        "subject, body, and mime_type; recipients are arrays and mime_type is "
+        "text/plain or text/html. For Gmail replies, add only the frozen source "
+        "message and thread header fields. Do not emit attachments, threading, "
+        "or Google connection fields; those are independently derived or bound. "
         "it will still be independently checked and require the broker's approval flow. "
         "Every exposed read tool has a closed typed schema and bounded result. "
         + (

@@ -939,6 +939,65 @@ def test_orchestration_rebuilds_a_canonical_gmail_preview() -> None:
     assert result.host_reason_code is None
 
 
+def test_orchestration_normalizes_redundant_model_gmail_fields() -> None:
+    plan = AgentsSdkPlan(
+        reply_text="The exact Gmail action is ready.",
+        proposal=AgentsSdkProposal(
+            kind="gmail_send",
+            preview="untrusted model prose is never the frozen preview",
+            payload={
+                "to": ["recipient@example.com"],
+                "cc": [],
+                "bcc": [],
+                "subject": "Quarterly check-in",
+                "body": "Please review.",
+                "mime_type": "text/plain",
+                "attachments": [],
+                "threading": "new_message",
+            },
+        ),
+    )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(final_output=plan),
+        model_settings_factory=lambda **values: values,
+        reasoning_factory=lambda **values: values,
+        run_config_factory=lambda **values: values,
+    ).run(
+        OrchestrationRequest(
+            state=RequestState(
+                request_id="request-model-shape",
+                event_id="event-model-shape",
+                message_id="message-model-shape",
+                operator_id=OPERATOR,
+                session_id="working-session-model-shape",
+                chat_id=OPERATOR,
+                created_at=NOW,
+                updated_at=NOW,
+                status="accepted",
+                phase="orchestration",
+            ),
+            text="prepare this plain-text email",
+        )
+    )
+
+    assert result.proposal is not None
+    request = gmail_write_request_from_proposal(result.proposal)
+    assert isinstance(request, GmailNewSendRequest)
+    payload = json.loads(result.proposal.payload)
+    assert set(payload) == {
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "body",
+        "mime_type",
+        "threading",
+    }
+    assert payload["threading"] == "new_message"
+
+
 def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
     terminal_dispatcher = ControlledActionDispatcher()
     gmail_provider = ControlledGmailWriteProvider(
