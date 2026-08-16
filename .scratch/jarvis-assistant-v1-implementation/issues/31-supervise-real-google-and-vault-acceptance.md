@@ -34,6 +34,12 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - Protected trace timing places the worker failure at the connector's 20-second write deadline; it records no authentication or explicit remote-rejection signal. This is a diagnostic lead for human recovery, not evidence that the unpushed commit may be retried.
 - The exact vault row remains blocked, and the ticket remains `ready-for-human`. A human must resolve the isolated local-ahead/manual-recovery state under the vault runbook before any further vault instruction.
 
+## Sanitized supervised evidence update — vault clone restoration — 2026-08-16
+
+- Following the documented human recovery direction, the dedicated clone was restored locally to its authoritative `origin/main` head. The local and remote-tracking heads now match at `c59eadab`, and the clone is clean on its attached `main` branch.
+- The previously local-only labeled commit is no longer present; no private remote mutation, duplicate commit, or note change remains. The connector process was not restarted or bypassed, so its in-memory manual-recovery latch still requires the documented administrative recovery before another vault write instruction.
+- The vault exact-write row remains blocked and the ticket remains `ready-for-human`.
+
 - [ ] Real bounded Gmail, Calendar, and Drive reads succeed with the configured identity and fixed scopes, including supervised failure and reconnection cases.
 - [ ] One reversibly labeled Gmail send or reply and one reversibly labeled Calendar mutation execute only through exact approval, with altered/replayed/unknown-outcome behavior checked safely.
 - [ ] A real deterministic vault read and one exact approved Markdown commit and normal push succeed; excluded and destructive capabilities are tested only through rejection.
