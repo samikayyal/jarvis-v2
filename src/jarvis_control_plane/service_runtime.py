@@ -498,6 +498,19 @@ def _operation_timeouts(
     return {operation: side_effect for operation in role.operations}
 
 
+def _vault_write_timeout(config: Mapping[str, Any]) -> float:
+    configured = config.get("timeouts")
+    if not isinstance(configured, Mapping):
+        raise CompositionError("service timeout configuration is unavailable")
+    try:
+        timeout = float(configured["side_effect_connector_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CompositionError("service timeout configuration is invalid") from exc
+    if not 0 < timeout <= 120:
+        raise CompositionError("vault write timeout is outside the connector bound")
+    return timeout
+
+
 def _client(
     config: Mapping[str, Any], *, client_identity: str, server_role: str
 ) -> AuthenticatedServiceClient:
@@ -945,6 +958,7 @@ def _vault_operations(
         repository=repository,
         now=clock.now,
         allowed_note_directories=tuple(note_directories),
+        timeout_seconds=_vault_write_timeout(config),
     )
     operations: dict[str, Callable[..., object]] = {
         "read": lambda payload, deadline=None: reads.read(

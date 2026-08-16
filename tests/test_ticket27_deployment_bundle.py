@@ -50,6 +50,7 @@ from jarvis_control_plane.service_runtime import (
     _orchestration_operations,
     _read_secret,
     _service_access,
+    _vault_write_timeout,
     _verified_inbound_event,
 )
 from jarvis_control_plane.service_runtime import (
@@ -1202,8 +1203,7 @@ def test_openwa_route_worker_overlay_and_docker_context_are_reviewed() -> None:
     dockerfile = (SHIPPED_BUNDLE / "Dockerfile").read_text("utf-8")
     assert "RUN npm ci --omit=dev --ignore-scripts" in dockerfile
     assert (
-        "useradd --uid 10006 --gid 20000 --home-dir /var/lib/jarvis/vault"
-        in dockerfile
+        "useradd --uid 10006 --gid 20000 --home-dir /var/lib/jarvis/vault" in dockerfile
     )
 
     active = tomllib.loads((SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8"))
@@ -1219,6 +1219,12 @@ def test_service_transport_timeouts_cover_configured_operation_deadlines() -> No
     assert _operation_timeouts(config, server_role="orchestration_agent")["run"] > 480
     worker = _operation_timeouts(config, server_role="worker_gateway")
     assert set(worker.values()) == {145.0}
+
+
+def test_vault_write_uses_the_configured_side_effect_budget() -> None:
+    config = tomllib.loads((SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8"))
+
+    assert _vault_write_timeout(config) == 30.0
 
 
 def test_trace_admission_preserves_the_configured_free_disk_floor(
