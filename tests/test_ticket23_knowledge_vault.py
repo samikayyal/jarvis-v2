@@ -136,6 +136,26 @@ def test_clean_vault_syncs_before_bounded_path_text_tag_frontmatter_and_link_rea
     assert all(len(excerpt.text) <= 600 for excerpt in by_link.excerpts)
 
 
+def test_exact_path_read_preserves_complete_small_note_for_exact_write_context(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    content = "one\ntwo\nthree\nfour\nfive\n"
+    exact_path = tmp_path / "Projects" / "Exact.md"
+    exact_path.write_text(content, encoding="utf-8", newline="")
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    result = connector.read(VaultReadInput(path="Projects/Exact.md"))
+
+    assert len(result.excerpts) == 1
+    excerpt = result.excerpts[0]
+    assert excerpt.start_line == 1
+    assert excerpt.end_line == 5
+    assert excerpt.text == content
+
+
 def test_unavailable_sync_permits_only_a_clean_stale_read_with_age_disclosure(
     tmp_path: Path,
 ) -> None:
