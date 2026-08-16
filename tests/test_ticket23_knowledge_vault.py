@@ -155,6 +155,8 @@ def test_exact_path_read_preserves_complete_small_note_for_exact_write_context(
     assert excerpt.start_line == 1
     assert excerpt.end_line == 5
     assert excerpt.text == content
+    assert excerpt.complete is True
+    assert excerpt.ends_with_newline is True
 
 
 def test_unavailable_sync_permits_only_a_clean_stale_read_with_age_disclosure(
@@ -549,8 +551,9 @@ def test_vault_write_instructions_require_a_fresh_exact_path_read() -> None:
     )
 
     assert "invoke read_knowledge_vault for each exact target path" in instructions
-    assert "never reconstruct it from conversation history" in instructions
-    assert "If an exact-path read is not complete enough" in instructions
+    assert "require its complete and ends_with_newline metadata" in instructions
+    assert "never reconstruct content from conversation history" in instructions
+    assert "If an exact-path read is not marked complete" in instructions
 
 
 def test_orchestration_deterministically_discloses_a_stale_vault_read(

@@ -4,7 +4,7 @@
     "name": "jarvis-v2",
     "version": "0.1.0",
     "git_revision": "06a9e88fff1fdc9b7cafcda493a4a70ee0535e66",
-    "source_sha256": "b2db7c6cfcfe14c2d27a60b7b28695c8119b323932f26bf114c47c256dfc9fc4"
+    "source_sha256": "cc527afec88a062f7b3c9c7e8677c6b342a866013bf292dd06544542ceb0b4b9"
   },
   "database_schemas": {
     "state": "4c4e03d8f879ad235051543caa4ef7782f408c05953087d5cf0201c261a59c43",

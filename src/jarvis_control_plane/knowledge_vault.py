@@ -100,6 +100,8 @@ class VaultExcerpt(BaseModel):
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
     text: str = Field(min_length=1, max_length=_MAX_EXCERPT_CHARS)
+    complete: bool = False
+    ends_with_newline: bool | None = None
 
 
 class KnowledgeVaultReadResult(BaseModel):
@@ -638,7 +640,8 @@ class KnowledgeVaultConnector:
             name="read_knowledge_vault",
             description=(
                 "Read or search the configured knowledge vault locally. Results are "
-                "bounded excerpts and may include a visible stale-read warning."
+                "bounded excerpts; exact-path small-note results explicitly report "
+                "whether the content is complete and whether it ends with a newline."
             ),
             input_model=VaultReadInput,
             output_model=KnowledgeVaultReadResult,
@@ -779,6 +782,8 @@ class KnowledgeVaultConnector:
                 start_line=1,
                 end_line=max(1, len(content.splitlines())),
                 text=content,
+                complete=True,
+                ends_with_newline=content.endswith("\n"),
             )
         return self._excerpt(note, path, budget)
 
