@@ -44,3 +44,14 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - [ ] One reversibly labeled Gmail send or reply and one reversibly labeled Calendar mutation execute only through exact approval, with altered/replayed/unknown-outcome behavior checked safely.
 - [ ] A real deterministic vault read and one exact approved Markdown commit and normal push succeed; excluded and destructive capabilities are tested only through rejection.
 
+## Sanitized supervised evidence update — configured vault timeout repair and release — 2026-08-16
+
+- The deterministic model-to-Gmail proposal boundary repair is committed as `c811304`: the vault write connector now receives the configured, bounded side-effect timeout, and a focused regression covers that wiring. Strict broker validation, closed proposal shapes, audit behavior, approval gates, and no-dispatch-before-approval semantics were preserved.
+- Focused tests passed (`102 passed`); Ruff, format checking, and compilation passed; the final full suite passed (`770 passed, 2 skipped`). The repair commit and this evidence update are pushed on the Ticket 31 branch.
+- The supervised release cutover completed from the repaired commit. The candidate changed only the 13 Jarvis image tags; all 13 images built, the protected image map was updated, pre-change and post-change backups passed, and all 13 Jarvis services are healthy/ready. Administrative status reports audit writable, both workers ready, and resource pressure `ok`.
+- OpenWA was not recreated or re-paired. Its named session remains ready with the expected active webhook and exact reviewed network membership; the private bind and firewall posture were unchanged.
+- Google live identity, baseline scopes, and OAuth generation checks pass. Current incremental grants still show Gmail send absent and Calendar write present; no credential or OAuth mutation was made during this repair.
+- The dedicated vault clone is clean on its attached `main` branch with local and remote heads equal at `c59eadab`. Durable-state reconciliation found no active request, pending outbox/action, unresolved outbound attempt, recovery-degraded marker, or duplicate side effect.
+- Chrome was closed and reopened as requested. Chrome diagnostics and tab discovery are healthy, but the browser control could not claim or inspect the existing WhatsApp tab after the documented recovery/retry. No post-cutover WhatsApp message was sent, and no OpenWA or direct-provider workaround was used.
+- Consequently, the fresh acceptance rows that require messages through the existing Chrome Jarvis chat—including the exact Markdown vault commit/push—were not rerun. Gmail/Calendar unknown-outcome rows also remain blocked because no separately reviewed post-dispatch interruption method is available. The ticket remains `ready-for-human`; do not mark `complete` until every worksheet row passes.
+
