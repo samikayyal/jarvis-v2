@@ -19,6 +19,13 @@
 
 The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedure and a safe exact Markdown write path. Do not mark `complete` until every worksheet row passes.
 
+## Sanitized supervised evidence update — 2026-08-16
+
+- The latest repaired release was built, cut over, and passed the administrative gates: all 13 Jarvis services are healthy and ready, audit is writable, the named OpenWA session is ready, the reviewed private bind and network memberships remain intact, and the post-change nightly backup passed.
+- The fresh exact-path vault read now reported complete content and a final newline through the broker metadata. The resulting visible write proposal was still malformed: its rendered unified diff contained no hunk and no requested acceptance-line addition. It was rejected with the displayed exact control grammar; no approval, write, commit, push, or unknown outcome occurred.
+- The Chrome `/status` reconciliation after rejection reported no active request and no pending action. The dedicated vault clone remains clean and equal to its remote base, and no duplicate side effect was observed.
+- The exact Markdown write row therefore remains blocked. The Gmail/Calendar unknown-outcome rows also remain blocked because the runbook requires a separately reviewed post-dispatch interruption method; no container, traffic, firewall, or proxy interruption was attempted.
+
 - [ ] Real bounded Gmail, Calendar, and Drive reads succeed with the configured identity and fixed scopes, including supervised failure and reconnection cases.
 - [ ] One reversibly labeled Gmail send or reply and one reversibly labeled Calendar mutation execute only through exact approval, with altered/replayed/unknown-outcome behavior checked safely.
 - [ ] A real deterministic vault read and one exact approved Markdown commit and normal push succeed; excluded and destructive capabilities are tested only through rejection.
