@@ -31,6 +31,7 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - A fresh exact vault proposal passed protected structural comparison: one canonical path, the current content preserved byte-for-byte, one appended marker line, zero removed diff lines, one added diff line, fixed subject, and configured identity shape.
 - The exact one-time approval was sent through the existing Chrome Jarvis chat. The connector committed locally but returned an outcome-unknown push result. Authoritative remote reconciliation shows the remote head unchanged; the local clone is clean but one commit ahead and contains the labeled marker. No remote vault side effect or duplicate commit was established.
 - The connector is now in its documented manual-recovery block. No manual Git push, retry, reset, deletion, or history rewrite was attempted. The session was reconciled to no active request and no pending action.
+- Protected trace timing places the worker failure at the connector's 20-second write deadline; it records no authentication or explicit remote-rejection signal. This is a diagnostic lead for human recovery, not evidence that the unpushed commit may be retried.
 - The exact vault row remains blocked, and the ticket remains `ready-for-human`. A human must resolve the isolated local-ahead/manual-recovery state under the vault runbook before any further vault instruction.
 
 - [ ] Real bounded Gmail, Calendar, and Drive reads succeed with the configured identity and fixed scopes, including supervised failure and reconnection cases.
