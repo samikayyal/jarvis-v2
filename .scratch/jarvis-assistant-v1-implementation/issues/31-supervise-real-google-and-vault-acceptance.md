@@ -55,3 +55,12 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - Chrome was closed and reopened as requested. Chrome diagnostics and tab discovery are healthy, but the browser control could not claim or inspect the existing WhatsApp tab after the documented recovery/retry. No post-cutover WhatsApp message was sent, and no OpenWA or direct-provider workaround was used.
 - Consequently, the fresh acceptance rows that require messages through the existing Chrome Jarvis chat—including the exact Markdown vault commit/push—were not rerun. Gmail/Calendar unknown-outcome rows also remain blocked because no separately reviewed post-dispatch interruption method is available. The ticket remains `ready-for-human`; do not mark `complete` until every worksheet row passes.
 
+## Sanitized supervised evidence update — replacement release — 2026-08-16
+
+- The diagnosed Calendar model-to-proposal contract repair was committed, pushed, packaged as an immutable replacement release, and activated on Ubuntu. The prior release and activation override were preserved for rollback; OpenWA was not recreated or re-paired.
+- Post-cutover checks passed: all 13 Jarvis services are healthy with zero new restarts after the cold-start window; administrative status reports every component ready, both workers ready, audit writable, messaging ready, current backup freshness, and resource pressure `ok`. OpenWA remains healthy with zero restarts.
+- The current Google credential retains the baseline scopes plus Gmail send and Calendar write. Durable state is reconciled to no active request, no pending action, empty outbound outbox, no recovery-degraded marker, and no unresolved outbound attempt.
+- The two Calendar proposal requests that preceded this deployment failed deterministically at the model boundary and produced no proposal, approval, dispatch, or external event. No post-cutover browser acceptance message was sent, so the repaired Calendar behavior has not yet been proven in the live worksheet.
+- The one final full-suite run was started after the repair but was interrupted before a result was captured. It is not reported as passing.
+- The ticket remains `ready-for-human`. It is not complete because the post-cutover Gmail/Calendar acceptance rows, exact Markdown vault commit/push, excluded-capability refusals, and worksheet reconciliation are still outstanding; Gmail and Calendar unknown-outcome rows remain blocked without a separately reviewed post-dispatch interruption method.
+
