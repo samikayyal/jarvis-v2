@@ -22,6 +22,7 @@ from jarvis_control_plane.google_oauth import (
 from jarvis_control_plane.google_reads import (
     GMAIL_READ_SCOPE,
     GOOGLE_READ_SCOPES,
+    CalendarReadInput,
     ControlledGoogleReadProvider,
     GoogleApiReadProvider,
     GoogleReadConnector,
@@ -43,6 +44,7 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkPlan,
 )
 from jarvis_control_plane.ports import AuditWriteError
+from jarvis_control_plane.sessions import ServiceReadiness
 from jarvis_control_plane.traces import (
     DiagnosticTraceRecorder,
     InMemoryDiagnosticTraceStore,
@@ -198,6 +200,39 @@ def test_google_read_rejects_wrong_identity_or_scope_before_the_provider(
         ).drive_files_list(request_id="request-001", query="report")
 
     assert provider.calls == []
+
+
+def test_google_readiness_is_a_safe_connected_service_projection() -> None:
+    connector = _connector()
+    assert connector.current() == ServiceReadiness("google", "ready")
+
+    disconnected = _connector(
+        credential_store=InMemoryGoogleCredentialStore(),
+    )
+    assert disconnected.current() == ServiceReadiness("google", "unavailable")
+
+
+def test_broker_status_persists_the_google_readiness_projection() -> None:
+    class FixedGoogleReadiness:
+        @staticmethod
+        def current() -> ServiceReadiness:
+            return ServiceReadiness("google", "ready")
+
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket17-test-secret",
+        now=NOW,
+        id_prefix="ticket17-status-google",
+        google_readiness_provider=FixedGoogleReadiness(),
+    )
+
+    result = components.receiver.receive(_event("/status"))
+
+    assert result.reply is not None
+    assert "connected services=google=ready" in result.reply.body
+    assert "credential" not in result.reply.body.lower()
+    assert "scope" not in result.reply.body.lower()
 
 
 @pytest.mark.parametrize(
@@ -449,6 +484,100 @@ def test_live_provider_uses_only_the_fixed_google_read_operations(
     assert result.items
 
 
+def test_calendar_event_reads_use_typed_time_bounds_and_bounded_calendar_pagination() -> (
+    None
+):
+    bounds = CalendarReadInput(
+        operation="events_list",
+        calendar_id="secondary-calendar",
+        query="review",
+        time_min=NOW,
+        time_max=datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+        max_results=20,
+    )
+    assert bounds.time_min == NOW
+    assert bounds.time_max is not None
+
+    event_transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            _json_response(
+                {
+                    "items": [{"id": "event-1", "summary": "Review"}],
+                }
+            ),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=event_transport
+    )
+    credential = OAuthCredentialRecord(
+        subject=IDENTITY,
+        granted_scopes=GOOGLE_READ_SCOPES,
+        refresh_token="refresh-token",
+    )
+
+    provider.read(
+        request=GoogleReadRequest(
+            "calendar_events_list",
+            {
+                "calendar_id": "secondary-calendar",
+                "query": "review",
+                "time_min": NOW.isoformat(),
+                "time_max": bounds.time_max.isoformat(),
+            },
+            20,
+        ),
+        credential=credential,
+    )
+
+    event_query = parse_qs(
+        urlparse(event_transport.calls[1]["url"]).query  # type: ignore[arg-type]
+    )
+    assert event_query["timeMin"] == [NOW.isoformat()]
+    assert event_query["timeMax"] == [bounds.time_max.isoformat()]
+    assert event_query["q"] == ["review"]
+    assert "2026-08-06" not in event_query["q"][0]
+
+    calendar_transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            _json_response(
+                {
+                    "items": [
+                        {"id": "calendar-1", "summary": "Other calendar"},
+                        {"id": "calendar-2", "summary": "Another calendar"},
+                        {"id": "calendar-3", "summary": "Third calendar"},
+                    ],
+                    "nextPageToken": "calendar-page-2",
+                }
+            ),
+            _json_response(
+                {
+                    "items": [
+                        {
+                            "id": "secondary-calendar",
+                            "summary": "Ticket 31 run calendar",
+                            "timeZone": "Asia/Amman",
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    calendar_provider = GoogleApiReadProvider(
+        client_id="client-id",
+        client_secret="client-secret",
+        transport=calendar_transport,
+    )
+    calendar_result = calendar_provider.read(
+        request=GoogleReadRequest("calendar_list", {}, 20),
+        credential=credential,
+    )
+    assert len(calendar_transport.calls) == 3
+    assert any("Ticket 31 run calendar" in item for item in calendar_result.items)
+
+
 def test_live_provider_exports_only_text_and_classifies_invalid_grant() -> None:
     export_transport = _RecordingGoogleTransport(
         [
@@ -612,6 +741,7 @@ def test_live_provider_never_downloads_non_text_drive_media() -> None:
 
     assert len(transport.calls) == 2
     assert json.loads(result.items[0]) == {
+        "content_unavailable": "unsupported_mime_type",
         "id": "file1",
         "mimeType": "image/png",
         "name": "photo",
@@ -735,3 +865,145 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
     assert len(traces) == 1
     assert traces[0].arguments is not None
     assert traces[0].result is not None
+
+
+def test_binary_drive_read_becomes_a_bounded_refusal_before_model_reply() -> None:
+    audit = InMemoryAuditBoundary()
+    connector = _connector(
+        provider=ControlledGoogleReadProvider(
+            result=GoogleReadProviderResult(
+                items=(
+                    json.dumps(
+                        {
+                            "content_unavailable": "unsupported_mime_type",
+                            "id": "file1",
+                            "mimeType": "image/png",
+                        }
+                    ),
+                )
+            ),
+        ),
+        audit=audit,
+    )
+    observed: dict[str, object] = {}
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        drive = next(tool for tool in agent.tools if tool.name == "read_google_drive")
+        observed["tool_result"] = asyncio.run(
+            drive.on_invoke_tool(
+                None,
+                json.dumps(
+                    {
+                        "operation": "files_get",
+                        "file_id": "file1",
+                    }
+                ),
+            )
+        )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="The binary file contains a chart.")
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        google_read_connector=connector,
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket17-test-secret",
+        now=NOW,
+        id_prefix="ticket17-binary",
+        audit=audit,
+        orchestration=adapter,  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("read the chart"))
+
+    assert result.disposition == "unavailable"
+    assert result.reply is not None
+    assert "does not support reading binary file content" in result.reply.body
+    assert "chart" not in result.reply.body
+    assert observed["tool_result"] == {
+        "unavailable": True,
+        "message": (
+            "The connected service is unavailable or not authorized. Explain that "
+            "the requested read could not be completed, do not claim any retrieved "
+            "data, and do not retry."
+        ),
+    }
+
+
+def test_calendar_operator_reply_is_grounded_only_in_returned_rows() -> None:
+    audit = InMemoryAuditBoundary()
+    connector = _connector(
+        provider=ControlledGoogleReadProvider(
+            result=GoogleReadProviderResult(
+                items=(
+                    json.dumps(
+                        {
+                            "id": "provider-calendar-id",
+                            "summary": "Work",
+                            "timeZone": "Asia/Amman",
+                        }
+                    ),
+                )
+            ),
+        ),
+        audit=audit,
+    )
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        calendar = next(
+            tool for tool in agent.tools if tool.name == "read_google_calendar"
+        )
+        observed = asyncio.run(
+            calendar.on_invoke_tool(
+                None,
+                json.dumps(
+                    {
+                        "operation": "calendar_list",
+                        "max_results": 50,
+                    }
+                ),
+            )
+        )
+        assert observed["items"]
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text=(
+                    "The requested Missing calendar was found; its provider ID is "
+                    "provider-calendar-id."
+                )
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        google_read_connector=connector,
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket17-test-secret",
+        now=NOW,
+        id_prefix="ticket17-calendar-grounded",
+        audit=audit,
+        orchestration=adapter,  # type: ignore[arg-type]
+    )
+
+    result = components.receiver.receive(_event("find the Missing calendar"))
+
+    assert result.disposition == "completed"
+    assert result.reply is not None
+    assert "Work" in result.reply.body
+    assert "Missing" not in result.reply.body
+    assert "provider-calendar-id" not in result.reply.body

@@ -19,6 +19,8 @@ from jarvis_control_plane import (
     InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryDurableStateStore,
+    OutboundAttemptStatus,
+    OutboundConnectorError,
     OutboundReply,
     SignedInboundEvent,
     SignedMessageReceiver,
@@ -336,7 +338,7 @@ def test_outbound_audit_batch_failure_blocks_before_send() -> None:
     assert state.list_requests() == (result.request,)
 
 
-def test_orchestration_failure_is_durable_and_has_no_outbound_reply() -> None:
+def test_orchestration_failure_is_durable_and_sends_sanitized_outbound_reply() -> None:
     orchestration = ControlledOrchestrationAdapter(failure="controlled planner failure")
     config, state, audit, _, outbound, receiver = make_components(
         orchestration=orchestration,
@@ -346,16 +348,54 @@ def test_orchestration_failure_is_durable_and_has_no_outbound_reply() -> None:
 
     assert result.status_code == 202
     assert result.disposition == "failed"
-    assert result.reply is None
+    assert result.reply is not None
+    assert len(outbound.sent) == 1
+    assert "controlled planner failure" not in result.reply.body
+    assert "controlled planner failure" not in outbound.sent[0].body
+    assert "could not complete" in result.reply.body
     assert result.request is not None
     assert result.request.status == "failed"
     assert result.request.outcome == "orchestration_failed"
-    assert outbound.sent == []
     assert len(state.list_requests()) == 1
     assert any(
         record.kind == "orchestration_result" and record.outcome == "failed"
         for record in audit.records
     )
+
+
+def test_ambiguous_orchestration_failure_reply_is_durable_and_not_retried() -> None:
+    class AmbiguousOutbound(ControlledOutboundConnector):
+        def send(self, reply: OutboundReply):
+            self.sent.append(reply)
+            raise OutboundConnectorError(
+                "gateway outcome was unknown", may_have_sent=True
+            )
+
+    orchestration = ControlledOrchestrationAdapter(failure="private planner cause")
+    config, state, audit, _, outbound, receiver = make_components(
+        orchestration=orchestration,
+    )
+    ambiguous = AmbiguousOutbound(
+        operator_id=config.operator_id,
+        session_id=config.session_id,
+        audit=audit,
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("ambiguous"),
+    )
+    receiver.broker.outbound = ambiguous
+
+    result = receiver.receive(make_event(config))
+
+    assert result.disposition == "unknown"
+    assert result.request is not None
+    assert result.request.status == "failed"
+    assert result.reply is not None
+    assert "private planner cause" not in result.reply.body
+    assert ambiguous.sent == [result.reply]
+    attempts = state.list_outbound_conversation_attempts()
+    assert len(attempts) == 1
+    assert attempts[0].status == OutboundAttemptStatus.UNKNOWN
+    assert outbound.sent == []
 
 
 def test_file_backed_sqlite_reconstructs_state_audit_and_replay(tmp_path) -> None:

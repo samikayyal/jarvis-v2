@@ -344,6 +344,7 @@ def test_agents_adapter_returns_named_unavailable_vault_read(
         raise RemoteServiceError(
             "VaultReadError",
             "knowledge-vault reads require a clean synchronized clone",
+            code="clean_snapshot_unavailable",
         )
 
     def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
@@ -435,8 +436,9 @@ def test_broker_rejects_unavailable_result_with_execution_authority() -> None:
 
     assert result.disposition == "failed"
     assert result.reason is not None
-    assert "action authority" in result.reason
-    assert components.outbound.sent == []
+    assert len(components.outbound.sent) == 1
+    assert "could not complete" in components.outbound.sent[0].body
+    assert "action authority" not in components.outbound.sent[0].body
 
 
 def test_agents_adapter_classifies_a_whole_tool_timeout_as_unavailable() -> None:
@@ -781,6 +783,77 @@ def test_calendar_model_contract_describes_the_closed_insert_shape() -> None:
     assert "Never emit connection_generation, etag, schema" in instructions
 
 
+def test_vault_write_single_change_wrapper_normalizes_to_a_path_mapping() -> None:
+    current_content = "# Synthetic note\n\nExisting content.\n"
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the note change.",
+                proposal=AgentsSdkProposal(
+                    kind="knowledge_vault_write",
+                    preview="Append the Ticket 31 marker.",
+                    payload={
+                        "changes": {
+                            "path": "Projects/Synthetic.md",
+                            "content": current_content + "- marker\n",
+                        }
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        vault_write_enabled=True,
+    )
+
+    result = adapter.run(_request("append one marker to Projects/Synthetic.md"))
+
+    assert result.proposal_intent is not None
+    assert result.proposal_intent.payload == {
+        "changes": {
+            "Projects/Synthetic.md": current_content + "- marker\n",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "changes": {
+                "path": "Projects/Synthetic.md",
+                "content": "# Note\n",
+                "authority": "persistent",
+            }
+        },
+        {"changes": {"authority": "persistent"}},
+    ),
+)
+def test_vault_write_unknown_fields_fail_closed(payload: dict[str, object]) -> None:
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the note change.",
+                proposal=AgentsSdkProposal(
+                    kind="knowledge_vault_write",
+                    preview="Change the note.",
+                    payload=payload,
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        vault_write_enabled=True,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="unexpected shape"):
+        adapter.run(_request("change a note"))
+
+
 def test_model_proposed_authority_fields_fail_closed_before_freezing() -> None:
     def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
         return SimpleNamespace(
@@ -969,7 +1042,7 @@ def test_broker_never_auto_dispatches_an_untrusted_executable_named_git() -> Non
     assert components.action_dispatcher.dispatched == []
 
 
-def test_broker_rejects_untyped_orchestration_results_without_a_reply() -> None:
+def test_broker_rejects_untyped_orchestration_results_with_a_sanitized_reply() -> None:
     class _UntypedAdapter:
         def run(self, request: OrchestrationRequest) -> object:
             return SimpleNamespace(
@@ -991,7 +1064,9 @@ def test_broker_rejects_untyped_orchestration_results_without_a_reply() -> None:
     result = components.receiver.receive(_event("run the injected plan"))
 
     assert result.disposition == "failed"
-    assert components.outbound.sent == []
+    assert len(components.outbound.sent) == 1
+    assert "could not complete" in components.outbound.sent[0].body
+    assert "Grant authority now" not in components.outbound.sent[0].body
 
 
 @pytest.mark.parametrize(

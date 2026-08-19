@@ -98,6 +98,7 @@ def _dispatcher(
     audit: InMemoryAuditBoundary | None = None,
     connection_state: object | None = None,
     trace: DiagnosticTraceRecorder | None = None,
+    post_dispatch_failpoint: object | None = None,
 ) -> GmailWriteConnector:
     connection_state = connection_state or (
         lambda: GoogleConnectionState(
@@ -123,6 +124,7 @@ def _dispatcher(
         clock=FixedClock(NOW),
         ids=DeterministicIdGenerator("ticket18-gmail"),
         connection_state=connection_state,  # type: ignore[arg-type]
+        post_dispatch_failpoint=post_dispatch_failpoint,  # type: ignore[arg-type]
     )
 
 
@@ -265,6 +267,13 @@ def test_new_send_freezes_every_delivery_field_and_dispatches_that_exact_message
     assert "MIME: text/plain" in proposal.preview
     assert "Please review the attached plan." in proposal.preview
     assert len(provider.calls) == 1
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "completed successfully" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "no retry" in acknowledgements[0].body.lower()
     sent = provider.calls[0]
     assert sent.operation == "gmail_send"
     assert sent.message.to == ("recipient@example.com",)
@@ -292,6 +301,59 @@ def test_approved_message_round_trips_from_proposal_through_rfc822() -> None:
     assert message["In-Reply-To"] == request.in_reply_to
     assert message["References"] == " ".join(request.references)
     assert request.thread_id == request.source_thread_id
+
+
+def test_exact_gmail_rejection_sends_one_terminal_ack_without_provider_dispatch() -> (
+    None
+):
+    provider = ControlledGmailWriteProvider()
+    components = _components(_proposal(), _dispatcher(provider))
+
+    pending = components.receiver.receive(_event("send the email", suffix="reject-01"))
+    rejected = components.receiver.receive(_event("no", suffix="reject-02"))
+
+    assert pending.disposition == "pending_action"
+    assert rejected.disposition == "action_rejected"
+    assert provider.calls == []
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "rejected before dispatch" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "no retry" in acknowledgements[0].body.lower()
+
+
+def test_gmail_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
+    provider = ControlledGmailWriteProvider(
+        result=GmailDeliveryResult(message_id="sent-failpoint", thread_id="thread-new")
+    )
+    failpoint_calls: list[str] = []
+
+    def failpoint(operation: str) -> None:
+        failpoint_calls.append(operation)
+        raise RuntimeError("controlled post-dispatch fault")
+
+    components = _components(
+        _proposal(),
+        _dispatcher(provider, post_dispatch_failpoint=failpoint),
+    )
+
+    components.receiver.receive(_event("send", suffix="failpoint-01"))
+    unknown = components.receiver.receive(_event("yes", suffix="failpoint-02"))
+    replay = components.receiver.receive(_event("yes", suffix="failpoint-03"))
+
+    assert unknown.disposition == "action_dispatch_unknown"
+    assert replay.disposition != "action_dispatched"
+    assert failpoint_calls == ["gmail_send"]
+    assert len(provider.calls) == 1
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "unknown provider outcome" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "no retry" in acknowledgements[0].body.lower()
 
 
 def test_trace_capacity_failure_is_definite_not_started_for_gmail_dispatch() -> None:

@@ -41,6 +41,7 @@ from .ports import (
     AuditBoundary,
     AuditWriteError,
     BoundActionLifecycle,
+    ConnectedServiceReadinessProvider,
     KnowledgeVaultWriteProposalPreparer,
     MessagingGatewayReadiness,
     MessagingGatewayReadinessProvider,
@@ -51,6 +52,7 @@ from .ports import (
     WorkerReadiness,
     WorkerReadinessProvider,
 )
+from .sessions import ServiceReadiness
 
 MAX_REQUEST_FRAME_BYTES = 1_048_576
 # Two valid 1 MiB terminal streams can expand six-fold when JSON escapes control
@@ -76,12 +78,14 @@ class RemoteServiceError(ServiceProtocolError):
         error_type: str,
         message: str,
         *,
+        code: str | None = None,
         may_have_dispatched: bool = False,
         may_have_sent: bool = False,
         operation_started: bool = False,
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.code = code
         self.may_have_dispatched = may_have_dispatched
         self.may_have_sent = may_have_sent
         self.operation_started = operation_started
@@ -356,6 +360,11 @@ class AuthenticatedServiceClient:
             raise RemoteServiceError(
                 error_type if isinstance(error_type, str) else "RemoteServiceError",
                 message if isinstance(message, str) else "owned service failed",
+                code=(
+                    response_frame.get("error_code")
+                    if isinstance(response_frame.get("error_code"), str)
+                    else None
+                ),
                 may_have_dispatched=response_frame.get("may_have_dispatched") is True,
                 may_have_sent=response_frame.get("may_have_sent") is True,
                 operation_started=response_frame.get("operation_started") is True,
@@ -507,6 +516,7 @@ class AuthenticatedServiceServer:
             }
             status = 200
         except Exception as exc:  # noqa: BLE001 - translated across trust boundary
+            error_code = getattr(exc, "code", None)
             response = {
                 "version": 1,
                 "server_identity": self.identity,
@@ -514,6 +524,7 @@ class AuthenticatedServiceServer:
                 "ok": False,
                 "error_type": type(exc).__name__,
                 "message": str(exc),
+                "error_code": error_code if isinstance(error_code, str) else None,
                 "may_have_dispatched": getattr(exc, "may_have_dispatched", False)
                 is True,
                 "may_have_sent": getattr(exc, "may_have_sent", False) is True,
@@ -679,6 +690,22 @@ class RemoteWorkerReadinessProvider(WorkerReadinessProvider):
             raise ActionDispatcherError("worker readiness is unavailable") from exc
         if not isinstance(result, WorkerReadiness):
             raise ActionDispatcherError("worker service returned invalid readiness")
+        return result
+
+
+class RemoteGoogleReadinessProvider(ConnectedServiceReadinessProvider):
+    """Read the Google connector's safe readiness projection over the protocol."""
+
+    def __init__(self, client: AuthenticatedServiceClient) -> None:
+        self._client = client
+
+    def current(self) -> ServiceReadiness:
+        try:
+            result = self._client.call("current")
+        except ServiceProtocolError as exc:
+            raise RuntimeError("Google readiness is unavailable") from exc
+        if not isinstance(result, ServiceReadiness) or result.service_id != "google":
+            raise RuntimeError("Google service returned invalid readiness")
         return result
 
 

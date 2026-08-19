@@ -79,6 +79,7 @@ from .service_protocol import (
     OwnedActionService,
     RemoteActionDispatcher,
     RemoteAuditBoundary,
+    RemoteGoogleReadinessProvider,
     RemoteMessagingReadinessProvider,
     RemoteOrchestrationAdapter,
     RemoteOutboundConnector,
@@ -139,6 +140,7 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
                 "drive_files_list",
                 "drive_files_get",
                 "drive_files_export",
+                "current",
                 "start_authorization",
                 "oauth_callback",
                 "disconnect",
@@ -489,7 +491,7 @@ def _operation_timeouts(
         return {
             operation: (
                 read
-                if operation == "read"
+                if operation in {"read", "current"}
                 or operation.startswith(("gmail_", "calendar_", "drive_"))
                 else side_effect
             )
@@ -650,14 +652,12 @@ def _broker_operations(
     outbound_client = _client(
         config, client_identity="jarvis-broker", server_role="openwa_outbound_connector"
     )
-    google_actions = RemoteActionDispatcher(
-        _client(
-            config,
-            client_identity="jarvis-broker",
-            server_role="google_connector",
-        ),
-        bound=True,
+    google_client = _client(
+        config,
+        client_identity="jarvis-broker",
+        server_role="google_connector",
     )
+    google_actions = RemoteActionDispatcher(google_client, bound=True)
     vault_client = _client(
         config, client_identity="jarvis-broker", server_role="knowledge_vault_connector"
     )
@@ -714,6 +714,7 @@ def _broker_operations(
         ),
         messaging_readiness_provider=RemoteMessagingReadinessProvider(outbound_client),
         worker_readiness_provider=RemoteWorkerReadinessProvider(worker_client),
+        google_readiness_provider=RemoteGoogleReadinessProvider(google_client),
         working_sessions=SQLiteWorkingSessionStore(state_root / "sessions.sqlite3"),
         action_dispatcher=actions,
         action_lifecycle=actions,
@@ -893,7 +894,7 @@ def _google_operations(
     operations = {
         name: getattr(reads, name)
         for name in SERVICE_ROLES["google_connector"].operations
-        if name.startswith(("gmail_", "calendar_", "drive_"))
+        if name == "current" or name.startswith(("gmail_", "calendar_", "drive_"))
     }
     operations.update(
         OwnedActionService(

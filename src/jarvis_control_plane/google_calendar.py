@@ -910,6 +910,7 @@ class CalendarActionDispatcher:
         provider: GoogleCalendarWriteProvider,
         trace: DiagnosticTraceRecorder,
         on_invalid_grant: Callable[[int], object] | None = None,
+        post_dispatch_failpoint: Callable[[str], None] | None = None,
     ) -> None:
         self._configured_identity = _text(configured_identity, "configured_identity")
         self._connection_state = connection_state
@@ -919,6 +920,12 @@ class CalendarActionDispatcher:
             raise TypeError("trace must be a DiagnosticTraceRecorder")
         self._trace = trace
         self._on_invalid_grant = on_invalid_grant
+        if post_dispatch_failpoint is not None and not callable(
+            post_dispatch_failpoint
+        ):
+            raise TypeError("post_dispatch_failpoint must be callable")
+        # Test-only fault injection. Production composition leaves this unset.
+        self._post_dispatch_failpoint = post_dispatch_failpoint
         self._prepared_lock = RLock()
         self._prepared: dict[str, _CalendarWriteDispatch] = {}
 
@@ -1046,6 +1053,14 @@ class CalendarActionDispatcher:
             result_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
             error_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
         )
+        if self._post_dispatch_failpoint is not None:
+            try:
+                self._post_dispatch_failpoint(request.operation)
+            except Exception as exc:
+                raise ActionDispatcherError(
+                    "test-only Calendar post-dispatch failpoint",
+                    may_have_dispatched=True,
+                ) from exc
 
     def _raise_provider_error(
         self, request: CalendarWriteRequest, error: GoogleCalendarWriteProviderError

@@ -219,6 +219,7 @@ def test_non_fast_forward_state_never_falls_back_to_a_stale_read(
         VaultReadInput(path="Projects/../Roadmap.md"),
         VaultReadInput(path=".obsidian/private.md"),
         VaultReadInput(path="attachments/private.md"),
+        VaultReadInput(path="Projects/Alpha.txt"),
     ),
 )
 def test_vault_read_rejects_traversal_hidden_and_excluded_paths(
@@ -231,6 +232,18 @@ def test_vault_read_rejects_traversal_hidden_and_excluded_paths(
 
     with pytest.raises(VaultReadError, match="not an ordinary knowledge-vault note"):
         connector.read(read_request)
+
+    expected_codes = {
+        "../outside.md": "outside_root",
+        "Projects/../Roadmap.md": "outside_root",
+        ".obsidian/private.md": "excluded_path",
+        "attachments/private.md": "excluded_path",
+        "Projects/Alpha.txt": "unsupported_file_type",
+    }
+    assert read_request.path is not None
+    with pytest.raises(VaultReadError) as error:
+        connector.read(read_request)
+    assert error.value.code == expected_codes[read_request.path]
 
 
 def test_vault_read_rejects_absolute_and_noncanonical_note_selectors(
@@ -544,6 +557,45 @@ def test_orchestration_exposes_the_vault_only_as_a_closed_bounded_read_tool(
     ]
 
 
+def test_orchestration_refuses_a_non_markdown_vault_path_without_a_proposal(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        result = asyncio.run(
+            _agent.tools[1].on_invoke_tool(
+                None, json.dumps({"path": "Projects/Alpha.txt"})
+            )
+        )
+        assert result["unavailable"] is True
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I found the requested file.",
+                proposal=None,
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        reasoning_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_config_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        vault_read_tool=connector.as_bounded_read_tool(),
+    )
+
+    result = adapter.run(_request())
+
+    assert result.outcome == "unavailable"
+    assert "ordinary Markdown note" in result.reply_text
+    assert result.proposal is None
+    assert result.proposal_intent is None
+
+
 def test_vault_write_instructions_require_a_fresh_exact_path_read() -> None:
     instructions = _instructions(
         has_vault_read=True,
@@ -554,6 +606,8 @@ def test_vault_write_instructions_require_a_fresh_exact_path_read() -> None:
     assert "require its complete and ends_with_newline metadata" in instructions
     assert "never reconstruct content from conversation history" in instructions
     assert "If an exact-path read is not marked complete" in instructions
+    assert '{"changes": {"Notes/example.md": "<complete content>"}}' in instructions
+    assert "do not wrap path/content in another object" in instructions
 
 
 def test_orchestration_deterministically_discloses_a_stale_vault_read(

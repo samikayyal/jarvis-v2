@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -52,7 +53,9 @@ def event(*, summary: str = "Design review") -> dict[str, object]:
     }
 
 
-def connected_dispatcher() -> tuple[
+def connected_dispatcher(
+    *, post_dispatch_failpoint: Callable[[str], None] | None = None
+) -> tuple[
     CalendarActionDispatcher,
     ControlledGoogleCalendarWriteProvider,
     InMemoryGoogleOAuthStateStore,
@@ -82,6 +85,7 @@ def connected_dispatcher() -> tuple[
                 clock=FixedClock(NOW),
                 ids=DeterministicIdGenerator("ticket19-calendar"),
             ),
+            post_dispatch_failpoint=post_dispatch_failpoint,
         ),
         provider,
         state,
@@ -595,9 +599,83 @@ def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
         )
 
     assert receive("create it", "1").disposition == "pending_action"
-    assert receive("yes", "2").disposition == "action_dispatched"
+    approved = receive("yes", "2")
+    assert approved.disposition == "action_dispatched"
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "Calendar action completed successfully" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "No retry" in acknowledgements[0].body
     assert receive("yes", "3").disposition != "action_dispatched"
     assert len(provider.calls) == 1
+
+
+def test_calendar_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
+    failpoint_calls: list[str] = []
+
+    def failpoint(operation: str) -> None:
+        failpoint_calls.append(operation)
+        raise RuntimeError("controlled post-dispatch fault")
+
+    dispatcher, provider, state = connected_dispatcher(
+        post_dispatch_failpoint=failpoint
+    )
+    orchestration = ControlledOrchestrationAdapter(
+        proposal_factory=lambda request: CalendarWriteProposal.insert(
+            action_id="calendar-action-failpoint",
+            request_id=request.state.request_id,
+            calendar_id="primary",
+            complete_event=event(),
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket19-failpoint-secret",
+        now=NOW,
+        id_prefix="ticket19-failpoint",
+        orchestration=orchestration,
+        action_dispatcher=dispatcher,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket19-failpoint-secret",
+            )
+        )
+
+    assert receive("create it", "1").disposition == "pending_action"
+    unknown = receive("yes", "2")
+    replay = receive("yes", "3")
+
+    assert unknown.disposition == "action_dispatch_unknown"
+    assert replay.disposition != "action_dispatched"
+    assert failpoint_calls == ["insert"]
+    assert len(provider.calls) == 1
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "unknown provider outcome" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "no retry" in acknowledgements[0].body.lower()
 
 
 def test_broker_closes_invalid_grant_action_when_invalidation_audit_fails() -> None:

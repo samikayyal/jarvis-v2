@@ -36,6 +36,7 @@ from .models import (
     RecoveryDegradedMarker,
     RequestState,
 )
+from .sessions import ServiceReadiness
 
 
 class ControlPlaneError(Exception):
@@ -482,6 +483,12 @@ class WorkerReadiness:
 
 class WorkerReadinessProvider(Protocol):
     def current(self) -> WorkerReadiness: ...
+
+
+class ConnectedServiceReadinessProvider(Protocol):
+    """Safe readiness projection for one named connected service."""
+
+    def current(self) -> ServiceReadiness: ...
 
 
 class OutboundConnector(Protocol):

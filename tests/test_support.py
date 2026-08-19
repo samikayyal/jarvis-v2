@@ -25,6 +25,7 @@ from jarvis_control_plane import (
     SignedMessageReceiver,
 )
 from jarvis_control_plane.ports import (
+    ConnectedServiceReadinessProvider,
     MessagingGatewayReadinessProvider,
     OutboundConnector,
     WorkerReadinessProvider,
@@ -64,6 +65,7 @@ def build_receiver_components(
     outbound: OutboundConnector | None = None,
     messaging_readiness_provider: MessagingGatewayReadinessProvider | None = None,
     worker_readiness_provider: WorkerReadinessProvider | None = None,
+    google_readiness_provider: ConnectedServiceReadinessProvider | None = None,
     availability: ModelAvailability | None = None,
     working_session_id: str | None = None,
     clock: FixedClock | None = None,
@@ -118,6 +120,7 @@ def build_receiver_components(
         model_availability_provider=provider,
         messaging_readiness_provider=messaging_readiness_provider,
         worker_readiness_provider=worker_readiness_provider,
+        google_readiness_provider=google_readiness_provider,
         action_dispatcher=action_dispatcher,
         action_lifecycle=action_lifecycle,
         vault_write_proposal_preparer=vault_write_proposal_preparer,

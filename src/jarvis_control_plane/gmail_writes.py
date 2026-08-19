@@ -315,6 +315,7 @@ class GmailWriteConnector:
         connection_state: Callable[[], GoogleConnectionState] | None = None,
         connection_binding: GoogleConnectionBinding | None = None,
         on_invalid_grant: Callable[[], object] | None = None,
+        post_dispatch_failpoint: Callable[[str], None] | None = None,
     ) -> None:
         self._configured_identity = _canonical_string(
             configured_identity, "configured_identity"
@@ -343,6 +344,12 @@ class GmailWriteConnector:
         self._prepared_lock = RLock()
         self._prepared: dict[str, _GmailWriteDispatch] = {}
         self._on_invalid_grant = on_invalid_grant or credential_store.delete
+        if post_dispatch_failpoint is not None and not callable(
+            post_dispatch_failpoint
+        ):
+            raise TypeError("post_dispatch_failpoint must be callable")
+        # Test-only fault injection. Production composition leaves this unset.
+        self._post_dispatch_failpoint = post_dispatch_failpoint
 
     def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
         """Prepare one Gmail write without beginning the provider exchange."""
@@ -462,7 +469,7 @@ class GmailWriteConnector:
     ) -> GmailWriteProviderResult:
         """Make the single traced provider attempt for this frozen action."""
 
-        return self._trace.execute(
+        result = self._trace.execute(
             request_id=f"{action.request_id}:gmail:{action.action_id}",
             operation_id=f"{action.request_id}:connector:gmail:{action.action_id}",
             operation_type="gmail_write_connector",
@@ -475,6 +482,14 @@ class GmailWriteConnector:
             result_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
             error_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
         )
+        if self._post_dispatch_failpoint is not None:
+            try:
+                self._post_dispatch_failpoint(request.operation)
+            except Exception as exc:
+                raise ActionDispatcherError(
+                    "test-only Gmail post-dispatch failpoint", may_have_dispatched=True
+                ) from exc
+        return result
 
     @staticmethod
     def _classify_provider_result(request: GmailWriteRequest, result: object) -> None:

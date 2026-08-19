@@ -8,6 +8,7 @@ that the deterministic capability broker still validates, audits, and approves.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,10 +64,20 @@ _GOOGLE_READ_FAILURE_REASONS = {
     "missing_scope": "Google authorization is missing the required scope",
     "wrong_identity": "Google authorization uses the wrong identity",
 }
+_GOOGLE_CONTENT_UNAVAILABLE_REASONS = {
+    "unsupported_mime_type": "Google Drive does not support reading binary file content",
+}
 _SERVICE_UNAVAILABLE_MESSAGE = "owned service is unavailable"
-_VAULT_SNAPSHOT_UNAVAILABLE_MESSAGE = (
-    "knowledge-vault reads require a clean synchronized clone"
-)
+_VAULT_READ_FAILURE_REASONS = {
+    "unsupported_file_type": "the requested path is not an ordinary Markdown note",
+    "excluded_path": "the requested path is excluded from the knowledge-vault read boundary",
+    "outside_root": "the requested path is outside the knowledge-vault read boundary",
+    "path_not_found": "the requested path is not an ordinary note in the vault",
+    "dirty_snapshot": "the knowledge vault clone is dirty",
+    "clean_snapshot_unavailable": "the knowledge vault has no clean synchronized snapshot",
+    "recovery_required": "the knowledge vault requires explicit recovery",
+    "ambiguous_selector": "the vault selector did not identify one note",
+}
 
 
 def _safe_unavailable_read_reason(exc: Exception) -> str | None:
@@ -76,20 +87,21 @@ def _safe_unavailable_read_reason(exc: Exception) -> str | None:
     ):
         code = str(exc)
         return _GOOGLE_READ_FAILURE_REASONS.get(code)
+    from .knowledge_vault import VaultReadError
     from .service_protocol import (
         RemoteServiceError,
         ServiceAuthenticationError,
         ServiceProtocolError,
     )
 
+    if isinstance(exc, VaultReadError):
+        return _VAULT_READ_FAILURE_REASONS.get(exc.code)
+
     if isinstance(exc, RemoteServiceError):
         if exc.error_type == "GoogleReadError":
             return _GOOGLE_READ_FAILURE_REASONS.get(str(exc))
-        if (
-            exc.error_type == "VaultReadError"
-            and str(exc) == _VAULT_SNAPSHOT_UNAVAILABLE_MESSAGE
-        ):
-            return "the knowledge vault has no clean synchronized snapshot"
+        if exc.error_type == "VaultReadError":
+            return _VAULT_READ_FAILURE_REASONS.get(exc.code)
         return None
     if isinstance(exc, ServiceAuthenticationError):
         return "the service identity could not be verified"
@@ -426,6 +438,7 @@ class AgentsSdkOrchestrationAdapter:
         budget = _ToolInvocationBudget(self._max_tool_invocations)
         stale_vault_read: tuple[datetime, str] | None = None
         unavailable_reads: list[tuple[str, str]] = []
+        calendar_observations: list[tuple[object, object]] = []
 
         def record_stale_vault_read(synchronized_at: datetime, warning: str) -> None:
             nonlocal stale_vault_read
@@ -440,6 +453,7 @@ class AgentsSdkOrchestrationAdapter:
                 milestones,
                 budget,
                 unavailable_reads,
+                calendar_observations,
                 record_stale_vault_read=record_stale_vault_read,
             )
             agent = self._agent_factory(
@@ -505,7 +519,11 @@ class AgentsSdkOrchestrationAdapter:
             proposal if isinstance(proposal, FrozenActionProposal) else None
         )
         if selected_host is None:
-            reply_text = plan.reply_text
+            reply_text = (
+                _render_calendar_grounded_reply(calendar_observations)
+                if calendar_observations and plan.proposal is None
+                else plan.reply_text
+            )
             host = None
             host_reason_code = None
         else:
@@ -642,6 +660,7 @@ class AgentsSdkOrchestrationAdapter:
         milestones: list[OrchestrationMilestone],
         budget: _ToolInvocationBudget,
         unavailable_reads: list[tuple[str, str]],
+        calendar_observations: list[tuple[object, object]],
         record_stale_vault_read: Callable[[datetime, str], None],
     ) -> list[Any]:
         """Build the closed tool list anew for each request and invocation budget."""
@@ -667,6 +686,8 @@ class AgentsSdkOrchestrationAdapter:
                     if not isinstance(typed_output, tool.output_model):
                         raise TypeError("bounded read returned an untyped result")
                     bounded_output = tool.output_model.model_validate(typed_output)
+                    if tool.name == "read_google_calendar":
+                        calendar_observations.append((typed_input, bounded_output))
                     if tool.name == "read_knowledge_vault":
                         warning = getattr(bounded_output, "stale_warning", None)
                         synchronized_at = getattr(
@@ -676,6 +697,32 @@ class AgentsSdkOrchestrationAdapter:
                             synchronized_at, datetime
                         ):
                             record_stale_vault_read(synchronized_at, warning)
+                    if (
+                        tool.name == "read_google_drive"
+                        and getattr(bounded_output, "content_available", None) is False
+                    ):
+                        content_reason = _GOOGLE_CONTENT_UNAVAILABLE_REASONS.get(
+                            getattr(
+                                bounded_output,
+                                "content_unavailable_reason",
+                                None,
+                            )
+                        )
+                        if content_reason is None:
+                            raise OrchestrationAdapterError(
+                                "Google Drive returned an unsupported content result"
+                            )
+                        unavailable_reads.append((tool.name, content_reason))
+                        milestones.append(
+                            OrchestrationMilestone(
+                                stage="bounded_read_unavailable",
+                                message=(
+                                    "Bounded read with read_google_drive reported "
+                                    "content unavailable."
+                                ),
+                            )
+                        )
+                        return _READ_UNAVAILABLE_RESULT
                 except TimeoutError:
                     unavailable_reason = "the service timed out"
                     unavailable_reads.append((tool.name, unavailable_reason))
@@ -708,7 +755,18 @@ class AgentsSdkOrchestrationAdapter:
                         message=f"Completed bounded read with {tool.name}.",
                     )
                 )
-                return bounded_output.model_dump(mode="json")
+                bounded_result = bounded_output.model_dump(mode="json")
+                if tool.name in {
+                    "read_gmail",
+                    "read_google_calendar",
+                    "read_google_drive",
+                }:
+                    bounded_result = {
+                        key: value
+                        for key, value in bounded_result.items()
+                        if value is not None
+                    }
+                return bounded_result
 
             tools.append(
                 FunctionTool(
@@ -874,22 +932,11 @@ class AgentsSdkOrchestrationAdapter:
                     **calendar_payload,
                 )
             elif plan.proposal.kind == "knowledge_vault_write":
-                if set(payload) != {"changes"}:
-                    raise OrchestrationAdapterError(
-                        "knowledge-vault write proposal has an unexpected shape"
-                    )
-                changes = payload["changes"]
-                if not isinstance(changes, Mapping) or any(
-                    not isinstance(path, str) or not isinstance(content, str)
-                    for path, content in changes.items()
-                ):
-                    raise OrchestrationAdapterError(
-                        "knowledge-vault write proposal has an unexpected shape"
-                    )
+                changes = _canonical_vault_changes(payload)
                 candidate = OrchestrationProposalIntent(
                     request_id=request.state.request_id,
                     kind=plan.proposal.kind,
-                    payload={"changes": dict(changes)},
+                    payload={"changes": changes},
                 )
             else:
                 gmail_payload = _canonical_gmail_model_payload("gmail_reply", payload)
@@ -948,6 +995,136 @@ def _canonical_gmail_model_payload(
     }
 
 
+def _canonical_vault_changes(payload: Mapping[str, object]) -> dict[str, str]:
+    """Normalize one explicitly supported model wrapper to path-to-content."""
+
+    if set(payload) != {"changes"}:
+        raise OrchestrationAdapterError(
+            "knowledge-vault write proposal has an unexpected shape"
+        )
+    changes = payload["changes"]
+    if not isinstance(changes, Mapping):
+        raise OrchestrationAdapterError(
+            "knowledge-vault write proposal has an unexpected shape"
+        )
+    path = changes.get("path")
+    content = changes.get("content")
+    if (
+        set(changes) == {"path", "content"}
+        and _is_canonical_vault_path(path)
+        and isinstance(content, str)
+    ):
+        return {path: content}
+    if "path" in changes or "content" in changes:
+        raise OrchestrationAdapterError(
+            "knowledge-vault write proposal has an unexpected shape"
+        )
+    if any(
+        not _is_canonical_vault_path(path) or not isinstance(content, str)
+        for path, content in changes.items()
+    ):
+        raise OrchestrationAdapterError(
+            "knowledge-vault write proposal has an unexpected shape"
+        )
+    return dict(changes)
+
+
+def _is_canonical_vault_path(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.endswith(".md")
+        and "\\" not in value
+        and all(part not in {"", ".", ".."} for part in value.split("/"))
+    )
+
+
+def _render_calendar_grounded_reply(
+    observations: list[tuple[object, object]],
+) -> str:
+    """Render read-only Calendar facts from connector rows, never model prose."""
+
+    sections: list[str] = []
+    for typed_input, output in observations:
+        operation = getattr(typed_input, "operation", None)
+        items = getattr(output, "items", ())
+        rows = []
+        for item in items if isinstance(items, tuple | list) else ():
+            if not isinstance(item, str):
+                continue
+            try:
+                row = json.loads(item)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, Mapping):
+                rows.append(row)
+
+        if operation == "calendar_list":
+            if not rows:
+                sections.append(
+                    "No calendars were returned by the bounded Calendar lookup."
+                )
+                continue
+            rendered = []
+            for row in rows:
+                summary = row.get("summary")
+                timezone = row.get("timeZone")
+                if not isinstance(summary, str) or not summary.strip():
+                    summary = "(unnamed calendar)"
+                rendered.append(
+                    f"- {summary[:160]}"
+                    + (
+                        f" (time zone: {timezone[:64]})"
+                        if isinstance(timezone, str)
+                        else ""
+                    )
+                )
+            sections.append(
+                "Calendars returned by the bounded Calendar lookup:\n"
+                + "\n".join(rendered)
+            )
+            continue
+
+        if operation in {"events_list", "events_get"}:
+            if not rows:
+                sections.append(
+                    "No Calendar events matched the requested bounded time range."
+                )
+                continue
+            rendered_events = []
+            for row in rows:
+                summary = row.get("summary")
+                if not isinstance(summary, str) or not summary.strip():
+                    summary = "(untitled event)"
+                start = _calendar_rendered_endpoint(row.get("start"))
+                end = _calendar_rendered_endpoint(row.get("end"))
+                timing = start or "time not supplied"
+                if end:
+                    timing += f" to {end}"
+                status = row.get("status")
+                suffix = " [cancelled]" if status == "cancelled" else ""
+                rendered_events.append(f"- {summary[:160]} — {timing}{suffix}")
+            sections.append(
+                "Calendar events returned by the bounded read:\n"
+                + "\n".join(rendered_events)
+            )
+
+    return (
+        "\n\n".join(sections)
+        or "The bounded Calendar read returned no renderable records."
+    )
+
+
+def _calendar_rendered_endpoint(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("dateTime", "date"):
+        endpoint = value.get(key)
+        if isinstance(endpoint, str) and endpoint.strip():
+            return endpoint[:80]
+    return None
+
+
 def _model_input_with_history(request: OrchestrationRequest) -> str:
     """Attach only broker-selected local context to the stateless model input."""
 
@@ -1003,6 +1180,13 @@ def _instructions(
         "instead of changes. Calendar changes must include the exact ETag-bound "
         "snapshot returned by the read tool. Never emit connection_generation, "
         "etag, schema, or other connector-owned Calendar fields. "
+        "For Calendar reads, use calendar_list with max_results up to 50 to discover "
+        "a named calendar. Treat only the returned calendar rows as grounded: never "
+        "claim an exact calendar match when it was omitted, never substitute a "
+        "different calendar ID, and never expose provider IDs in the operator reply. "
+        "For events_list, put timezone-aware ISO bounds in time_min and time_max; "
+        "use q only for event text and never put date bounds in q. The bounded "
+        "Calendar read will determine the operator-facing facts from returned rows. "
         "For Gmail new sends, the payload must contain exactly to, cc, bcc, "
         "subject, body, and mime_type; recipients are arrays and mime_type is "
         "text/plain or text/html. For Gmail replies, add only the frozen source "
@@ -1026,8 +1210,11 @@ def _instructions(
         )
         + (
             "For an approved knowledge-vault note change, emit one complete "
-            "knowledge_vault_write proposal containing only a path-to-new-content "
-            "changes mapping. Before emitting it, invoke read_knowledge_vault for "
+            "knowledge_vault_write proposal using exactly "
+            '{"changes": {"Notes/example.md": "<complete content>"}}; '
+            "do not wrap path/content in another object or include base, commit, "
+            "remote, or authority metadata. Before emitting it, invoke "
+            "read_knowledge_vault for "
             "each exact target path in the same turn and use only the returned text "
             "for existing content; require its complete and ends_with_newline "
             "metadata, and never reconstruct content from conversation history. "

@@ -40,25 +40,44 @@ _UNIFIED_HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 class VaultReadError(Exception):
     """A vault read was invalid, unavailable, or outside the configured boundary."""
 
+    _default_code = "read_failed"
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        selected_code = code or self._default_code
+        if not selected_code or selected_code.strip() != selected_code:
+            raise ValueError("vault read error code must be canonical")
+        self.code = selected_code
+
 
 class VaultSynchronizationError(VaultReadError):
     """The dedicated clone could not be synchronized safely."""
+
+    _default_code = "synchronization_failed"
 
 
 class VaultRemoteUnavailable(VaultSynchronizationError):
     """The remote could not be reached; a known clean clone may be read stale."""
 
+    _default_code = "remote_unavailable"
+
 
 class VaultRepositoryConflict(VaultSynchronizationError):
     """The local clone requires explicit administrator recovery."""
+
+    _default_code = "recovery_required"
 
 
 class VaultPushPreDispatchFailure(VaultSynchronizationError):
     """The push process did not start, so no remote update could have occurred."""
 
+    _default_code = "push_not_started"
+
 
 class VaultPushUnknownOutcome(VaultSynchronizationError):
     """The push process started, but its remote side effect cannot be established."""
+
+    _default_code = "push_outcome_unknown"
 
 
 class VaultSynchronizationMetadataStore(Protocol):
@@ -595,13 +614,15 @@ class KnowledgeVaultConnector:
             synchronized_at = self._synchronizer.last_synchronized_at
             if synchronized_at is None:
                 raise VaultReadError(
-                    "knowledge-vault reads require a clean synchronized clone"
+                    "knowledge-vault reads require a clean synchronized clone",
+                    code="clean_snapshot_unavailable",
                 ) from exc
             self._require_clean_clone(deadline=deadline)
             stale_warning = _stale_warning(now - synchronized_at)
         except VaultSynchronizationError as exc:
             raise VaultReadError(
-                "knowledge-vault synchronization requires explicit recovery"
+                "knowledge-vault synchronization requires explicit recovery",
+                code="recovery_required",
             ) from exc
 
         read_budget = _VaultReadBudget(deadline=deadline)
@@ -617,11 +638,13 @@ class KnowledgeVaultConnector:
             is_clean = self._synchronizer.is_clean(self._root, deadline=deadline)
         except VaultSynchronizationError as exc:
             raise VaultReadError(
-                "knowledge-vault synchronization requires explicit recovery"
+                "knowledge-vault synchronization requires explicit recovery",
+                code="recovery_required",
             ) from exc
         if not is_clean:
             raise VaultReadError(
-                "knowledge-vault reads require a clean synchronized clone"
+                "knowledge-vault reads require a clean synchronized clone",
+                code="dirty_snapshot",
             )
 
     def as_bounded_read_tool(self):
@@ -664,7 +687,10 @@ class KnowledgeVaultConnector:
                 if _note_title(budget.read(note)) == request.title
             ]
             if len(matches) != 1:
-                raise VaultReadError("knowledge-vault title is not unambiguous")
+                raise VaultReadError(
+                    "knowledge-vault title is not unambiguous",
+                    code="ambiguous_selector",
+                )
             return [self._excerpt(matches[0], request.title, budget)]
 
         assert request.query is not None
@@ -712,10 +738,30 @@ class KnowledgeVaultConnector:
             or any(part in {".", ".."} for part in value.split("/"))
             or raw_path.as_posix() != value
         ):
-            raise VaultReadError("path is not an ordinary knowledge-vault note")
+            raise VaultReadError(
+                "path is not an ordinary knowledge-vault note",
+                code="outside_root",
+            )
         candidate = self._root.joinpath(*raw_path.parts)
         if not self._is_ordinary_note(candidate) or self._relative(candidate) != value:
-            raise VaultReadError("path is not an ordinary knowledge-vault note")
+            parts = raw_path.parts
+            if any(part.startswith(".") for part in parts) or any(
+                part in _EXCLUDED_TOP_LEVEL_DIRECTORIES for part in parts
+            ):
+                code = "excluded_path"
+            elif raw_path.suffix != ".md":
+                code = "unsupported_file_type"
+            elif candidate.is_symlink() or any(
+                parent.is_symlink()
+                for parent in candidate.parents
+                if parent != self._root
+            ):
+                code = "excluded_path"
+            else:
+                code = "path_not_found"
+            raise VaultReadError(
+                "path is not an ordinary knowledge-vault note", code=code
+            )
         return candidate
 
     def _is_ordinary_note(self, path: Path) -> bool:

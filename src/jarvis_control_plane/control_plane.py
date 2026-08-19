@@ -60,6 +60,7 @@ from .ports import (
     AuditWriteError,
     BoundActionLifecycle,
     Clock,
+    ConnectedServiceReadinessProvider,
     DiagnosticTraceError,
     DurableStateStore,
     IdGenerator,
@@ -88,6 +89,7 @@ from .sessions import (
     PermissionLifetime,
     ProposalPresentationStatus,
     RequestResult,
+    ServiceReadiness,
     SessionConfig,
     SessionStoreError,
     SessionTransition,
@@ -396,6 +398,7 @@ class DeterministicCapabilityBroker:
         model_availability_provider: ModelAvailabilityProvider,
         messaging_readiness_provider: MessagingGatewayReadinessProvider | None = None,
         worker_readiness_provider: WorkerReadinessProvider | None = None,
+        google_readiness_provider: ConnectedServiceReadinessProvider | None = None,
         working_sessions: WorkingSessionStore | None = None,
         action_dispatcher: ActionDispatcher | None = None,
         action_lifecycle: BoundActionLifecycle | None = None,
@@ -416,6 +419,7 @@ class DeterministicCapabilityBroker:
         self.model_availability_provider = model_availability_provider
         self.messaging_readiness_provider = messaging_readiness_provider
         self.worker_readiness_provider = worker_readiness_provider
+        self.google_readiness_provider = google_readiness_provider
         self.working_sessions = working_sessions or InMemoryWorkingSessionStore()
         selected_dispatcher = action_dispatcher or _UnavailableActionDispatcher()
         if not isinstance(selected_dispatcher, ActionDispatcher):
@@ -488,6 +492,9 @@ class DeterministicCapabilityBroker:
         if readiness_failure is not None:
             return readiness_failure
         readiness_failure = self._refresh_worker_readiness()
+        if readiness_failure is not None:
+            return readiness_failure
+        readiness_failure = self._refresh_google_readiness()
         if readiness_failure is not None:
             return readiness_failure
         session = self._current_working_session()
@@ -683,6 +690,49 @@ class DeterministicCapabilityBroker:
                 status_code=503,
                 disposition="readiness_state_unavailable",
                 reason="worker readiness could not be persisted",
+            )
+        return None
+
+    def _refresh_google_readiness(self) -> ReceiveResult | None:
+        provider = self.google_readiness_provider
+        if provider is None:
+            return None
+        try:
+            observation = provider.current()
+            if not isinstance(observation, ServiceReadiness):
+                raise TypeError("Google readiness provider returned an invalid value")
+            if observation.service_id != "google":
+                raise ValueError("Google readiness provider returned the wrong service")
+        except Exception:  # noqa: BLE001 - readiness failures become safe unknown state
+            observation = ServiceReadiness("google", "unknown")
+
+        current = self._current_working_session()
+        services = list(current.readiness.connected_services)
+        replaced = False
+        for index, service in enumerate(services):
+            if service.service_id == "google":
+                services[index] = observation
+                replaced = True
+                break
+        if not replaced:
+            services.append(observation)
+        connected_services = tuple(services)
+        if current.readiness.connected_services == connected_services:
+            return None
+        updated = replace(
+            current,
+            readiness=replace(
+                current.readiness,
+                connected_services=connected_services,
+            ),
+        )
+        try:
+            self.working_sessions.compare_and_set(current, updated)
+        except SessionStoreError:
+            return ReceiveResult(
+                status_code=503,
+                disposition="readiness_state_unavailable",
+                reason="Google readiness could not be persisted",
             )
         return None
 
@@ -1038,9 +1088,12 @@ class DeterministicCapabilityBroker:
                 )
             if current.pending_action.is_expired(self.clock):
                 return self._expire_pending_action(message, current)
+            pending_kind = current.pending_action.kind
             approved_or_result = self._approve_pending_action(message, current, choice)
         if isinstance(approved_or_result, ReceiveResult):
-            return approved_or_result
+            return self._maybe_dispatch_action_ack(
+                message, pending_kind, approved_or_result
+            )
         prepared_or_result = self._prepare_approved_dispatch(
             message=message,
             action=approved_or_result.action,
@@ -1048,7 +1101,9 @@ class DeterministicCapabilityBroker:
             permission_id=approved_or_result.permission_id,
         )
         if isinstance(prepared_or_result, ReceiveResult):
-            return prepared_or_result
+            return self._maybe_dispatch_action_ack(
+                message, pending_kind, prepared_or_result
+            )
         if not self._dispatch_is_still_attempted(prepared_or_result.action.action_id):
             self._release_prepared_dispatch(
                 prepared_or_result.action.action_id,
@@ -1060,7 +1115,93 @@ class DeterministicCapabilityBroker:
                 prepared_or_result,
                 reason="worker registration completed after cancellation",
             )
-        return self._run_prepared_action(message, prepared_or_result)
+        result = self._run_prepared_action(message, prepared_or_result)
+        return self._maybe_dispatch_action_ack(
+            message, prepared_or_result.action.kind, result
+        )
+
+    @staticmethod
+    def _action_ack_kind(action_kind: str) -> str | None:
+        return {
+            "gmail_send": "Gmail",
+            "gmail_reply": "Gmail",
+            "calendar_insert": "Calendar",
+            "calendar_update": "Calendar",
+            "calendar_patch": "Calendar",
+        }.get(action_kind)
+
+    def _maybe_dispatch_action_ack(
+        self,
+        message: InboundMessage,
+        action_kind: str,
+        result: ReceiveResult,
+    ) -> ReceiveResult:
+        """Send one terminal connector-action acknowledgement after reconciliation."""
+
+        service_name = self._action_ack_kind(action_kind)
+        if service_name is None or result.disposition not in {
+            "action_rejected",
+            "action_invalidated",
+            "action_dispatched",
+            "action_dispatch_failed",
+            "action_dispatch_not_started",
+            "action_dispatch_unavailable",
+            "action_dispatch_unknown",
+        }:
+            return result
+        if result.disposition == "action_rejected":
+            body = (
+                f"The {service_name} action was rejected before dispatch. No side "
+                "effect occurred and no retry is needed."
+            )
+        elif result.disposition == "action_invalidated":
+            body = (
+                f"The {service_name} action was invalidated before dispatch because "
+                "its connector state changed. No retry is needed."
+            )
+        elif result.disposition == "action_dispatched":
+            body = (
+                f"The approved {service_name} action completed successfully after "
+                "durable reconciliation. No retry is needed."
+            )
+        elif result.disposition == "action_dispatch_unknown":
+            body = (
+                f"The approved {service_name} action has an unknown provider "
+                "outcome. No retry will be attempted."
+            )
+        elif result.disposition == "action_dispatch_not_started":
+            body = (
+                f"The approved {service_name} action was not started. No retry was "
+                "attempted."
+            )
+        else:
+            body = (
+                f"The approved {service_name} action failed before completion. No "
+                "retry was attempted."
+            )
+        control_id = self.ids.new_id("action-ack")
+        acknowledgement = self._dispatch_control_text(
+            message,
+            body=_bounded_informational_reply(body, request_id=control_id),
+            control_id=control_id,
+            disposition=result.disposition,
+        )
+        if acknowledgement.disposition in {"failed", "unknown"}:
+            reason = acknowledgement.reason or "terminal acknowledgement failed"
+            return replace(
+                result,
+                request=result.request,
+                reply=acknowledgement.reply,
+                reason=(
+                    f"{result.reason or result.disposition}; terminal "
+                    f"acknowledgement outcome was {acknowledgement.disposition}: {reason}"
+                ),
+            )
+        return replace(
+            acknowledgement,
+            request=result.request,
+            reason=result.reason,
+        )
 
     def _approve_pending_action(
         self,
@@ -2398,7 +2539,7 @@ class DeterministicCapabilityBroker:
                     outcome=failure_outcome,
                     error_code=failure_code,
                 )
-            except (StateStoreError, AuditWriteError) as transition_error:
+            except (StateStoreError, AuditWriteError):
                 self._best_effort_audit(
                     kind="orchestration_result",
                     event_id=message.event_id,
@@ -2415,14 +2556,11 @@ class DeterministicCapabilityBroker:
                     outcome=failure_outcome,
                     message=message,
                 )
-                return ReceiveResult(
-                    status_code=202,
-                    disposition="failed",
+                return self._dispatch_orchestration_failure(
+                    message=message,
                     request=request,
-                    reason=(
-                        f"{str(exc) or 'orchestration failed'}; the failure state "
-                        "could not be persisted: "
-                        f"{transition_error}"
+                    failure_outcome=(
+                        f"{failure_outcome}; the failure state could not be persisted"
                     ),
                 )
             self._best_effort_audit(
@@ -2441,14 +2579,45 @@ class DeterministicCapabilityBroker:
                 outcome=failure_outcome,
                 message=message,
             )
-            return ReceiveResult(
-                status_code=202,
-                disposition="failed",
+            return self._dispatch_orchestration_failure(
+                message=message,
                 request=failed,
-                reason=str(exc) or "orchestration failed",
+                failure_outcome=failure_outcome,
             )
 
         return result
+
+    def _dispatch_orchestration_failure(
+        self,
+        *,
+        message: InboundMessage,
+        request: RequestState,
+        failure_outcome: str,
+    ) -> ReceiveResult:
+        """Send one bounded failure notice after the request is terminalized."""
+
+        control_id = self.ids.new_id("orchestration-failure")
+        body = _bounded_informational_reply(
+            "I could not complete that request because the orchestration service "
+            "failed. No action was taken.",
+            request_id=control_id,
+        )
+        response = self._dispatch_control_text(
+            message,
+            body=body,
+            control_id=control_id,
+            disposition="failed",
+        )
+        if response.disposition == "unknown":
+            reason = (
+                f"{failure_outcome}; the failure response has an unknown outbound "
+                "outcome and will not be retried"
+            )
+        elif response.disposition == "failed":
+            reason = f"{failure_outcome}; the failure response was not sent"
+        else:
+            reason = failure_outcome
+        return replace(response, request=request, reason=reason)
 
     def _prepare_orchestration_proposal(
         self, result: OrchestrationResult, *, request_id: str

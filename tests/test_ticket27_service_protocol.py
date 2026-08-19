@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from jarvis_control_plane.adapters import SQLiteAuditBoundary
+from jarvis_control_plane.knowledge_vault import VaultReadError
 from jarvis_control_plane.models import AuditEvidence, AuditFilter
 from jarvis_control_plane.openwa import OpenWAReadiness
 from jarvis_control_plane.ports import (
@@ -35,6 +36,7 @@ from jarvis_control_plane.service_protocol import (
     RemoteAuditBoundary,
     RemoteMessagingReadinessProvider,
     RemoteOrchestrationAdapter,
+    RemoteServiceError,
     ServiceAuthenticationError,
     ServiceProtocolError,
     _decode,
@@ -79,6 +81,41 @@ def test_remote_messaging_readiness_accepts_the_openwa_readiness_contract() -> N
     readiness = RemoteMessagingReadinessProvider(_ReadinessClient()).current()  # type: ignore[arg-type]
 
     assert readiness.messaging_ready is True
+
+
+def test_protocol_preserves_stable_vault_read_error_codes() -> None:
+    port = find_available_port()
+
+    def read() -> None:
+        raise VaultReadError(
+            "path is not an ordinary knowledge-vault note",
+            code="unsupported_file_type",
+        )
+
+    server = AuthenticatedServiceServer(
+        identity="jarvis-vault",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        operations={"read": read},
+    )
+    Thread(target=server.serve_forever, daemon=True).start()
+    wait_until_ready("127.0.0.1", port)
+    client = AuthenticatedServiceClient(
+        identity="jarvis-broker",
+        expected_server_identity="jarvis-vault",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+    )
+    try:
+        with pytest.raises(RemoteServiceError) as caught:
+            client.call("read")
+    finally:
+        server.shutdown()
+
+    assert caught.value.error_type == "VaultReadError"
+    assert caught.value.code == "unsupported_file_type"
 
 
 def _evidence(identifier: str) -> AuditEvidence:
