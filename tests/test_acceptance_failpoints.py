@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,7 +32,7 @@ def _enabled_config() -> dict[str, object]:
         "enabled": True,
         "service": "gmail",
         "operation": "gmail_send",
-        "action_id": "ticket31-gmail-send-01",
+        "action_id": "",
         "review_id": "ticket31-gmail-unknown",
     }
     return config
@@ -85,6 +86,237 @@ def test_exact_match_consumes_once_and_mismatches_preserve_the_armed_target() ->
     )
 
 
+def test_request_scoped_arm_binds_the_frozen_action_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    spec = ReviewedPostDispatchFailpointSpec(
+        service="gmail",
+        operation="gmail_send",
+        action_id="",
+        review_id="ticket31-gmail-unknown-restart",
+    )
+    first = ReviewedPostDispatchFailpoint(spec, durable_root=tmp_path)
+
+    assert first.bind_action(
+        service="gmail",
+        operation="gmail_send",
+        action_id="request-real:proposal",
+    )
+    first.raise_if_armed(
+        service="gmail", operation="gmail_send", action_id="request-other:proposal"
+    )
+
+    restarted = ReviewedPostDispatchFailpoint(spec, durable_root=tmp_path)
+    assert restarted.bound_action_id == "request-real:proposal"
+    with pytest.raises(ReviewedPostDispatchFailure):
+        restarted.raise_if_armed(
+            service="gmail",
+            operation="gmail_send",
+            action_id="request-real:proposal",
+        )
+    assert restarted.consumed is True
+
+    third_process = ReviewedPostDispatchFailpoint(spec, durable_root=tmp_path)
+    third_process.bind_action(
+        service="gmail",
+        operation="gmail_send",
+        action_id="request-real:proposal",
+    )
+    third_process.raise_if_armed(
+        service="gmail",
+        operation="gmail_send",
+        action_id="request-real:proposal",
+    )
+    assert third_process.consumed is True
+
+
+def test_request_scoped_arm_is_inert_when_durable_claim_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    durable_root = tmp_path / "not-a-directory"
+    durable_root.write_text("occupied", encoding="utf-8")
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="",
+            review_id="ticket31-gmail-unknown-inert",
+        ),
+        durable_root=durable_root,
+    )
+
+    assert (
+        failpoint.bind_action(
+            service="gmail", operation="gmail_send", action_id="request:proposal"
+        )
+        is False
+    )
+    failpoint.raise_if_armed(
+        service="gmail", operation="gmail_send", action_id="request:proposal"
+    )
+    assert failpoint.consumed is False
+    assert failpoint.inert is True
+
+
+def test_google_service_composition_binds_the_actual_frozen_action() -> None:
+    import jarvis_control_plane.service_runtime as runtime
+    from jarvis_control_plane.models import FrozenActionProposal
+
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="",
+            review_id="ticket31-gmail-composition",
+        )
+    )
+    action = FrozenActionProposal.create(
+        action_id="request-real:proposal",
+        request_id="request-real",
+        kind="gmail_send",
+        preview="Send the reviewed message.",
+        payload={
+            "schema": "gmail_write_v1",
+            "operation": "gmail_send",
+            "to": ["operator@example.test"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Acceptance",
+            "body": "Reviewed",
+            "mime_type": "text/plain",
+        },
+    )
+
+    class Owner:
+        def bind_proposal(
+            self, candidate: FrozenActionProposal
+        ) -> FrozenActionProposal:
+            return candidate
+
+    dispatcher = runtime._GoogleActionDispatcher(
+        gmail=Owner(), calendar=SimpleNamespace(), acceptance_failpoint=failpoint
+    )
+    bound = dispatcher.bind_proposal(action)
+
+    assert bound.action_id == "request-real:proposal"
+    assert failpoint.bound_action_id == "request-real:proposal"
+
+
+def test_google_service_composition_fails_closed_after_consumption() -> None:
+    import jarvis_control_plane.service_runtime as runtime
+    from jarvis_control_plane.models import FrozenActionProposal
+
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="",
+            review_id="ticket31-gmail-composition-consumed",
+        )
+    )
+    first_action = FrozenActionProposal.create(
+        action_id="request-first:proposal",
+        request_id="request-first",
+        kind="gmail_send",
+        preview="Send the first reviewed message.",
+        payload={
+            "schema": "gmail_write_v1",
+            "operation": "gmail_send",
+            "to": ["operator@example.test"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Acceptance",
+            "body": "First",
+            "mime_type": "text/plain",
+        },
+    )
+    second_action = FrozenActionProposal.create(
+        action_id="request-second:proposal",
+        request_id="request-second",
+        kind="gmail_send",
+        preview="Send the second reviewed message.",
+        payload={
+            "schema": "gmail_write_v1",
+            "operation": "gmail_send",
+            "to": ["operator@example.test"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Acceptance",
+            "body": "Second",
+            "mime_type": "text/plain",
+        },
+    )
+
+    class Owner:
+        def bind_proposal(
+            self, candidate: FrozenActionProposal
+        ) -> FrozenActionProposal:
+            return candidate
+
+    dispatcher = runtime._GoogleActionDispatcher(
+        gmail=Owner(), calendar=SimpleNamespace(), acceptance_failpoint=failpoint
+    )
+    assert dispatcher.bind_proposal(first_action).action_id == "request-first:proposal"
+    with pytest.raises(ReviewedPostDispatchFailure):
+        failpoint.raise_if_armed(
+            service="gmail",
+            operation="gmail_send",
+            action_id="request-first:proposal",
+        )
+
+    with pytest.raises(ValueError, match="bind the frozen action durably"):
+        dispatcher.bind_proposal(second_action)
+
+
+def test_google_service_composition_rejects_matching_arm_without_durable_binding(
+    tmp_path: Path,
+) -> None:
+    import jarvis_control_plane.service_runtime as runtime
+    from jarvis_control_plane.models import FrozenActionProposal
+
+    durable_root = tmp_path / "not-a-directory"
+    durable_root.write_text("occupied", encoding="utf-8")
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="",
+            review_id="ticket31-gmail-composition-inert",
+        ),
+        durable_root=durable_root,
+    )
+    action = FrozenActionProposal.create(
+        action_id="request-real:proposal",
+        request_id="request-real",
+        kind="gmail_send",
+        preview="Send the reviewed message.",
+        payload={
+            "schema": "gmail_write_v1",
+            "operation": "gmail_send",
+            "to": ["operator@example.test"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Acceptance",
+            "body": "Reviewed",
+            "mime_type": "text/plain",
+        },
+    )
+
+    class Owner:
+        def bind_proposal(
+            self, candidate: FrozenActionProposal
+        ) -> FrozenActionProposal:
+            return candidate
+
+    dispatcher = runtime._GoogleActionDispatcher(
+        gmail=Owner(), calendar=SimpleNamespace(), acceptance_failpoint=failpoint
+    )
+
+    with pytest.raises(ValueError, match="bind the frozen action durably"):
+        dispatcher.bind_proposal(action)
+    assert failpoint.inert is True
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -94,7 +326,7 @@ def test_exact_match_consumes_once_and_mismatches_preserve_the_armed_target() ->
             "enabled": True,
             "service": "gmail",
             "operation": "gmail_send",
-            "action_id": "ticket31-*",
+            "action_id": "ticket31-gmail-send-01",
             "review_id": "review",
         },
         {

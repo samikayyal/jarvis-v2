@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from threading import RLock
 from typing import Literal, Protocol
 from urllib.parse import quote, urlencode
@@ -31,14 +31,17 @@ from .google_oauth import (
     GoogleOAuthStateStore,
     OAuthCredentialRecord,
 )
-from .models import FrozenActionProposal
+from .models import AuditEvidence, FrozenActionProposal
 from .ports import (
     ActionCancellationResult,
     ActionCancellationStatus,
     ActionDispatcherError,
     ActionDispatchHandle,
+    AuditBoundary,
     AuditWriteError,
+    Clock,
     DiagnosticTraceError,
+    IdGenerator,
     TraceCapacityError,
     TraceWriteError,
 )
@@ -912,7 +915,10 @@ class CalendarActionDispatcher:
         connection_state: GoogleOAuthStateStore,
         credential_store: GoogleCredentialStore,
         provider: GoogleCalendarWriteProvider,
+        audit: AuditBoundary,
         trace: DiagnosticTraceRecorder,
+        clock: Clock,
+        ids: IdGenerator,
         on_invalid_grant: Callable[[int], object] | None = None,
         acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
     ) -> None:
@@ -920,9 +926,12 @@ class CalendarActionDispatcher:
         self._connection_state = connection_state
         self._credential_store = credential_store
         self._provider = provider
+        self._audit = audit
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError("trace must be a DiagnosticTraceRecorder")
         self._trace = trace
+        self._clock = clock
+        self._ids = ids
         self._on_invalid_grant = on_invalid_grant
         if acceptance_failpoint is not None and not isinstance(
             acceptance_failpoint, ReviewedPostDispatchFailpoint
@@ -942,19 +951,14 @@ class CalendarActionDispatcher:
         self._prepared: dict[str, _CalendarWriteDispatch] = {}
 
     def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
-        """Freeze the connector-owned Google generation before presentation."""
+        """Validate the proposal's already-frozen Google generation."""
 
         request = self._parse_request(action)
-        connection = self._connection_state.get_connection()
-        bound_request = replace(
-            request,
-            connection_generation=connection.generation,
-        )
-        self._require_current_connection(bound_request)
+        self._require_current_connection(request)
         return CalendarWriteProposal._from_request(
             action_id=action.action_id,
             request_id=action.request_id,
-            request=bound_request,
+            request=request,
         )
 
     def validate_pending_action(self, action: FrozenActionProposal) -> None:
@@ -991,6 +995,9 @@ class CalendarActionDispatcher:
         try:
             with self._connection_state.dispatch_lease():
                 credential = self._require_current_connection(request)
+                self._append_audit(
+                    action, outcome="attempted", execution_status="attempted"
+                )
                 self._execute_traced_write(
                     action=action,
                     request=request,
@@ -998,16 +1005,39 @@ class CalendarActionDispatcher:
                     context=context,
                 )
         except GoogleCalendarWriteProviderError as exc:
-            self._raise_provider_error(request, exc)
+            self._raise_provider_error(action, request, exc)
+        except AuditWriteError as exc:
+            raise ActionDispatcherError(
+                "Calendar audit evidence is unavailable",
+                may_have_dispatched=context.provider_started,
+            ) from exc
         except (TraceCapacityError, TraceWriteError, DiagnosticTraceError) as exc:
-            self._raise_trace_error(exc)
+            self._raise_trace_error(action, exc)
         except ActionDispatcherError:
             raise
         except Exception as exc:
+            outcome = "unknown" if context.provider_started else "failed"
+            try:
+                self._record_terminal(action, outcome=outcome)
+            except AuditWriteError as audit_error:
+                raise ActionDispatcherError(
+                    (
+                        "Calendar terminal audit evidence is unavailable; "
+                        "provider outcome is unknown"
+                        if context.provider_started
+                        else "Calendar terminal audit evidence is unavailable"
+                    ),
+                    may_have_dispatched=context.provider_started,
+                ) from audit_error
             raise ActionDispatcherError(
-                "Calendar provider is unavailable",
+                (
+                    "Calendar provider outcome is unknown"
+                    if context.provider_started
+                    else "Calendar provider is unavailable"
+                ),
                 may_have_dispatched=context.provider_started,
             ) from exc
+        self._record_completed_delivery(action)
 
     @staticmethod
     def _parse_request(action: FrozenActionProposal) -> CalendarWriteRequest:
@@ -1073,36 +1103,136 @@ class CalendarActionDispatcher:
                     action_id=action.action_id,
                 )
             except ReviewedPostDispatchFailure as exc:
+                try:
+                    self._record_terminal(action, outcome="unknown")
+                except AuditWriteError as audit_error:
+                    raise ActionDispatcherError(
+                        "Calendar terminal audit evidence is unavailable; "
+                        "provider outcome is unknown",
+                        may_have_dispatched=True,
+                    ) from audit_error
                 raise ActionDispatcherError(
                     "Calendar provider outcome is unknown",
                     may_have_dispatched=True,
                 ) from exc
 
     def _raise_provider_error(
-        self, request: CalendarWriteRequest, error: GoogleCalendarWriteProviderError
+        self,
+        action: FrozenActionProposal,
+        request: CalendarWriteRequest,
+        error: GoogleCalendarWriteProviderError,
     ) -> None:
         if error.code == "invalid_grant" and self._on_invalid_grant is not None:
             try:
                 self._on_invalid_grant(request.connection_generation)
             except (AuditWriteError, GoogleOAuthError, OSError) as cleanup_error:
+                try:
+                    self._record_terminal(action, outcome="failed")
+                except AuditWriteError as audit_error:
+                    raise ActionDispatcherError(
+                        "Calendar terminal audit evidence is unavailable",
+                        may_have_dispatched=False,
+                    ) from audit_error
                 raise ActionDispatcherError(
                     "Calendar credential invalidation failed",
                     may_have_dispatched=False,
                 ) from cleanup_error
+        try:
+            self._record_terminal(
+                action,
+                outcome="unknown" if error.may_have_dispatched else "failed",
+            )
+        except AuditWriteError as audit_error:
+            raise ActionDispatcherError(
+                (
+                    "Calendar terminal audit evidence is unavailable; "
+                    "provider outcome is unknown"
+                    if error.may_have_dispatched
+                    else "Calendar terminal audit evidence is unavailable"
+                ),
+                may_have_dispatched=error.may_have_dispatched,
+            ) from audit_error
         raise ActionDispatcherError(
             str(error), may_have_dispatched=error.may_have_dispatched
         ) from error
 
-    @staticmethod
-    def _raise_trace_error(error: BaseException) -> None:
+    def _raise_trace_error(
+        self, action: FrozenActionProposal, error: BaseException
+    ) -> None:
         if isinstance(error, TraceWriteError):
+            outcome = "unknown" if error.operation_started else "failed"
+            try:
+                self._record_terminal(action, outcome=outcome)
+            except AuditWriteError as audit_error:
+                raise ActionDispatcherError(
+                    (
+                        "Calendar terminal audit evidence is unavailable; "
+                        "provider outcome is unknown"
+                        if error.operation_started
+                        else "Calendar terminal audit evidence is unavailable"
+                    ),
+                    may_have_dispatched=error.operation_started,
+                ) from audit_error
             raise ActionDispatcherError(
                 "Calendar trace retention failed",
                 may_have_dispatched=error.operation_started,
             ) from error
+        try:
+            self._record_terminal(action, outcome="failed")
+        except AuditWriteError as audit_error:
+            raise ActionDispatcherError(
+                "Calendar terminal audit evidence is unavailable",
+                may_have_dispatched=False,
+            ) from audit_error
         raise ActionDispatcherError(
             "Calendar trace admission is unavailable"
         ) from error
+
+    def _record_completed_delivery(self, action: FrozenActionProposal) -> None:
+        """Record terminal success; missing evidence keeps the outcome unknown."""
+
+        try:
+            self._append_audit(
+                action, outcome="completed", execution_status="completed"
+            )
+        except AuditWriteError as exc:
+            # Calendar may already have accepted the event.  The broker must
+            # close the durable action as unknown rather than permit a second
+            # provider attempt when this terminal evidence is unavailable.
+            raise ActionDispatcherError(
+                "Calendar provider outcome is unknown", may_have_dispatched=True
+            ) from exc
+
+    def _record_terminal(self, action: FrozenActionProposal, *, outcome: str) -> None:
+        self._append_audit(
+            action,
+            outcome=outcome,
+            execution_status="unknown" if outcome == "unknown" else "failed",
+        )
+
+    def _append_audit(
+        self,
+        action: FrozenActionProposal,
+        *,
+        outcome: str,
+        execution_status: str,
+    ) -> None:
+        try:
+            self._audit.append(
+                AuditEvidence(
+                    evidence_id=self._ids.new_id("audit"),
+                    kind="calendar_write",
+                    occurred_at=self._clock.now(),
+                    request_id=action.request_id,
+                    outcome=outcome,
+                    actor="google_connector",
+                    operation_type=action.kind,
+                    target_category="calendar",
+                    execution_status=execution_status,
+                )
+            )
+        except (AuditWriteError, ValueError, TypeError, RuntimeError) as exc:
+            raise AuditWriteError("Calendar audit evidence is unavailable") from exc
 
 
 def build_live_calendar_action_dispatcher(
@@ -1113,7 +1243,10 @@ def build_live_calendar_action_dispatcher(
     on_invalid_grant: Callable[[int], object],
     client_id: str,
     client_secret: str,
+    audit: AuditBoundary,
     trace: DiagnosticTraceRecorder,
+    clock: Clock,
+    ids: IdGenerator,
     transport: GoogleCalendarHttpTransport | None = None,
     acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
 ) -> CalendarActionDispatcher:
@@ -1128,7 +1261,10 @@ def build_live_calendar_action_dispatcher(
             client_secret=client_secret,
             transport=transport,
         ),
+        audit=audit,
         trace=trace,
+        clock=clock,
+        ids=ids,
         on_invalid_grant=on_invalid_grant,
         acceptance_failpoint=acceptance_failpoint,
     )

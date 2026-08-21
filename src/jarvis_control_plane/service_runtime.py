@@ -519,6 +519,8 @@ def _vault_write_timeout(config: Mapping[str, Any]) -> float:
 
 def _reviewed_acceptance_failpoint(
     config: Mapping[str, Any],
+    *,
+    durable_root: Path | str | None = None,
 ) -> ReviewedPostDispatchFailpoint | None:
     """Load the optional host-reviewed, one-shot Google fault injection.
 
@@ -529,7 +531,7 @@ def _reviewed_acceptance_failpoint(
 
     try:
         return reviewed_post_dispatch_failpoint_from_config(
-            config.get("acceptance_failpoint")
+            config.get("acceptance_failpoint"), durable_root=durable_root
         )
     except (TypeError, ValueError) as exc:
         raise CompositionError("acceptance failpoint configuration is invalid") from exc
@@ -756,10 +758,15 @@ def _broker_operations(
 
 class _GoogleActionDispatcher:
     def __init__(
-        self, *, gmail: GmailWriteConnector, calendar: CalendarActionDispatcher
+        self,
+        *,
+        gmail: GmailWriteConnector,
+        calendar: CalendarActionDispatcher,
+        acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
     ) -> None:
         self._gmail = gmail
         self._calendar = calendar
+        self._acceptance_failpoint = acceptance_failpoint
         self._owners: dict[str, object] = {}
         self._lock = RLock()
 
@@ -773,7 +780,28 @@ class _GoogleActionDispatcher:
     def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
         owner = self._owner(action)
         binder = getattr(owner, "bind_proposal", None)
-        return binder(action) if callable(binder) else action
+        bound = binder(action) if callable(binder) else action
+        if self._acceptance_failpoint is not None:
+            target = {
+                "gmail_send": ("gmail", "gmail_send"),
+                "gmail_reply": ("gmail", "gmail_reply"),
+                "calendar_insert": ("calendar", "insert"),
+                "calendar_update": ("calendar", "update"),
+                "calendar_patch": ("calendar", "patch"),
+            }.get(bound.kind)
+            if target is not None and target == (
+                self._acceptance_failpoint.spec.service,
+                self._acceptance_failpoint.spec.operation,
+            ):
+                bound_ok = self._acceptance_failpoint.bind_action(
+                    service=target[0], operation=target[1], action_id=bound.action_id
+                )
+                if not bound_ok:
+                    raise ValueError(
+                        "reviewed acceptance failpoint could not bind the frozen "
+                        "action durably"
+                    )
+        return bound
 
     def validate_pending_action(self, action: FrozenActionProposal) -> None:
         owner = self._owner(action)
@@ -851,9 +879,8 @@ def _google_operations(
             raise CompositionError(
                 "disconnected Google credential could not be discarded"
             ) from exc
-    clock, ids, trace = _service_trace(
-        config, "google", root=Path("/var/lib/jarvis/google-traces")
-    )
+    google_trace_root = Path("/var/lib/jarvis/google-traces")
+    clock, ids, trace = _service_trace(config, "google", root=google_trace_root)
     audit = RemoteAuditBoundary(
         _client(config, client_identity="jarvis-google", server_role="audit_service")
     )
@@ -874,7 +901,9 @@ def _google_operations(
         clock=clock,
         ids=ids,
     )
-    acceptance_failpoint = _reviewed_acceptance_failpoint(config)
+    acceptance_failpoint = _reviewed_acceptance_failpoint(
+        config, durable_root=google_trace_root / "acceptance-failpoints"
+    )
     reads = GoogleReadConnector(
         configured_identity=identity,
         credential_store=credential_store,
@@ -885,6 +914,7 @@ def _google_operations(
         trace=trace,
         clock=clock,
         ids=ids,
+        connection_binding=lifecycle.connection_binding,
         on_invalid_grant=lambda generation: lifecycle.handle_refresh_failure(
             "invalid_grant", connection_generation=generation
         ),
@@ -915,7 +945,10 @@ def _google_operations(
         provider=GoogleApiCalendarWriteProvider(
             client_id=client_id, client_secret=client_secret
         ),
+        audit=audit,
         trace=trace,
+        clock=clock,
+        ids=ids,
         on_invalid_grant=lambda generation: lifecycle.handle_refresh_failure(
             "invalid_grant", connection_generation=generation
         ),
@@ -933,7 +966,11 @@ def _google_operations(
     }
     operations.update(
         OwnedActionService(
-            _GoogleActionDispatcher(gmail=gmail, calendar=calendar)  # type: ignore[arg-type]
+            _GoogleActionDispatcher(
+                gmail=gmail,
+                calendar=calendar,
+                acceptance_failpoint=acceptance_failpoint,
+            )  # type: ignore[arg-type]
         ).operations()
     )
 

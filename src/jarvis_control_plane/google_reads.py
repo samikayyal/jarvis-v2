@@ -11,13 +11,13 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Literal, Protocol
 from urllib.parse import quote, urlencode
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .google_auth import (
     GoogleRefreshTokenExchanger,
@@ -33,6 +33,7 @@ from .google_http import (
     ensure_bounded_response_body,
 )
 from .google_oauth import (
+    GoogleConnectionBinding,
     GoogleCredentialStore,
     GoogleOAuthLifecycle,
     OAuthCredentialRecord,
@@ -441,6 +442,9 @@ class GoogleReadResult:
     items: tuple[str, ...]
     truncated: bool
     continuation_available: bool
+    # Connector-owned evidence used only by the server-side orchestration seam.
+    # It is deliberately excluded from the model-facing GoogleReadOutput.
+    connection_generation: int = field(repr=False)
     content_available: bool | None = None
     content_unavailable_reason: Literal["unsupported_mime_type"] | None = None
 
@@ -458,6 +462,7 @@ class GoogleReadConnector:
         trace: DiagnosticTraceRecorder,
         clock: Clock,
         ids: IdGenerator,
+        connection_binding: GoogleConnectionBinding,
         on_invalid_grant: Callable[[int], object] | None = None,
         max_result_items: int = DEFAULT_MAX_RESULT_ITEMS,
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
@@ -469,6 +474,9 @@ class GoogleReadConnector:
         self._credential_store = credential_store
         self._provider = provider
         self._audit = audit
+        if not isinstance(connection_binding, GoogleConnectionBinding):
+            raise TypeError("connection_binding must be a GoogleConnectionBinding")
+        self._connection_binding = connection_binding
         if not isinstance(trace, DiagnosticTraceRecorder):
             raise TypeError("trace must be a DiagnosticTraceRecorder")
         self._trace = trace
@@ -491,12 +499,23 @@ class GoogleReadConnector:
         """Return only the safe connection projection used by `/status`."""
 
         try:
-            credential = self._credential_store.current
+            snapshot = self._connection_binding.snapshot()
+            credential = snapshot.credential
         except Exception:  # noqa: BLE001 - credential failures become safe unknown state
             return ServiceReadiness("google", "unknown")
-        if credential is None or credential.subject != self._configured_identity:
+        if (
+            not snapshot.connection.connected
+            or credential is None
+            or credential.subject != self._configured_identity
+            or credential.connection_generation != snapshot.connection.generation
+        ):
             return ServiceReadiness("google", "unavailable")
         return ServiceReadiness("google", "ready")
+
+    def current_connection_generation(self) -> int:
+        """Return the connector-owned generation for the orchestration seam."""
+
+        return self._connection_binding.snapshot().connection.generation
 
     def gmail_messages_list(
         self,
@@ -637,44 +656,58 @@ class GoogleReadConnector:
             outcome="attempted",
             execution_status="attempted",
         )
+        credential_validated = False
         try:
-            credential = self._credential(operation)
+            # The lifecycle's synchronization lock keeps the credential and
+            # connection generation bound together through the provider call.
+            # A reconnect cannot occur between the read admission and the
+            # provider result that is attached to this observation.
+            with self._connection_binding.synchronization_lock:
+                credential, connection_generation = self._credential(operation)
+                credential_validated = True
+                provider_request = GoogleReadRequest(
+                    operation=operation,
+                    arguments=dict(arguments),
+                    max_results=requested_count,
+                )
+                trace_payload = self._trace.execute(
+                    # The broker owns the parent request's full trace reservation
+                    # while the model is running.  A deterministic child key gives
+                    # this connector its own pre-reserved complete-payload budget
+                    # in the same trace store without competing with that parent.
+                    request_id=f"{request_id}:google:{operation}",
+                    operation_id=f"{request_id}:connector:google:{operation}",
+                    operation_type="google_read_connector",
+                    input_payload=provider_request,
+                    arguments={
+                        "parent_request_id": request_id,
+                        "operation": operation,
+                        "arguments": dict(arguments),
+                        "max_results": requested_count,
+                    },
+                    telemetry={"service": _SERVICE_BY_OPERATION[operation]},
+                    operation=lambda: self._read_provider_result(
+                        request=provider_request,
+                        credential=credential,
+                        connection_generation=connection_generation,
+                    ),
+                    result_limit_bytes=GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES,
+                    error_limit_bytes=GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES,
+                )
         except GoogleReadError:
-            self._append_audit(
-                request_id=request_id,
-                operation=operation,
-                outcome="failed",
-                execution_status="failed",
-            )
+            if credential_validated:
+                self._record_failure(request_id, operation)
+            else:
+                # Admission failures happen before a provider attempt.  Keep
+                # the historical audit contract: if the failure record cannot
+                # be written, expose that bounded administrative failure.
+                self._append_audit(
+                    request_id=request_id,
+                    operation=operation,
+                    outcome="failed",
+                    execution_status="failed",
+                )
             raise
-        try:
-            provider_request = GoogleReadRequest(
-                operation=operation,
-                arguments=dict(arguments),
-                max_results=requested_count,
-            )
-            trace_payload = self._trace.execute(
-                # The broker owns the parent request's full trace reservation
-                # while the model is running.  A deterministic child key gives
-                # this connector its own pre-reserved complete-payload budget
-                # in the same trace store without competing with that parent.
-                request_id=f"{request_id}:google:{operation}",
-                operation_id=f"{request_id}:connector:google:{operation}",
-                operation_type="google_read_connector",
-                input_payload=provider_request,
-                arguments={
-                    "parent_request_id": request_id,
-                    "operation": operation,
-                    "arguments": dict(arguments),
-                    "max_results": requested_count,
-                },
-                telemetry={"service": _SERVICE_BY_OPERATION[operation]},
-                operation=lambda: self._read_provider_result(
-                    request=provider_request, credential=credential
-                ),
-                result_limit_bytes=GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES,
-                error_limit_bytes=GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES,
-            )
         except GoogleReadProviderError as exc:
             if exc.code == "invalid_grant":
                 try:
@@ -687,9 +720,6 @@ class GoogleReadConnector:
         except (DiagnosticTraceError, TraceCapacityError, TraceWriteError) as exc:
             self._record_failure(request_id, operation)
             raise GoogleReadError("google_read_trace_unavailable") from exc
-        except GoogleReadError:
-            self._record_failure(request_id, operation)
-            raise
         except Exception as exc:
             self._record_failure(request_id, operation)
             raise GoogleReadError("google_read_unavailable") from exc
@@ -706,6 +736,7 @@ class GoogleReadConnector:
         *,
         request: GoogleReadRequest,
         credential: OAuthCredentialRecord,
+        connection_generation: int,
     ) -> GoogleReadTracePayload:
         provider_result = self._provider.read(request=request, credential=credential)
         if not isinstance(provider_result, GoogleReadProviderResult):
@@ -734,6 +765,7 @@ class GoogleReadConnector:
             content_unavailable_reason=_content_unavailable_reason(
                 request.operation, items
             ),
+            connection_generation=connection_generation,
         )
         if len(_serialized_result(result)) > self._max_result_bytes:
             raise GoogleReadError("google_read_oversized")
@@ -778,15 +810,21 @@ class GoogleReadConnector:
         except (AuditWriteError, ValueError, TypeError, RuntimeError) as exc:
             raise GoogleReadError("google_read_audit_unavailable") from exc
 
-    def _credential(self, operation: GoogleReadOperation) -> OAuthCredentialRecord:
+    def _credential(
+        self, operation: GoogleReadOperation
+    ) -> tuple[OAuthCredentialRecord, int]:
         try:
-            credential = self._credential_store.current
+            snapshot = self._connection_binding.snapshot()
+            connection = snapshot.connection
+            credential = snapshot.credential
         except Exception as exc:
             raise GoogleReadError("google_read_unavailable") from exc
-        if credential is None:
+        if not connection.connected or credential is None:
             raise GoogleReadError("google_read_disconnected")
         if credential.subject != self._configured_identity:
             raise GoogleReadError("wrong_identity")
+        if credential.connection_generation != connection.generation:
+            raise GoogleReadError("google_read_unavailable")
         required_scopes = _OPERATION_SCOPES[operation]
         # ``_credential`` is called from ``_read`` immediately after the operation
         # is selected; keeping scope validation in the connector makes it impossible
@@ -796,7 +834,7 @@ class GoogleReadConnector:
             and not required_scopes <= credential.granted_scopes
         ):
             raise GoogleReadError("missing_scope")
-        return credential
+        return credential, connection.generation
 
     def _discard_invalid_credential(self, connection_generation: int) -> None:
         credential = self._credential_store.current
@@ -841,6 +879,7 @@ def build_live_google_read_connector(
         trace=trace,
         clock=clock,
         ids=ids,
+        connection_binding=oauth_lifecycle.connection_binding,
         on_invalid_grant=lambda connection_generation: (
             oauth_lifecycle.handle_refresh_failure(
                 "invalid_grant", connection_generation=connection_generation
@@ -934,6 +973,7 @@ class GoogleReadOutput(BaseModel):
     continuation_available: bool
     content_available: bool | None = None
     content_unavailable_reason: Literal["unsupported_mime_type"] | None = None
+    _connection_generation: int | None = PrivateAttr(default=None)
 
 
 def _google_read_tools(connector: object) -> tuple[BoundedReadTool, ...]:
@@ -1057,7 +1097,7 @@ def _google_read_tools(connector: object) -> tuple[BoundedReadTool, ...]:
 
 
 def _output(result: GoogleReadResult) -> GoogleReadOutput:
-    return GoogleReadOutput(
+    output = GoogleReadOutput(
         service=result.service,
         operation=result.operation,
         items=result.items,
@@ -1066,6 +1106,10 @@ def _output(result: GoogleReadResult) -> GoogleReadOutput:
         content_available=result.content_available,
         content_unavailable_reason=result.content_unavailable_reason,
     )
+    # Keep connector-owned provenance on the server-side model instance only.
+    # PrivateAttr is absent from both the tool schema and model_dump output.
+    output._connection_generation = result.connection_generation
+    return output
 
 
 def _non_blank(value: object, name: str) -> str:

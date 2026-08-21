@@ -76,6 +76,18 @@ def test_runbook_does_not_document_a_destructive_or_secret_bypass() -> None:
     assert "do not retry" in runbook.lower()
 
 
+def test_runbook_keeps_activation_and_provider_boundaries_human_owned() -> None:
+    runbook = " ".join(_runbook().split())
+
+    assert "This worksheet does not authorize activation, deployment" in runbook
+    assert "transport or container interruption" in runbook
+    assert "firewall/proxy changes" in runbook
+    assert "direct-provider workarounds" in runbook
+    assert "Direct provider mutation" in runbook
+    assert "do not restart to manufacture an outcome" in runbook.lower()
+    assert "never interrupt transport" not in runbook
+
+
 def test_repair_rerun_contract_keeps_gate_dependencies_and_aggregate_explicit() -> None:
     runbook = " ".join(_runbook().split())
 
@@ -86,7 +98,9 @@ def test_repair_rerun_contract_keeps_gate_dependencies_and_aggregate_explicit() 
         "Google unavailable",
         "Gmail success does not cover Calendar or Drive",
         "Gate 08 is Gmail-only",
-        "Gates 09-11",
+        "Gate 09",
+        "Gate 10",
+        "Gate 11",
         "Gate 12",
         "Gate 13",
         "Gate 15",
@@ -94,13 +108,22 @@ def test_repair_rerun_contract_keeps_gate_dependencies_and_aggregate_explicit() 
         "outcome-unknown",
         "Gate 18",
         "`fail`, `blocked`, or `deferred`",
+        "complete frozen proposal",
+        "exact secondary calendar",
+        "no pending action and no provider event",
+        "provider-first and durable Jarvis reconciliation",
     )
     assert all(phrase in runbook for phrase in required_phrases)
     assert (
         "Do not run Calendar mutation gates until the Calendar read boundary is proven"
         in runbook
     )
-    assert "If Gate 03 is `fail`, these rows remain `deferred`" in runbook
+    assert "If Gate 09 is `fail`, Gate 10 remains `deferred`" in runbook
+    assert "If Gate 10 has no completed action, Gate 11 remains `deferred`" in runbook
+    assert (
+        "If Gate 03 or Gate 09 is not a real-system `pass`, Gate 13 remains `deferred`"
+        in runbook
+    )
     assert "Git heads alone are not an acknowledgement" in runbook
 
 
@@ -112,8 +135,7 @@ def test_unknown_outcome_rows_require_provider_specific_reviewed_failpoints() ->
         " only if the operator separately authorizes" in runbook
     )
     assert (
-        "Gate 12 (Calendar unknown outcome)"
-        " only after the Calendar read and write prerequisites have passed" in runbook
+        "Gate 12 (Calendar unknown outcome) only after Gates 03 and 09 pass" in runbook
     )
     assert runbook.count("application-level post-dispatch failpoint") >= 2
     assert "do not substitute Gmail's failpoint" in runbook
@@ -128,10 +150,64 @@ def test_runbook_documents_exact_failpoint_fields_and_retirement() -> None:
 
     for field in ("enabled", "service", "operation", "action_id", "review_id"):
         assert field in runbook
-    assert "root-owned, read-only active configuration" in runbook
+    assert "[acceptance_failpoint]" in runbook
+    assert 'service = "gmail"' in runbook
+    assert 'operation = "gmail_send"' in runbook
+    assert 'action_id = ""' in runbook
+    assert "root-owned and read-only" in runbook
+    assert "protected reviewed mechanism" in runbook
+    assert "actual frozen request-scoped action before approval" in runbook
+    assert "Never fill it with a guessed" in runbook
     assert "one-shot" in runbook
+    assert "durable across restart" in runbook
+    assert "consumed/retired disposition survives a controlled" in runbook
     assert "all four target fields empty" in runbook
     assert "no pending action or unresolved unknown remains" in runbook
+
+
+def test_failpoint_arm_bind_verify_and_approval_order_is_explicit() -> None:
+    runbook = _runbook()
+
+    arm = runbook.index("While Jarvis is idle with no pending action")
+    prepare = runbook.index("With that empty-action arm already active")
+    bind = runbook.index("first matching connector-owned frozen")
+    verify = runbook.index("Before the operator sends `yes`")
+    approval = runbook.index("Do not reload, replace, or otherwise change")
+    send = runbook.index("Send the exact approval only")
+    normalized = " ".join(runbook.split())
+
+    assert arm < prepare < bind < verify < approval < send
+    assert "service reload invalidates the pending action" in runbook
+    assert "Do not arm or reload after a proposal has been prepared" in normalized
+    assert "With the failpoint disabled, prepare" not in runbook
+    assert "durable bound marker names the same action" in normalized
+    assert "deterministically reply `reject`" in normalized
+
+
+def test_stale_calendar_generation_uses_the_original_pending_proposal() -> None:
+    runbook = _runbook()
+    read_generation = runbook.index(
+        "Gate 03's connector-owned Calendar read supplies the\ncredential generation"
+    )
+    prepare = runbook.index(
+        "prepare one labeled event update for the exact\nsecondary calendar"
+    )
+    pending = runbook.index("leave only\nthat intentional proposal pending")
+    reconnect = runbook.index(
+        "Disconnect and reconnect Google only after\nthe proposal is pending"
+    )
+    no_fresh_read = runbook.index(
+        "After reconnect, do not make a fresh Calendar read or prepare a new proposal"
+    )
+    approval = runbook.index("then reply\n`yes`; its old generation must fail")
+
+    assert read_generation < prepare < pending < reconnect < no_fresh_read < approval
+    assert "frozen proposal\nto carry that same read generation" in runbook
+    assert "model-supplied or invented generation is\nnot valid evidence" in runbook
+    assert (
+        "that would exercise a new generation rather than prove rejection of the stale\n"
+        "pending proposal"
+    ) in runbook
 
 
 def test_controlled_unknown_outcome_harness_covers_gmail_and_calendar_separately() -> (
@@ -140,6 +216,7 @@ def test_controlled_unknown_outcome_harness_covers_gmail_and_calendar_separately
     root = Path(__file__).parents[1]
     gmail_tests = (root / "tests/test_ticket18_gmail_writes.py").read_text()
     calendar_tests = (root / "tests/test_ticket19_calendar_actions.py").read_text()
+    failpoint_tests = (root / "tests/test_acceptance_failpoints.py").read_text()
 
     assert (
         "test_gmail_post_dispatch_failpoint_is_unknown_and_replay_free" in gmail_tests
@@ -152,6 +229,11 @@ def test_controlled_unknown_outcome_harness_covers_gmail_and_calendar_separately
     assert "failpoint" in calendar_tests.lower()
     assert "unknown provider outcome" in gmail_tests
     assert "unknown provider outcome" in calendar_tests
+    assert "bind_action" in failpoint_tests
+    assert "test_request_scoped_arm_binds_the_frozen_action_and_survives_restart" in (
+        failpoint_tests
+    )
+    assert "durable_root" in failpoint_tests
 
 
 def test_vault_ack_harness_distinguishes_success_and_unknown_outcome() -> None:

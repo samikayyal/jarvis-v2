@@ -636,8 +636,16 @@ class GmailWriteConnector:
                 outcome=outcome,
                 execution_status="unknown" if outcome == "unknown" else "failed",
             )
-        except AuditWriteError:
-            pass
+        except AuditWriteError as exc:
+            # Do not emit a terminal acknowledgement while the connector's
+            # own terminal outcome is missing.  Preserve the provider outcome
+            # classification so the broker can close the action as unknown
+            # without treating this audit failure as a successful terminal
+            # record.
+            raise ActionDispatcherError(
+                "Gmail terminal audit evidence is unavailable",
+                may_have_dispatched=outcome == "unknown",
+            ) from exc
 
     def _append_audit(
         self,
