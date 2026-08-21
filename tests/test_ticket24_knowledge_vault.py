@@ -509,6 +509,84 @@ def test_routed_broker_dispatches_one_exact_vault_write_after_approval(
     )
     assert len(repository.commit_calls) == 1
     assert len(repository.push_calls) == 1
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "completed successfully" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "knowledge vault action completed successfully" in acknowledgements[0].body
+    assert "no retry" in acknowledgements[0].body.lower()
+
+
+def test_vault_write_unknown_push_gets_one_terminal_unknown_ack(tmp_path: Path) -> None:
+    class UnknownPushRepository(ControlledVaultWriteRepository):
+        def push(self, *args: object, **kwargs: object) -> None:
+            self.push_calls.append(
+                {
+                    "expected_base": kwargs["expected_base"],
+                    "commit_id": kwargs["commit_id"],
+                }
+            )
+            raise VaultPushUnknownOutcome("push response was interrupted")
+
+    repository = UnknownPushRepository(current_commit=BASE, remote_commit=BASE)
+    connector, _ = _connector(tmp_path, repository=repository)
+    router = RoutedActionDispatcher(
+        terminal=ControlledActionDispatcher(),
+        gmail=ControlledActionDispatcher(),
+        gmail_lifecycle=_IdentityLifecycle(),
+        vault=connector,
+        vault_lifecycle=connector,
+    )
+    orchestration = ControlledOrchestrationAdapter(
+        proposal_factory=lambda request: connector.propose(
+            request_id=request.state.request_id,
+            changes={"Projects/Alpha.md": "# Alpha\n\nStatus: approved\n"},
+        )
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket24-secret",
+        now=NOW,
+        id_prefix="ticket24-unknown",
+        orchestration=orchestration,
+        action_dispatcher=router,
+        action_lifecycle=router,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket24-secret",
+            )
+        )
+
+    assert receive("change Alpha", "1").disposition == "pending_action"
+    result = receive("yes", "2")
+
+    assert result.disposition == "action_dispatch_unknown"
+    acknowledgements = [
+        reply
+        for reply in components.outbound.sent
+        if "unknown provider outcome" in reply.body
+    ]
+    assert len(acknowledgements) == 1
+    assert "knowledge vault action" in acknowledgements[0].body
+    assert "no retry" in acknowledgements[0].body.lower()
 
 
 def test_subprocess_vault_edge_uses_fetch_only_verification_and_normal_push(

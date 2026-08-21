@@ -556,10 +556,14 @@ def test_calendar_event_reads_use_typed_time_bounds_and_bounded_calendar_paginat
                 {
                     "items": [
                         {
+                            "id": "calendar-2",
+                            "summary": "Another calendar",
+                        },
+                        {
                             "id": "secondary-calendar",
                             "summary": "Ticket 31 run calendar",
                             "timeZone": "Asia/Amman",
-                        }
+                        },
                     ]
                 }
             ),
@@ -575,6 +579,13 @@ def test_calendar_event_reads_use_typed_time_bounds_and_bounded_calendar_paginat
         credential=credential,
     )
     assert len(calendar_transport.calls) == 3
+    calendar_rows = [json.loads(item) for item in calendar_result.items]
+    assert [row["id"] for row in calendar_rows] == [
+        "calendar-1",
+        "calendar-2",
+        "calendar-3",
+        "secondary-calendar",
+    ]
     assert any("Ticket 31 run calendar" in item for item in calendar_result.items)
 
 
@@ -613,6 +624,35 @@ def test_live_provider_exports_only_text_and_classifies_invalid_grant() -> None:
             client_secret="client-secret",
             transport=invalid_grant_transport,
         ).read(request=GoogleReadRequest("calendar_list", {}, 1), credential=credential)
+
+
+def test_live_provider_accepts_case_insensitive_text_export_content_type() -> None:
+    transport = _RecordingGoogleTransport(
+        [
+            _json_response({"access_token": "access-token"}),
+            GoogleReadHttpResponse(
+                status_code=200,
+                headers={"content-type": "text/plain; charset=utf-8"},
+                body=b"plain document",
+            ),
+        ]
+    )
+    provider = GoogleApiReadProvider(
+        client_id="client-id", client_secret="client-secret", transport=transport
+    )
+
+    result = provider.read(
+        request=GoogleReadRequest(
+            "drive_files_export", {"file_id": "doc1", "mime_type": "text/plain"}, 1
+        ),
+        credential=OAuthCredentialRecord(
+            subject=IDENTITY,
+            granted_scopes=GOOGLE_READ_SCOPES,
+            refresh_token="refresh-token",
+        ),
+    )
+
+    assert result.items == ("plain document",)
 
 
 def test_live_provider_reads_only_inline_textual_gmail_parts() -> None:

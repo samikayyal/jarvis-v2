@@ -50,6 +50,10 @@ from jarvis_control_plane import (
     create_gmail_reply_proposal,
     gmail_write_request_from_proposal,
 )
+from jarvis_control_plane.acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailpointSpec,
+)
 from jarvis_control_plane.gmail_writes import _encode_rfc822
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.orchestration import (
@@ -98,7 +102,7 @@ def _dispatcher(
     audit: InMemoryAuditBoundary | None = None,
     connection_state: object | None = None,
     trace: DiagnosticTraceRecorder | None = None,
-    post_dispatch_failpoint: object | None = None,
+    acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
 ) -> GmailWriteConnector:
     connection_state = connection_state or (
         lambda: GoogleConnectionState(
@@ -124,7 +128,7 @@ def _dispatcher(
         clock=FixedClock(NOW),
         ids=DeterministicIdGenerator("ticket18-gmail"),
         connection_state=connection_state,  # type: ignore[arg-type]
-        post_dispatch_failpoint=post_dispatch_failpoint,  # type: ignore[arg-type]
+        acceptance_failpoint=acceptance_failpoint,
     )
 
 
@@ -171,6 +175,7 @@ def _components(
     *,
     audit: InMemoryAuditBoundary | None = None,
     trace: DiagnosticTraceRecorder | None = None,
+    action_id: str | None = None,
 ) -> object:
     from jarvis_control_plane import ControlledOrchestrationAdapter
 
@@ -183,7 +188,7 @@ def _components(
         audit=audit,
         orchestration=ControlledOrchestrationAdapter(
             proposal_factory=lambda request: FrozenActionProposal.create(
-                action_id=f"{request.state.request_id}:gmail",
+                action_id=action_id or f"{request.state.request_id}:gmail",
                 request_id=request.state.request_id,
                 kind=proposal.kind,
                 preview=proposal.preview,
@@ -328,15 +333,19 @@ def test_gmail_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
     provider = ControlledGmailWriteProvider(
         result=GmailDeliveryResult(message_id="sent-failpoint", thread_id="thread-new")
     )
-    failpoint_calls: list[str] = []
-
-    def failpoint(operation: str) -> None:
-        failpoint_calls.append(operation)
-        raise RuntimeError("controlled post-dispatch fault")
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="gmail-action-001",
+            review_id="ticket18-gmail-unknown",
+        )
+    )
 
     components = _components(
         _proposal(),
-        _dispatcher(provider, post_dispatch_failpoint=failpoint),
+        _dispatcher(provider, acceptance_failpoint=failpoint),
+        action_id="gmail-action-001",
     )
 
     components.receiver.receive(_event("send", suffix="failpoint-01"))
@@ -345,7 +354,7 @@ def test_gmail_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
 
     assert unknown.disposition == "action_dispatch_unknown"
     assert replay.disposition != "action_dispatched"
-    assert failpoint_calls == ["gmail_send"]
+    assert failpoint.consumed is True
     assert len(provider.calls) == 1
     acknowledgements = [
         reply

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -30,6 +29,10 @@ from jarvis_control_plane import (
     OAuthGrant,
     SignedInboundEvent,
 )
+from jarvis_control_plane.acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailpointSpec,
+)
 from jarvis_control_plane.google_calendar import GoogleCalendarWriteProviderError
 from jarvis_control_plane.ports import ActionDispatcherError
 from jarvis_control_plane.sessions import DispatchStatus
@@ -54,7 +57,7 @@ def event(*, summary: str = "Design review") -> dict[str, object]:
 
 
 def connected_dispatcher(
-    *, post_dispatch_failpoint: Callable[[str], None] | None = None
+    *, acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None
 ) -> tuple[
     CalendarActionDispatcher,
     ControlledGoogleCalendarWriteProvider,
@@ -85,7 +88,7 @@ def connected_dispatcher(
                 clock=FixedClock(NOW),
                 ids=DeterministicIdGenerator("ticket19-calendar"),
             ),
-            post_dispatch_failpoint=post_dispatch_failpoint,
+            acceptance_failpoint=acceptance_failpoint,
         ),
         provider,
         state,
@@ -612,16 +615,150 @@ def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
     assert len(provider.calls) == 1
 
 
-def test_calendar_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
-    failpoint_calls: list[str] = []
-
-    def failpoint(operation: str) -> None:
-        failpoint_calls.append(operation)
-        raise RuntimeError("controlled post-dispatch fault")
-
-    dispatcher, provider, state = connected_dispatcher(
-        post_dispatch_failpoint=failpoint
+def test_broker_update_approval_dispatches_the_frozen_snapshot_once() -> None:
+    dispatcher, provider, state = connected_dispatcher()
+    current = {
+        **event(summary="Existing summary"),
+        "id": "event-update",
+        "etag": '"etag-update"',
+    }
+    snapshot = CalendarEventSnapshot(event=current, etag='"etag-update"')
+    orchestration = ControlledOrchestrationAdapter(
+        proposal_factory=lambda request: CalendarWriteProposal.update_from_snapshot(
+            action_id="calendar-update-broker",
+            request_id=request.state.request_id,
+            calendar_id="primary",
+            event_id="event-update",
+            snapshot=snapshot,
+            changes={"summary": "Changed summary"},
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
     )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket19-update-secret",
+        now=NOW,
+        id_prefix="ticket19-update",
+        orchestration=orchestration,
+        action_dispatcher=dispatcher,
+        action_lifecycle=dispatcher,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket19-update-secret",
+            )
+        )
+
+    assert receive("change it", "1").disposition == "pending_action"
+    approved = receive("yes", "2")
+
+    assert approved.disposition == "action_dispatched"
+    assert len(provider.calls) == 1
+    request, _credential = provider.calls[0]
+    assert request.operation == "update"
+    assert request.event_id == "event-update"
+    assert request.etag == '"etag-update"'
+    assert request.complete_event["summary"] == "Changed summary"
+    assert request.complete_event["attendees"] == snapshot.event["attendees"]
+    assert receive("yes", "3").disposition != "action_dispatched"
+    assert len(provider.calls) == 1
+
+
+def test_broker_rejects_calendar_proposal_after_reconnect_before_dispatch() -> None:
+    dispatcher, provider, state = connected_dispatcher()
+    current = {
+        **event(summary="Existing summary"),
+        "id": "event-stale",
+        "etag": '"etag-stale"',
+    }
+    snapshot = CalendarEventSnapshot(event=current, etag='"etag-stale"')
+    generation = state.get_connection().generation
+    orchestration = ControlledOrchestrationAdapter(
+        proposal_factory=lambda request: CalendarWriteProposal.update_from_snapshot(
+            action_id="calendar-stale-broker",
+            request_id=request.state.request_id,
+            calendar_id="primary",
+            event_id="event-stale",
+            snapshot=snapshot,
+            changes={"summary": "Must not dispatch"},
+            notification="none",
+            connection_generation=generation,
+        )
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket19-stale-secret",
+        now=NOW,
+        id_prefix="ticket19-stale",
+        orchestration=orchestration,
+        action_dispatcher=dispatcher,
+        action_lifecycle=dispatcher,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket19-stale-secret",
+            )
+        )
+
+    assert receive("change it", "1").disposition == "pending_action"
+    state.set_connection(connected=False)
+    state.set_connection(
+        connected=True, granted_scopes=frozenset({CALENDAR_WRITE_SCOPE})
+    )
+    invalidated = receive("yes", "2")
+
+    assert invalidated.disposition == "action_invalidated"
+    assert "connection changed" in (invalidated.reason or "")
+    assert provider.calls == []
+    assert components.broker.current_pending_action is None
+    assert components.broker.working_sessions.load().active_request is None
+    assert any(
+        "invalidated before dispatch" in reply.body
+        for reply in components.outbound.sent
+    )
+
+
+def test_calendar_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="calendar",
+            operation="insert",
+            action_id="calendar-action-failpoint",
+            review_id="ticket19-calendar-unknown",
+        )
+    )
+    dispatcher, provider, state = connected_dispatcher(acceptance_failpoint=failpoint)
     orchestration = ControlledOrchestrationAdapter(
         proposal_factory=lambda request: CalendarWriteProposal.insert(
             action_id="calendar-action-failpoint",
@@ -667,7 +804,7 @@ def test_calendar_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
 
     assert unknown.disposition == "action_dispatch_unknown"
     assert replay.disposition != "action_dispatched"
-    assert failpoint_calls == ["insert"]
+    assert failpoint.consumed is True
     assert len(provider.calls) == 1
     acknowledgements = [
         reply

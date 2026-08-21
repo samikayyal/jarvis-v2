@@ -18,6 +18,10 @@ from email.policy import SMTP
 from threading import RLock
 from typing import Literal, Protocol
 
+from .acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailure,
+)
 from .gmail_actions import (
     GMAIL_SEND_SCOPE,
     GmailReplyRequest,
@@ -315,7 +319,7 @@ class GmailWriteConnector:
         connection_state: Callable[[], GoogleConnectionState] | None = None,
         connection_binding: GoogleConnectionBinding | None = None,
         on_invalid_grant: Callable[[], object] | None = None,
-        post_dispatch_failpoint: Callable[[str], None] | None = None,
+        acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
     ) -> None:
         self._configured_identity = _canonical_string(
             configured_identity, "configured_identity"
@@ -344,12 +348,18 @@ class GmailWriteConnector:
         self._prepared_lock = RLock()
         self._prepared: dict[str, _GmailWriteDispatch] = {}
         self._on_invalid_grant = on_invalid_grant or credential_store.delete
-        if post_dispatch_failpoint is not None and not callable(
-            post_dispatch_failpoint
+        if acceptance_failpoint is not None and not isinstance(
+            acceptance_failpoint, ReviewedPostDispatchFailpoint
         ):
-            raise TypeError("post_dispatch_failpoint must be callable")
-        # Test-only fault injection. Production composition leaves this unset.
-        self._post_dispatch_failpoint = post_dispatch_failpoint
+            raise TypeError(
+                "acceptance_failpoint must be a reviewed post-dispatch failpoint"
+            )
+        if (
+            acceptance_failpoint is not None
+            and acceptance_failpoint.spec.service != "gmail"
+        ):
+            raise ValueError("Gmail connector requires a Gmail acceptance failpoint")
+        self._acceptance_failpoint = acceptance_failpoint
 
     def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle:
         """Prepare one Gmail write without beginning the provider exchange."""
@@ -482,12 +492,16 @@ class GmailWriteConnector:
             result_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
             error_limit_bytes=GMAIL_WRITE_TRACE_PAYLOAD_LIMIT_BYTES,
         )
-        if self._post_dispatch_failpoint is not None:
+        if self._acceptance_failpoint is not None:
             try:
-                self._post_dispatch_failpoint(request.operation)
-            except Exception as exc:
+                self._acceptance_failpoint.raise_if_armed(
+                    service="gmail",
+                    operation=request.operation,
+                    action_id=action.action_id,
+                )
+            except ReviewedPostDispatchFailure as exc:
                 raise ActionDispatcherError(
-                    "test-only Gmail post-dispatch failpoint", may_have_dispatched=True
+                    "Gmail delivery outcome is unknown", may_have_dispatched=True
                 ) from exc
         return result
 
@@ -662,6 +676,7 @@ def build_live_gmail_write_connector(
     clock: Clock,
     ids: IdGenerator,
     transport: GoogleHttpTransport | None = None,
+    acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
 ) -> GmailWriteConnector:
     """Compose Gmail's fixed write connector with OAuth invalidation ownership."""
 
@@ -679,6 +694,7 @@ def build_live_gmail_write_connector(
         on_invalid_grant=lambda: oauth_lifecycle.handle_refresh_failure(
             "invalid_grant"
         ),
+        acceptance_failpoint=acceptance_failpoint,
     )
 
 
