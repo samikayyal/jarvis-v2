@@ -1356,7 +1356,7 @@ def _service_access(
                 operation
                 for operation in role.operations
                 if operation.startswith("action_")
-                or operation in {"start_authorization", "disconnect"}
+                or operation in {"current", "start_authorization", "disconnect"}
             ),
             "jarvis-orchestration": tuple(
                 operation
