@@ -134,6 +134,29 @@ def test_runbook_documents_exact_failpoint_fields_and_retirement() -> None:
     assert "no pending action or unresolved unknown remains" in runbook
 
 
+def test_gmail_gate08_binds_the_live_action_reference_before_approval() -> None:
+    runbook = " ".join(_runbook().split())
+
+    assert "replace it with the exact `action_ref` displayed" in runbook
+    assert (
+        "The Google authorize operation ID is only an external consent label" in runbook
+    )
+    assert "Keep the failpoint absent or disabled" in runbook
+    assert "leave it pending" in runbook
+    assert "do not approve it yet" in runbook
+    assert "installs the failpoint with `action_id` set to that exact value" in runbook
+    assert "reloads only the Google connector" in runbook
+    assert (
+        "Do not ask the model or chat control grammar to choose or edit the target"
+        in runbook
+    )
+    assert (
+        "consumed state is evidence that Gate 08 exercised the intended action"
+        in runbook
+    )
+    assert "leave Gate 08 `blocked`" in runbook
+
+
 def test_controlled_unknown_outcome_harness_covers_gmail_and_calendar_separately() -> (
     None
 ):

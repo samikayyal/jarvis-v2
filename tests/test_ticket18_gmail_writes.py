@@ -365,6 +365,41 @@ def test_gmail_post_dispatch_failpoint_is_unknown_and_replay_free() -> None:
     assert "no retry" in acknowledgements[0].body.lower()
 
 
+def test_gmail_failpoint_does_not_swallow_terminal_audit_failure() -> None:
+    class UnknownOutcomeAuditFailure(InMemoryAuditBoundary):
+        def append(self, evidence: object) -> None:
+            if evidence.kind == "gmail_write" and evidence.outcome == "unknown":
+                raise AuditWriteError("unknown outcome audit unavailable")
+            super().append(evidence)  # type: ignore[arg-type]
+
+    provider = ControlledGmailWriteProvider(
+        result=GmailDeliveryResult(
+            message_id="sent-audit-failure", thread_id="thread-new"
+        )
+    )
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="gmail-action-001",
+            review_id="ticket31-gmail-audit-failure",
+        )
+    )
+    dispatcher = _dispatcher(
+        provider,
+        audit=UnknownOutcomeAuditFailure(),
+        acceptance_failpoint=failpoint,
+    )
+
+    with pytest.raises(ActionDispatcherError) as caught:
+        dispatcher.dispatch(dispatcher.bind_proposal(_proposal()))
+
+    assert caught.value.may_have_dispatched is True
+    assert str(caught.value) == "Gmail terminal audit evidence is unavailable"
+    assert isinstance(caught.value.__cause__, AuditWriteError)
+    assert len(provider.calls) == 1
+
+
 def test_trace_capacity_failure_is_definite_not_started_for_gmail_dispatch() -> None:
     trace_store = InMemoryDiagnosticTraceStore()
     writer = trace_store.writer()

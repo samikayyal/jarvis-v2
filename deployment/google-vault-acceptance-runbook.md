@@ -75,16 +75,18 @@ not satisfy a real-system gate.
 
 The normal production configuration has no `acceptance_failpoint` section and
 therefore has no fault injection. A human reviewer may authorize one bounded
-acceptance run by adding this exact section to the root-owned, read-only active
+acceptance run by adding this section to the root-owned, read-only active
 configuration; the model, broker, and chat control grammar cannot create or
-change it:
+change it. The `action_id` below is not a reusable label: replace it with the
+exact `action_ref` displayed for the one frozen pending proposal before
+installing the active file:
 
 ```toml
 [acceptance_failpoint]
 enabled = true
 service = "gmail"             # `gmail` or `calendar`
 operation = "gmail_send"      # service-specific reviewed operation
-action_id = "ticket31-gmail-send-01"
+action_id = "<exact frozen action_ref>"
 review_id = "ticket31-gmail-unknown"
 ```
 
@@ -94,7 +96,29 @@ The five fields are required exactly as shown: `enabled`, `service`,
 the selected service; `action_id` and `review_id` are exact bounded identifiers,
 not wildcards or prefixes. Use a separately reviewed Calendar target for Gate
 12. The failpoint is one-shot and remains disabled unless `enabled = true` is
-present in an active configuration.
+present in an active configuration. The Google authorize operation ID is only
+an external consent label; it is not the Gmail action reference.
+
+For Gate 08, use this controlled binding sequence so the request-scoped
+production action ID cannot become stale:
+
+1. Keep the failpoint absent or disabled. Create the one fresh, exact labeled
+   Gmail proposal and leave it pending. Record its displayed `action_ref`,
+   request reference, digest, and complete material-field comparison; do not
+   approve it yet.
+2. The independent reviewer verifies that the recorded `action_ref` belongs
+   to this pending proposal. The human operator then installs the failpoint
+   with `action_id` set to that exact value and reloads only the Google
+   connector. Do not ask the model or chat control grammar to choose or edit
+   the target, and do not create a replacement request.
+3. Verify the protected failpoint metadata reports that exact action reference
+   as armed, then reply exactly `yes` for the already frozen proposal. The
+   provider-return boundary is now the Gmail connector's one reviewed
+   post-dispatch failpoint; its consumed state is evidence that Gate 08
+   exercised the intended action.
+4. If the exact action reference cannot be installed and verified, leave Gate
+   08 `blocked`. Do not approve a differently targeted proposal, retry, or
+   improvise an interruption.
 
 Before arming it, record the exact target and external baseline. After the
 unknown acknowledgement, reconcile Gmail or Calendar directly and record zero
