@@ -666,7 +666,9 @@ def test_google_administration_is_authenticated_and_not_model_accessible() -> No
         "jarvis-orchestration",
         "jarvis-oauth-callback",
     )
-    assert {"start_authorization", "disconnect"} <= set(allowlists["jarvis-broker"])
+    assert {"current", "start_authorization", "disconnect"} <= set(
+        allowlists["jarvis-broker"]
+    )
     assert "start_authorization" not in allowlists["jarvis-orchestration"]
     assert allowlists["jarvis-oauth-callback"] == ("oauth_callback",)
 
