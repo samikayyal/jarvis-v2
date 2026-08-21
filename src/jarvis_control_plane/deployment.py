@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .acceptance_failpoints import reviewed_post_dispatch_failpoint_from_config
 from .knowledge_vault_writes import canonical_allowed_note_directories
 
 
@@ -228,6 +229,7 @@ CONFIG_KEYS = frozenset(
         "resource_bounds",
     }
 )
+OPTIONAL_CONFIG_KEYS = frozenset({"acceptance_failpoint"})
 
 
 class BundleValidationError(ValueError):
@@ -332,7 +334,7 @@ def _load_mapping(path: Path, errors: list[str], label: str) -> dict[str, Any]:
 
 
 def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> None:
-    for key in sorted(set(config) - CONFIG_KEYS):
+    for key in sorted(set(config) - (CONFIG_KEYS | OPTIONAL_CONFIG_KEYS)):
         errors.append(f"unknown configuration key: {key}")
     for key in sorted(CONFIG_KEYS - set(config)):
         errors.append(f"missing configuration key: {key}")
@@ -344,6 +346,22 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
         errors.append("artifact_lock must reference artifacts.lock.json")
     if config.get("configuration_kind") not in {"example", "active"}:
         errors.append("configuration_kind must be example or active")
+
+    if "acceptance_failpoint" in config:
+        try:
+            configured_failpoint = reviewed_post_dispatch_failpoint_from_config(
+                config["acceptance_failpoint"]
+            )
+        except (TypeError, ValueError) as exc:
+            errors.append(f"acceptance_failpoint is invalid: {exc}")
+        else:
+            if (
+                configured_failpoint is not None
+                and config.get("configuration_kind") != "active"
+            ):
+                errors.append(
+                    "acceptance_failpoint may only be enabled in active configuration"
+                )
 
     identities = config.get("identities")
     if not isinstance(identities, Mapping):

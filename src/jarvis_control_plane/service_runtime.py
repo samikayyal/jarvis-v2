@@ -21,6 +21,10 @@ from urllib.error import URLError
 from urllib.parse import parse_qsl, urlsplit
 from urllib.request import urlopen
 
+from .acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    reviewed_post_dispatch_failpoint_from_config,
+)
 from .action_dispatch import RoutedActionDispatcher
 from .adapters import (
     FixedModelAvailabilityProvider,
@@ -513,6 +517,24 @@ def _vault_write_timeout(config: Mapping[str, Any]) -> float:
     return timeout
 
 
+def _reviewed_acceptance_failpoint(
+    config: Mapping[str, Any],
+) -> ReviewedPostDispatchFailpoint | None:
+    """Load the optional host-reviewed, one-shot Google fault injection.
+
+    The active configuration is root-owned and read-only in every service
+    container.  No broker operation, model output, or chat control reaches
+    this parser.  An absent section is the normal production state.
+    """
+
+    try:
+        return reviewed_post_dispatch_failpoint_from_config(
+            config.get("acceptance_failpoint")
+        )
+    except (TypeError, ValueError) as exc:
+        raise CompositionError("acceptance failpoint configuration is invalid") from exc
+
+
 def _client(
     config: Mapping[str, Any], *, client_identity: str, server_role: str
 ) -> AuthenticatedServiceClient:
@@ -852,6 +874,7 @@ def _google_operations(
         clock=clock,
         ids=ids,
     )
+    acceptance_failpoint = _reviewed_acceptance_failpoint(config)
     reads = GoogleReadConnector(
         configured_identity=identity,
         credential_store=credential_store,
@@ -878,6 +901,12 @@ def _google_operations(
         ids=ids,
         connection_binding=lifecycle.connection_binding,
         on_invalid_grant=lambda: lifecycle.handle_refresh_failure("invalid_grant"),
+        acceptance_failpoint=(
+            acceptance_failpoint
+            if acceptance_failpoint is not None
+            and acceptance_failpoint.spec.service == "gmail"
+            else None
+        ),
     )
     calendar = CalendarActionDispatcher(
         configured_identity=identity,
@@ -889,6 +918,12 @@ def _google_operations(
         trace=trace,
         on_invalid_grant=lambda generation: lifecycle.handle_refresh_failure(
             "invalid_grant", connection_generation=generation
+        ),
+        acceptance_failpoint=(
+            acceptance_failpoint
+            if acceptance_failpoint is not None
+            and acceptance_failpoint.spec.service == "calendar"
+            else None
         ),
     )
     operations = {

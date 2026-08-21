@@ -1128,6 +1128,7 @@ class DeterministicCapabilityBroker:
             "calendar_insert": "Calendar",
             "calendar_update": "Calendar",
             "calendar_patch": "Calendar",
+            "knowledge_vault_write": "knowledge vault",
         }.get(action_kind)
 
     def _maybe_dispatch_action_ack(

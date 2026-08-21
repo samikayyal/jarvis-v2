@@ -55,6 +55,56 @@ Stop condition encountered: yes/no
 For every row record `started`, `finished`, `request_ref`, `action_ref` when
 applicable, `sanitized_evidence_pointer`, and `pass/fail/blocked`.
 
+## Acceptance repair rerun contract (Gates 03, 08-13, 15, and 18)
+
+The following dependencies are part of the worksheet, not optional reviewer
+notes. A controlled-provider unit test or a successful neighboring row does
+not satisfy a real-system gate.
+
+| Gate | Rerun contract | Stop/defer rule |
+| --- | --- | --- |
+| Gate 03 | Prove the connected Google generation at the start of each bounded read; prove Calendar list/get grounding against the labeled calendar and event; prove Drive text export returns text through that same connected generation; and prove unsupported binary Drive export is refused without download. Gmail success does not cover Calendar or Drive. | Any Calendar grounding mismatch, stale-generation use, or literal `Google unavailable` result for the text export fails Gate 03. Do not run Calendar mutation gates until the Calendar read boundary is proven. |
+| Gate 08 | Run Gmail unknown-outcome only with a separately reviewed, application-level post-dispatch failpoint owned by the Gmail connector and armed for one exact operation/action. The review records the provider-return boundary, owner, reviewer, and reconciliation procedure. | Gate 08 is Gmail-only and is not unblocked by Calendar evidence. Without that reviewed failpoint, leave it `blocked`; never improvise a transport interruption, container kill, firewall edit, proxy replacement, or retry. |
+| Gates 09-11 | Run Calendar altered-approval, exact-approval, and replay in that order only after Gate 03 Calendar read evidence passes. | If Gate 03 is `fail`, these rows remain `deferred`; a deferred row is not a pass and must not be included as successful aggregate evidence. |
+| Gate 12 | Run Calendar unknown-outcome only after the Calendar write prerequisite has passed and the reviewer has approved a Calendar-specific, application-level post-dispatch failpoint owned by the Calendar connector and armed for one exact operation/action, with its reconciliation plan. | Missing either prerequisite leaves Gate 12 `blocked`; do not substitute Gmail's failpoint or manufacture a transport, container, firewall, or proxy interruption in production. |
+| Gate 13 | Run the dedicated stale-generation sequence after the Calendar read boundary is proven, with one intentional old-generation proposal and no replacement request. | An unproven Calendar read boundary leaves Gate 13 `deferred`; do not claim stale-generation coverage from controlled tests alone. |
+| Gate 15 | For the exact Markdown write, capture one terminal Jarvis acknowledgement tied to the action reference that explicitly says either success (including commit/push evidence) or `outcome-unknown` (including the manual-recovery instruction). Git heads alone are not an acknowledgement. | A missing, ambiguous, or undifferentiated terminal acknowledgement leaves Gate 15 `blocked`, even if the Markdown change appears committed and pushed. |
+| Gate 18 | Aggregate the repaired rows only after Gates 03, 08-13, and 15 each have a real-system `pass` and the final reconciliation has no unresolved unknown. | Any `fail`, `blocked`, or `deferred` input keeps Gate 18 `fail`; do not mark the ticket complete or report live acceptance. |
+
+### Reviewed failpoint configuration and retirement
+
+The normal production configuration has no `acceptance_failpoint` section and
+therefore has no fault injection. A human reviewer may authorize one bounded
+acceptance run by adding this exact section to the root-owned, read-only active
+configuration; the model, broker, and chat control grammar cannot create or
+change it:
+
+```toml
+[acceptance_failpoint]
+enabled = true
+service = "gmail"             # `gmail` or `calendar`
+operation = "gmail_send"      # service-specific reviewed operation
+action_id = "ticket31-gmail-send-01"
+review_id = "ticket31-gmail-unknown"
+```
+
+The five fields are required exactly as shown: `enabled`, `service`,
+`operation`, `action_id`, and `review_id`. The operation must be one of
+`gmail_send`, `gmail_reply`, `insert`, `update`, or `patch` and must belong to
+the selected service; `action_id` and `review_id` are exact bounded identifiers,
+not wildcards or prefixes. Use a separately reviewed Calendar target for Gate
+12. The failpoint is one-shot and remains disabled unless `enabled = true` is
+present in an active configuration.
+
+Before arming it, record the exact target and external baseline. After the
+unknown acknowledgement, reconcile Gmail or Calendar directly and record zero
+or one side effect before any new request. Then retire the target by restoring
+the normal absent section (preferred) or setting `enabled = false` with all four
+target fields empty. Reinstall the active file with its reviewed owner/mode,
+reload the service, and verify that the failpoint is absent/disabled and that
+no pending action or unresolved unknown remains. Never reuse an action ID after
+reconciliation; obtain a new review for another acceptance run.
+
 ## 1. Pin and readiness preflight
 
 Run on the activated Ubuntu host from the exact installed release directory.
@@ -146,6 +196,14 @@ labeled data containing no secrets or third-party personal data.
    export. Confirm non-text binary media is not downloaded or interpreted.
 4. Externally confirm no email, event, or Drive object changed.
 
+For the Calendar result, record the bounded calendar target, the labeled event
+correlation, and the generation used for the provider call. A plausible event
+list without target/event grounding is not a passing Calendar read. For the
+Drive result, the labeled text export must complete while the same connected
+generation is current; a sanitized `Google unavailable` result is a failed
+text-export row, not an authentication diagnosis. Keep the binary refusal as a
+separate negative check and verify that no binary bytes were downloaded.
+
 Record result counts, bounds/staleness disclosures, request references, and
 redacted audit pointers, not returned content.
 
@@ -209,14 +267,22 @@ identical signed webhook/message-ID replay may use only ticket 30's reviewed
 replay mechanism; it must retain its original disposition. Never expose the
 signing secret or create an ad hoc replay tool.
 
-Exercise unknown outcome only if the operator separately authorizes the exact
-labeled test and the reviewer has a previously reviewed post-dispatch transport
-interruption method. Require an unknown result, no automatic retry, and direct
-Gmail reconciliation showing zero or one send. Record reconciliation before a
-fresh request. If one send exists, compare the same complete material-field set
-with the frozen proposal. If no method can prove post-dispatch interruption without new
-authority, mark the row `blocked`; do not improvise with container kills,
-firewall edits, or proxy replacement.
+Exercise Gate 08 (Gmail unknown outcome) only if the operator separately
+authorizes the exact labeled test and the reviewer has a previously reviewed
+application-level post-dispatch failpoint owned by the Gmail connector. It is
+armed for one exact operation/action and runs after the provider returns but
+before terminal acknowledgement; it does not interrupt transport, a firewall,
+a proxy, or a container. The review record must identify the Gmail operation,
+the boundary after provider dispatch and before terminal acknowledgement, the
+failpoint owner, and the authoritative reconciliation steps. Require an
+unknown result, no automatic retry, and direct Gmail reconciliation showing
+zero or one send. Record reconciliation before a fresh request. If one send
+exists, compare the same complete material-field set with the frozen proposal.
+This is a Gmail-only gate and does not wait on or repair a Calendar
+prerequisite. If no reviewed failpoint can prove post-dispatch uncertainty
+without new authority, mark Gate 08 `blocked`; do not improvise with a
+transport interruption, container kill, firewall edit, proxy replacement, or
+a retry.
 
 A Gmail reply may additionally use an operator-owned acceptance thread. Verify
 frozen source message/thread/recipient/header binding and the returned thread.
@@ -257,14 +323,21 @@ or cancel it without approving a side effect. Reconcile Calendar directly,
 require the labeled event count and fields to remain unchanged, and confirm no
 fresh pending action or dispatch remains.
 
-Exercise a Calendar unknown outcome only with separate authorization for the
-exact labeled test and a previously reviewed post-dispatch interruption method.
-Require an unknown result, no automatic retry, and direct Calendar
-reconciliation showing zero or one mutation before any fresh request. If one
-mutation exists, compare the same complete material-field set with the frozen
-proposal. If no
-method can prove the interruption without new authority, mark the row `blocked`;
-do not improvise with container kills, firewall edits, or proxy replacement.
+Exercise Gate 12 (Calendar unknown outcome) only after the Calendar read and
+write prerequisites have passed, with separate authorization for the exact
+labeled test and a previously reviewed Calendar-specific application-level
+post-dispatch failpoint owned by the Calendar connector. It is armed for one
+exact operation/action and runs after the provider returns but before terminal
+acknowledgement; it does not interrupt transport, a firewall, a proxy, or a
+container. The review record must identify the Calendar operation, the boundary
+after provider dispatch and before terminal acknowledgement, the failpoint
+owner, and the authoritative reconciliation steps. Require an unknown result,
+no automatic retry, and direct Calendar reconciliation showing zero or one
+mutation before any fresh request. If one mutation exists, compare the same complete material-field set
+with the frozen proposal. If either prerequisite or
+the reviewed failpoint is missing, mark Gate 12 `blocked`; do not substitute
+Gmail's failpoint or improvise with a transport interruption, container kill,
+firewall edit, proxy replacement, or a retry.
 
 For stale-generation rejection, use this dedicated negative sequence instead
 of section 3's ordinary reconnect procedure: begin with no pending action,
@@ -310,6 +383,13 @@ commit subject is the fixed `jarvis:` subject and its author identity equals the
 configured identity from the frozen proposal. Record only commit prefixes,
 subject conformance, identity match, and hashes of protected evidence, not the
 remote URL, full note, author name, or author address.
+
+Require Jarvis to send one terminal completion acknowledgement for the same
+action reference after reconciliation. The acknowledgement must distinguish a
+successful commit-and-push from `outcome-unknown` requiring manual recovery;
+do not infer success from matching Git heads or from a change that merely
+appears to have committed. A missing or ambiguous acknowledgement is a Gate 15
+failure/block, and the run must stop before any retry or fresh vault request.
 
 Do not run a manual `git push` to rescue a failed/unknown Jarvis push. Reconcile
 against the private remote before a fresh instruction. Exercise dirty clone,
@@ -368,6 +448,12 @@ never copy them into the worksheet.
 | Audit and traces | Redacted audit complete; protected trace pointers retained | |
 | Final reconciliation | No duplicate, unresolved unknown, stale action, dirty clone, or health regression | |
 | Stop conditions | Explicit confirmation that none remains active | |
+
+The worksheet is the source for Gate 18 aggregation: copy each repaired gate's
+actual outcome into the table only after its prerequisites and evidence are
+complete. `fail`, `blocked`, and `deferred` are all unresolved outcomes for
+Gate 18. A controlled-provider result may explain a preflight failure or
+validate a harness, but cannot turn a live row green.
 
 ## Closing ticket 31
 

@@ -14,6 +14,10 @@ from threading import RLock
 from typing import Literal, Protocol
 from urllib.parse import quote, urlencode
 
+from .acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailure,
+)
 from .google_auth import GoogleRefreshTokenExchanger, GoogleTokenExchangeError
 from .google_http import (
     GOOGLE_HTTP_TIMEOUT_SECONDS,
@@ -910,7 +914,7 @@ class CalendarActionDispatcher:
         provider: GoogleCalendarWriteProvider,
         trace: DiagnosticTraceRecorder,
         on_invalid_grant: Callable[[int], object] | None = None,
-        post_dispatch_failpoint: Callable[[str], None] | None = None,
+        acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
     ) -> None:
         self._configured_identity = _text(configured_identity, "configured_identity")
         self._connection_state = connection_state
@@ -920,12 +924,20 @@ class CalendarActionDispatcher:
             raise TypeError("trace must be a DiagnosticTraceRecorder")
         self._trace = trace
         self._on_invalid_grant = on_invalid_grant
-        if post_dispatch_failpoint is not None and not callable(
-            post_dispatch_failpoint
+        if acceptance_failpoint is not None and not isinstance(
+            acceptance_failpoint, ReviewedPostDispatchFailpoint
         ):
-            raise TypeError("post_dispatch_failpoint must be callable")
-        # Test-only fault injection. Production composition leaves this unset.
-        self._post_dispatch_failpoint = post_dispatch_failpoint
+            raise TypeError(
+                "acceptance_failpoint must be a reviewed post-dispatch failpoint"
+            )
+        if (
+            acceptance_failpoint is not None
+            and acceptance_failpoint.spec.service != "calendar"
+        ):
+            raise ValueError(
+                "Calendar connector requires a Calendar acceptance failpoint"
+            )
+        self._acceptance_failpoint = acceptance_failpoint
         self._prepared_lock = RLock()
         self._prepared: dict[str, _CalendarWriteDispatch] = {}
 
@@ -1053,12 +1065,16 @@ class CalendarActionDispatcher:
             result_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
             error_limit_bytes=GOOGLE_CALENDAR_TRACE_PAYLOAD_LIMIT_BYTES,
         )
-        if self._post_dispatch_failpoint is not None:
+        if self._acceptance_failpoint is not None:
             try:
-                self._post_dispatch_failpoint(request.operation)
-            except Exception as exc:
+                self._acceptance_failpoint.raise_if_armed(
+                    service="calendar",
+                    operation=request.operation,
+                    action_id=action.action_id,
+                )
+            except ReviewedPostDispatchFailure as exc:
                 raise ActionDispatcherError(
-                    "test-only Calendar post-dispatch failpoint",
+                    "Calendar provider outcome is unknown",
                     may_have_dispatched=True,
                 ) from exc
 
@@ -1099,6 +1115,7 @@ def build_live_calendar_action_dispatcher(
     client_secret: str,
     trace: DiagnosticTraceRecorder,
     transport: GoogleCalendarHttpTransport | None = None,
+    acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
 ) -> CalendarActionDispatcher:
     """Compose the production Calendar capability from fixed, injectable edges."""
 
@@ -1113,6 +1130,7 @@ def build_live_calendar_action_dispatcher(
         ),
         trace=trace,
         on_invalid_grant=on_invalid_grant,
+        acceptance_failpoint=acceptance_failpoint,
     )
 
 

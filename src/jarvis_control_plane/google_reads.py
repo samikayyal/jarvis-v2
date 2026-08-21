@@ -232,7 +232,27 @@ class GoogleApiReadProvider:
     ) -> GoogleReadProviderResult:
         """Read a bounded number of Calendar pages without exposing page tokens."""
 
-        items: list[str] = list(_response_items(request.operation, payload))
+        items: list[str] = []
+        seen_rows: set[str] = set()
+
+        def append_page_rows(page_payload: Mapping[str, object]) -> None:
+            for item in _response_items(request.operation, page_payload):
+                try:
+                    row = json.loads(item)
+                except json.JSONDecodeError:
+                    row = None
+                row_id = row.get("id") if isinstance(row, Mapping) else None
+                row_key = (
+                    f"id:{row_id}"
+                    if isinstance(row_id, str) and row_id
+                    else f"row:{item}"
+                )
+                if row_key in seen_rows:
+                    continue
+                seen_rows.add(row_key)
+                items.append(item)
+
+        append_page_rows(payload)
         page_token = _continuation_token(payload)
         pages = 1
         while (
@@ -249,7 +269,7 @@ class GoogleApiReadProvider:
             )
             page_response = self._authorized_get(page_request, access_token)
             page_payload = self._json_response(page_response)
-            items.extend(_response_items(request.operation, page_payload))
+            append_page_rows(page_payload)
             page_token = _continuation_token(page_payload)
             pages += 1
         return GoogleReadProviderResult(
@@ -1482,7 +1502,14 @@ def _html_to_text(value: str) -> str:
 
 
 def _response_mime_type(response: GoogleReadHttpResponse) -> str:
-    return response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+    # HTTP header names are case-insensitive.  urllib normally preserves the
+    # provider spelling, while gateways and test transports may normalize it.
+    # Looking up one exact spelling would turn a valid text export into the
+    # generic Google-unavailable outcome.
+    for name, value in response.headers.items():
+        if name.lower() == "content-type":
+            return value.split(";", 1)[0].strip().lower()
+    return ""
 
 
 def _drive_media_url(file_id: str) -> str:
