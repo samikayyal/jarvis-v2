@@ -1349,7 +1349,7 @@ def test_calendar_insert_rejects_notification_alias_collision(
         adapter.run(_request("create a design review"))
 
 
-def test_calendar_insert_rejects_returned_target_without_explicit_secondary_flag() -> (
+def test_calendar_insert_accepts_returned_secondary_with_api_omitted_primary_flag() -> (
     None
 ):
     connector = _calendar_connector(
@@ -1385,7 +1385,51 @@ def test_calendar_insert_rejects_returned_target_without_explicit_secondary_flag
         connector=connector,
     )
 
-    with pytest.raises(OrchestrationAdapterError, match="not grounded"):
+    result = adapter.run(_request("create a design review"))
+
+    assert result.proposal is not None
+    assert json.loads(result.proposal.payload)["calendar_id"] == "secondary-calendar"
+
+
+@pytest.mark.parametrize("primary", (None, "false", 0))
+def test_calendar_insert_rejects_malformed_returned_primary_metadata(
+    primary: object,
+) -> None:
+    connector = _calendar_connector(
+        result=GoogleReadProviderResult(
+            items=(
+                json.dumps(
+                    {
+                        "id": "secondary-calendar",
+                        "summary": "Ticket 31 Acceptance",
+                        "primary": primary,
+                    }
+                ),
+            )
+        )
+    )
+    adapter = _calendar_adapter(
+        AgentsSdkProposal(
+            kind="calendar_insert",
+            preview="Create the event.",
+            payload={
+                "calendar_id": "secondary-calendar",
+                "complete_event": {
+                    "summary": "Design review",
+                    "start": {"dateTime": "2026-08-10T10:00:00Z"},
+                    "end": {"dateTime": "2026-08-10T11:00:00Z"},
+                    "attendees": [],
+                    "recurrence": [],
+                    "reminders": {"useDefault": False, "overrides": []},
+                    "visibility": "private",
+                },
+                "notification": "none",
+            },
+        ),
+        connector=connector,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="primary metadata"):
         adapter.run(_request("create a design review"))
 
 

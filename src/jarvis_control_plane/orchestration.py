@@ -1292,11 +1292,19 @@ def _require_reviewed_calendar_target(
             if not isinstance(row_id, str) or not row_id.strip():
                 continue
             if row_id == proposed_calendar_id:
-                if row.get("primary") is True:
+                primary = row.get("primary")
+                if primary is True:
                     proposed_is_primary = True
-                elif row.get("primary") is False:
+                elif "primary" in row and primary is not False:
+                    raise OrchestrationAdapterError(
+                        "Calendar read returned malformed primary metadata"
+                    )
+                else:
                     # Freeze the connector-returned value, never the model's
                     # untrusted candidate, after exact equality is proven.
+                    # Google's CalendarListEntry omits the optional primary
+                    # field for non-primary calendars rather than returning
+                    # an explicit false value.
                     reviewed_calendar_id = row_id
     if proposed_is_primary:
         raise OrchestrationAdapterError(
