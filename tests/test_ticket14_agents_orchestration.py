@@ -29,6 +29,7 @@ from jarvis_control_plane.google_reads import (
     ControlledGoogleReadProvider,
     GoogleReadConnector,
     GoogleReadProviderResult,
+    GoogleReadResult,
 )
 from jarvis_control_plane.models import (
     InboundMessage,
@@ -1056,6 +1057,94 @@ def test_calendar_insert_rejects_read_without_connector_provenance() -> None:
 
     with pytest.raises(OrchestrationAdapterError, match="malformed data"):
         adapter.run(_request("create a design review"))
+
+
+def test_remote_google_reads_calendar_prepare_freezes_grounded_proposal() -> None:
+    import jarvis_control_plane.service_runtime as runtime
+
+    class RemoteClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def call(self, operation: str, **kwargs: object) -> GoogleReadResult | int:
+            self.calls.append((operation, kwargs))
+            if operation == "current_connection_generation":
+                return 1
+            return GoogleReadResult(
+                service="calendar",
+                operation="calendar_list",
+                items=(
+                    json.dumps(
+                        {
+                            "id": "secondary-calendar",
+                            "summary": "Ticket 31 secondary",
+                            "primary": False,
+                        }
+                    ),
+                ),
+                truncated=False,
+                continuation_available=False,
+                connection_generation=1,
+            )
+
+    complete_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    remote_client = RemoteClient()
+    adapter = _calendar_adapter(
+        AgentsSdkProposal(
+            kind="calendar_insert",
+            preview="Create the event.",
+            payload={
+                "calendar_id": "secondary-calendar",
+                "complete_event": complete_event,
+                "notification": "none",
+            },
+        ),
+        connector=runtime._RemoteGoogleReads(remote_client),
+    )
+
+    result = adapter.run(_request("create a design review"))
+
+    assert remote_client.calls == [
+        (
+            "calendar_list",
+            {"request_id": "request-001", "max_results": 50},
+        ),
+        ("current_connection_generation", {}),
+    ]
+    assert result.proposal is not None
+    proposal = result.proposal
+    assert proposal.action_id == "request-001:proposal"
+    assert proposal.request_id == "request-001"
+    assert proposal.kind == "calendar_insert"
+    assert proposal.preview
+    assert proposal.digest
+    assert len(proposal.digest) == 64
+    frozen_payload = json.loads(proposal.payload)
+    assert frozen_payload["calendar_id"] == "secondary-calendar"
+    assert frozen_payload["complete_event"] == complete_event
+    assert frozen_payload["notification"] == "none"
+    assert frozen_payload["connection_generation"] == 1
+
+    repeated = adapter.run(_request("create a design review")).proposal
+    assert repeated is not None
+    assert repeated.digest == proposal.digest
+    assert repeated.payload == proposal.payload
+    assert (
+        remote_client.calls
+        == [
+            ("calendar_list", {"request_id": "request-001", "max_results": 50}),
+            ("current_connection_generation", {}),
+        ]
+        * 2
+    )
 
 
 @pytest.mark.parametrize(

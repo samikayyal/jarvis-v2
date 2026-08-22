@@ -89,6 +89,7 @@ from .service_protocol import (
     RemoteOutboundConnector,
     RemoteVaultProposalPreparer,
     RemoteWorkerReadinessProvider,
+    ServiceProtocolError,
     _encode,
 )
 from .sessions import ModelAvailability, SQLiteWorkingSessionStore
@@ -145,6 +146,7 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
                 "drive_files_get",
                 "drive_files_export",
                 "current",
+                "current_connection_generation",
                 "start_authorization",
                 "oauth_callback",
                 "disconnect",
@@ -432,6 +434,14 @@ class _RemoteGoogleReads:
 
     def drive_files_export(self, **kwargs: object) -> object:
         return self._client.call("drive_files_export", **kwargs)
+
+    def current_connection_generation(self) -> int:
+        result = self._client.call("current_connection_generation")
+        if isinstance(result, bool) or not isinstance(result, int) or result < 0:
+            raise ServiceProtocolError(
+                "Google service returned invalid connection generation"
+            )
+        return result
 
 
 def _openwa_operations(
@@ -962,7 +972,8 @@ def _google_operations(
     operations = {
         name: getattr(reads, name)
         for name in SERVICE_ROLES["google_connector"].operations
-        if name == "current" or name.startswith(("gmail_", "calendar_", "drive_"))
+        if name in {"current", "current_connection_generation"}
+        or name.startswith(("gmail_", "calendar_", "drive_"))
     }
     operations.update(
         OwnedActionService(
@@ -1433,7 +1444,8 @@ def _service_access(
             "jarvis-orchestration": tuple(
                 operation
                 for operation in role.operations
-                if operation.startswith(("gmail_", "calendar_", "drive_"))
+                if operation == "current_connection_generation"
+                or operation.startswith(("gmail_", "calendar_", "drive_"))
             ),
             "jarvis-oauth-callback": ("oauth_callback",),
         }

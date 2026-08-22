@@ -39,6 +39,7 @@ from jarvis_control_plane.ports import (
     TraceCapacityError,
     WorkerReadiness,
 )
+from jarvis_control_plane.service_protocol import ServiceProtocolError
 from jarvis_control_plane.service_runtime import (
     SERVICE_ROLES,
     CompositionError,
@@ -49,6 +50,7 @@ from jarvis_control_plane.service_runtime import (
     _operation_timeouts,
     _orchestration_operations,
     _read_secret,
+    _RemoteGoogleReads,
     _service_access,
     _vault_write_timeout,
     _verified_inbound_event,
@@ -666,11 +668,41 @@ def test_google_administration_is_authenticated_and_not_model_accessible() -> No
         "jarvis-orchestration",
         "jarvis-oauth-callback",
     )
+    assert "current_connection_generation" in allowlists["jarvis-orchestration"]
     assert {"current", "start_authorization", "disconnect"} <= set(
         allowlists["jarvis-broker"]
     )
     assert "start_authorization" not in allowlists["jarvis-orchestration"]
     assert allowlists["jarvis-oauth-callback"] == ("oauth_callback",)
+
+
+@pytest.mark.parametrize("generation", (0, 1, 42))
+def test_remote_google_reads_exposes_a_strict_connection_generation(
+    generation: int,
+) -> None:
+    calls: list[str] = []
+
+    class Client:
+        def call(self, operation: str, **_kwargs: object) -> int:
+            calls.append(operation)
+            return generation
+
+    reads = _RemoteGoogleReads(Client())
+
+    assert reads.current_connection_generation() == generation
+    assert calls == ["current_connection_generation"]
+
+
+@pytest.mark.parametrize("invalid", (True, False, -1, "1", None))
+def test_remote_google_reads_rejects_invalid_connection_generation(
+    invalid: object,
+) -> None:
+    class Client:
+        def call(self, _operation: str, **_kwargs: object) -> object:
+            return invalid
+
+    with pytest.raises(ServiceProtocolError, match="invalid connection generation"):
+        _RemoteGoogleReads(Client()).current_connection_generation()
 
 
 def test_fresh_google_authorization_requests_only_identity_and_read_scopes(
