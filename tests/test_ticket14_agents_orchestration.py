@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from agents.exceptions import ModelBehaviorError
 from test_support import build_receiver_components
 
 from jarvis_control_plane import (
@@ -165,6 +166,7 @@ def _calendar_adapter(
     proposal: AgentsSdkProposal,
     *,
     connector: GoogleReadConnector | None = None,
+    structured_output: bool = False,
     read_inputs: tuple[dict[str, object], ...] = (
         {"operation": "calendar_list", "max_results": 50},
     ),
@@ -181,12 +183,13 @@ def _calendar_adapter(
             asyncio.run(calendar_tool.on_invoke_tool(None, json.dumps(read_input)))
         if after_reads is not None:
             after_reads()
-        return SimpleNamespace(
-            final_output=AgentsSdkPlan(
-                reply_text="I prepared the Calendar event.",
-                proposal=proposal,
-            )
+        plan = AgentsSdkPlan(
+            reply_text="I prepared the Calendar event.",
+            proposal=proposal,
         )
+        if structured_output:
+            plan = agent.output_type.validate_json(plan.model_dump_json())
+        return SimpleNamespace(final_output=plan)
 
     return AgentsSdkOrchestrationAdapter(
         agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -231,8 +234,76 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert settings.reasoning.effort == "high"
     assert captured["model"] == "gpt-5.6-terra"
     output_type = captured["output_type"]
-    assert output_type.output_type is AgentsSdkPlan
+    assert output_type.output_type.__name__ == "_AgentsSdkStructuredPlan"
     assert output_type.is_strict_json_schema() is False
+    schema = output_type.json_schema()
+    assert set(schema["$defs"]["_CalendarInsertEvent"]["required"]) == {
+        "attendees",
+        "recurrence",
+        "reminders",
+        "visibility",
+        "start",
+        "end",
+    }
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        output_type.validate_json(
+            json.dumps(
+                {
+                    "reply_text": "I prepared the event.",
+                    "execution_host": None,
+                    "host_reason_code": None,
+                    "proposal": {
+                        "kind": "calendar_insert",
+                        "preview": "Create the event.",
+                        "payload": {
+                            "calendar_id": "secondary-calendar",
+                            "complete_event": {
+                                "summary": "Design review",
+                                "start": {"dateTime": "2026-08-10T10:00:00Z"},
+                                "end": {"dateTime": "2026-08-10T11:00:00Z"},
+                            },
+                            "notification": "none",
+                        },
+                    },
+                }
+            )
+        )
+    validated_calendar = output_type.validate_json(
+        json.dumps(
+            {
+                "reply_text": "I prepared the event.",
+                "execution_host": None,
+                "host_reason_code": None,
+                "proposal": {
+                    "kind": "calendar_insert",
+                    "preview": "Create the event.",
+                    "payload": {
+                        "calendar_id": "secondary-calendar",
+                        "complete_event": {
+                            "summary": "Design review",
+                            "start": {"dateTime": "2026-08-10T10:00:00Z"},
+                            "end": {"dateTime": "2026-08-10T11:00:00Z"},
+                            "attendees": [],
+                            "recurrence": [],
+                            "reminders": {
+                                "useDefault": False,
+                                "overrides": [],
+                            },
+                            "visibility": "default",
+                        },
+                        "notification": "none",
+                    },
+                },
+            }
+        )
+    )
+    assert (
+        validated_calendar.proposal.payload.complete_event.reminders.model_dump()
+        == {
+            "useDefault": False,
+            "overrides": [],
+        }
+    )
     assert captured["run_text"] == "inspect the repository"
     assert captured["run_kwargs"] == {
         "max_turns": 4,
@@ -1108,6 +1179,7 @@ def test_remote_google_reads_calendar_prepare_freezes_grounded_proposal() -> Non
             },
         ),
         connector=runtime._RemoteGoogleReads(remote_client),
+        structured_output=True,
     )
 
     result = adapter.run(_request("create a design review"))
@@ -1236,7 +1308,22 @@ def test_calendar_insert_google_notification_name_is_normalized(
     assert json.loads(result.proposal.payload)["notification"] == "none"
 
 
-def test_calendar_insert_rejects_notification_alias_collision() -> None:
+@pytest.mark.parametrize(
+    "notification_fields",
+    (
+        {"sendUpdates": "none", "send_updates": "none"},
+        {"notification": "none", "sendUpdates": "none"},
+        {"notification": "none", "send_updates": "none"},
+        {
+            "notification": "none",
+            "sendUpdates": "none",
+            "send_updates": "none",
+        },
+    ),
+)
+def test_calendar_insert_rejects_notification_alias_collision(
+    notification_fields: dict[str, object],
+) -> None:
     complete_event = {
         "summary": "Design review",
         "start": {"dateTime": "2026-08-10T10:00:00Z"},
@@ -1253,13 +1340,52 @@ def test_calendar_insert_rejects_notification_alias_collision() -> None:
             payload={
                 "calendar_id": "secondary-calendar",
                 "event": complete_event,
-                "sendUpdates": "none",
-                "send_updates": "none",
+                **notification_fields,
             },
         )
     )
 
     with pytest.raises(OrchestrationAdapterError, match="notification"):
+        adapter.run(_request("create a design review"))
+
+
+def test_calendar_insert_rejects_returned_target_without_explicit_secondary_flag() -> (
+    None
+):
+    connector = _calendar_connector(
+        result=GoogleReadProviderResult(
+            items=(
+                json.dumps(
+                    {
+                        "id": "secondary-calendar",
+                        "summary": "Ticket 31 Acceptance",
+                    }
+                ),
+            )
+        )
+    )
+    adapter = _calendar_adapter(
+        AgentsSdkProposal(
+            kind="calendar_insert",
+            preview="Create the event.",
+            payload={
+                "calendar_id": "secondary-calendar",
+                "complete_event": {
+                    "summary": "Design review",
+                    "start": {"dateTime": "2026-08-10T10:00:00Z"},
+                    "end": {"dateTime": "2026-08-10T11:00:00Z"},
+                    "attendees": [],
+                    "recurrence": [],
+                    "reminders": {"useDefault": False, "overrides": []},
+                    "visibility": "private",
+                },
+                "notification": "none",
+            },
+        ),
+        connector=connector,
+    )
+
+    with pytest.raises(OrchestrationAdapterError, match="not grounded"):
         adapter.run(_request("create a design review"))
 
 
@@ -1394,6 +1520,7 @@ def test_calendar_model_contract_describes_the_closed_insert_shape() -> None:
         "calendar_id, complete_event, and notification, with optional event_id"
         in instructions
     )
+    assert "represent no reminders as useDefault false" in instructions
     assert "Never emit connection_generation, etag, schema" in instructions
 
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Event, Lock
 from time import monotonic
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -182,6 +182,89 @@ class AgentsSdkPlan(BaseModel):
         Literal["default_ubuntu", "explicit_windows", "windows_dependency"] | None
     ) = None
     proposal: AgentsSdkProposal | None = None
+
+
+class _CalendarDateEndpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: str = Field(min_length=1)
+    timeZone: str | None = None
+
+
+class _CalendarDateTimeEndpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dateTime: str = Field(min_length=1)
+    timeZone: str | None = None
+
+
+class _CalendarReminders(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    useDefault: bool
+    overrides: list[dict[str, object]]
+
+
+class _CalendarInsertEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    attendees: list[dict[str, object]]
+    recurrence: list[str]
+    reminders: _CalendarReminders
+    visibility: Literal["default", "public", "private", "confidential"]
+    start: _CalendarDateEndpoint | _CalendarDateTimeEndpoint
+    end: _CalendarDateEndpoint | _CalendarDateTimeEndpoint
+
+
+class _CalendarInsertPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    calendar_id: str = Field(min_length=1)
+    complete_event: _CalendarInsertEvent
+    notification: Literal["none", "all", "externalOnly"]
+    event_id: str | None = None
+
+
+class _CalendarInsertStructuredProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["calendar_insert"]
+    preview: str = Field(min_length=1, max_length=2_000)
+    payload: _CalendarInsertPayload
+
+
+class _OtherStructuredProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[
+        "terminal",
+        "gmail_send",
+        "gmail_reply",
+        "calendar_update",
+        "calendar_patch",
+        "knowledge_vault_write",
+    ]
+    preview: str = Field(min_length=1, max_length=2_000)
+    payload: dict[str, object]
+
+
+class _AgentsSdkStructuredPlan(BaseModel):
+    """Provider schema that requires complete Calendar insert material choices."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reply_text: str = Field(min_length=1, max_length=_MAX_REPLY_CHARS)
+    execution_host: Literal["ubuntu", "windows"] | None = None
+    host_reason_code: (
+        Literal["default_ubuntu", "explicit_windows", "windows_dependency"] | None
+    ) = None
+    proposal: (
+        Annotated[
+            _CalendarInsertStructuredProposal | _OtherStructuredProposal,
+            Field(discriminator="kind"),
+        ]
+        | None
+    ) = None
 
 
 class BoundedReadInput(BaseModel):
@@ -482,7 +565,9 @@ class AgentsSdkOrchestrationAdapter:
                     store=False,
                 ),
                 tools=tools,
-                output_type=AgentOutputSchema(AgentsSdkPlan, strict_json_schema=False),
+                output_type=AgentOutputSchema(
+                    _AgentsSdkStructuredPlan, strict_json_schema=False
+                ),
             )
             run_config = self._run_config_factory(
                 tracing_disabled=True,
@@ -510,8 +595,14 @@ class AgentsSdkOrchestrationAdapter:
                 milestones=tuple(milestones),
             )
 
-        plan = getattr(run_result, "final_output", None)
-        if not isinstance(plan, AgentsSdkPlan):
+        raw_plan = getattr(run_result, "final_output", None)
+        if isinstance(raw_plan, _AgentsSdkStructuredPlan):
+            plan = AgentsSdkPlan.model_validate(
+                raw_plan.model_dump(mode="python", exclude_none=True)
+            )
+        elif isinstance(raw_plan, AgentsSdkPlan):
+            plan = raw_plan
+        else:
             raise OrchestrationAdapterError(
                 "Agents SDK returned malformed structured output"
             )
@@ -1194,7 +1285,7 @@ def _require_reviewed_calendar_target(
             "Calendar proposal requires a returned Calendar target row"
         )
     proposed_is_primary = False
-    proposed_was_returned = False
+    reviewed_calendar_id: str | None = None
     for observation in list_observations:
         for row in _calendar_observation_rows(observation):
             row_id = row.get("id")
@@ -1203,19 +1294,21 @@ def _require_reviewed_calendar_target(
             if row_id == proposed_calendar_id:
                 if row.get("primary") is True:
                     proposed_is_primary = True
-                else:
-                    proposed_was_returned = True
+                elif row.get("primary") is False:
+                    # Freeze the connector-returned value, never the model's
+                    # untrusted candidate, after exact equality is proven.
+                    reviewed_calendar_id = row_id
     if proposed_is_primary:
         raise OrchestrationAdapterError(
             "Calendar proposals cannot target the primary calendar"
         )
-    if not proposed_was_returned:
+    if reviewed_calendar_id is None:
         raise OrchestrationAdapterError(
             "Calendar target was not returned by the bounded Calendar read and "
             "is not grounded"
         )
 
-    return proposed_calendar_id, generation
+    return reviewed_calendar_id, generation
 
 
 def _require_reviewed_calendar_event(
@@ -1504,7 +1597,10 @@ def _instructions(
         "complete_event must explicitly contain attendees, recurrence, reminders, "
         "visibility, start, and end. The reminders object contains exactly "
         "useDefault and overrides, and start/end each contain exactly one date or "
-        "dateTime. Calendar update payloads contain exactly calendar_id, event_id, "
+        "dateTime. Represent no attendees and no recurrence as empty arrays, and "
+        "represent no reminders as useDefault false with an empty overrides array; "
+        "never omit those material choices. Calendar update payloads contain exactly "
+        "calendar_id, event_id, "
         "snapshot, changes, and notification; patch payloads use reviewed_patch "
         "instead of changes. Calendar changes must include the exact ETag-bound "
         "snapshot returned by the read tool. Never emit connection_generation, "
