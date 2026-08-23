@@ -297,6 +297,50 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
             }
         )
     )
+    validated_prepare_only_calendar = output_type.validate_json(
+        json.dumps(
+            {
+                "reply_text": "",
+                "execution_host": None,
+                "host_reason_code": None,
+                "proposal": {
+                    "kind": "calendar_insert",
+                    "preview": "Prepare the exact event for approval.",
+                    "payload": {
+                        "calendar_id": "secondary-calendar",
+                        "complete_event": {
+                            "summary": "Design review",
+                            "start": {"dateTime": "2026-08-10T10:00:00Z"},
+                            "end": {"dateTime": "2026-08-10T11:00:00Z"},
+                            "attendees": [],
+                            "recurrence": [],
+                            "reminders": {
+                                "useDefault": False,
+                                "overrides": [],
+                            },
+                            "visibility": "default",
+                        },
+                        "notification": "none",
+                    },
+                },
+            }
+        )
+    )
+    assert (
+        validated_prepare_only_calendar.reply_text
+        == "Prepare the exact event for approval."
+    )
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        output_type.validate_json(
+            json.dumps(
+                {
+                    "reply_text": "",
+                    "execution_host": None,
+                    "host_reason_code": None,
+                    "proposal": None,
+                }
+            )
+        )
     assert (
         validated_calendar.proposal.payload.complete_event.reminders.model_dump()
         == {

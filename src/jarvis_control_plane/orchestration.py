@@ -16,7 +16,7 @@ from threading import Event, Lock
 from time import monotonic
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .codex_specialist import CodexInvocation, CodexSpecialist, CodexSpecialistError
 from .gmail_actions import (
@@ -265,6 +265,19 @@ class _AgentsSdkStructuredPlan(BaseModel):
         ]
         | None
     ) = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def use_proposal_preview_for_empty_reply(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or value.get("reply_text") != "":
+            return value
+        proposal = value.get("proposal")
+        preview = proposal.get("preview") if isinstance(proposal, Mapping) else None
+        if not isinstance(preview, str) or not preview:
+            return value
+        normalized = dict(value)
+        normalized["reply_text"] = preview
+        return normalized
 
 
 class BoundedReadInput(BaseModel):
