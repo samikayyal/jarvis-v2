@@ -271,7 +271,7 @@ class VaultWriteProposal:
 
     @classmethod
     def from_proposal(cls, proposal: FrozenActionProposal) -> VaultWriteRequest:
-        """Parse a frozen proposal through the same public type as Calendar/Gmail."""
+        """Parse a frozen proposal through the same public type as Gmail."""
 
         return VaultWriteRequest.from_proposal(proposal)
 

@@ -38,7 +38,6 @@ allowed_reasoning = ["none", "low", "medium", "high", "xhigh", "max"]
 
 [connector_allowlists]
 gmail = ["read", "search", "send", "reply"]
-calendar = ["read", "search", "create", "update"]
 drive = ["read", "search"]
 vault = ["read", "search", "write_markdown"]
 

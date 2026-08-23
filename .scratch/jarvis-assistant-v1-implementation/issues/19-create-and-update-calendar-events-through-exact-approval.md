@@ -4,7 +4,9 @@
 
 **Blocked by:** 08 — Present oversized proposals through the universal envelope; 17 — Read bounded Gmail, Calendar, and Drive content.
 
-**Status:** complete
+**Status:** wontfix
+
+Calendar was removed from the Jarvis v1 product surface on 2026-08-23 and deferred to a later Jarvis version. The completed implementation below is retained only as historical context; v1 no longer requests Calendar scopes, exposes Calendar tools, accepts Calendar proposals, or routes Calendar actions.
 
 - [x] Proposals freeze the calendar, event identity, complete resulting content, attendees, recurrence, visibility, reminders, ETag, and notification effects.
 - [x] Approval dispatches exactly the stored insert, update, or reviewed patch once and rejects changed or stale proposals.

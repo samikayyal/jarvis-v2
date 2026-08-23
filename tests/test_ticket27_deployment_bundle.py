@@ -570,7 +570,7 @@ def test_google_action_finalization_retires_owner() -> None:
         prepare=lambda _action: object(),
         cancel=lambda **_kwargs: None,
     )
-    dispatcher = _GoogleActionDispatcher(gmail=owner, calendar=owner)  # type: ignore[arg-type]
+    dispatcher = _GoogleActionDispatcher(gmail=owner)  # type: ignore[arg-type]
     action = SimpleNamespace(kind="gmail_send", action_id="action-1")
 
     dispatcher.prepare(action)  # type: ignore[arg-type]
@@ -729,9 +729,7 @@ def test_fresh_google_authorization_requests_only_identity_and_read_scopes(
     assert captured["operation_id"] == "connect-01"
     assert "openid" in requested_scopes
     assert "https://www.googleapis.com/auth/gmail.readonly" in requested_scopes
-    assert (
-        "https://www.googleapis.com/auth/calendar.events.readonly" in requested_scopes
-    )
+    assert not any("/auth/calendar" in scope for scope in requested_scopes)
     assert "https://www.googleapis.com/auth/drive.readonly" in requested_scopes
     assert "https://www.googleapis.com/auth/gmail.send" not in requested_scopes
     assert "https://www.googleapis.com/auth/calendar.events" not in requested_scopes
@@ -745,11 +743,6 @@ def test_fresh_google_authorization_requests_only_identity_and_read_scopes(
             "gmail-send",
             "https://www.googleapis.com/auth/gmail.send",
             "https://www.googleapis.com/auth/calendar.events",
-        ),
-        (
-            "calendar-write",
-            "https://www.googleapis.com/auth/calendar.events",
-            "https://www.googleapis.com/auth/gmail.send",
         ),
     ),
 )
@@ -861,10 +854,6 @@ def test_google_startup_does_not_revive_a_persisted_disconnect(
     monkeypatch.setattr(runtime, "GoogleApiReadProvider", lambda **_kwargs: object())
     monkeypatch.setattr(runtime, "GmailWriteConnector", lambda **_kwargs: object())
     monkeypatch.setattr(runtime, "GmailApiWriteProvider", lambda **_kwargs: object())
-    monkeypatch.setattr(runtime, "CalendarActionDispatcher", lambda **_kwargs: object())
-    monkeypatch.setattr(
-        runtime, "GoogleApiCalendarWriteProvider", lambda **_kwargs: object()
-    )
     monkeypatch.setattr(
         runtime,
         "OwnedActionService",

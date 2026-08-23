@@ -2,7 +2,7 @@
 
 **What to build:** Gmail new-send and typed-reply proposals freeze the complete externally meaningful email operation and dispatch it once only after exact approval.
 
-**Blocked by:** 08 — Present oversized proposals through the universal envelope; 17 — Read bounded Gmail, Calendar, and Drive content.
+**Blocked by:** 08 — Present oversized proposals through the universal envelope; 17 — Read bounded Gmail and Drive content.
 
 **Status:** complete
 

@@ -1,6 +1,6 @@
-"""Closed, bounded Google read connector for the Ticket 17 capability surface.
+"""Closed, bounded Gmail and Drive read connector for Jarvis v1.
 
-The connector owns credential validation and only accepts the eight read
+The connector owns credential validation and only accepts the seven read
 operations named by the V1 specification.  Its caller receives typed, bounded
 content; credentials, provider payloads, and provider exception details remain
 inside this boundary.
@@ -12,7 +12,6 @@ import base64
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Literal, Protocol
 from urllib.parse import quote, urlencode
@@ -54,19 +53,8 @@ from .sessions import ServiceReadiness
 from .traces import DiagnosticTraceRecorder
 
 GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-CALENDAR_LIST_READ_SCOPE = (
-    "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
-)
-CALENDAR_EVENTS_READ_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly"
 DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
-GOOGLE_READ_SCOPES = frozenset(
-    {
-        GMAIL_READ_SCOPE,
-        CALENDAR_LIST_READ_SCOPE,
-        CALENDAR_EVENTS_READ_SCOPE,
-        DRIVE_READ_SCOPE,
-    }
-)
+GOOGLE_READ_SCOPES = frozenset({GMAIL_READ_SCOPE, DRIVE_READ_SCOPE})
 
 DEFAULT_MAX_RESULT_ITEMS = 20
 MAX_RESULT_ITEMS = 50
@@ -75,14 +63,12 @@ MAX_ITEM_BYTES = 64 * 1024
 DEFAULT_MAX_RESULT_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 1024 * 1024
 MAX_PROVIDER_RESPONSE_BYTES = MAX_GOOGLE_HTTP_RESPONSE_BYTES
-MAX_CALENDAR_READ_PAGES = 4
 # A single blocking HTTPS exchange may take up to five seconds.  The
 # orchestration tool owns the 20-second deadline for the complete, possibly
 # multi-request read (token refresh plus one or more fixed Google calls).
 GOOGLE_READ_TRACE_PAYLOAD_LIMIT_BYTES = 2 * 1024 * 1024
 
 _GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me"
-_CALENDAR_API_ROOT = "https://www.googleapis.com/calendar/v3"
 _DRIVE_API_ROOT = "https://www.googleapis.com/drive/v3"
 _TEXT_EXPORT_MIME_TYPES = frozenset({"text/plain", "text/csv", "text/markdown"})
 _TEXT_MEDIA_MIME_TYPES = frozenset(
@@ -112,9 +98,6 @@ GoogleReadOperation = Literal[
     "gmail_messages_get",
     "gmail_threads_list",
     "gmail_threads_get",
-    "calendar_list",
-    "calendar_events_list",
-    "calendar_events_get",
     "drive_files_list",
     "drive_files_get",
     "drive_files_export",
@@ -125,19 +108,12 @@ _OPERATION_SCOPES: dict[str, frozenset[str]] = {
     "gmail_messages_get": frozenset({GMAIL_READ_SCOPE}),
     "gmail_threads_list": frozenset({GMAIL_READ_SCOPE}),
     "gmail_threads_get": frozenset({GMAIL_READ_SCOPE}),
-    "calendar_list": frozenset({CALENDAR_LIST_READ_SCOPE}),
-    "calendar_events_list": frozenset({CALENDAR_EVENTS_READ_SCOPE}),
-    "calendar_events_get": frozenset({CALENDAR_EVENTS_READ_SCOPE}),
     "drive_files_list": frozenset({DRIVE_READ_SCOPE}),
     "drive_files_get": frozenset({DRIVE_READ_SCOPE}),
     "drive_files_export": frozenset({DRIVE_READ_SCOPE}),
 }
 _SERVICE_BY_OPERATION = {
-    operation: "gmail"
-    if operation.startswith("gmail_")
-    else "calendar"
-    if operation.startswith("calendar_")
-    else "drive"
+    operation: "gmail" if operation.startswith("gmail_") else "drive"
     for operation in _OPERATION_SCOPES
 }
 
@@ -218,64 +194,9 @@ class GoogleApiReadProvider:
         payload = self._json_response(response)
         if request.operation == "drive_files_get":
             return self._drive_file_result(request, payload, access_token)
-        if request.operation in {"calendar_list", "calendar_events_list"}:
-            return self._calendar_list_result(request, payload, access_token)
         return GoogleReadProviderResult(
             items=_response_items(request.operation, payload),
             continuation_token=_continuation_token(payload),
-        )
-
-    def _calendar_list_result(
-        self,
-        request: GoogleReadRequest,
-        payload: Mapping[str, object],
-        access_token: str,
-    ) -> GoogleReadProviderResult:
-        """Read a bounded number of Calendar pages without exposing page tokens."""
-
-        items: list[str] = []
-        seen_rows: set[str] = set()
-
-        def append_page_rows(page_payload: Mapping[str, object]) -> None:
-            for item in _response_items(request.operation, page_payload):
-                try:
-                    row = json.loads(item)
-                except json.JSONDecodeError:
-                    row = None
-                row_id = row.get("id") if isinstance(row, Mapping) else None
-                row_key = (
-                    f"id:{row_id}"
-                    if isinstance(row_id, str) and row_id
-                    else f"row:{item}"
-                )
-                if row_key in seen_rows:
-                    continue
-                seen_rows.add(row_key)
-                items.append(item)
-
-        append_page_rows(payload)
-        page_token = _continuation_token(payload)
-        pages = 1
-        while (
-            page_token is not None
-            and len(items) < request.max_results
-            and pages < MAX_CALENDAR_READ_PAGES
-        ):
-            arguments = dict(request.arguments)
-            arguments["page_token"] = page_token
-            page_request = GoogleReadRequest(
-                operation=request.operation,
-                arguments=arguments,
-                max_results=request.max_results,
-            )
-            page_response = self._authorized_get(page_request, access_token)
-            page_payload = self._json_response(page_response)
-            append_page_rows(page_payload)
-            page_token = _continuation_token(page_payload)
-            pages += 1
-        return GoogleReadProviderResult(
-            items=tuple(items[: request.max_results]),
-            continuation_token=page_token,
         )
 
     def _drive_file_result(
@@ -437,7 +358,7 @@ class ControlledGoogleReadProvider:
 class GoogleReadResult:
     """Sanitized output allowed into orchestration request working data."""
 
-    service: Literal["gmail", "calendar", "drive"]
+    service: Literal["gmail", "drive"]
     operation: GoogleReadOperation
     items: tuple[str, ...]
     truncated: bool
@@ -450,7 +371,7 @@ class GoogleReadResult:
 
 
 class GoogleReadConnector:
-    """Closed Gmail, Calendar, and Drive read capability for one Google subject."""
+    """Closed Gmail and Drive read capability for one Google subject."""
 
     def __init__(
         self,
@@ -560,49 +481,6 @@ class GoogleReadConnector:
             request_id,
             "gmail_threads_get",
             {"thread_id": _non_blank(thread_id, "thread_id")},
-            1,
-        )
-
-    def calendar_list(
-        self,
-        *,
-        request_id: str,
-        max_results: int = DEFAULT_MAX_RESULT_ITEMS,
-    ) -> GoogleReadResult:
-        return self._read(request_id, "calendar_list", {}, max_results)
-
-    def calendar_events_list(
-        self,
-        *,
-        request_id: str,
-        calendar_id: str,
-        time_min: datetime,
-        time_max: datetime,
-        query: str = "",
-        max_results: int = DEFAULT_MAX_RESULT_ITEMS,
-    ) -> GoogleReadResult:
-        return self._read(
-            request_id,
-            "calendar_events_list",
-            {
-                "calendar_id": _non_blank(calendar_id, "calendar_id"),
-                "query": _text(query, "query"),
-                "time_min": _calendar_time(time_min, "time_min"),
-                "time_max": _calendar_time(time_max, "time_max"),
-            },
-            max_results,
-        )
-
-    def calendar_events_get(
-        self, *, request_id: str, calendar_id: str, event_id: str
-    ) -> GoogleReadResult:
-        return self._read(
-            request_id,
-            "calendar_events_get",
-            {
-                "calendar_id": _non_blank(calendar_id, "calendar_id"),
-                "event_id": _non_blank(event_id, "event_id"),
-            },
             1,
         )
 
@@ -746,11 +624,7 @@ class GoogleReadConnector:
         items, item_truncated = _bounded_items(
             provider_result.items,
             max_items=min(request.max_results, self._max_result_items),
-            max_item_bytes=(
-                MAX_ITEM_BYTES
-                if request.operation == "calendar_events_get"
-                else self._max_item_bytes
-            ),
+            max_item_bytes=self._max_item_bytes,
         )
         result = GoogleReadResult(
             service=_SERVICE_BY_OPERATION[request.operation],
@@ -908,36 +782,6 @@ class GmailReadInput(BaseModel):
         return self
 
 
-class CalendarReadInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    operation: Literal["calendar_list", "events_list", "events_get"]
-    calendar_id: str | None = Field(default=None, max_length=512)
-    event_id: str | None = Field(default=None, max_length=512)
-    query: str | None = Field(default=None, max_length=1000)
-    time_min: datetime | None = None
-    time_max: datetime | None = None
-    max_results: int = Field(
-        default=DEFAULT_MAX_RESULT_ITEMS, ge=1, le=MAX_RESULT_ITEMS
-    )
-
-    @model_validator(mode="after")
-    def _validate_shape(self) -> CalendarReadInput:
-        if self.operation != "calendar_list" and not self.calendar_id:
-            raise ValueError("event reads require calendar_id")
-        if self.operation == "events_get" and not self.event_id:
-            raise ValueError("event lookup requires event_id")
-        if self.operation == "events_list":
-            if self.time_min is None or self.time_max is None:
-                raise ValueError("event list reads require time_min and time_max")
-            if self.time_min.tzinfo is None or self.time_max.tzinfo is None:
-                raise ValueError("event list bounds must be timezone-aware")
-            if self.time_min >= self.time_max:
-                raise ValueError("event list time_min must be before time_max")
-        elif self.time_min is not None or self.time_max is not None:
-            raise ValueError("time bounds are valid only for event list reads")
-        return self
-
-
 class DriveReadInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     operation: Literal["files_list", "files_get", "files_export"]
@@ -966,7 +810,7 @@ class DriveReadInput(BaseModel):
 
 class GoogleReadOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    service: Literal["gmail", "calendar", "drive"]
+    service: Literal["gmail", "drive"]
     operation: GoogleReadOperation
     items: tuple[str, ...] = Field(max_length=MAX_RESULT_ITEMS)
     truncated: bool
@@ -977,15 +821,12 @@ class GoogleReadOutput(BaseModel):
 
 
 def _google_read_tools(connector: object) -> tuple[BoundedReadTool, ...]:
-    """Return the three closed Google service tools for orchestration injection."""
+    """Return the two closed Google service tools exposed by Jarvis v1."""
     required_operations = (
         "gmail_messages_list",
         "gmail_messages_get",
         "gmail_threads_list",
         "gmail_threads_get",
-        "calendar_list",
-        "calendar_events_list",
-        "calendar_events_get",
         "drive_files_list",
         "drive_files_get",
         "drive_files_export",
@@ -1020,34 +861,6 @@ def _google_read_tools(connector: object) -> tuple[BoundedReadTool, ...]:
         }[input.operation]()
         return _output(result)
 
-    def calendar(
-        _request: OrchestrationRequest, input: BaseModel, _deadline: float
-    ) -> BaseModel:
-        if not isinstance(input, CalendarReadInput):
-            raise TypeError("read_google_calendar received an invalid input model")
-        if input.operation == "calendar_list":
-            result = connector.calendar_list(
-                request_id=_request.state.request_id,
-                max_results=input.max_results,
-            )
-        elif input.operation == "events_list":
-            assert input.time_min is not None and input.time_max is not None
-            result = connector.calendar_events_list(
-                request_id=_request.state.request_id,
-                calendar_id=input.calendar_id or "",
-                query=input.query or "",
-                time_min=input.time_min,
-                time_max=input.time_max,
-                max_results=input.max_results,
-            )
-        else:
-            result = connector.calendar_events_get(
-                request_id=_request.state.request_id,
-                calendar_id=input.calendar_id or "",
-                event_id=input.event_id or "",
-            )
-        return _output(result)
-
     def drive(
         _request: OrchestrationRequest, input: BaseModel, _deadline: float
     ) -> BaseModel:
@@ -1078,13 +891,6 @@ def _google_read_tools(connector: object) -> tuple[BoundedReadTool, ...]:
             GmailReadInput,
             GoogleReadOutput,
             gmail,
-        ),
-        BoundedReadTool(
-            "read_google_calendar",
-            "Read only bounded Google Calendar lists and events.",
-            CalendarReadInput,
-            GoogleReadOutput,
-            calendar,
         ),
         BoundedReadTool(
             "read_google_drive",
@@ -1153,12 +959,6 @@ def _content_unavailable_reason(
     if "content" not in payload and isinstance(payload.get("mimeType"), str):
         return "unsupported_mime_type"
     return None
-
-
-def _calendar_time(value: object, name: str) -> str:
-    if not isinstance(value, datetime) or value.tzinfo is None:
-        raise ValueError(f"{name} must be a timezone-aware datetime")
-    return value.astimezone(UTC).isoformat()
 
 
 def _text(value: object, name: str) -> str:
@@ -1266,38 +1066,6 @@ def _google_read_url(request: GoogleReadRequest) -> str:
                 "fields": "id,historyId,messages(" + _gmail_message_fields() + ")",
             },
         )
-    if operation == "calendar_list":
-        query: dict[str, object] = {
-            "maxResults": request.max_results,
-            "fields": "items(id,summary,description,timeZone,primary,accessRole),nextPageToken",
-        }
-        if arguments.get("page_token"):
-            query["pageToken"] = arguments["page_token"]
-        return _url(
-            f"{_CALENDAR_API_ROOT}/users/me/calendarList",
-            query,
-        )
-    if operation == "calendar_events_list":
-        calendar = quote(arguments["calendar_id"], safe="")
-        query: dict[str, object] = {
-            "maxResults": request.max_results,
-            "singleEvents": "true",
-            "orderBy": "startTime",
-            "fields": "items(id,etag,status,summary,description,location,start,end,attendees,organizer,recurrence,visibility,reminders,updated),nextPageToken",
-        }
-        if arguments.get("query"):
-            query["q"] = arguments["query"]
-        if arguments.get("time_min"):
-            query["timeMin"] = arguments["time_min"]
-        if arguments.get("time_max"):
-            query["timeMax"] = arguments["time_max"]
-        if arguments.get("page_token"):
-            query["pageToken"] = arguments["page_token"]
-        return _url(f"{_CALENDAR_API_ROOT}/calendars/{calendar}/events", query)
-    if operation == "calendar_events_get":
-        calendar = quote(arguments["calendar_id"], safe="")
-        event = quote(arguments["event_id"], safe="")
-        return _url(f"{_CALENDAR_API_ROOT}/calendars/{calendar}/events/{event}", {})
     if operation == "drive_files_list":
         return _url(
             f"{_DRIVE_API_ROOT}/files",
@@ -1341,8 +1109,6 @@ def _response_items(
     collection_key = {
         "gmail_messages_list": "messages",
         "gmail_threads_list": "threads",
-        "calendar_list": "items",
-        "calendar_events_list": "items",
         "drive_files_list": "files",
     }.get(operation)
     if operation in {"gmail_messages_get", "gmail_threads_get"}:

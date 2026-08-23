@@ -24,7 +24,6 @@ from jarvis_control_plane.google_oauth import (
 from jarvis_control_plane.google_reads import (
     GMAIL_READ_SCOPE,
     GOOGLE_READ_SCOPES,
-    CalendarReadInput,
     ControlledGoogleReadProvider,
     GoogleApiReadProvider,
     GoogleReadConnector,
@@ -33,6 +32,7 @@ from jarvis_control_plane.google_reads import (
     GoogleReadProviderError,
     GoogleReadProviderResult,
     GoogleReadRequest,
+    _google_read_tools,
 )
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.models import (
@@ -54,6 +54,13 @@ from jarvis_control_plane.traces import (
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
+
+
+def test_v1_google_read_tools_exclude_calendar() -> None:
+    assert {tool.name for tool in _google_read_tools(_connector())} == {
+        "read_gmail",
+        "read_google_drive",
+    }
 
 
 def _trace() -> DiagnosticTraceRecorder:
@@ -258,7 +265,7 @@ def test_google_read_failures_are_sanitized(failure: str, expected: str) -> None
     with pytest.raises(GoogleReadError, match=expected) as caught:
         _connector(
             provider=ControlledGoogleReadProvider(failure=failure)
-        ).calendar_list(request_id="request-001")
+        ).drive_files_list(request_id="request-001", query="name = 'fixture'")
 
     assert "controlled-refresh-token" not in str(caught.value)
 
@@ -284,7 +291,7 @@ def test_invalid_grant_discards_the_credential_before_reporting_disconnection() 
             credential_store=store,
             provider=ControlledGoogleReadProvider(failure="invalid_grant"),
             on_invalid_grant=invalidate,
-        ).calendar_list(request_id="request-001")
+        ).drive_files_list(request_id="request-001", query="name = 'fixture'")
 
     assert store.current is None
     assert invalidations == ["invalidated"]
@@ -416,30 +423,6 @@ def test_disconnected_read_propagates_failure_audit_outage() -> None:
             None,
         ),
         (
-            GoogleReadRequest("calendar_list", {}, 2),
-            {"items": [{"id": "primary"}]},
-            "/calendar/v3/users/me/calendarList",
-            "maxResults",
-        ),
-        (
-            GoogleReadRequest(
-                "calendar_events_list", {"calendar_id": "primary", "query": "review"}, 2
-            ),
-            {"items": [{"id": "event1"}]},
-            "/calendar/v3/calendars/primary/events",
-            "maxResults",
-        ),
-        (
-            GoogleReadRequest(
-                "calendar_events_get",
-                {"calendar_id": "primary", "event_id": "event1"},
-                1,
-            ),
-            {"id": "event1"},
-            "/calendar/v3/calendars/primary/events/event1",
-            None,
-        ),
-        (
             GoogleReadRequest("drive_files_list", {"query": "name contains 'plan'"}, 2),
             {"files": [{"id": "file1"}]},
             "/drive/v3/files",
@@ -485,120 +468,10 @@ def test_live_provider_uses_only_the_fixed_google_read_operations(
     assert call["method"] == "GET"
     assert parsed.path == expected_path
     assert "pageToken" not in query
-    if read_request.operation == "calendar_events_get":
-        # A single event is the source for an ETag-bound Calendar mutation
-        # snapshot, so it must return the complete Event resource.
-        assert "fields" not in query
-    else:
-        assert "fields" in query
+    assert "fields" in query
     if page_size_key is not None:
         assert query[page_size_key] == [str(read_request.max_results)]
     assert result.items
-
-
-def test_calendar_event_reads_use_typed_time_bounds_and_bounded_calendar_pagination() -> (
-    None
-):
-    bounds = CalendarReadInput(
-        operation="events_list",
-        calendar_id="secondary-calendar",
-        query="review",
-        time_min=NOW,
-        time_max=datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
-        max_results=20,
-    )
-    assert bounds.time_min == NOW
-    assert bounds.time_max is not None
-
-    event_transport = _RecordingGoogleTransport(
-        [
-            _json_response({"access_token": "access-token"}),
-            _json_response(
-                {
-                    "items": [{"id": "event-1", "summary": "Review"}],
-                }
-            ),
-        ]
-    )
-    provider = GoogleApiReadProvider(
-        client_id="client-id", client_secret="client-secret", transport=event_transport
-    )
-    credential = OAuthCredentialRecord(
-        subject=IDENTITY,
-        granted_scopes=GOOGLE_READ_SCOPES,
-        refresh_token="refresh-token",
-    )
-
-    provider.read(
-        request=GoogleReadRequest(
-            "calendar_events_list",
-            {
-                "calendar_id": "secondary-calendar",
-                "query": "review",
-                "time_min": NOW.isoformat(),
-                "time_max": bounds.time_max.isoformat(),
-            },
-            20,
-        ),
-        credential=credential,
-    )
-
-    event_query = parse_qs(
-        urlparse(event_transport.calls[1]["url"]).query  # type: ignore[arg-type]
-    )
-    assert event_query["timeMin"] == [NOW.isoformat()]
-    assert event_query["timeMax"] == [bounds.time_max.isoformat()]
-    assert event_query["q"] == ["review"]
-    assert "2026-08-06" not in event_query["q"][0]
-
-    calendar_transport = _RecordingGoogleTransport(
-        [
-            _json_response({"access_token": "access-token"}),
-            _json_response(
-                {
-                    "items": [
-                        {"id": "calendar-1", "summary": "Other calendar"},
-                        {"id": "calendar-2", "summary": "Another calendar"},
-                        {"id": "calendar-3", "summary": "Third calendar"},
-                    ],
-                    "nextPageToken": "calendar-page-2",
-                }
-            ),
-            _json_response(
-                {
-                    "items": [
-                        {
-                            "id": "calendar-2",
-                            "summary": "Another calendar",
-                        },
-                        {
-                            "id": "secondary-calendar",
-                            "summary": "Ticket 31 run calendar",
-                            "timeZone": "Asia/Amman",
-                        },
-                    ]
-                }
-            ),
-        ]
-    )
-    calendar_provider = GoogleApiReadProvider(
-        client_id="client-id",
-        client_secret="client-secret",
-        transport=calendar_transport,
-    )
-    calendar_result = calendar_provider.read(
-        request=GoogleReadRequest("calendar_list", {}, 20),
-        credential=credential,
-    )
-    assert len(calendar_transport.calls) == 3
-    calendar_rows = [json.loads(item) for item in calendar_result.items]
-    assert [row["id"] for row in calendar_rows] == [
-        "calendar-1",
-        "calendar-2",
-        "calendar-3",
-        "secondary-calendar",
-    ]
-    assert any("Ticket 31 run calendar" in item for item in calendar_result.items)
 
 
 def test_live_provider_exports_only_text_and_classifies_invalid_grant() -> None:
@@ -635,7 +508,12 @@ def test_live_provider_exports_only_text_and_classifies_invalid_grant() -> None:
             client_id="client-id",
             client_secret="client-secret",
             transport=invalid_grant_transport,
-        ).read(request=GoogleReadRequest("calendar_list", {}, 1), credential=credential)
+        ).read(
+            request=GoogleReadRequest(
+                "drive_files_list", {"query": "name = 'fixture'"}, 1
+            ),
+            credential=credential,
+        )
 
 
 def test_live_provider_accepts_case_insensitive_text_export_content_type() -> None:
@@ -851,7 +729,6 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
         assert [tool.name for tool in tools] == [
             "read_request_context",
             "read_gmail",
-            "read_google_calendar",
             "read_google_drive",
         ]
         gmail = tools[1]
@@ -988,74 +865,3 @@ def test_binary_drive_read_becomes_a_bounded_refusal_before_model_reply() -> Non
             "data, and do not retry."
         ),
     }
-
-
-def test_calendar_operator_reply_is_grounded_only_in_returned_rows() -> None:
-    audit = InMemoryAuditBoundary()
-    connector = _connector(
-        provider=ControlledGoogleReadProvider(
-            result=GoogleReadProviderResult(
-                items=(
-                    json.dumps(
-                        {
-                            "id": "provider-calendar-id",
-                            "summary": "Work",
-                            "timeZone": "Asia/Amman",
-                        }
-                    ),
-                )
-            ),
-        ),
-        audit=audit,
-    )
-
-    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
-        calendar = next(
-            tool for tool in agent.tools if tool.name == "read_google_calendar"
-        )
-        observed = asyncio.run(
-            calendar.on_invoke_tool(
-                None,
-                json.dumps(
-                    {
-                        "operation": "calendar_list",
-                        "max_results": 50,
-                    }
-                ),
-            )
-        )
-        assert observed["items"]
-        return SimpleNamespace(
-            final_output=AgentsSdkPlan(
-                reply_text=(
-                    "The requested Missing calendar was found; its provider ID is "
-                    "provider-calendar-id."
-                )
-            )
-        )
-
-    adapter = AgentsSdkOrchestrationAdapter(
-        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
-        run_sync=run_sync,
-        model_settings_factory=_FakeModelSettings,
-        reasoning_factory=_FakeReasoning,
-        run_config_factory=_FakeRunConfig,
-        google_read_connector=connector,
-    )
-    components = build_receiver_components(
-        operator_id="operator.test",
-        transport_session_id="session.test",
-        signing_secret=b"ticket17-test-secret",
-        now=NOW,
-        id_prefix="ticket17-calendar-grounded",
-        audit=audit,
-        orchestration=adapter,  # type: ignore[arg-type]
-    )
-
-    result = components.receiver.receive(_event("find the Missing calendar"))
-
-    assert result.disposition == "completed"
-    assert result.reply is not None
-    assert "Work" in result.reply.body
-    assert "Missing" not in result.reply.body
-    assert "provider-calendar-id" not in result.reply.body

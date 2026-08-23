@@ -457,7 +457,6 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
     allowlists = config.get("connector_allowlists")
     expected_allowlists = {
         "gmail": ["read", "search", "send", "reply"],
-        "calendar": ["read", "search", "create", "update"],
         "drive": ["read", "search"],
         "vault": ["read", "search", "write_markdown"],
     }

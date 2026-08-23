@@ -8,13 +8,12 @@ that the deterministic capability broker still validates, audits, and approves.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Event, Lock
 from time import monotonic
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -23,7 +22,6 @@ from .gmail_actions import (
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
 )
-from .google_calendar import CalendarEventSnapshot, CalendarWriteProposal
 from .models import (
     FrozenActionProposal,
     OrchestrationMilestone,
@@ -52,7 +50,6 @@ _READ_UNAVAILABLE_RESULT = {
 _READ_DEPENDENCY_NAMES = {
     "read_request_context": "request context",
     "read_gmail": "Gmail",
-    "read_google_calendar": "Google Calendar",
     "read_google_drive": "Google Drive",
     "read_knowledge_vault": "knowledge vault",
 }
@@ -122,7 +119,6 @@ _CLOSED_READ_TOOL_NAMES = frozenset(
     {
         "read_request_context",
         "read_gmail",
-        "read_google_calendar",
         "read_google_drive",
         "read_knowledge_vault",
     }
@@ -162,9 +158,6 @@ class AgentsSdkProposal(BaseModel):
         "terminal",
         "gmail_send",
         "gmail_reply",
-        "calendar_insert",
-        "calendar_update",
-        "calendar_patch",
         "knowledge_vault_write",
     ]
     preview: str = Field(min_length=1, max_length=2_000)
@@ -184,56 +177,6 @@ class AgentsSdkPlan(BaseModel):
     proposal: AgentsSdkProposal | None = None
 
 
-class _CalendarDateEndpoint(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    date: str = Field(min_length=1)
-    timeZone: str | None = None
-
-
-class _CalendarDateTimeEndpoint(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    dateTime: str = Field(min_length=1)
-    timeZone: str | None = None
-
-
-class _CalendarReminders(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    useDefault: bool
-    overrides: list[dict[str, object]]
-
-
-class _CalendarInsertEvent(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    summary: str = Field(min_length=1)
-    attendees: list[dict[str, object]]
-    recurrence: list[str]
-    reminders: _CalendarReminders
-    visibility: Literal["default", "public", "private", "confidential"]
-    start: _CalendarDateEndpoint | _CalendarDateTimeEndpoint
-    end: _CalendarDateEndpoint | _CalendarDateTimeEndpoint
-
-
-class _CalendarInsertPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    calendar_id: str = Field(min_length=1)
-    complete_event: _CalendarInsertEvent
-    notification: Literal["none", "all", "externalOnly"]
-    event_id: str | None = None
-
-
-class _CalendarInsertStructuredProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kind: Literal["calendar_insert"]
-    preview: str = Field(min_length=1, max_length=2_000)
-    payload: _CalendarInsertPayload
-
-
 class _OtherStructuredProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -241,8 +184,6 @@ class _OtherStructuredProposal(BaseModel):
         "terminal",
         "gmail_send",
         "gmail_reply",
-        "calendar_update",
-        "calendar_patch",
         "knowledge_vault_write",
     ]
     preview: str = Field(min_length=1, max_length=2_000)
@@ -250,7 +191,7 @@ class _OtherStructuredProposal(BaseModel):
 
 
 class _AgentsSdkStructuredPlan(BaseModel):
-    """Provider schema that requires complete Calendar insert material choices."""
+    """Closed provider schema for the v1 proposal surface."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -259,13 +200,7 @@ class _AgentsSdkStructuredPlan(BaseModel):
     host_reason_code: (
         Literal["default_ubuntu", "explicit_windows", "windows_dependency"] | None
     ) = None
-    proposal: (
-        Annotated[
-            _CalendarInsertStructuredProposal | _OtherStructuredProposal,
-            Field(discriminator="kind"),
-        ]
-        | None
-    ) = None
+    proposal: _OtherStructuredProposal | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -296,15 +231,6 @@ class BoundedReadOutput(BaseModel):
 
     source: Literal["authorized_request"]
     text: str = Field(min_length=1, max_length=_MAX_READ_CHARS)
-
-
-@dataclass(frozen=True, slots=True)
-class _CalendarReadObservation:
-    """Connector-owned Calendar read evidence kept outside model output."""
-
-    typed_input: object
-    output: object
-    connection_generation: int
 
 
 class CodexToolInput(BaseModel):
@@ -504,7 +430,6 @@ class AgentsSdkOrchestrationAdapter:
             from .google_reads import _google_read_tools
 
             read_tools.extend(_google_read_tools(google_read_connector))
-        self._google_read_connector = google_read_connector
         if vault_read_tool is not None and not isinstance(
             vault_read_tool, BoundedReadTool
         ):
@@ -545,7 +470,6 @@ class AgentsSdkOrchestrationAdapter:
         budget = _ToolInvocationBudget(self._max_tool_invocations)
         stale_vault_read: tuple[datetime, str] | None = None
         unavailable_reads: list[tuple[str, str]] = []
-        calendar_observations: list[_CalendarReadObservation] = []
 
         def record_stale_vault_read(synchronized_at: datetime, warning: str) -> None:
             nonlocal stale_vault_read
@@ -560,7 +484,6 @@ class AgentsSdkOrchestrationAdapter:
                 milestones,
                 budget,
                 unavailable_reads,
-                calendar_observations,
                 record_stale_vault_read=record_stale_vault_read,
             )
             agent = self._agent_factory(
@@ -620,55 +543,12 @@ class AgentsSdkOrchestrationAdapter:
             raise OrchestrationAdapterError(
                 "Agents SDK returned malformed structured output"
             )
-        if (
-            plan.proposal is not None
-            and plan.proposal.kind in {"calendar_update", "calendar_patch"}
-            and not any(
-                getattr(observation.typed_input, "operation", None) == "events_get"
-                for observation in calendar_observations
-            )
-        ):
-            run_result = self._run_model_turn(
-                request=request,
-                agent=agent,
-                model_input=(
-                    f"{model_input}\n\n"
-                    "Your prior Calendar change draft was not grounded and was "
-                    "discarded. Before returning another update or patch proposal, "
-                    "call calendar_list, then events_list, then events_get for the "
-                    "exact returned event ID. Use that events_get ETag-bound snapshot "
-                    "in the proposal. Do not return a proposal if any read fails."
-                ),
-                run_config=run_config,
-            )
-            if unavailable_reads:
-                tool_name, reason = unavailable_reads[0]
-                return OrchestrationResult(
-                    request_id=request.state.request_id,
-                    outcome="unavailable",
-                    reply_text=_unavailable_read_reply(tool_name, reason),
-                    adapter="agents_sdk_responses",
-                    milestones=tuple(milestones),
-                )
-            raw_plan = getattr(run_result, "final_output", None)
-            if isinstance(raw_plan, _AgentsSdkStructuredPlan):
-                plan = AgentsSdkPlan.model_validate(
-                    raw_plan.model_dump(mode="python", exclude_none=True)
-                )
-            elif isinstance(raw_plan, AgentsSdkPlan):
-                plan = raw_plan
-            else:
-                raise OrchestrationAdapterError(
-                    "Agents SDK returned malformed structured output"
-                )
         selected_host = _validate_host_selection(plan)
 
         proposal = self._frozen_proposal(
             request,
             plan,
             selected_host[0] if selected_host is not None else None,
-            calendar_observations=calendar_observations,
-            google_read_connector=self._google_read_connector,
         )
         proposal_intent = (
             proposal if isinstance(proposal, OrchestrationProposalIntent) else None
@@ -677,11 +557,7 @@ class AgentsSdkOrchestrationAdapter:
             proposal if isinstance(proposal, FrozenActionProposal) else None
         )
         if selected_host is None:
-            reply_text = (
-                _render_calendar_grounded_reply(calendar_observations)
-                if calendar_observations and plan.proposal is None
-                else plan.reply_text
-            )
+            reply_text = plan.reply_text
             host = None
             host_reason_code = None
         else:
@@ -818,7 +694,6 @@ class AgentsSdkOrchestrationAdapter:
         milestones: list[OrchestrationMilestone],
         budget: _ToolInvocationBudget,
         unavailable_reads: list[tuple[str, str]],
-        calendar_observations: list[_CalendarReadObservation],
         record_stale_vault_read: Callable[[datetime, str], None],
     ) -> list[Any]:
         """Build the closed tool list anew for each request and invocation budget."""
@@ -844,25 +719,6 @@ class AgentsSdkOrchestrationAdapter:
                     if not isinstance(typed_output, tool.output_model):
                         raise TypeError("bounded read returned an untyped result")
                     bounded_output = tool.output_model.model_validate(typed_output)
-                    if tool.name == "read_google_calendar":
-                        generation = getattr(
-                            bounded_output, "_connection_generation", None
-                        )
-                        if (
-                            not isinstance(generation, int)
-                            or isinstance(generation, bool)
-                            or generation < 0
-                        ):
-                            raise TypeError(
-                                "Calendar read did not return connector-owned provenance"
-                            )
-                        calendar_observations.append(
-                            _CalendarReadObservation(
-                                typed_input=typed_input,
-                                output=bounded_output,
-                                connection_generation=generation,
-                            )
-                        )
                     if tool.name == "read_knowledge_vault":
                         warning = getattr(bounded_output, "stale_warning", None)
                         synchronized_at = getattr(
@@ -933,7 +789,6 @@ class AgentsSdkOrchestrationAdapter:
                 bounded_result = bounded_output.model_dump(mode="json")
                 if tool.name in {
                     "read_gmail",
-                    "read_google_calendar",
                     "read_google_drive",
                 }:
                     bounded_result = {
@@ -1029,9 +884,6 @@ class AgentsSdkOrchestrationAdapter:
         request: OrchestrationRequest,
         plan: AgentsSdkPlan,
         host: Literal["ubuntu", "windows"] | None,
-        *,
-        calendar_observations: list[_CalendarReadObservation],
-        google_read_connector: object | None,
     ) -> FrozenActionProposal | OrchestrationProposalIntent | None:
         if plan.proposal is None:
             return None
@@ -1069,72 +921,6 @@ class AgentsSdkOrchestrationAdapter:
                     request_id=request.state.request_id,
                     **gmail_payload,
                 )
-            elif plan.proposal.kind == "calendar_insert":
-                calendar_payload = _canonical_calendar_insert_payload(payload)
-                calendar_id, connection_generation = _require_reviewed_calendar_target(
-                    calendar_payload.get("calendar_id"),
-                    calendar_observations,
-                    google_read_connector,
-                )
-                calendar_payload["calendar_id"] = calendar_id
-                candidate = CalendarWriteProposal.insert(
-                    action_id=f"{request.state.request_id}:proposal",
-                    request_id=request.state.request_id,
-                    connection_generation=connection_generation,
-                    **calendar_payload,
-                )
-            elif plan.proposal.kind in {"calendar_update", "calendar_patch"}:
-                if "connection_generation" in payload:
-                    raise OrchestrationAdapterError(
-                        "model proposed connector-owned Calendar state"
-                    )
-                calendar_id, connection_generation = _require_reviewed_calendar_target(
-                    payload.get("calendar_id"),
-                    calendar_observations,
-                    google_read_connector,
-                )
-                payload = _ground_calendar_change_payload(
-                    payload=payload,
-                    calendar_id=calendar_id,
-                    observations=calendar_observations,
-                )
-                _require_reviewed_calendar_event(
-                    payload=payload,
-                    calendar_id=calendar_id,
-                    observations=calendar_observations,
-                )
-                snapshot_payload = payload.get("snapshot")
-                if not isinstance(snapshot_payload, Mapping) or set(
-                    snapshot_payload
-                ) != {
-                    "event",
-                    "etag",
-                }:
-                    raise OrchestrationAdapterError(
-                        "Calendar change requires an ETag-bound snapshot"
-                    )
-                snapshot = CalendarEventSnapshot(
-                    event=dict(snapshot_payload.get("event", {})),
-                    etag=snapshot_payload.get("etag"),
-                )
-                calendar_payload = {
-                    key: value
-                    for key, value in payload.items()
-                    if key not in {"snapshot", "calendar_id"}
-                }
-                factory = (
-                    CalendarWriteProposal.update
-                    if plan.proposal.kind == "calendar_update"
-                    else CalendarWriteProposal.patch
-                )
-                candidate = factory(
-                    action_id=f"{request.state.request_id}:proposal",
-                    request_id=request.state.request_id,
-                    snapshot=snapshot,
-                    connection_generation=connection_generation,
-                    calendar_id=calendar_id,
-                    **calendar_payload,
-                )
             elif plan.proposal.kind == "knowledge_vault_write":
                 changes = _canonical_vault_changes(payload)
                 candidate = OrchestrationProposalIntent(
@@ -1154,338 +940,6 @@ class AgentsSdkOrchestrationAdapter:
                 "model returned a malformed action proposal"
             ) from exc
         return candidate
-
-
-def _canonical_calendar_insert_payload(
-    payload: Mapping[str, object],
-) -> dict[str, object]:
-    """Normalize one model Calendar insert wrapper to the closed factory shape.
-
-    The Agents SDK proposal payload is intentionally open-ended because the
-    model emits nested JSON. Calendar's factory, however, accepts the
-    canonical ``complete_event``/``notification`` names only. Models that
-    describe the same Google request using the API's ``event`` and
-    ``sendUpdates`` names are adapted before that factory; no connector state
-    or authority fields are accepted here.
-    """
-
-    allowed = {
-        "calendar_id",
-        "complete_event",
-        "event",
-        "notification",
-        "sendUpdates",
-        "send_updates",
-        "event_id",
-    }
-    unknown = set(payload) - allowed
-    if unknown:
-        if (
-            "connection_generation" in unknown
-            or {"etag", "schema", "operation"} & unknown
-        ):
-            raise OrchestrationAdapterError(
-                "model proposed connector-owned Calendar state"
-            )
-        raise OrchestrationAdapterError(
-            "model proposed Calendar fields outside the closed insert shape"
-        )
-
-    event_fields = {field for field in ("complete_event", "event") if field in payload}
-    if len(event_fields) != 1:
-        raise OrchestrationAdapterError(
-            "Calendar insert requires one complete event payload"
-        )
-
-    notification_fields = {
-        field
-        for field in ("notification", "sendUpdates", "send_updates")
-        if field in payload
-    }
-    if len(notification_fields) != 1:
-        raise OrchestrationAdapterError(
-            "Calendar insert requires one notification choice"
-        )
-
-    event = payload[next(iter(event_fields))]
-    if not isinstance(event, Mapping):
-        raise OrchestrationAdapterError(
-            "Calendar insert complete event must be an object"
-        )
-
-    canonical: dict[str, object] = {
-        "calendar_id": payload.get("calendar_id"),
-        "complete_event": dict(event),
-        "notification": payload[next(iter(notification_fields))],
-    }
-    if "event_id" in payload:
-        canonical["event_id"] = payload["event_id"]
-    return canonical
-
-
-def _calendar_observation_rows(
-    observation: _CalendarReadObservation,
-) -> tuple[Mapping[str, object], ...]:
-    """Decode only the sanitized Calendar rows retained for one read."""
-
-    items = getattr(observation.output, "items", ())
-    if not isinstance(items, tuple | list):
-        raise OrchestrationAdapterError("Calendar read returned malformed rows")
-    rows: list[Mapping[str, object]] = []
-    for item in items:
-        if not isinstance(item, str):
-            raise OrchestrationAdapterError("Calendar read returned malformed rows")
-        try:
-            row = json.loads(item)
-        except json.JSONDecodeError as exc:
-            raise OrchestrationAdapterError(
-                "Calendar read returned malformed rows"
-            ) from exc
-        if not isinstance(row, Mapping):
-            raise OrchestrationAdapterError("Calendar read returned malformed rows")
-        rows.append(row)
-    return tuple(rows)
-
-
-def _require_reviewed_calendar_target(
-    proposed_calendar_id: object,
-    observations: list[_CalendarReadObservation],
-    connector: object | None,
-) -> tuple[str, int]:
-    """Bind a proposal to one exact, connector-observed non-primary calendar."""
-
-    if (
-        not isinstance(proposed_calendar_id, str)
-        or not proposed_calendar_id
-        or proposed_calendar_id.strip() != proposed_calendar_id
-    ):
-        raise OrchestrationAdapterError(
-            "Calendar proposal requires an exact reviewed calendar target"
-        )
-    if proposed_calendar_id.casefold() == "primary":
-        raise OrchestrationAdapterError(
-            "Calendar proposals cannot target the primary calendar"
-        )
-    if not observations:
-        raise OrchestrationAdapterError(
-            "Calendar proposal requires a bounded Calendar read first"
-        )
-
-    generations = {observation.connection_generation for observation in observations}
-    if len(generations) != 1:
-        raise OrchestrationAdapterError(
-            "Calendar proposal reads crossed OAuth connection generations"
-        )
-    generation = next(iter(generations))
-    if (
-        not isinstance(generation, int)
-        or isinstance(generation, bool)
-        or generation < 0
-        or connector is None
-        or not callable(getattr(connector, "current_connection_generation", None))
-    ):
-        raise OrchestrationAdapterError(
-            "Calendar proposal lacks connector-owned connection provenance"
-        )
-    try:
-        current_generation = connector.current_connection_generation()
-    except Exception as exc:
-        raise OrchestrationAdapterError(
-            "Calendar connection generation is unavailable"
-        ) from exc
-    if current_generation != generation:
-        raise OrchestrationAdapterError(
-            "Calendar read evidence is stale before proposal creation"
-        )
-
-    list_observations = [
-        observation
-        for observation in observations
-        if getattr(observation.typed_input, "operation", None) == "calendar_list"
-    ]
-    event_observations = [
-        observation
-        for observation in observations
-        if getattr(observation.typed_input, "operation", None)
-        in {"events_list", "events_get"}
-    ]
-
-    # Event reads are target-pinned by their connector-validated input.  If
-    # more than one event-read calendar was used, the evidence is ambiguous;
-    # all of it must name the exact target in the proposal.
-    event_calendar_ids: set[str] = set()
-    for observation in event_observations:
-        calendar_id = getattr(observation.typed_input, "calendar_id", None)
-        if (
-            not isinstance(calendar_id, str)
-            or not calendar_id
-            or calendar_id.strip() != calendar_id
-        ):
-            raise OrchestrationAdapterError(
-                "Calendar event read lacks an exact calendar target"
-            )
-        if calendar_id.casefold() == "primary":
-            raise OrchestrationAdapterError(
-                "Calendar proposals cannot target the primary calendar"
-            )
-        event_calendar_ids.add(calendar_id)
-    if event_calendar_ids and (event_calendar_ids != {proposed_calendar_id}):
-        raise OrchestrationAdapterError(
-            "Calendar event evidence does not match the proposed calendar"
-        )
-
-    # Event-read inputs cannot confer Calendar authority on their own: they
-    # are selected by the model.  The exact target must first appear in a
-    # connector-returned calendar-list row.  A list may contain several
-    # secondary calendars; the exact returned ID is still the one the human
-    # reviewer will compare in the frozen proposal.  A subsequent event read
-    # must use that same returned target.
-    if not list_observations:
-        raise OrchestrationAdapterError(
-            "Calendar proposal requires a returned Calendar target row"
-        )
-    proposed_is_primary = False
-    reviewed_calendar_id: str | None = None
-    for observation in list_observations:
-        for row in _calendar_observation_rows(observation):
-            row_id = row.get("id")
-            if not isinstance(row_id, str) or not row_id.strip():
-                continue
-            if row_id == proposed_calendar_id:
-                primary = row.get("primary")
-                if primary is True:
-                    proposed_is_primary = True
-                elif "primary" in row and primary is not False:
-                    raise OrchestrationAdapterError(
-                        "Calendar read returned malformed primary metadata"
-                    )
-                else:
-                    # Freeze the connector-returned value, never the model's
-                    # untrusted candidate, after exact equality is proven.
-                    # Google's CalendarListEntry omits the optional primary
-                    # field for non-primary calendars rather than returning
-                    # an explicit false value.
-                    reviewed_calendar_id = row_id
-    if proposed_is_primary:
-        raise OrchestrationAdapterError(
-            "Calendar proposals cannot target the primary calendar"
-        )
-    if reviewed_calendar_id is None:
-        raise OrchestrationAdapterError(
-            "Calendar target was not returned by the bounded Calendar read and "
-            "is not grounded"
-        )
-
-    return reviewed_calendar_id, generation
-
-
-def _require_reviewed_calendar_event(
-    *,
-    payload: Mapping[str, object],
-    calendar_id: str,
-    observations: list[_CalendarReadObservation],
-) -> None:
-    """Require an update/patch snapshot to equal a bounded event observation."""
-
-    event_id = payload.get("event_id")
-    snapshot_payload = payload.get("snapshot")
-    if (
-        not isinstance(event_id, str)
-        or not event_id
-        or event_id.strip() != event_id
-        or not isinstance(snapshot_payload, Mapping)
-    ):
-        raise OrchestrationAdapterError(
-            "Calendar change requires an observed ETag-bound event"
-        )
-    snapshot_event = snapshot_payload.get("event")
-    snapshot_etag = snapshot_payload.get("etag")
-    if not isinstance(snapshot_event, Mapping) or not isinstance(snapshot_etag, str):
-        raise OrchestrationAdapterError(
-            "Calendar change requires an observed ETag-bound event"
-        )
-
-    event_rows: list[Mapping[str, object]] = []
-    for observation in observations:
-        operation = getattr(observation.typed_input, "operation", None)
-        if operation not in {"events_list", "events_get"}:
-            continue
-        input_calendar_id = getattr(observation.typed_input, "calendar_id", None)
-        if input_calendar_id != calendar_id:
-            continue
-        event_rows.extend(_calendar_observation_rows(observation))
-
-    for row in event_rows:
-        if row.get("id") != event_id or row.get("etag") != snapshot_etag:
-            continue
-        try:
-            observed_snapshot = CalendarEventSnapshot(
-                event=dict(row), etag=snapshot_etag
-            )
-        except (TypeError, ValueError):
-            continue
-        try:
-            requested_snapshot = CalendarEventSnapshot(
-                event=dict(snapshot_event), etag=snapshot_etag
-            )
-        except (TypeError, ValueError) as exc:
-            raise OrchestrationAdapterError(
-                "Calendar change requires an observed ETag-bound event"
-            ) from exc
-        if observed_snapshot.event == requested_snapshot.event:
-            return
-
-    raise OrchestrationAdapterError(
-        "Calendar change snapshot was not returned by the bounded event read"
-    )
-
-
-def _ground_calendar_change_payload(
-    *,
-    payload: Mapping[str, object],
-    calendar_id: str,
-    observations: list[_CalendarReadObservation],
-) -> dict[str, object]:
-    """Supply provider-owned event identity from one exact events_get result."""
-
-    grounded_rows: list[Mapping[str, object]] = []
-    for observation in observations:
-        if getattr(observation.typed_input, "operation", None) != "events_get":
-            continue
-        if getattr(observation.typed_input, "calendar_id", None) != calendar_id:
-            continue
-        grounded_rows.extend(_calendar_observation_rows(observation))
-
-    unique_rows = {
-        (row.get("id"), row.get("etag")): row
-        for row in grounded_rows
-        if isinstance(row.get("id"), str)
-        and bool(row.get("id"))
-        and isinstance(row.get("etag"), str)
-        and bool(row.get("etag"))
-    }
-    if len(unique_rows) != 1:
-        return dict(payload)
-
-    (observed_event_id, observed_etag), observed_event = next(
-        iter(unique_rows.items())
-    )
-    grounded = dict(payload)
-    proposed_event_id = grounded.get("event_id")
-    if not isinstance(proposed_event_id, str) or not proposed_event_id:
-        grounded["event_id"] = observed_event_id
-    snapshot = grounded.get("snapshot")
-    if (
-        not isinstance(snapshot, Mapping)
-        or not isinstance(snapshot.get("event"), Mapping)
-        or not isinstance(snapshot.get("etag"), str)
-        or not snapshot.get("etag")
-    ):
-        grounded["snapshot"] = {
-            "event": dict(observed_event),
-            "etag": observed_etag,
-        }
-    return grounded
 
 
 def _canonical_gmail_model_payload(
@@ -1575,94 +1029,6 @@ def _is_canonical_vault_path(value: object) -> bool:
     )
 
 
-def _render_calendar_grounded_reply(
-    observations: list[_CalendarReadObservation],
-) -> str:
-    """Render read-only Calendar facts from connector rows, never model prose."""
-
-    sections: list[str] = []
-    for observation in observations:
-        typed_input = observation.typed_input
-        output = observation.output
-        operation = getattr(typed_input, "operation", None)
-        items = getattr(output, "items", ())
-        rows = []
-        for item in items if isinstance(items, tuple | list) else ():
-            if not isinstance(item, str):
-                continue
-            try:
-                row = json.loads(item)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, Mapping):
-                rows.append(row)
-
-        if operation == "calendar_list":
-            if not rows:
-                sections.append(
-                    "No calendars were returned by the bounded Calendar lookup."
-                )
-                continue
-            rendered = []
-            for row in rows:
-                summary = row.get("summary")
-                timezone = row.get("timeZone")
-                if not isinstance(summary, str) or not summary.strip():
-                    summary = "(unnamed calendar)"
-                rendered.append(
-                    f"- {summary[:160]}"
-                    + (
-                        f" (time zone: {timezone[:64]})"
-                        if isinstance(timezone, str)
-                        else ""
-                    )
-                )
-            sections.append(
-                "Calendars returned by the bounded Calendar lookup:\n"
-                + "\n".join(rendered)
-            )
-            continue
-
-        if operation in {"events_list", "events_get"}:
-            if not rows:
-                sections.append(
-                    "No Calendar events matched the requested bounded time range."
-                )
-                continue
-            rendered_events = []
-            for row in rows:
-                summary = row.get("summary")
-                if not isinstance(summary, str) or not summary.strip():
-                    summary = "(untitled event)"
-                start = _calendar_rendered_endpoint(row.get("start"))
-                end = _calendar_rendered_endpoint(row.get("end"))
-                timing = start or "time not supplied"
-                if end:
-                    timing += f" to {end}"
-                status = row.get("status")
-                suffix = " [cancelled]" if status == "cancelled" else ""
-                rendered_events.append(f"- {summary[:160]} — {timing}{suffix}")
-            sections.append(
-                "Calendar events returned by the bounded read:\n"
-                + "\n".join(rendered_events)
-            )
-
-    return (
-        "\n\n".join(sections)
-        or "The bounded Calendar read returned no renderable records."
-    )
-
-
-def _calendar_rendered_endpoint(value: object) -> str | None:
-    if not isinstance(value, Mapping):
-        return None
-    for key in ("dateTime", "date"):
-        endpoint = value.get(key)
-        if isinstance(endpoint, str) and endpoint.strip():
-            return endpoint[:80]
-    return None
-
-
 def _model_input_with_history(request: OrchestrationRequest) -> str:
     """Attach only broker-selected local context to the stateless model input."""
 
@@ -1707,31 +1073,7 @@ def _instructions(
         "operator's Windows laptop or depends on it; a mere platform or "
         "file-format mention is not a dependency. For a Windows terminal "
         "selection, use only explicit_windows or windows_dependency. For a "
-        "terminal action, Gmail send/reply, or Calendar insert/update/patch, emit "
-        "one complete typed proposal. Calendar insert payloads contain exactly "
-        "calendar_id, complete_event, and notification, with optional event_id; "
-        "complete_event must explicitly contain a non-empty summary, attendees, "
-        "recurrence, reminders, visibility, start, and end. The reminders object "
-        "contains exactly "
-        "useDefault and overrides, and start/end each contain exactly one date or "
-        "dateTime. Represent no attendees and no recurrence as empty arrays, and "
-        "represent no reminders as useDefault false with an empty overrides array; "
-        "never omit those material choices. Calendar update payloads contain exactly "
-        "calendar_id, event_id, "
-        "snapshot, changes, and notification; patch payloads use reviewed_patch "
-        "instead of changes. Calendar changes must include the exact ETag-bound "
-        "snapshot returned by the read tool. Never emit connection_generation, "
-        "etag, schema, or other connector-owned Calendar fields. "
-        "Before a Calendar update or patch, call calendar_list, then events_list, "
-        "then events_get for the exact returned event ID; emit the proposal only "
-        "after all three grounded reads succeed in the current request. "
-        "For Calendar reads, use calendar_list with max_results up to 50 to discover "
-        "a named calendar. Treat only the returned calendar rows as grounded: never "
-        "claim an exact calendar match when it was omitted, never substitute a "
-        "different calendar ID, and never expose provider IDs in the operator reply. "
-        "For events_list, put timezone-aware ISO bounds in time_min and time_max; "
-        "use q only for event text and never put date bounds in q. The bounded "
-        "Calendar read will determine the operator-facing facts from returned rows. "
+        "terminal action or Gmail send/reply, emit one complete typed proposal. "
         "For Gmail new sends, the payload must contain exactly to, cc, bcc, "
         "subject, body, and mime_type; recipients are arrays and mime_type is "
         "text/plain or text/html. For Gmail replies, add only the frozen source "

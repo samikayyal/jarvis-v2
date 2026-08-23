@@ -53,11 +53,6 @@ from .deployment import BundleValidationError, validate_configuration
 from .egress_proxy import connect_through_proxy, serve_egress_proxy
 from .gmail_actions import GMAIL_SEND_SCOPE
 from .gmail_writes import GmailApiWriteProvider, GmailWriteConnector
-from .google_calendar import (
-    CALENDAR_WRITE_SCOPE,
-    CalendarActionDispatcher,
-    GoogleApiCalendarWriteProvider,
-)
 from .google_oauth import (
     GOOGLE_OAUTH_BASELINE_SCOPES,
     FileGoogleCredentialStore,
@@ -139,9 +134,6 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
                 "gmail_messages_get",
                 "gmail_threads_list",
                 "gmail_threads_get",
-                "calendar_list",
-                "calendar_events_list",
-                "calendar_events_get",
                 "drive_files_list",
                 "drive_files_get",
                 "drive_files_export",
@@ -206,7 +198,6 @@ SERVICE_ROLES: Mapping[str, ServiceRole] = {
 _GOOGLE_AUTHORIZATION_ACCESS_SCOPES: Mapping[str, frozenset[str]] = {
     "baseline": frozenset(),
     "gmail-send": frozenset({GMAIL_SEND_SCOPE}),
-    "calendar-write": frozenset({CALENDAR_WRITE_SCOPE}),
 }
 
 
@@ -417,15 +408,6 @@ class _RemoteGoogleReads:
     def gmail_threads_get(self, **kwargs: object) -> object:
         return self._client.call("gmail_threads_get", **kwargs)
 
-    def calendar_list(self, **kwargs: object) -> object:
-        return self._client.call("calendar_list", **kwargs)
-
-    def calendar_events_list(self, **kwargs: object) -> object:
-        return self._client.call("calendar_events_list", **kwargs)
-
-    def calendar_events_get(self, **kwargs: object) -> object:
-        return self._client.call("calendar_events_get", **kwargs)
-
     def drive_files_list(self, **kwargs: object) -> object:
         return self._client.call("drive_files_list", **kwargs)
 
@@ -506,7 +488,7 @@ def _operation_timeouts(
             operation: (
                 read
                 if operation in {"read", "current"}
-                or operation.startswith(("gmail_", "calendar_", "drive_"))
+                or operation.startswith(("gmail_", "drive_"))
                 else side_effect
             )
             for operation in role.operations
@@ -704,8 +686,6 @@ def _broker_operations(
         terminal=worker_actions,
         gmail=google_actions,
         gmail_lifecycle=google_actions,
-        calendar=google_actions,
-        calendar_lifecycle=google_actions,
         vault=vault_actions,
         vault_lifecycle=vault_actions,
     )
@@ -771,11 +751,9 @@ class _GoogleActionDispatcher:
         self,
         *,
         gmail: GmailWriteConnector,
-        calendar: CalendarActionDispatcher,
         acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
     ) -> None:
         self._gmail = gmail
-        self._calendar = calendar
         self._acceptance_failpoint = acceptance_failpoint
         self._owners: dict[str, object] = {}
         self._lock = RLock()
@@ -783,8 +761,6 @@ class _GoogleActionDispatcher:
     def _owner(self, action: FrozenActionProposal) -> object:
         if action.kind in {"gmail_send", "gmail_reply"}:
             return self._gmail
-        if action.kind in {"calendar_insert", "calendar_update", "calendar_patch"}:
-            return self._calendar
         raise ValueError("action kind is outside the Google connector")
 
     def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
@@ -795,9 +771,6 @@ class _GoogleActionDispatcher:
             target = {
                 "gmail_send": ("gmail", "gmail_send"),
                 "gmail_reply": ("gmail", "gmail_reply"),
-                "calendar_insert": ("calendar", "insert"),
-                "calendar_update": ("calendar", "update"),
-                "calendar_patch": ("calendar", "patch"),
             }.get(bound.kind)
             if target is not None and target == (
                 self._acceptance_failpoint.spec.service,
@@ -948,38 +921,16 @@ def _google_operations(
             else None
         ),
     )
-    calendar = CalendarActionDispatcher(
-        configured_identity=identity,
-        connection_state=state_store,
-        credential_store=credential_store,
-        provider=GoogleApiCalendarWriteProvider(
-            client_id=client_id, client_secret=client_secret
-        ),
-        audit=audit,
-        trace=trace,
-        clock=clock,
-        ids=ids,
-        on_invalid_grant=lambda generation: lifecycle.handle_refresh_failure(
-            "invalid_grant", connection_generation=generation
-        ),
-        acceptance_failpoint=(
-            acceptance_failpoint
-            if acceptance_failpoint is not None
-            and acceptance_failpoint.spec.service == "calendar"
-            else None
-        ),
-    )
     operations = {
         name: getattr(reads, name)
         for name in SERVICE_ROLES["google_connector"].operations
         if name in {"current", "current_connection_generation"}
-        or name.startswith(("gmail_", "calendar_", "drive_"))
+        or name.startswith(("gmail_", "drive_"))
     }
     operations.update(
         OwnedActionService(
             _GoogleActionDispatcher(
                 gmail=gmail,
-                calendar=calendar,
                 acceptance_failpoint=acceptance_failpoint,
             )  # type: ignore[arg-type]
         ).operations()
@@ -1445,7 +1396,7 @@ def _service_access(
                 operation
                 for operation in role.operations
                 if operation == "current_connection_generation"
-                or operation.startswith(("gmail_", "calendar_", "drive_"))
+                or operation.startswith(("gmail_", "drive_"))
             ),
             "jarvis-oauth-callback": ("oauth_callback",),
         }

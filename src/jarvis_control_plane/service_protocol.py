@@ -96,7 +96,6 @@ def _type_registry() -> Mapping[str, type[Any]]:
     approved_modules = (models, ports) + tuple(
         importlib.import_module(f"{__package__}.{name}")
         for name in (
-            "google_calendar",
             "google_oauth",
             "google_reads",
             "knowledge_vault",

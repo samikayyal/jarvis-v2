@@ -319,7 +319,7 @@ the state requires manual resolution before another vault write.
 _Avoid_: Transient network failure, approved automatic merge
 
 **Connected-service cache**:
-Request-scoped copies of content fetched from Gmail, Google Calendar, Google
+Request-scoped copies of content fetched from Gmail and Google
 Drive, the knowledge vault, or another connected source. Cached content is
 cleared when the request ends or Jarvis restarts. Only source identifiers and
 non-content synchronization metadata persist in ordinary state; credentials live

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -194,7 +193,7 @@ def test_google_service_composition_binds_the_actual_frozen_action() -> None:
             return candidate
 
     dispatcher = runtime._GoogleActionDispatcher(
-        gmail=Owner(), calendar=SimpleNamespace(), acceptance_failpoint=failpoint
+        gmail=Owner(), acceptance_failpoint=failpoint
     )
     bound = dispatcher.bind_proposal(action)
 
@@ -254,7 +253,7 @@ def test_google_service_composition_fails_closed_after_consumption() -> None:
             return candidate
 
     dispatcher = runtime._GoogleActionDispatcher(
-        gmail=Owner(), calendar=SimpleNamespace(), acceptance_failpoint=failpoint
+        gmail=Owner(), acceptance_failpoint=failpoint
     )
     assert dispatcher.bind_proposal(first_action).action_id == "request-first:proposal"
     with pytest.raises(ReviewedPostDispatchFailure):
@@ -309,7 +308,7 @@ def test_google_service_composition_rejects_matching_arm_without_durable_binding
             return candidate
 
     dispatcher = runtime._GoogleActionDispatcher(
-        gmail=Owner(), calendar=SimpleNamespace(), acceptance_failpoint=failpoint
+        gmail=Owner(), acceptance_failpoint=failpoint
     )
 
     with pytest.raises(ValueError, match="bind the frozen action durably"):

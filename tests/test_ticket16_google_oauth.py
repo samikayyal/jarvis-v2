@@ -34,7 +34,7 @@ NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
 READ_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
 )
 
 
@@ -215,26 +215,20 @@ def test_callback_rejects_invalid_google_response_metadata_without_consuming_sta
         trace_store._close_writer_service()
 
 
-def test_incremental_authorization_retains_existing_scopes_and_adds_one_write_scope() -> (
-    None
-):
-    gmail_send = "https://www.googleapis.com/auth/gmail.send"
+def test_calendar_scope_is_outside_the_v1_authorization_surface() -> None:
     calendar_write = "https://www.googleapis.com/auth/calendar.events"
     state = InMemoryGoogleOAuthStateStore()
     state.set_connection(
         connected=True,
-        granted_scopes=frozenset({*READ_SCOPES, "openid", gmail_send}),
+        granted_scopes=frozenset({*READ_SCOPES, "openid"}),
     )
     lifecycle, trace_store = build_lifecycle(state_store=state)
     try:
-        authorization = lifecycle.start_authorization(
-            operation_id="enable-calendar-write",
-            requested_scopes=(*READ_SCOPES, "openid", calendar_write),
-        )
-
-        assert authorization.requested_scopes == frozenset(
-            {*READ_SCOPES, "openid", gmail_send, calendar_write}
-        )
+        with pytest.raises(ValueError, match="outside the Jarvis v1 request surface"):
+            lifecycle.start_authorization(
+                operation_id="enable-calendar-write",
+                requested_scopes=(*READ_SCOPES, "openid", calendar_write),
+            )
     finally:
         trace_store._close_writer_service()
 

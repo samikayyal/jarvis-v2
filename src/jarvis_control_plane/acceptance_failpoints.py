@@ -17,13 +17,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Literal
 
-AcceptanceFailpointService = Literal["gmail", "calendar"]
+AcceptanceFailpointService = Literal["gmail"]
 
 _CONFIG_KEYS = frozenset({"enabled", "service", "operation", "action_id", "review_id"})
-_SERVICES = frozenset({"gmail", "calendar"})
+_SERVICES = frozenset({"gmail"})
 _OPERATIONS: Mapping[str, frozenset[str]] = {
     "gmail": frozenset({"gmail_send", "gmail_reply"}),
-    "calendar": frozenset({"insert", "update", "patch"}),
 }
 _MARKER_VERSION = "1"
 _MAX_MARKER_BYTES = 4096

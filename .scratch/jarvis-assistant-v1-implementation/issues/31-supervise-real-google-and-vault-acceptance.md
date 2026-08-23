@@ -1,6 +1,6 @@
 # 31 — Supervise real Google and knowledge-vault acceptance
 
-**What to build:** Under direct human supervision and exact production approvals, demonstrate the bounded real Google and knowledge-vault behaviors without treating mocks as production proof.
+**What to build:** Under direct human supervision and exact production approvals, demonstrate the bounded real Gmail, Drive, and knowledge-vault behaviors without treating mocks as production proof. Calendar is excluded from Jarvis v1.
 
 **Blocked by:** 30 — Supervise initial activation and OpenWA handoff acceptance.
 
@@ -40,8 +40,8 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - The previously local-only labeled commit is no longer present; no private remote mutation, duplicate commit, or note change remains. The connector process was not restarted or bypassed, so its in-memory manual-recovery latch still requires the documented administrative recovery before another vault write instruction.
 - The vault exact-write row remains blocked and the ticket remains `ready-for-human`.
 
-- [ ] Real bounded Gmail, Calendar, and Drive reads succeed with the configured identity and fixed scopes, including supervised failure and reconnection cases.
-- [ ] One reversibly labeled Gmail send or reply and one reversibly labeled Calendar mutation execute only through exact approval, with altered/replayed/unknown-outcome behavior checked safely.
+- [ ] Real bounded Gmail and Drive reads succeed with the configured identity and fixed scopes, including supervised failure and reconnection cases.
+- [ ] One reversibly labeled Gmail send or reply executes only through exact approval, with altered/replayed/unknown-outcome behavior checked safely.
 - [ ] A real deterministic vault read and one exact approved Markdown commit and normal push succeed; excluded and destructive capabilities are tested only through rejection.
 
 ## Sanitized supervised evidence update — configured vault timeout repair and release — 2026-08-16
@@ -63,4 +63,11 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - The two Calendar proposal requests that preceded this deployment failed deterministically at the model boundary and produced no proposal, approval, dispatch, or external event. No post-cutover browser acceptance message was sent, so the repaired Calendar behavior has not yet been proven in the live worksheet.
 - The one final full-suite run was started after the repair but was interrupted before a result was captured. It is not reported as passing.
 - The ticket remains `ready-for-human`. It is not complete because the post-cutover Gmail/Calendar acceptance rows, exact Markdown vault commit/push, excluded-capability refusals, and worksheet reconciliation are still outstanding; Gmail and Calendar unknown-outcome rows remain blocked without a separately reviewed post-dispatch interruption method.
+
+## Scope decision — Calendar removed from v1 — 2026-08-23
+
+- The operator removed Calendar completely from the Jarvis v1 product and acceptance scope and deferred any Calendar capability to a separately triaged later version.
+- Historical Calendar evidence above is retained as an append-only record; it no longer represents a v1 requirement or an exposed v1 capability.
+- The replacement v1 contract requests no Calendar OAuth scope, registers no Calendar read tool or proposal kind, advertises no Calendar protocol operation, configures no Calendar allowlist, and routes no Calendar action. A Calendar request must be refused without proposal or dispatch.
+- Ticket 31 completion now depends only on the in-scope Gmail, Drive, vault, exclusion, and final-reconciliation gates in the replacement runbook.
 

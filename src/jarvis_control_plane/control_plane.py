@@ -1125,9 +1125,6 @@ class DeterministicCapabilityBroker:
         return {
             "gmail_send": "Gmail",
             "gmail_reply": "Gmail",
-            "calendar_insert": "Calendar",
-            "calendar_update": "Calendar",
-            "calendar_patch": "Calendar",
             "knowledge_vault_write": "knowledge vault",
         }.get(action_kind)
 
