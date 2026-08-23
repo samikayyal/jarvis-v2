@@ -14,7 +14,7 @@ def test_runbook_requires_real_supervision_and_separate_exact_approvals() -> Non
     assert "operator and a second reviewer" in runbook
     assert "Agreement to run this worksheet is not approval" in runbook
     assert "Reply exactly `yes`" in runbook
-    assert "leave this gate blocked" in runbook
+    assert "status stays `ready-for-human`" in runbook
 
 
 def test_runbook_covers_every_in_scope_ticket31_gate() -> None:
@@ -27,15 +27,13 @@ def test_runbook_covers_every_in_scope_ticket31_gate() -> None:
         "altered Gmail approval",
         "exact operator-owned labeled Gmail",
         "Replaying the old exact approval",
-        "Gmail-only application-level post-dispatch failpoint",
         "Deterministic synchronized vault read",
         "exact Markdown append",
-        "Calendar requests",
-        "No active request",
+        "A Calendar request is refused",
+        "no active request",
     )
     assert all(item in runbook for item in required)
     assert "one normal commit and push" in runbook
-    assert "provider first" in runbook
     assert "Git heads alone are not an acknowledgement" in runbook
 
 
@@ -45,25 +43,29 @@ def test_calendar_is_an_explicit_v1_refusal_not_an_acceptance_capability() -> No
     assert "protocol exposes no Calendar operation" in runbook
     assert "orchestration has no Calendar tool or proposal kind" in runbook
     assert "broker has no Calendar dispatcher route" in runbook
+    assert (
+        "No configuration allowlist or acceptance failpoint can target Calendar"
+        in runbook
+    )
     assert "A Calendar scope is a v1 hard stop" in runbook
-    assert "Calendar refusal must be tested with Luna at medium or high" in runbook
+    assert "`/model gpt-5.6-luna`" in runbook
+    assert "`/reasoning high`" in runbook
+    assert (
+        "without a tool call, proposal, pending action, or provider dispatch" in runbook
+    )
     assert "--access calendar-write" not in runbook
     assert 'service = "calendar"' not in runbook
     assert "Calendar exact approval" not in runbook
 
 
-def test_unknown_outcome_is_gmail_only_and_durably_retired() -> None:
-    normalized = " ".join(_runbook().split())
-    for field in ("enabled", "service", "operation", "action_id", "review_id"):
-        assert field in normalized
-    assert 'service = "gmail"' in normalized
-    assert 'operation = "gmail_send"' in normalized
-    assert 'action_id = ""' in normalized
-    assert "Never guess, copy, precompute" in normalized
-    assert "durable binding marker" in normalized
-    assert "Never retry" in normalized
-    assert "consumed marker remains inert" in normalized
-    assert "target is retired" in normalized
+def test_ticket31_does_not_require_manufactured_unknown_outcomes() -> None:
+    runbook = _runbook()
+    assert "post-dispatch failpoint" not in runbook
+    assert "acceptance_failpoint" not in runbook
+    assert 'service = "gmail"' not in runbook
+    assert "Require one durable `unknown`" not in runbook
+    assert "failure injection" in runbook
+    assert "If the push result is ambiguous, stop for manual recovery" in runbook
 
 
 def test_runbook_keeps_privileged_and_provider_boundaries_human_owned() -> None:

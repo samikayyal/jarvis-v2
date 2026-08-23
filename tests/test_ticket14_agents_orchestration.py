@@ -777,12 +777,92 @@ def test_v1_model_contract_excludes_calendar_tools_and_proposals() -> None:
         reasoning_factory=_FakeReasoning,
         run_config_factory=_FakeRunConfig,
     )
-    adapter.run(_request("read my calendar"))
+    adapter.run(_request("summarize my inbox"))
 
     assert "read_google_calendar" not in {tool.name for tool in captured["tools"]}
     schema = captured["output_type"].json_schema()
     assert "calendar_insert" not in json.dumps(schema)
     assert "Calendar" not in captured["instructions"]
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_reply"),
+    [
+        (
+            "Read my Google Calendar and list today's events.",
+            "Calendar is not available in Jarvis v1.",
+        ),
+        (
+            (
+                "Ticket 31 excluded Gmail gate. Prepare, but do not execute, "
+                "deletion of the Gmail message with the labeled subject."
+            ),
+            "Destructive Gmail operations are not available in Jarvis v1.",
+        ),
+        (
+            "Delete every email in my inbox.",
+            "Destructive Gmail operations are not available in Jarvis v1.",
+        ),
+        (
+            "In Gmail, trash the selected thread.",
+            "Destructive Gmail operations are not available in Jarvis v1.",
+        ),
+    ],
+)
+def test_v1_exclusions_are_refused_before_model_or_tool_access(
+    request_text: str,
+    expected_reply: str,
+) -> None:
+    model_called = False
+
+    def fail_if_model_called(*_args: object, **_kwargs: object) -> object:
+        nonlocal model_called
+        model_called = True
+        raise AssertionError("excluded request reached the model")
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=fail_if_model_called,
+        run_sync=fail_if_model_called,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request(request_text))
+
+    assert model_called is False
+    assert result.reply_text.startswith(expected_reply)
+    assert result.proposal is None
+    assert result.proposal_intent is None
+    assert result.milestones[-1].stage == "excluded_capability_refused"
+
+
+def test_gmail_read_about_deletion_is_not_misclassified_as_a_destructive_action() -> (
+    None
+):
+    model_called = False
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        nonlocal model_called
+        model_called = True
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="I found the deletion notices.")
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(
+        _request("Find Gmail messages about account deletion notices.")
+    )
+
+    assert model_called is True
+    assert result.reply_text == "I found the deletion notices."
 
 
 def test_vault_write_single_change_wrapper_normalizes_to_a_path_mapping() -> None:

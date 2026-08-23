@@ -8,6 +8,7 @@ that the deterministic capability broker still validates, audits, and approves.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -75,6 +76,44 @@ _VAULT_READ_FAILURE_REASONS = {
     "recovery_required": "the knowledge vault requires explicit recovery",
     "ambiguous_selector": "the vault selector did not identify one note",
 }
+
+_CALENDAR_REQUEST = re.compile(r"\b(?:google\s+)?calendar\b", re.IGNORECASE)
+_GMAIL_DESTRUCTIVE_ACTION = (
+    r"(?:delete|deleting|remove|removing|trash|trashing|purge|purging|"
+    r"erase|erasing|destroy|destroying)"
+)
+_GMAIL_SERVICE = r"(?:gmail|e-?mail|mailbox|inbox)"
+_GMAIL_DESTRUCTIVE_REQUESTS = (
+    re.compile(
+        rf"\b{_GMAIL_DESTRUCTIVE_ACTION}\b.{{0,120}}\b{_GMAIL_SERVICE}\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        rf"\b{_GMAIL_SERVICE}\b.{{0,120}}\b{_GMAIL_DESTRUCTIVE_ACTION}\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        rf"\b(?:deletion|removal|erasure|destruction)\s+of\b"
+        rf".{{0,120}}\b{_GMAIL_SERVICE}\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+)
+
+
+def _excluded_capability_refusal(text: str) -> str | None:
+    """Refuse closed v1 exclusions before a model can invoke any read tool."""
+
+    if _CALENDAR_REQUEST.search(text):
+        return (
+            "Calendar is not available in Jarvis v1. "
+            "No tool, proposal, pending action, or provider dispatch was created."
+        )
+    if any(pattern.search(text) for pattern in _GMAIL_DESTRUCTIVE_REQUESTS):
+        return (
+            "Destructive Gmail operations are not available in Jarvis v1. "
+            "No Gmail read, proposal, pending action, or provider dispatch was created."
+        )
+    return None
 
 
 def _safe_unavailable_read_reason(exc: Exception) -> str | None:
@@ -467,6 +506,21 @@ class AgentsSdkOrchestrationAdapter:
                 message="Started bounded orchestration.",
             )
         ]
+        excluded_refusal = _excluded_capability_refusal(request.text)
+        if excluded_refusal is not None:
+            milestones.append(
+                OrchestrationMilestone(
+                    stage="excluded_capability_refused",
+                    message="Refused a capability excluded from Jarvis v1.",
+                )
+            )
+            return OrchestrationResult(
+                request_id=request.state.request_id,
+                outcome="completed",
+                reply_text=excluded_refusal,
+                adapter="agents_sdk_responses",
+                milestones=tuple(milestones),
+            )
         budget = _ToolInvocationBudget(self._max_tool_invocations)
         stale_vault_read: tuple[datetime, str] | None = None
         unavailable_reads: list[tuple[str, str]] = []

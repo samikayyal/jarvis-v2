@@ -1,10 +1,10 @@
 # Gmail, Drive, and knowledge-vault supervised acceptance
 
-This worksheet is for Jarvis v1 after activation. Calendar is not a v1 capability: the baseline grant requests no Calendar scope, the protocol exposes no Calendar operation, orchestration has no Calendar tool or proposal kind, and the broker has no Calendar dispatcher route.
+This worksheet is for Jarvis v1 after activation. Calendar is not a v1 capability: the baseline grant requests no Calendar scope, the protocol exposes no Calendar operation, orchestration has no Calendar tool or proposal kind, and the broker has no Calendar dispatcher route. No configuration allowlist or acceptance failpoint can target Calendar.
 
 Controlled providers and unit tests are not production proof. Run this worksheet only with the authorized operator and a second reviewer. Agreement to run this worksheet is not approval for any mutation. The operator separately approves each Gmail or vault action only after comparing the complete frozen proposal.
 
-This worksheet does not authorize activation, deployment, active-configuration edits, service reloads, transport or container interruption, firewall or proxy changes, retries of unknown outcomes, or direct-provider mutation. Those actions require separate authority. Never expose OAuth URLs, credentials, tokens, account content, signing material, provider identifiers, or private remote URLs in the evidence note.
+This worksheet does not authorize activation, deployment, active-configuration edits, service reloads, failure injection, transport or container interruption, firewall or proxy changes, retries after an ambiguous side effect, or direct-provider mutation. Those actions require separate authority. Never expose OAuth URLs, credentials, tokens, account content, signing material, provider identifiers, or private remote URLs in the evidence note.
 
 ## Gate contract
 
@@ -17,38 +17,10 @@ This worksheet does not authorize activation, deployment, active-configuration e
 | 05 | An altered Gmail approval phrase is rejected before provider dispatch. | Any proposal change, dispatch, or matching sent message stops the row. |
 | 06 | One exact operator-owned labeled Gmail send or reply matches the complete frozen proposal and has one terminal acknowledgement. | Do not approve until To, Cc, Bcc, subject, body, MIME type, attachments, source/thread binding when replying, generation, action reference, and digest all match. |
 | 07 | Replaying the old exact approval creates no second send and leaves no pending action. | Never create a replacement message solely to exercise replay. |
-| 08 | A separately reviewed Gmail-only application-level post-dispatch failpoint produces one durable unknown outcome, no retry, provider-first reconciliation, durable-state reconciliation, restart survival, and protected retirement. | If exact binding, durable consumption, provider reconciliation, restart survival, or retirement is unavailable, leave this gate blocked. Never improvise interruption. |
-| 09 | Deterministic synchronized vault read returns bounded complete Markdown content. | Dirty, stale, ambiguous, excluded, non-Markdown, or incomplete reads are not proof. |
-| 10 | One exact Markdown append preserves all prior bytes, produces one normal commit and push, matching clean heads, and one terminal Jarvis acknowledgement. | Git heads alone are not an acknowledgement. Do not run manual push, force, reset, rebase, or conflict repair. |
-| 11 | Calendar requests, destructive Gmail requests, Drive mutations, vault delete/rename/non-Markdown/hidden/config/nested-repository/outside-root/history-rewrite requests are refused without proposal or dispatch. | Any exposed excluded operation stops the run. |
-| 12 | No active request, pending action, executable outbox entry, unresolved unknown, dirty vault clone, unretired failpoint, duplicate side effect, health regression, or Calendar surface remains. | Any unresolved input keeps Ticket 31 out of `complete`. |
-
-## Reviewed Gmail failpoint
-
-Normal production configuration has no `acceptance_failpoint` section. Only a separately authorized administrator may activate the reviewed Gmail-only target while Jarvis is idle:
-
-```toml
-[acceptance_failpoint]
-enabled = true
-service = "gmail"
-operation = "gmail_send"
-action_id = ""
-review_id = "ticket31-gmail-unknown"
-```
-
-The five fields are exact. The empty action ID is bound durably by the Google connector to the first matching frozen request-scoped Gmail action. Never guess, copy, precompute, or supply an action ID through chat.
-
-Use this order:
-
-1. Activate the reviewed configuration before preparing a proposal; a later reload invalidates the row.
-2. Prepare one operator-owned labeled Gmail message through Jarvis.
-3. Compare the displayed action, digest, generation, and complete message with the protected durable binding marker.
-4. Reply exactly `yes` only when both views match.
-5. Require one durable `unknown` result after the provider returned and before terminal acknowledgement. Never retry.
-6. Reconcile the provider first, recording zero or one matching labeled message.
-7. Reconcile Jarvis durable state second: terminal unknown action, no pending action, and no executable retry.
-8. Restart the owning connector and prove the consumed marker remains inert.
-9. Restore the normal configuration with the section absent, restart, and prove the target is retired.
+| 08 | Deterministic synchronized vault read returns bounded complete Markdown content. | Dirty, stale, ambiguous, excluded, non-Markdown, or incomplete reads are not proof. |
+| 09 | One exact Markdown append preserves all prior bytes, produces one normal commit and push, matching clean heads, and one terminal Jarvis acknowledgement. | Git heads alone are not an acknowledgement. Do not run manual push, force, reset, rebase, or conflict repair. |
+| 10 | A Calendar request is refused without a tool call, proposal, pending action, or provider dispatch. Destructive Gmail requests, Drive mutations, and vault delete/rename/non-Markdown/hidden/config/nested-repository/outside-root/history-rewrite requests are likewise refused without proposal or dispatch. | Any Calendar surface or exposed excluded operation stops the run. |
+| 11 | Health remains good and there is no active request, pending action, executable outbox entry, unresolved dispatch attempt, dirty vault clone, duplicate Gmail or vault side effect, or Calendar surface. OAuth grants still contain no Calendar scope. | Any unresolved input keeps Ticket 31 out of `complete`. |
 
 ## Preflight
 
@@ -97,10 +69,10 @@ Verify the dedicated clone as its service UID without displaying remote URL, not
 
 For the write, choose one ordinary Markdown note in an allowed directory. The proposal must preserve the synchronized base byte-for-byte and append one unique non-sensitive marker line. Require one path, zero removed lines, one added line, the fixed `jarvis:` subject, configured author shape, and normal push. Reply exactly `yes` once. Require Jarvis's terminal acknowledgement, one new matching commit, equal clean heads, and exactly one marker.
 
-Do not run a manual `git push`, destructive worktree reset, history rewrite, conflict resolution, or direct file edit. An outcome-unknown push enters manual recovery and is never retried by this worksheet.
+Do not run a manual `git push`, destructive worktree reset, history rewrite, conflict resolution, or direct file edit. If the push result is ambiguous, stop for manual recovery; this worksheet never retries it.
 
 ## Exclusions and final reconciliation
 
-Send prepare-only requests that attempt Calendar access, destructive Gmail operations, Drive writes, and excluded vault operations. Each must produce no proposal and no connector dispatch. Calendar refusal must be tested with Luna at medium or high reasoning.
+First set `/model gpt-5.6-luna` and `/reasoning high`. Send one Calendar request and require refusal without a tool call, proposal, pending action, or provider dispatch. Then send prepare-only requests that attempt destructive Gmail operations, Drive writes, and excluded vault operations; each must produce no proposal and no connector dispatch.
 
-Finish with `/status`, protected durable-state inspection, provider counts, vault clean/equal heads, failpoint absence, service health, restart counts, audit writability, and backup freshness. Ticket 31 may be marked `complete` only when every in-scope gate above passes and no stop condition remains.
+Finish with `/status`, protected durable-state inspection, provider counts, vault clean/equal heads, OAuth-scope inspection, service health, restart counts, audit writability, and backup freshness. Reconcile active requests, pending actions, outbox and dispatch records, vault cleanliness, and duplicate Gmail or vault side effects. Ticket 31 may be marked `complete` only when every in-scope gate above passes and no stop condition remains; otherwise its status stays `ready-for-human`.

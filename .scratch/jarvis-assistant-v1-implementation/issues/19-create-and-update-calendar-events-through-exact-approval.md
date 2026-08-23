@@ -1,8 +1,8 @@
 # 19 — Create and update Calendar events through exact approval
 
-**What to build:** Calendar insert, update, and reviewed-patch proposals freeze the complete resulting event and dispatch it once only after exact approval.
+**Historical scope:** Calendar insert, update, and reviewed-patch proposals once froze the complete resulting event and dispatched it only after exact approval. This is not Jarvis v1 work.
 
-**Blocked by:** 08 — Present oversized proposals through the universal envelope; 17 — Read bounded Gmail, Calendar, and Drive content.
+**Historical dependencies:** 08 — Present oversized proposals through the universal envelope; the former Calendar-inclusive version of 17 — Read bounded Google content.
 
 **Status:** wontfix
 

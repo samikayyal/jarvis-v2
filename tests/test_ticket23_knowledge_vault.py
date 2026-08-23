@@ -419,11 +419,9 @@ def test_vault_tool_enforces_one_deadline_when_process_runner_is_slow(
     tmp_path: Path,
 ) -> None:
     _vault(tmp_path)
-    observed_timeouts: list[float] = []
     invocation_durations: list[float] = []
 
-    def slow_process(*_args: object, **kwargs: object) -> SimpleNamespace:
-        observed_timeouts.append(float(kwargs["timeout"]))
+    def slow_process(*_args: object, **_kwargs: object) -> SimpleNamespace:
         time.sleep(0.15)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -473,6 +471,27 @@ def test_vault_tool_enforces_one_deadline_when_process_runner_is_slow(
     assert "knowledge vault" in result.reply_text
     assert "service timed out" in result.reply_text
     assert invocation_durations[0] < 0.12
+
+
+def test_vault_deadline_is_passed_to_the_process_runner(tmp_path: Path) -> None:
+    observed_timeouts: list[float] = []
+
+    def timed_out_process(*args: object, **kwargs: object) -> SimpleNamespace:
+        observed_timeouts.append(float(kwargs["timeout"]))
+        raise TimeoutExpired(args[0], kwargs["timeout"])
+
+    synchronizer = SubprocessVaultSynchronizer(
+        git_executable=PurePosixPath("/usr/bin/git"),
+        ssh_executable=PurePosixPath("/usr/bin/ssh"),
+        ssh_config_path=PurePosixPath("/etc/jarvis/vault-ssh-config"),
+        known_hosts_path=PurePosixPath("/etc/jarvis/vault-known-hosts"),
+        synchronization_state=InMemoryDurableStateStore(),
+        run_process=timed_out_process,
+    )
+
+    with pytest.raises(VaultRepositoryConflict, match="timed out"):
+        synchronizer.is_clean(tmp_path, deadline=time.monotonic() + 0.05)
+
     assert observed_timeouts and observed_timeouts[0] <= 0.05
 
 
