@@ -1471,11 +1471,20 @@ def _ground_calendar_change_payload(
         iter(unique_rows.items())
     )
     grounded = dict(payload)
-    grounded.setdefault("event_id", observed_event_id)
-    grounded.setdefault(
-        "snapshot",
-        {"event": dict(observed_event), "etag": observed_etag},
-    )
+    proposed_event_id = grounded.get("event_id")
+    if not isinstance(proposed_event_id, str) or not proposed_event_id:
+        grounded["event_id"] = observed_event_id
+    snapshot = grounded.get("snapshot")
+    if (
+        not isinstance(snapshot, Mapping)
+        or not isinstance(snapshot.get("event"), Mapping)
+        or not isinstance(snapshot.get("etag"), str)
+        or not snapshot.get("etag")
+    ):
+        grounded["snapshot"] = {
+            "event": dict(observed_event),
+            "etag": observed_etag,
+        }
     return grounded
 
 

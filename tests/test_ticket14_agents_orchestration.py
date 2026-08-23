@@ -1459,6 +1459,8 @@ def test_calendar_change_uses_provider_owned_identity_from_exact_events_get() ->
             preview="Change the event.",
             payload={
                 "calendar_id": "secondary-calendar",
+                "event_id": None,
+                "snapshot": {},
                 "changes": {"summary": "Changed review"},
                 "notification": "none",
             },
