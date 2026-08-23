@@ -1642,6 +1642,16 @@ def test_calendar_model_contract_describes_the_closed_insert_shape() -> None:
     assert "Never emit connection_generation, etag, schema" in instructions
 
 
+def test_calendar_model_contract_requires_grounded_update_read_sequence() -> None:
+    instructions = _instructions(has_vault_read=False, has_vault_write=False)
+
+    assert (
+        "Before a Calendar update or patch, call calendar_list, then events_list, "
+        "then events_get"
+        in instructions
+    )
+
+
 def test_vault_write_single_change_wrapper_normalizes_to_a_path_mapping() -> None:
     current_content = "# Synthetic note\n\nExisting content.\n"
     adapter = AgentsSdkOrchestrationAdapter(
