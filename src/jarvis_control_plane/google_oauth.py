@@ -43,17 +43,9 @@ GOOGLE_OAUTH_BASELINE_SCOPES = frozenset(
         "https://www.googleapis.com/auth/drive.readonly",
     }
 )
-_LEGACY_CALENDAR_SCOPES = frozenset(
-    {
-        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
-        "https://www.googleapis.com/auth/calendar.events.readonly",
-        "https://www.googleapis.com/auth/calendar.events",
-    }
-)
-_GOOGLE_OAUTH_REQUESTABLE_SCOPES = GOOGLE_OAUTH_BASELINE_SCOPES | frozenset(
+GOOGLE_OAUTH_SCOPES = GOOGLE_OAUTH_BASELINE_SCOPES | frozenset(
     {"https://www.googleapis.com/auth/gmail.send"}
 )
-GOOGLE_OAUTH_SCOPES = _GOOGLE_OAUTH_REQUESTABLE_SCOPES | _LEGACY_CALENDAR_SCOPES
 _CALLBACK_FIELDS = frozenset(
     {
         "state",
@@ -1001,14 +993,13 @@ class GoogleOAuthLifecycle:
     ) -> OAuthAuthorization:
         operation_id = _canonical_string(operation_id, "operation_id")
         scopes = _canonical_scopes(requested_scopes)
-        if not scopes <= _GOOGLE_OAUTH_REQUESTABLE_SCOPES:
+        if not scopes <= GOOGLE_OAUTH_SCOPES:
             raise ValueError("OAuth scope is outside the Jarvis v1 request surface")
         connection = self.connection
         if connection.connected:
             # An action-specific consent adds one capability without silently
-            # dropping an in-scope grant. Legacy Calendar grants are intentionally
-            # omitted so the next authorization narrows the live credential.
-            retained = connection.granted_scopes & _GOOGLE_OAUTH_REQUESTABLE_SCOPES
+            # dropping another in-scope grant from the reviewed connection.
+            retained = connection.granted_scopes & GOOGLE_OAUTH_SCOPES
             scopes = _canonical_scopes(scopes | retained)
         self._append_audit(
             kind="google_oauth_authorization_started",

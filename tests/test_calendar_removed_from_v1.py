@@ -11,6 +11,7 @@ from jarvis_control_plane.acceptance_failpoints import (
     ReviewedPostDispatchFailpointSpec,
 )
 from jarvis_control_plane.action_dispatch import RoutedActionDispatcher
+from jarvis_control_plane.google_oauth import GOOGLE_OAUTH_SCOPES
 from jarvis_control_plane.models import FrozenActionProposal
 from jarvis_control_plane.orchestration import AgentsSdkProposal
 from jarvis_control_plane.ports import ActionDispatcherError
@@ -33,6 +34,7 @@ def test_v1_package_and_protocol_do_not_expose_calendar() -> None:
 
 
 def test_v1_authorization_and_configuration_do_not_offer_calendar() -> None:
+    assert not any("/auth/calendar" in scope for scope in GOOGLE_OAUTH_SCOPES)
     assert set(_GOOGLE_AUTHORIZATION_ACCESS_SCOPES) == {"baseline", "gmail-send"}
     assert not any(
         "/auth/calendar" in scope

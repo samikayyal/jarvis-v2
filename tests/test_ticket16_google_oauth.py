@@ -224,7 +224,9 @@ def test_calendar_scope_is_outside_the_v1_authorization_surface() -> None:
     )
     lifecycle, trace_store = build_lifecycle(state_store=state)
     try:
-        with pytest.raises(ValueError, match="outside the Jarvis v1 request surface"):
+        with pytest.raises(
+            ValueError, match="outside the exact Google connector allowlist"
+        ):
             lifecycle.start_authorization(
                 operation_id="enable-calendar-write",
                 requested_scopes=(*READ_SCOPES, "openid", calendar_write),
