@@ -1351,6 +1351,88 @@ def test_calendar_change_freezes_only_an_observed_event_and_etag(
     assert frozen_payload["etag"] == '"etag-ticket31"'
 
 
+def test_calendar_change_retries_once_when_first_draft_skips_grounding_reads() -> None:
+    observed_event = {
+        "id": "event-ticket31",
+        "etag": '"etag-ticket31"',
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    connector = _calendar_connector(
+        result=GoogleReadProviderResult(
+            items=(
+                json.dumps(observed_event),
+                json.dumps({"id": "secondary-calendar", "primary": False}),
+            )
+        )
+    )
+    proposal = AgentsSdkProposal(
+        kind="calendar_update",
+        preview="Change the event.",
+        payload={
+            "calendar_id": "secondary-calendar",
+            "event_id": "event-ticket31",
+            "snapshot": {
+                "event": observed_event,
+                "etag": '"etag-ticket31"',
+            },
+            "changes": {"summary": "Changed review"},
+            "notification": "none",
+        },
+    )
+    calls = 0
+
+    def run_sync(agent: object, _text: str, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            calendar_tool = next(
+                tool for tool in agent.tools if tool.name == "read_google_calendar"
+            )
+            for read_input in (
+                {"operation": "calendar_list", "max_results": 50},
+                {
+                    "operation": "events_list",
+                    "calendar_id": "secondary-calendar",
+                    "time_min": "2026-08-10T09:55:00Z",
+                    "time_max": "2026-08-10T11:05:00Z",
+                },
+                {
+                    "operation": "events_get",
+                    "calendar_id": "secondary-calendar",
+                    "event_id": "event-ticket31",
+                },
+            ):
+                asyncio.run(
+                    calendar_tool.on_invoke_tool(None, json.dumps(read_input))
+                )
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the Calendar event.",
+                proposal=proposal,
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+        google_read_connector=connector,
+    )
+
+    frozen = adapter.run(_request("change the design review")).proposal
+
+    assert calls == 2
+    assert frozen is not None
+
+
 @pytest.mark.parametrize("notification_field", ("sendUpdates", "send_updates"))
 def test_calendar_insert_google_notification_name_is_normalized(
     notification_field: str,

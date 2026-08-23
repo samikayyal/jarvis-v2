@@ -620,6 +620,47 @@ class AgentsSdkOrchestrationAdapter:
             raise OrchestrationAdapterError(
                 "Agents SDK returned malformed structured output"
             )
+        if (
+            plan.proposal is not None
+            and plan.proposal.kind in {"calendar_update", "calendar_patch"}
+            and not any(
+                getattr(observation.typed_input, "operation", None) == "events_get"
+                for observation in calendar_observations
+            )
+        ):
+            run_result = self._run_model_turn(
+                request=request,
+                agent=agent,
+                model_input=(
+                    f"{model_input}\n\n"
+                    "Your prior Calendar change draft was not grounded and was "
+                    "discarded. Before returning another update or patch proposal, "
+                    "call calendar_list, then events_list, then events_get for the "
+                    "exact returned event ID. Use that events_get ETag-bound snapshot "
+                    "in the proposal. Do not return a proposal if any read fails."
+                ),
+                run_config=run_config,
+            )
+            if unavailable_reads:
+                tool_name, reason = unavailable_reads[0]
+                return OrchestrationResult(
+                    request_id=request.state.request_id,
+                    outcome="unavailable",
+                    reply_text=_unavailable_read_reply(tool_name, reason),
+                    adapter="agents_sdk_responses",
+                    milestones=tuple(milestones),
+                )
+            raw_plan = getattr(run_result, "final_output", None)
+            if isinstance(raw_plan, _AgentsSdkStructuredPlan):
+                plan = AgentsSdkPlan.model_validate(
+                    raw_plan.model_dump(mode="python", exclude_none=True)
+                )
+            elif isinstance(raw_plan, AgentsSdkPlan):
+                plan = raw_plan
+            else:
+                raise OrchestrationAdapterError(
+                    "Agents SDK returned malformed structured output"
+                )
         selected_host = _validate_host_selection(plan)
 
         proposal = self._frozen_proposal(
