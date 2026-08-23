@@ -208,6 +208,7 @@ class _CalendarReminders(BaseModel):
 class _CalendarInsertEvent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    summary: str = Field(min_length=1)
     attendees: list[dict[str, object]]
     recurrence: list[str]
     reminders: _CalendarReminders
@@ -1615,8 +1616,9 @@ def _instructions(
         "terminal action, Gmail send/reply, or Calendar insert/update/patch, emit "
         "one complete typed proposal. Calendar insert payloads contain exactly "
         "calendar_id, complete_event, and notification, with optional event_id; "
-        "complete_event must explicitly contain attendees, recurrence, reminders, "
-        "visibility, start, and end. The reminders object contains exactly "
+        "complete_event must explicitly contain a non-empty summary, attendees, "
+        "recurrence, reminders, visibility, start, and end. The reminders object "
+        "contains exactly "
         "useDefault and overrides, and start/end each contain exactly one date or "
         "dateTime. Represent no attendees and no recurrence as empty arrays, and "
         "represent no reminders as useDefault false with an empty overrides array; "
