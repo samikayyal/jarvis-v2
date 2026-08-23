@@ -1093,6 +1093,11 @@ class AgentsSdkOrchestrationAdapter:
                     calendar_observations,
                     google_read_connector,
                 )
+                payload = _ground_calendar_change_payload(
+                    payload=payload,
+                    calendar_id=calendar_id,
+                    observations=calendar_observations,
+                )
                 _require_reviewed_calendar_event(
                     payload=payload,
                     calendar_id=calendar_id,
@@ -1433,6 +1438,45 @@ def _require_reviewed_calendar_event(
     raise OrchestrationAdapterError(
         "Calendar change snapshot was not returned by the bounded event read"
     )
+
+
+def _ground_calendar_change_payload(
+    *,
+    payload: Mapping[str, object],
+    calendar_id: str,
+    observations: list[_CalendarReadObservation],
+) -> dict[str, object]:
+    """Supply provider-owned event identity from one exact events_get result."""
+
+    grounded_rows: list[Mapping[str, object]] = []
+    for observation in observations:
+        if getattr(observation.typed_input, "operation", None) != "events_get":
+            continue
+        if getattr(observation.typed_input, "calendar_id", None) != calendar_id:
+            continue
+        grounded_rows.extend(_calendar_observation_rows(observation))
+
+    unique_rows = {
+        (row.get("id"), row.get("etag")): row
+        for row in grounded_rows
+        if isinstance(row.get("id"), str)
+        and bool(row.get("id"))
+        and isinstance(row.get("etag"), str)
+        and bool(row.get("etag"))
+    }
+    if len(unique_rows) != 1:
+        return dict(payload)
+
+    (observed_event_id, observed_etag), observed_event = next(
+        iter(unique_rows.items())
+    )
+    grounded = dict(payload)
+    grounded.setdefault("event_id", observed_event_id)
+    grounded.setdefault(
+        "snapshot",
+        {"event": dict(observed_event), "etag": observed_etag},
+    )
+    return grounded
 
 
 def _canonical_gmail_model_payload(

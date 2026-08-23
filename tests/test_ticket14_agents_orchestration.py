@@ -1433,6 +1433,55 @@ def test_calendar_change_retries_once_when_first_draft_skips_grounding_reads() -
     assert frozen is not None
 
 
+def test_calendar_change_uses_provider_owned_identity_from_exact_events_get() -> None:
+    observed_event = {
+        "id": "event-ticket31",
+        "etag": '"etag-ticket31"',
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    connector = _calendar_connector(
+        result=GoogleReadProviderResult(
+            items=(
+                json.dumps(observed_event),
+                json.dumps({"id": "secondary-calendar", "primary": False}),
+            )
+        )
+    )
+    adapter = _calendar_adapter(
+        AgentsSdkProposal(
+            kind="calendar_update",
+            preview="Change the event.",
+            payload={
+                "calendar_id": "secondary-calendar",
+                "changes": {"summary": "Changed review"},
+                "notification": "none",
+            },
+        ),
+        connector=connector,
+        read_inputs=(
+            {"operation": "calendar_list", "max_results": 50},
+            {
+                "operation": "events_get",
+                "calendar_id": "secondary-calendar",
+                "event_id": "event-ticket31",
+            },
+        ),
+    )
+
+    frozen = adapter.run(_request("change the design review")).proposal
+
+    assert frozen is not None
+    frozen_payload = json.loads(frozen.payload)
+    assert frozen_payload["event_id"] == "event-ticket31"
+    assert frozen_payload["etag"] == '"etag-ticket31"'
+
+
 @pytest.mark.parametrize("notification_field", ("sendUpdates", "send_updates"))
 def test_calendar_insert_google_notification_name_is_normalized(
     notification_field: str,
