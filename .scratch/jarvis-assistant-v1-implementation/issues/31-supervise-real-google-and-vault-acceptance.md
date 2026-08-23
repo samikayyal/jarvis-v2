@@ -4,7 +4,7 @@
 
 **Blocked by:** 30 — Supervise initial activation and OpenWA handoff acceptance.
 
-**Status:** ready-for-human
+**Status:** complete
 
 ## Sanitized supervised evidence — 2026-08-16
 
@@ -84,4 +84,16 @@ The ticket remains `ready-for-human` pending a reviewed unknown-outcome procedur
 - Drive mutation and the vault delete, rename, non-Markdown, hidden/configuration, nested-repository, outside-root, and history-rewrite requests were refused without proposal or provider dispatch. The destructive Gmail request was refused without a proposal or Gmail write, but protected Google traces record two completed Gmail read dispatches for that request before refusal. This violates Gate 10's requirement that the destructive request be refused without connector dispatch.
 - Final reconciliation otherwise passes: `/status` reports model `gpt-5.6-luna`, reasoning `high`, no active request, no pending action, and zero active command permissions. Protected durable state has no executable action, conversation outbox row, unresolved dispatch attempt, or recovery-degraded marker. The Gmail subject count remains one, the vault marker count remains one, the vault clone is clean and synchronized, OAuth remains Calendar-free, and all health checks remain good.
 - Gate 10 is failed, so Ticket 31 remains `ready-for-human`. Do not mark it `complete` unless a fresh reviewed release demonstrates that destructive Gmail requests are refused before every connector dispatch and all other in-scope gates still pass.
+
+## Sanitized supervised evidence update — final completion — 2026-08-24
+
+- The Gate 10 repair was committed as `df557b3` and pinned by release commit `f23b664`; both commits are pushed and local `main` equals `origin/main`. The deterministic exclusion boundary now refuses Calendar and destructive Gmail requests before agent construction, so neither request can invoke a read tool or reach provider dispatch. Legitimate Gmail reads about deletion-related content remain available.
+- The immutable `f23b664` release was installed and verified against the unchanged active configuration. The pending activation override differed from production in exactly the 13 image tags. All 13 images built, the pre-change backup passed, the replacement cutover completed without changing OpenWA, the 13-entry running-image map was installed, and the post-change backup passed. `/opt/jarvis/current` points to the replacement and `/opt/jarvis/previous` preserves the prior release for rollback.
+- All 13 Jarvis services and the independent OpenWA container are healthy with zero restarts. Administrative status reports application revision `df557b3792642253b44336f8333a979fd3365691`, every component ready, Ubuntu and Windows ready, messaging ready, audit writable, backup current, and resource pressure `ok`.
+- In fresh session `S-071`, `/model gpt-5.6-luna` and `/reasoning high` were explicitly set. The exact destructive Gmail request that previously failed Gate 10 was refused as `request-eb340b00485f433fb085b363f3527ace` with no Gmail read, proposal, pending action, or provider dispatch; protected Google traces contain zero rows for that request.
+- The Calendar request was refused as `request-f5f2f91ca64d421c8eb311cdbabb7e5d` with no tool, proposal, pending action, or provider dispatch; protected Google traces likewise contain zero rows. OAuth remains connected at generation 48 with exactly OpenID, Gmail read-only, and Drive read-only. Gmail send, Calendar, Drive-write, and broad Gmail scopes are absent, and the connection and credential records agree.
+- Final Gmail reconciliation on the replacement release reports exactly one message with the labeled subject (`request-b5f029b54a7a465d88de4aae16805851`). The vault remains clean on attached `main`; local and upstream heads both equal `9449fa47e3c7de826e4b7bbfc2afc21226f440be`, divergence is `0 0`, and the vault acceptance marker occurs exactly once.
+- Final `/status` reports Luna/high, no active request, no pending action, zero active command permissions, and every connected dependency ready. Protected durable state has zero executable actions, conversation outbox rows, unresolved dispatch attempts, and recovery-degraded markers.
+- Post-repair orchestration tests passed (`35 passed`). The expanded focused matrix covered 276 tests: 272 passed immediately and the four deployment checks failed only because the artifact lock still carried the prior source pin; after the required repin, the complete deployment file passed (`60 passed`). Repository-wide Ruff, format checking, and Python compilation pass. The requested single full-suite run was not repeated; its recorded result remains `790 passed, 2 skipped`, and the later narrow exclusion repair is covered by the post-repair focused matrix.
+- Gates 01–11 now pass with no failed or blocked in-scope row. Ticket 31 is `complete`.
 
