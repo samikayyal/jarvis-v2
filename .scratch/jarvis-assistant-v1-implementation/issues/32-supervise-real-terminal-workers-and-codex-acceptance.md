@@ -101,6 +101,11 @@
   reported that component unavailable. The runbook treats any post-start
   restart as a hard stop, so no WhatsApp retry or Ticket 32 acceptance action was
   attempted.
+- Read-only kernel evidence confirms the restart was a memory-cgroup OOM at the
+  candidate proxy's 32 MiB service limit; the kernel killed its UID-10012 Python
+  process. Re-running the same candidate is therefore unsafe. A new attempt
+  requires a separately reviewed resource-envelope repair, artifact repin, and
+  replacement authorization rather than an acceptance retry.
 - Rollback restored release `f23b664`, the prior active override, image map,
   `current` and `previous` pointers. Final verification reports revision
   `df557b3`, all 13 components ready and healthy with zero restarts, both workers
