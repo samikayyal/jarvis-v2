@@ -359,6 +359,8 @@
 - Post-stop administrative status still reports application revision
   `f609dc4a4140c802988d7e2b705575a898bfdc65`, both workers ready, messaging
   ready, audit writable, and resource pressure `ok`; all 13 Jarvis services
-  remain healthy with zero restarts or OOMs. Ticket 32 remains
-  `ready-for-human` at Gate 05 pending containment `/status` and a separately
-  justified repair.
+  remain healthy with zero restarts or OOMs. Final `/status` reports session
+  `S-075` on Luna with medium reasoning, no active request, no pending action,
+  zero command permissions, and Ubuntu, Windows, OpenWA, and Google ready.
+  Ticket 32 remains `ready-for-human` at Gate 05 pending a separately justified
+  repair.
