@@ -301,3 +301,40 @@
   or WhatsApp state changed during the local repair. Ticket 32 remains
   `ready-for-human` pending an authorized replacement cutover and a fresh
   supervised retry.
+
+### Authorized safe-read policy replacement cutover — 2026-08-24
+
+- The synchronized `711ba88` Git archive was installed as the immutable
+  root-owned release
+  `/opt/jarvis/releases/711ba886d2ad5e12a0a60f1d963d51730aa9ecb0`.
+  Its canonical artifact-lock SHA-256 is `295b9a989b2e`; the installed
+  application revision is `f609dc4a4140c802988d7e2b705575a898bfdc65`.
+  Locked dependency installation, candidate Compose parsing, all 13 image
+  builds, and image-internal bundle verification passed before replacement.
+- The verified pre-change backup is
+  `/var/backups/jarvis/20260824T111201.322611Z-pre-change`. All 13 candidate
+  services then became healthy within their reviewed cold-start windows with
+  zero restarts and no OOM flags. Administrative status reported both workers
+  ready, messaging ready, audit writable, backup current, and resource pressure
+  `ok`.
+- The active pointer now targets `711ba88`; `previous` targets rollback release
+  `3d07bab`. The root-owned active override SHA-256 is `c570e0d07469`, the
+  preserved pending override remains `5f3079be2bbc`, and the exact running
+  13-image map was installed root-only at SHA-256 `f424ae62637e`. The verified
+  post-cutover baseline backup is
+  `/var/backups/jarvis/20260824T112226.205176Z-nightly`.
+- Three settled resource samples passed. The proxies remained between 34.9 and
+  36.2 MiB under their 48 MiB limits; host memory, swap, and disk headroom
+  remained acceptable. The kernel OOM gate passed. Read-only filesystems,
+  dropped capabilities, no-new-privileges, non-root identities, restart policy,
+  exact published ports, reviewed network membership, and the enabled/active
+  backup timer all passed.
+- OpenWA was not recreated, modified, or re-paired. It retained container ID
+  `24fb501ab8eb`, its original start time, healthy state, zero restarts, no OOM,
+  and one named session in `ready`. The Funnel remains enabled at the exact
+  `/callback` route to `http://127.0.0.1:8080/callback`.
+- Local and Ubuntu cutover transfer artifacts were removed after final
+  reconciliation. No WhatsApp acceptance message or terminal action was sent
+  during the cutover. Ticket 32 remains `ready-for-human`; the repaired safe
+  read and each later worksheet message still require fresh action-time
+  confirmation.
