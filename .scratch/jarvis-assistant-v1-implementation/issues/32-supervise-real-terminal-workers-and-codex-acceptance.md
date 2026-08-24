@@ -424,3 +424,37 @@
   was sent during the cutover. Ticket 32 remains `ready-for-human`; the next
   action is the fresh `/status` control message, which requires action-time
   confirmation under the Browser safety boundary.
+
+### Diagnostic-release safe-read stop and offline replay repair — 2026-08-24
+
+- Fresh supervised controls opened session `S-076` idle with no pending action
+  and zero command permissions. `/permissions` and `/revoke session` proved the
+  permission boundary clean, and the session model was explicitly set to
+  `gpt-5.6-luna` with medium reasoning.
+- The single confirmed host-neutral safe read was admitted as
+  `request-824919470022453f80c3044e98a91968`. Jarvis returned
+  `orchestration-failure-6cc574316249457aa654997e1033e5a5`, stated that no
+  action was taken, and emitted no proposal or terminal result. The request was
+  not retried and all later worksheet actions remained stopped.
+- The protected model trace retained the new stable diagnostic code
+  `terminal_cwd_not_absolute`. A deterministic, no-dispatch adapter replay
+  reproduced that exact failure with the otherwise valid Ubuntu
+  `/usr/bin/uname -s` plan. The replay is now the fast pre-deployment gate for
+  this production failure pattern.
+- The broker now supplies `/tmp` only when that exact Ubuntu OS-name safe read
+  contains a relative model cwd. Existing absolute cwd values remain unchanged;
+  relative cwd values on ordinary terminal actions still fail closed with
+  `terminal_cwd_not_absolute`. No general terminal validation, permission,
+  approval, dispatch, or worker rule was relaxed.
+- The two exact replay controls pass. Focused orchestration, terminal policy,
+  service protocol, and Ticket 32 coverage passes (`76 passed`); the broader
+  terminal, permissions, recovery, Ubuntu worker, Windows worker, orchestration,
+  protocol, and acceptance matrix passes (`239 passed, 1 skipped`). Ruff,
+  formatting, compilation, diff, and the deployment verifier pass; all 60
+  deployment-bundle tests pass.
+- Source commit `141ac1f` contains the repair. Artifact-pin commit `b87e11e`
+  locks revision `141ac1f785e344d53cefe171b5df76ff1d0b2103` and source
+  SHA-256 `3d58999d8a47`. The single final full-suite run passed with
+  `813 passed, 2 skipped` in 906.07 seconds; it was not repeated. Production
+  remains on the healthy diagnostic release `b13ed77` pending a separately
+  reconciled replacement cutover and one fresh supervised safe-read attempt.
