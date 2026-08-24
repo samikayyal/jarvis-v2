@@ -80,3 +80,34 @@
   installed or activated, no active configuration or image map changed, and no
   service was recreated. Live Ticket 32 acceptance remains blocked until a
   separately authorized supervised replacement cutover and fresh safe-read gate.
+
+### Supervised replacement attempt and rollback — 2026-08-24
+
+- The authorized candidate archive matched its local and Ubuntu SHA-256, was
+  extracted as the root-owned release `3565391`, and passed the artifact,
+  active-configuration, and base Compose validators. Its locked Python
+  environment installed successfully with `uv` and all 13 candidate-specific
+  images built successfully.
+- The rendered candidate model differed from the active model in exactly the 13
+  image references and in no other field. A separate pre-existing pending
+  override was preserved untouched. The pre-change backup
+  `20260824T013225.917811Z-pre-change` remained available before activation.
+- The 13 candidate services were activated with `--no-build --pull never` and
+  initially reached healthy state. Administrative status reported revision
+  `3639024`, both workers ready, messaging ready, audit writable, and resource
+  pressure `ok`; the running image IDs were recorded and a verified baseline
+  backup was created as `20260824T014954.627073Z-nightly`.
+- The subsequent host-side gate caught one restart of `google_egress_proxy` and
+  reported that component unavailable. The runbook treats any post-start
+  restart as a hard stop, so no WhatsApp retry or Ticket 32 acceptance action was
+  attempted.
+- Rollback restored release `f23b664`, the prior active override, image map,
+  `current` and `previous` pointers. Final verification reports revision
+  `df557b3`, all 13 components ready and healthy with zero restarts, both workers
+  ready, messaging ready, audit writable, backup freshness current, resource
+  pressure `ok`, and exact running-image/map equality.
+- OpenWA retained the same container identity and start time throughout, stayed
+  healthy with zero restarts, and the callback Funnel route remained unchanged.
+  The exact local and Ubuntu transfer archives were removed; the candidate
+  release, candidate images, protected backups, and rollback evidence remain
+  available for diagnosis. Ticket 32 remains `ready-for-human`.
