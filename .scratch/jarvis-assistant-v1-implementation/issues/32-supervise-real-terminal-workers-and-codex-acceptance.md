@@ -364,3 +364,29 @@
   zero command permissions, and Ubuntu, Windows, OpenWA, and Google ready.
   Ticket 32 remains `ready-for-human` at Gate 05 pending a separately justified
   repair.
+
+### Orchestration diagnostic-preservation repair — 2026-08-24
+
+- A minimal deterministic regression reproduced the production observability
+  defect twice: a structurally valid terminal plan with a relative executable
+  reached semantic terminal validation, became the generic malformed-proposal
+  failure, and exposed no stable diagnostic code. The same code was absent
+  across a real authenticated orchestration service boundary.
+- `OrchestrationAdapterError` now carries an optional canonical diagnostic code.
+  Terminal semantic failures map only to closed, content-free categories such
+  as `terminal_executable_not_absolute`; private validation text, model output,
+  prompts, and payloads do not cross the service boundary. The remote
+  orchestration adapter retains the code for protected traces. Terminal policy,
+  approval, permissions, dispatch behavior, and user-visible failure text are
+  unchanged.
+- The source repair is committed as `d933131`; artifact-pin commit `83429f0`
+  locks revision `d933131875d61cd0aea008bb827bb08be54a2a34` and source SHA-256
+  `22d9b3f8ae2b`. The exact three regressions pass, orchestration and service
+  protocol coverage passes (`60 passed`), and the expanded trace, terminal,
+  orchestration, service-protocol, and Ticket 32 matrix passes (`91 passed`).
+  Ruff, format, compilation, diff, and deployment artifact verification pass.
+- The single final full-suite run passed with `811 passed, 2 skipped` in 804.90
+  seconds. No second full-suite run was started. No production release,
+  configuration, service, network, credential, OpenWA, terminal, or WhatsApp
+  state changed during this repair. Ticket 32 remains `ready-for-human` pending
+  an authorized replacement cutover and one fresh supervised safe-read attempt.
