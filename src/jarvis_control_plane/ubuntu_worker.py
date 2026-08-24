@@ -849,6 +849,8 @@ class SystemdUbuntuProcessScope:
             process_tree_stopped=process_tree_stopped,
             stdout=stdout,
             stderr=stderr,
+            stdout_truncated=truncated[WorkerOutputStream.STDOUT],
+            stderr_truncated=truncated[WorkerOutputStream.STDERR],
         )
 
     def _stop_scope(
@@ -1279,6 +1281,8 @@ def _bound_result(
 ) -> WorkerExecutionResult:
     if not isinstance(result, WorkerExecutionResult):
         raise TypeError("Ubuntu process scope returned an invalid result")
+    stdout_overflow = len(result.stdout.encode()) > invocation.stdout_limit_bytes
+    stderr_overflow = len(result.stderr.encode()) > invocation.stderr_limit_bytes
     stdout = _truncate_utf8(result.stdout, invocation.stdout_limit_bytes)
     stderr = _truncate_utf8(result.stderr, invocation.stderr_limit_bytes)
     return WorkerExecutionResult(
@@ -1288,6 +1292,8 @@ def _bound_result(
         process_tree_stopped=result.process_tree_stopped,
         stdout=stdout,
         stderr=stderr,
+        stdout_truncated=result.stdout_truncated or stdout_overflow,
+        stderr_truncated=result.stderr_truncated or stderr_overflow,
     )
 
 

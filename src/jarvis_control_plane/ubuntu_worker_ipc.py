@@ -861,6 +861,8 @@ def _result_to_wire(result: WorkerExecutionResult) -> dict[str, object]:
         "process_tree_stopped": result.process_tree_stopped,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        "stdout_truncated": result.stdout_truncated,
+        "stderr_truncated": result.stderr_truncated,
     }
 
 
@@ -874,6 +876,8 @@ def _result_from_wire(value: Mapping[str, object]) -> WorkerExecutionResult:
             "process_tree_stopped",
             "stdout",
             "stderr",
+            "stdout_truncated",
+            "stderr_truncated",
         },
     )
     started = value["started_components"]
@@ -887,6 +891,8 @@ def _result_from_wire(value: Mapping[str, object]) -> WorkerExecutionResult:
         process_tree_stopped=_required_bool(value, "process_tree_stopped"),
         stdout=_required_text_allow_empty(value, "stdout"),
         stderr=_required_text_allow_empty(value, "stderr"),
+        stdout_truncated=_required_bool(value, "stdout_truncated"),
+        stderr_truncated=_required_bool(value, "stderr_truncated"),
     )
 
 

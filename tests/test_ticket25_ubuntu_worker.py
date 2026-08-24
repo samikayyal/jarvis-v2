@@ -240,7 +240,14 @@ def test_ubuntu_worker_runs_one_bounded_noninteractive_scope_with_tagged_output(
 def test_gateway_dispatch_and_result_cross_the_authenticated_local_channel() -> None:
     gateway_connection, worker_connection = socket.socketpair()
     process_scope = ControlledUbuntuProcessScope(
-        result=WorkerExecutionResult.completed(stdout="over-local-channel"),
+        result=WorkerExecutionResult(
+            status=WorkerExecutionStatus.COMPLETED,
+            process_tree_stopped=True,
+            stdout="over-local-channel\n[output truncated]",
+            stderr="warning\n[output truncated]",
+            stdout_truncated=True,
+            stderr_truncated=True,
+        ),
         progress_events=(
             WorkerProgressEvent(
                 sequence=2,
@@ -275,7 +282,10 @@ def test_gateway_dispatch_and_result_cross_the_authenticated_local_channel() -> 
     try:
         result = gateway.dispatch(_proposal("action-ubuntu-ipc"))
 
-        assert result.stdout == "over-local-channel"
+        assert result.stdout == "over-local-channel\n[output truncated]"
+        assert result.stderr == "warning\n[output truncated]"
+        assert result.stdout_truncated is True
+        assert result.stderr_truncated is True
         assert result.progress_events[-1].text == "over-local-channel"
         assert [item.action_id for item in process_scope.invocations] == [
             "action-ubuntu-ipc"
@@ -727,6 +737,48 @@ def test_systemd_scope_accepts_a_collected_unit_after_wait_wrapper_exits(
     assert result.status is WorkerExecutionStatus.COMPLETED
     assert result.process_tree_stopped is True
     assert not running.unit_observed.is_set()
+
+
+def test_systemd_scope_reports_real_stream_truncation_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedWrapper:
+        def __init__(self) -> None:
+            self.stdout = BytesIO(b"A" * 33)
+            self.stderr = BytesIO(b"B" * 33)
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    scope = SystemdUbuntuProcessScope()
+    monkeypatch.setattr(scope, "_unit_is_stopped", lambda *_args, **_kwargs: True)
+    running = ubuntu_worker_module._RunningSystemdScope(
+        unit_name="jarvis-action-truncation.service",
+        process=cast("subprocess.Popen[bytes]", ExitedWrapper()),
+        cancel_requested=Event(),
+        termination_lock=RLock(),
+        unit_observed=Event(),
+    )
+    invocation = replace(
+        _invocation(
+            "action-ubuntu-truncation",
+            WorkerIdentity(
+                host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+            ),
+        ),
+        stdout_limit_bytes=32,
+        stderr_limit_bytes=32,
+    )
+
+    result = scope._observe(running, invocation, lambda _event: None)
+
+    assert len(result.stdout.encode()) == 32
+    assert len(result.stderr.encode()) == 32
+    assert result.stdout.endswith("[output truncated]")
+    assert result.stderr.endswith("[output truncated]")
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
 
 
 def test_systemd_scope_runs_structured_compounds_inside_the_same_unit() -> None:
