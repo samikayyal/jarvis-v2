@@ -488,5 +488,19 @@
 - The first confirmed post-cutover `/status` opened session `S-077` idle with
   no pending action, zero command permissions, and Ubuntu, Windows, OpenWA, and
   Google ready. Inactivity selected Terra with medium reasoning. Ticket 32
-  remains `ready-for-human` immediately before the required `/permissions`
-  control message; no later WhatsApp or terminal action has been sent.
+  remains `ready-for-human` for the remaining behavioral worksheet.
+- The fresh `/permissions` control reported no active command permissions under
+  `control-05d02a6121c146bb9f43edfe5412af5e`. The immediately following
+  `/revoke session` control found no matching active permission under
+  `control-c5180c8db2c24a12ac5286722e3c17a9`. No terminal action was dispatched.
+- A subsequent read-only preflight reconfirmed the exact active release and
+  application revision, the reviewed active-configuration and image-map hashes,
+  all 13 Jarvis services healthy with zero restarts or OOM flags, both workers
+  ready, messaging ready, audit writable, and resource pressure `ok`. OpenWA
+  retained its previously recorded container identity and original start time,
+  remained healthy, and still had zero restarts and no OOM flag.
+- The deployed orchestration schema currently exposes only bounded Codex
+  `inspect` and `review` operations. It exposes no broker-owned
+  `workspace_prepare` proposal route, so Gate 13 must not be bypassed through an
+  administrative or direct adapter call. This row remains unpassed pending a
+  deployed broker route or an accurate blocked disposition at final closure.
