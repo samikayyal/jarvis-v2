@@ -147,3 +147,43 @@
   image map, network, credential, active configuration, service, or WhatsApp
   side effect was changed. Ticket 32 remains `ready-for-human` pending a fresh
   replacement-cutover authorization.
+
+### Authorized replacement cutover — 2026-08-24
+
+- The synchronized `aa9104e` archive matched SHA-256 across Windows and Ubuntu
+  and was installed as the immutable root-owned release
+  `/opt/jarvis/releases/aa9104e42f6edacc175899b4691f61b9876a0c23`.
+  Artifact, active-configuration, base Compose, locked-venv, and image-internal
+  validation all passed with 13 services and the 1056 MiB reviewed envelope.
+- All 13 candidate-specific images built from the pinned base images. After
+  normalizing release build paths, the rendered candidate differed from the
+  active model in exactly 13 image references and the three reviewed proxy
+  memory limits, with no other change. The pre-existing pending override was
+  preserved at SHA-256 `5f3079be2bbc`.
+- The final rollback baseline had all 13 services healthy with zero restarts or
+  OOMs, both workers ready, messaging ready, audit writable, backup current, and
+  resource pressure `ok`. A verified pre-change backup was created at
+  `/var/backups/jarvis/20260824T025015.891704Z-pre-change` immediately before
+  activation.
+- The active pointer now targets release `aa9104e`; `previous` targets rollback
+  release `f23b664`. All 13 candidate services became healthy with zero restart
+  or OOM hard stops. Administrative status reports application revision
+  `bf91bb9`, both workers ready, messaging ready, audit writable, current backup
+  freshness, and resource pressure `ok`.
+- The exact 13-entry running image map was installed and verified at SHA-256
+  `a5dcbc03c414`. A verified candidate baseline backup was created at
+  `/var/backups/jarvis/20260824T025808.113584Z-nightly`. The backup timer remains
+  enabled and active.
+- Three fixed-interval settled-resource samples passed. Each proxy remained
+  stable near 34.8 MiB under its 48 MiB cap; every service remained healthy with
+  zero restarts and `oom_killed=false`. Host memory, swap, and disk headroom
+  remained acceptable, and the post-cutover kernel OOM gate passed.
+- Running hardening, port, and network checks passed. Jarvis publishes only the
+  reviewed loopback callback and private Tailscale worker-gateway binds; OpenWA
+  retains its private LAN bind. The handoff and API networks each retain exactly
+  two members, and the worker overlay retains one member.
+- OpenWA retained container ID `24fb501ab8eb`, its original start time, healthy
+  state, and zero restarts. The Funnel remains the exact `/callback` route. The
+  local and Ubuntu transfer archives were removed. No WhatsApp acceptance
+  message or terminal action was sent during cutover. Ticket 32 remains
+  `ready-for-human` for the supervised behavioral worksheet.
