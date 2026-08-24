@@ -187,3 +187,27 @@
   local and Ubuntu transfer archives were removed. No WhatsApp acceptance
   message or terminal action was sent during cutover. Ticket 32 remains
   `ready-for-human` for the supervised behavioral worksheet.
+
+### Post-cutover supervised safe-read stop — 2026-08-24
+
+- Fresh WhatsApp controls opened session `S-073` idle with no pending action,
+  zero command permissions, both workers ready, OpenWA ready, and Google ready.
+  `/revoke session` found no matching active permission. The operator-selected
+  session model was restored to Luna with medium reasoning; the persistent
+  default was not changed.
+- The first authorized post-cutover request asked for a host-neutral,
+  non-mutating operating-system safe read. Jarvis returned an orchestration
+  failure under `orchestration-failure-bdf4b90098334694ace515f520da196d` and
+  explicitly reported that no action was taken. The Windows request and every
+  later worksheet row were not sent after this gate failed.
+- Protected trace metadata classifies the underlying model turn as `model
+  returned a malformed action proposal`, rather than the earlier unknown-field
+  rejection. The retained exception metadata records `operation_started=false`,
+  `may_have_dispatched=false`, and `may_have_sent=false`. The field-level model
+  validation cause and raw malformed proposal were not retained, so an exact
+  repair cannot be derived safely from this trace and no retry was attempted.
+- Final protected reconciliation reports session `S-073` idle with no pending
+  action and zero permissions; Ubuntu, Windows, OpenWA, and Google remain ready.
+  Administrative status remains fully ready with audit writable, backup current,
+  and resource pressure `ok`; all 13 services remain healthy with zero restarts
+  or OOMs. Ticket 32 remains `ready-for-human` at the safe-read gate.
