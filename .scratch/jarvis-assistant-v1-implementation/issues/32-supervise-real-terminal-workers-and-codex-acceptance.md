@@ -211,3 +211,26 @@
   Administrative status remains fully ready with audit writable, backup current,
   and resource pressure `ok`; all 13 services remain healthy with zero restarts
   or OOMs. Ticket 32 remains `ready-for-human` at the safe-read gate.
+
+### Provider terminal-schema repair — 2026-08-24
+
+- The provider-facing structured output now uses a discriminated terminal
+  proposal with a closed, typed payload. It requires `host`, `executable`,
+  `arguments`, and `cwd`; permits only typed `components`; and forbids extra
+  terminal and component fields before deterministic proposal freezing. Gmail,
+  vault, and the public adapter proposal contract remain unchanged.
+- The source repair is committed as `0b203aa`; artifact-pin commit `db88088`
+  locks that exact application revision and source hash. Focused orchestration
+  coverage passed (`41 passed`), unchanged Gmail/vault/exclusion coverage passed
+  (`61 passed`), and the deployment, egress, and Ticket 32 matrix passed (`71
+  passed`). Repository-wide Ruff, format, Python compilation, and diff checks
+  pass.
+- The single final full-suite run completed with `806 passed, 2 skipped, 1
+  failed` in 906.86 seconds. The sole failure was the unrelated Windows manual
+  trace-boundary worker test; its one isolated rerun passed in 4.36 seconds.
+  The full suite was not repeated.
+- No production release, service, configuration, network, credential, OpenWA,
+  or WhatsApp state was changed, and the failed acceptance request was not
+  retried. Ticket 32 remains `ready-for-human` pending a fresh replacement
+  cutover authorization and a new action-time confirmation for each WhatsApp
+  acceptance message.
