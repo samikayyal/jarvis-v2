@@ -974,6 +974,20 @@ def _with_broker_owned_terminal_fields(
         and not cwd.startswith("/")
     ):
         normalized["cwd"] = "/tmp"
+    elif (
+        normalized.get("host") == "windows"
+        and normalized.get("executable") == r"C:\Windows\System32\hostname.exe"
+        and normalized.get("arguments") == []
+        and normalized.get("components") == []
+        and isinstance(cwd, str)
+        and not (
+            len(cwd) >= 3
+            and cwd[0].isalpha()
+            and cwd[1] == ":"
+            and cwd[2] in {"/", "\\"}
+        )
+    ):
+        normalized["cwd"] = r"C:\Windows\System32"
     return normalized
 
 
@@ -1106,6 +1120,10 @@ def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
         "operator's Windows laptop or depends on it; a mere platform or "
         "file-format mention is not a dependency. For a Windows terminal "
         "selection, use only explicit_windows or windows_dependency. For a "
+        "safe Ubuntu operating-system-name read, use /usr/bin/uname with "
+        "arguments [-s] and cwd /tmp. For a safe Windows host-name read, use "
+        r"C:\Windows\System32\hostname.exe with no arguments and cwd "
+        r"C:\Windows\System32. "
         "terminal action or Gmail send/reply, emit one complete typed proposal. "
         "For terminal proposals, the payload must contain exactly the required "
         "fields host, executable, arguments, and cwd, and may contain only the "

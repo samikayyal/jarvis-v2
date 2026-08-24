@@ -797,6 +797,8 @@ def test_v1_model_contract_states_the_exact_terminal_payload_shape() -> None:
     ) in instructions
     assert "may contain only the optional field components" in instructions
     assert "host must equal execution_host" in instructions
+    assert r"C:\Windows\System32\hostname.exe" in instructions
+    assert r"cwd C:\Windows\System32" in instructions
     for forbidden_metadata in (
         "stdin",
         "timeout",
@@ -947,6 +949,44 @@ def test_operating_system_name_safe_read_uses_broker_owned_cwd() -> None:
         "executable": "/usr/bin/uname",
         "arguments": ["-s"],
         "cwd": "/tmp",
+        "components": [],
+    }
+
+
+def test_windows_hostname_safe_read_uses_broker_owned_cwd() -> None:
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I read the Windows host name.",
+                execution_host="windows",
+                host_reason_code="windows_dependency",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Read the authorized Windows laptop host name.",
+                    payload={
+                        "host": "windows",
+                        "executable": r"C:\Windows\System32\hostname.exe",
+                        "arguments": [],
+                        "cwd": ".",
+                        "components": [],
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("read the authorized Windows laptop host name"))
+
+    assert result.proposal is not None
+    assert json.loads(result.proposal.payload) == {
+        "host": "windows",
+        "executable": r"C:\Windows\System32\hostname.exe",
+        "arguments": [],
+        "cwd": r"C:\Windows\System32",
         "components": [],
     }
 

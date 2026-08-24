@@ -46,7 +46,7 @@ _SAFE_READ_EXECUTABLES_BY_HOST = {
             "/usr/bin/uname",
         }
     ),
-    "windows": frozenset(),
+    "windows": frozenset({r"C:\Windows\System32\hostname.exe"}),
 }
 
 
@@ -422,6 +422,8 @@ def _uses_protected_resource(arguments: tuple[str, ...]) -> bool:
 def _is_safe_read(command: str, arguments: tuple[str, ...]) -> bool:
     if command == "uname":
         return arguments == ("-s",)
+    if command == "hostname.exe":
+        return not arguments
     if command in {"pwd", "ls", "dir", "get-childitem"}:
         return not any(
             argument.startswith("-") and argument not in {"-a", "-l", "-la", "/a"}

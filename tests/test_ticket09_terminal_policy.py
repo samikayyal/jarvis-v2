@@ -165,6 +165,37 @@ def test_safe_read_requires_no_redirection_and_no_protected_or_relative_paths() 
     )
 
 
+def test_windows_hostname_is_one_exact_registered_safe_read() -> None:
+    safe = TerminalAction(
+        host="windows",
+        executable=r"C:\Windows\System32\hostname.exe",
+        arguments=(),
+        cwd=r"C:\Windows\System32",
+    )
+    changed_arguments = TerminalAction(
+        host="windows",
+        executable=r"C:\Windows\System32\hostname.exe",
+        arguments=("unexpected",),
+        cwd=r"C:\Windows\System32",
+    )
+    substituted_executable = TerminalAction(
+        host="windows",
+        executable=r"C:\Temp\hostname.exe",
+        arguments=(),
+        cwd=r"C:\Windows\System32",
+    )
+
+    assert authorize_terminal_action(safe).disposition is TerminalDisposition.SAFE_READ
+    assert (
+        authorize_terminal_action(changed_arguments).disposition
+        is TerminalDisposition.ORDINARY_APPROVAL
+    )
+    assert (
+        authorize_terminal_action(substituted_executable).disposition
+        is TerminalDisposition.ORDINARY_APPROVAL
+    )
+
+
 def _event(text: str, suffix: str) -> SignedInboundEvent:
     return SignedInboundEvent.from_message(
         InboundMessage(
