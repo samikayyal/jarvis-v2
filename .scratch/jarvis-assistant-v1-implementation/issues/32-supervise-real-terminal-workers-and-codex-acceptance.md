@@ -66,3 +66,17 @@
   32 matrix produced `287 passed, 1 skipped`; its four expected deployment-lock
   failures report only that the changed application source has not yet been
   repinned. No active release or production configuration has been changed.
+
+### Candidate pin and final verification — 2026-08-24
+
+- The narrow repair is committed as `3639024`; the application artifact lock is
+  repinned by `ee31e10` to that exact revision and source hash. The branch is
+  pushed as `origin/codex/ticket32-terminal-codex-acceptance`.
+- After repinning, the complete deployment-bundle file passed (`60 passed`).
+  Ruff, format checking, Python compilation, and diff checking pass.
+- The single final full-suite run passed with `802 passed, 2 skipped` in
+  603.45 seconds. No additional full-suite run was started.
+- This is candidate evidence only. No image was built on Ubuntu, no release was
+  installed or activated, no active configuration or image map changed, and no
+  service was recreated. Live Ticket 32 acceptance remains blocked until a
+  separately authorized supervised replacement cutover and fresh safe-read gate.
