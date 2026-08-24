@@ -614,6 +614,8 @@ class RemoteOrchestrationAdapter(OrchestrationAdapter):
     def run(self, request: models.OrchestrationRequest) -> models.OrchestrationResult:
         try:
             result = self._client.call("run", request)
+        except RemoteServiceError as exc:
+            raise OrchestrationAdapterError(str(exc), code=exc.code) from exc
         except ServiceProtocolError as exc:
             raise OrchestrationAdapterError(str(exc)) from exc
         if not isinstance(result, models.OrchestrationResult):

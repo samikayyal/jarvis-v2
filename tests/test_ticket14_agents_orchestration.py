@@ -896,6 +896,37 @@ def test_provider_schema_rejects_malformed_terminal_payloads(
         )
 
 
+def test_semantically_invalid_terminal_proposal_has_a_stable_diagnostic_code() -> None:
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the safe read.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Read the operating-system name.",
+                    payload={
+                        "host": "ubuntu",
+                        "executable": "uname",
+                        "arguments": ["-s"],
+                        "cwd": "/workspace",
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    with pytest.raises(OrchestrationAdapterError) as caught:
+        adapter.run(_request("inspect the operating system"))
+
+    assert caught.value.code == "terminal_executable_not_absolute"
+
+
 @pytest.mark.parametrize(
     "components",
     (

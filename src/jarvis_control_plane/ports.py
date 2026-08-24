@@ -74,6 +74,12 @@ class AuditWriteError(ControlPlaneError):
 class OrchestrationAdapterError(ControlPlaneError):
     """The controlled orchestration adapter failed."""
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None and (not code or code.strip() != code):
+            raise ValueError("orchestration diagnostic code must be canonical")
+        self.code = code
+
 
 class ActionDispatcherError(ControlPlaneError):
     """A frozen approval-gated action lifecycle could not proceed."""

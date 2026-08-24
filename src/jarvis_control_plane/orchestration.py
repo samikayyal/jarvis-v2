@@ -978,15 +978,18 @@ class AgentsSdkOrchestrationAdapter:
             if plan.proposal.kind == "terminal":
                 if host is None or plan.host_reason_code is None:
                     raise OrchestrationAdapterError(
-                        "terminal proposal is missing its execution host"
+                        "terminal proposal is missing its execution host",
+                        code="terminal_execution_host_missing",
                     )
                 if set(payload) - _TERMINAL_PAYLOAD_FIELDS:
                     raise OrchestrationAdapterError(
-                        "model proposed fields outside terminal authority"
+                        "model proposed fields outside terminal authority",
+                        code="terminal_payload_shape_invalid",
                     )
                 if payload.get("host") != host:
                     raise OrchestrationAdapterError(
-                        "terminal proposal selected a different host"
+                        "terminal proposal selected a different host",
+                        code="terminal_host_mismatch",
                     )
                 candidate = FrozenActionProposal.create(
                     action_id=f"{request.state.request_id}:proposal",
@@ -1023,9 +1026,39 @@ class AgentsSdkOrchestrationAdapter:
                 )
         except (TypeError, ValueError, KeyError) as exc:
             raise OrchestrationAdapterError(
-                "model returned a malformed action proposal"
+                "model returned a malformed action proposal",
+                code=(
+                    _terminal_validation_code(exc)
+                    if plan.proposal.kind == "terminal"
+                    else "action_proposal_invalid"
+                ),
             ) from exc
         return candidate
+
+
+_TERMINAL_VALIDATION_CODES = {
+    "terminal action has unknown or missing fields": "terminal_payload_shape_invalid",
+    "terminal arguments must be an ordered sequence": "terminal_arguments_invalid",
+    "terminal components must be an ordered sequence": "terminal_components_invalid",
+    "terminal executable must be canonical and absolute": "terminal_executable_not_absolute",
+    "terminal cwd must be canonical and absolute": "terminal_cwd_not_absolute",
+    "terminal arguments must be non-empty strings": "terminal_arguments_invalid",
+    "first compound component must match terminal action": "terminal_first_component_mismatch",
+    "first compound component cannot have a leading operator": "terminal_first_component_invalid",
+    "terminal component executable must be canonical and absolute": "terminal_component_executable_not_absolute",
+    "terminal redirection target must be canonical and absolute": "terminal_redirection_not_absolute",
+    "terminal components must be TerminalComponent mappings": "terminal_components_invalid",
+    "terminal component has unknown or missing fields": "terminal_component_shape_invalid",
+    "terminal component arguments must be an ordered sequence": "terminal_component_arguments_invalid",
+    "terminal component redirections must be an ordered sequence": "terminal_component_redirections_invalid",
+    "compound operator is not supported": "terminal_compound_operator_invalid",
+}
+
+
+def _terminal_validation_code(error: Exception) -> str:
+    """Map private validation detail to a stable, content-free diagnostic code."""
+
+    return _TERMINAL_VALIDATION_CODES.get(str(error), "terminal_action_invalid")
 
 
 def _canonical_gmail_model_payload(

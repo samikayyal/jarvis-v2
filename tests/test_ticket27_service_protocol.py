@@ -25,6 +25,7 @@ from jarvis_control_plane.ports import (
     ActionCancellationResult,
     ActionCancellationStatus,
     ActionDispatcherError,
+    OrchestrationAdapterError,
 )
 from jarvis_control_plane.service_protocol import (
     MAX_FRAME_BYTES,
@@ -116,6 +117,63 @@ def test_protocol_preserves_stable_vault_read_error_codes() -> None:
 
     assert caught.value.error_type == "VaultReadError"
     assert caught.value.code == "unsupported_file_type"
+
+
+def test_protocol_preserves_stable_orchestration_diagnostic_codes() -> None:
+    port = find_available_port()
+
+    def run() -> None:
+        raise OrchestrationAdapterError(
+            "model returned a malformed action proposal",
+            code="terminal_executable_not_absolute",
+        )
+
+    server = AuthenticatedServiceServer(
+        identity="jarvis-orchestration",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+        operations={"run": run},
+    )
+    Thread(target=server.serve_forever, daemon=True).start()
+    wait_until_ready("127.0.0.1", port)
+    client = AuthenticatedServiceClient(
+        identity="jarvis-broker",
+        expected_server_identity="jarvis-orchestration",
+        secret=SECRET,
+        host="127.0.0.1",
+        port=port,
+    )
+    try:
+        with pytest.raises(RemoteServiceError) as caught:
+            client.call("run")
+    finally:
+        server.shutdown()
+
+    assert caught.value.error_type == "OrchestrationAdapterError"
+    assert caught.value.code == "terminal_executable_not_absolute"
+    assert caught.value.operation_started is False
+    assert caught.value.may_have_dispatched is False
+    assert caught.value.may_have_sent is False
+
+
+def test_remote_orchestration_adapter_retains_the_diagnostic_code() -> None:
+    class Client:
+        def call(self, operation: str, _request: object) -> None:
+            assert operation == "run"
+            raise RemoteServiceError(
+                "OrchestrationAdapterError",
+                "model returned a malformed action proposal",
+                code="terminal_executable_not_absolute",
+            )
+
+    adapter = RemoteOrchestrationAdapter(Client())  # type: ignore[arg-type]
+
+    with pytest.raises(OrchestrationAdapterError) as caught:
+        adapter.run(object())  # type: ignore[arg-type]
+
+    assert caught.value.code == "terminal_executable_not_absolute"
+    assert isinstance(caught.value.__cause__, RemoteServiceError)
 
 
 def _evidence(identifier: str) -> AuditEvidence:
