@@ -113,7 +113,7 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "vault_egress_proxy",
         "worker_gateway",
     )
-    assert report.aggregate_memory_mib == 1008
+    assert report.aggregate_memory_mib == 1056
     assert report.aggregate_cpus == pytest.approx(1.80)
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
@@ -147,6 +147,15 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
             "start_interval": "30s",
         },
         "vault_egress_proxy": {"start_period": "10m", "start_interval": "30s"},
+    }
+    assert {
+        service: compose["services"][service]["deploy"]["resources"]["limits"]["memory"]
+        for service in report.services
+        if service.endswith("_egress_proxy")
+    } == {
+        "google_egress_proxy": "48M",
+        "orchestration_egress_proxy": "48M",
+        "vault_egress_proxy": "48M",
     }
 
 

@@ -77,9 +77,9 @@ RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
         "deleted_conversation_archive": ServiceResourceLimits(
             "48M", Decimal("0.10"), 32
         ),
-        "orchestration_egress_proxy": ServiceResourceLimits("32M", Decimal("0.03"), 16),
-        "google_egress_proxy": ServiceResourceLimits("32M", Decimal("0.03"), 16),
-        "vault_egress_proxy": ServiceResourceLimits("32M", Decimal("0.03"), 16),
+        "orchestration_egress_proxy": ServiceResourceLimits("48M", Decimal("0.03"), 16),
+        "google_egress_proxy": ServiceResourceLimits("48M", Decimal("0.03"), 16),
+        "vault_egress_proxy": ServiceResourceLimits("48M", Decimal("0.03"), 16),
     }
 )
 

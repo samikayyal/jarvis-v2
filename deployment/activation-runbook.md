@@ -170,7 +170,7 @@ PYTHONPATH="$JARVIS_RELEASE/src" \
 docker compose --file "$JARVIS_RELEASE/deployment/compose.yaml" config --quiet
 ```
 
-Expected verifier summary for this bundle: 13 services, 1008 MiB memory, 1.80
+Expected verifier summary for this bundle: 13 services, 1056 MiB memory, 1.80
 CPU cores, 512 PIDs, and `activation unchanged`.
 
 Do not pass `--profile manual-activation` and do not run `up` in this phase.
@@ -593,7 +593,7 @@ samples at fixed, recorded intervals and record:
 | 2 | | | | | | | | |
 | 3 | | | | | | | | |
 
-Jarvis must remain within 1008 MiB, 1.80 CPU cores, and 512 PIDs for the reviewed
+Jarvis must remain within 1056 MiB, 1.80 CPU cores, and 512 PIDs for the reviewed
 Compose set, with at least 2 GiB free disk. OpenWA should settle near its
 established Baileys envelope; investigate material regression instead of treating
 the historical sample as a hard quota.
