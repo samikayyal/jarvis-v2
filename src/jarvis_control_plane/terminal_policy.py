@@ -43,6 +43,7 @@ _SAFE_READ_EXECUTABLES_BY_HOST = {
             "/usr/bin/ls",
             "/usr/bin/pwd",
             "/usr/bin/tail",
+            "/usr/bin/uname",
         }
     ),
     "windows": frozenset(),
@@ -419,6 +420,8 @@ def _uses_protected_resource(arguments: tuple[str, ...]) -> bool:
 
 
 def _is_safe_read(command: str, arguments: tuple[str, ...]) -> bool:
+    if command == "uname":
+        return arguments == ("-s",)
     if command in {"pwd", "ls", "dir", "get-childitem"}:
         return not any(
             argument.startswith("-") and argument not in {"-a", "-l", "-la", "/a"}

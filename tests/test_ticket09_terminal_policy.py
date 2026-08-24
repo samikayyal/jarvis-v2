@@ -230,6 +230,28 @@ def test_broker_dispatches_safe_reads_without_an_operator_approval() -> None:
     assert len(dispatcher.dispatched) == 1
 
 
+def test_broker_auto_authorizes_operating_system_name_safe_read() -> None:
+    assert (
+        authorize_terminal_action(
+            action(executable="/usr/bin/uname", arguments=("-a",))
+        ).disposition
+        is TerminalDisposition.ORDINARY_APPROVAL
+    )
+    components, dispatcher = _broker_for(
+        {
+            "host": "ubuntu",
+            "executable": "/usr/bin/uname",
+            "arguments": ["-s"],
+            "cwd": "/workspace",
+        }
+    )
+
+    result = components.receiver.receive(_event("show operating system name", "uname"))
+
+    assert result.disposition == "action_dispatched"
+    assert len(dispatcher.dispatched) == 1
+
+
 def test_broker_creates_a_session_permission_for_choice_two_then_dispatches() -> None:
     components, dispatcher = _broker_for(
         {
