@@ -148,6 +148,13 @@ reports no credentials or personal identifiers. Backup
 freshness is calculated on the host as `missing`, `current`, `stale`, or `invalid`
 from the local snapshot manifests without exposing backup contents.
 
+After activation, run real Google and vault checks from
+`google-vault-acceptance-runbook.md`. Run authenticated Ubuntu, Windows,
+terminal-authority, and bounded Codex checks from
+`terminal-codex-acceptance-runbook.md`. Both are human-supervised worksheets;
+passing controlled tests is not production acceptance and neither worksheet
+authorizes deployment or trust-critical activation.
+
 ## Administrative backup and isolated restore
 
 Run the backup command as the root administrator so SQLite can take online,

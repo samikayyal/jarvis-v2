@@ -785,6 +785,43 @@ def test_v1_model_contract_excludes_calendar_tools_and_proposals() -> None:
     assert "Calendar" not in captured["instructions"]
 
 
+def test_v1_model_contract_states_the_exact_terminal_payload_shape() -> None:
+    captured: dict[str, object] = {}
+
+    def agent_factory(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=agent_factory,
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="No terminal action was needed.")
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    adapter.run(_request("inspect the operating system"))
+
+    instructions = captured["instructions"]
+    assert isinstance(instructions, str)
+    assert (
+        "payload must contain exactly the required fields host, executable, "
+        "arguments, and cwd"
+    ) in instructions
+    assert "may contain only the optional field components" in instructions
+    assert "host must equal execution_host" in instructions
+    for forbidden_metadata in (
+        "stdin",
+        "timeout",
+        "environment",
+        "approval",
+        "permission",
+        "sandbox",
+    ):
+        assert forbidden_metadata in instructions
+
+
 @pytest.mark.parametrize(
     ("request_text", "expected_reply"),
     [
