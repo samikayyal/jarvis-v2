@@ -338,3 +338,27 @@
   during the cutover. Ticket 32 remains `ready-for-human`; the repaired safe
   read and each later worksheet message still require fresh action-time
   confirmation.
+
+### Post-policy-cutover safe-read stop — 2026-08-24
+
+- Fresh supervised controls opened session `S-075` idle with no pending action
+  and zero command permissions. The session model was set explicitly to
+  `gpt-5.6-luna` with medium reasoning; the persistent default was unchanged.
+  `/permissions` and `/revoke session` both confirmed that no command permission
+  was active.
+- The single confirmed host-neutral safe-read request was admitted as
+  `request-a39b5fd42b54449b98a96296ead23b48`. Jarvis returned
+  `orchestration-failure-de32c3bc55534841b902a782b2cedca9`, explicitly stated
+  that no action was taken, and did not present a proposal or terminal result.
+  The request was not retried and every later worksheet row remained stopped.
+- Protected trace metadata records one failed model span with the generic cause
+  `model returned a malformed action proposal`. Its retained remote exception
+  metadata has `operation_started=false`, `may_have_dispatched=false`, and
+  `may_have_sent=false`; no structured output or field-level validation cause
+  was retained. A further repair cannot be derived safely from this trace.
+- Post-stop administrative status still reports application revision
+  `f609dc4a4140c802988d7e2b705575a898bfdc65`, both workers ready, messaging
+  ready, audit writable, and resource pressure `ok`; all 13 Jarvis services
+  remain healthy with zero restarts or OOMs. Ticket 32 remains
+  `ready-for-human` at Gate 05 pending containment `/status` and a separately
+  justified repair.
