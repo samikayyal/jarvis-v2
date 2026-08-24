@@ -41,8 +41,6 @@ REQUIRED_FILES = (
     "artifacts.lock.json",
     "compose.yaml",
     "config.example.toml",
-    "codex/package.json",
-    "codex/package-lock.json",
     "openwa-handoff.md",
     "requirements.lock",
     "systemd/jarvis-backup.service",
@@ -57,7 +55,6 @@ DATABASE_SCHEMAS = MappingProxyType(
         "sessions": "702f19c90b7c336532f4a7e598801150ac9f68bc3471b5d2b0e69317eb974470",
         "audit": "07918a1e796be9ed5f0c720fd490ca59354e39742eee2b9e77769f6ec1702648",
         "traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
-        "codex_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
         "google_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
         "deleted_conversations": "fb1b292ce25216b5f697aba99a90a83f77dbc6aba755c61ce69488748bef066d",
     }
@@ -191,7 +188,7 @@ ALLOWED_STATE_MOUNTS: Mapping[str, frozenset[str]] = MappingProxyType(
                 "/run/jarvis-deleted",
             }
         ),
-        "orchestration_agent": frozenset({"/var/lib/jarvis/codex-traces"}),
+        "orchestration_agent": frozenset(),
         "audit_service": frozenset({"/var/lib/jarvis/audit"}),
         "google_connector": frozenset({"/var/lib/jarvis/google-traces"}),
         "knowledge_vault_connector": frozenset({"/var/lib/jarvis/vault"}),
@@ -504,7 +501,6 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
         "model_turn_seconds": 90,
         "read_connector_seconds": 20,
         "side_effect_connector_seconds": 30,
-        "codex_seconds": 300,
         "terminal_seconds": 120,
         "active_request_seconds": 480,
     }
@@ -574,8 +570,6 @@ def _validate_artifacts(
         "database_schemas",
         "python_base_image",
         "uv_build_image",
-        "node_build_image",
-        "codex_cli",
         "os_packages",
         "requirements_lock",
     }:
@@ -610,76 +604,18 @@ def _validate_artifacts(
         r"ghcr\.io/astral-sh/uv:0\.6\.14@sha256:[0-9a-f]{64}", uv_reference
     ):
         errors.append("uv build image must be pinned by tag and sha256 digest")
-    node_image = lock.get("node_build_image")
-    node_reference = (
-        node_image.get("reference") if isinstance(node_image, Mapping) else None
-    )
-    if node_reference != (
-        "node:24-bookworm-slim@sha256:"
-        "65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848"
-    ):
-        errors.append("Node build image must be pinned by tag and sha256 digest")
-    if lock.get("codex_cli") != {
-        "package": "@openai/codex",
-        "version": "0.147.0",
-        "integrity": (
-            "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
-            "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
-        ),
-        "package_lock_sha256": (
-            "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
-        ),
-    }:
-        errors.append("Codex CLI artifact differs from the reviewed pin")
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
     from_instructions = tuple(
         line.strip() for line in dockerfile.splitlines() if line.startswith("FROM ")
     )
-    expected_from = (
-        f"FROM {node_reference} AS codex",
-        f"FROM {uv_reference} AS uv",
-        f"FROM {reference}",
-    )
-    if len(from_instructions) != 3 or not re.fullmatch(
+    expected_from = (f"FROM {uv_reference} AS uv", f"FROM {reference}")
+    if len(from_instructions) != 2 or not re.fullmatch(
         r"FROM python:3\.13\.13-slim-bookworm@sha256:[0-9a-f]{64}",
         from_instructions[-1] if from_instructions else "",
     ):
         errors.append("Dockerfile base image must be pinned by sha256 digest")
     elif from_instructions != expected_from:
         errors.append("Dockerfile images differ from artifact lock")
-    codex_lock = _load_mapping(
-        root / "codex/package-lock.json", errors, "Codex package lock"
-    )
-    codex_packages = (
-        codex_lock.get("packages") if isinstance(codex_lock, Mapping) else None
-    )
-    codex_package = (
-        codex_packages.get("node_modules/@openai/codex")
-        if isinstance(codex_packages, Mapping)
-        else None
-    )
-    if not isinstance(codex_package, Mapping) or {
-        "version": codex_package.get("version"),
-        "integrity": codex_package.get("integrity"),
-    } != {
-        "version": "0.147.0",
-        "integrity": (
-            "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
-            "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
-        ),
-    }:
-        errors.append("Codex npm lock does not match the reviewed artifact")
-    codex_artifact = lock.get("codex_cli")
-    if (
-        codex_artifact.get("package_lock_sha256")
-        if isinstance(codex_artifact, Mapping)
-        else None
-    ) != hashlib.sha256(
-        (root / "codex/package-lock.json").read_bytes().replace(b"\r\n", b"\n")
-    ).hexdigest():
-        errors.append("Codex npm lock digest differs from artifact lock")
-    if "RUN npm ci --omit=dev --ignore-scripts" not in dockerfile:
-        errors.append("Dockerfile must install Codex from the npm lock")
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
     if (
@@ -980,12 +916,6 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
                 and service in {"capability_broker", "deleted_conversation_archive"}
             )
             or (
-                service == "orchestration_agent"
-                and parts[0] == "/srv/jarvis-workspace"
-                and target == "/srv/jarvis-workspace"
-                and parts[-1] == "ro"
-            )
-            or (
                 parts[0] == target
                 and target in ALLOWED_STATE_MOUNTS[service]
                 and len(parts) == 2
@@ -1034,8 +964,6 @@ def _validate_service_volumes(service: str, volumes: object, errors: list[str]) 
     )
     if service == "worker_gateway":
         reviewed.add("/run/jarvis-worker/ubuntu.sock:/run/jarvis-worker/ubuntu.sock:ro")
-    if service == "orchestration_agent":
-        reviewed.add("/srv/jarvis-workspace:/srv/jarvis-workspace:ro")
     actual = {volume for volume in volumes if isinstance(volume, str)}
     if actual != reviewed or len(actual) != len(volumes):
         errors.append(f"{service} volumes differ from the reviewed boundary")

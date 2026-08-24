@@ -34,7 +34,6 @@ DATABASES = (
     ("sessions", "state", "sessions.sqlite3", "working_session_current"),
     ("audit", "audit", "audit.sqlite3", "audit_evidence"),
     ("traces", "traces", "traces.sqlite3", "diagnostic_traces"),
-    ("codex_traces", "codex_traces", "codex.sqlite3", "diagnostic_traces"),
     ("google_traces", "google_traces", "google.sqlite3", "diagnostic_traces"),
     (
         "deleted_conversations",
@@ -47,13 +46,11 @@ DEFAULT_ROOTS = {
     "state": Path("/var/lib/jarvis/state"),
     "audit": Path("/var/lib/jarvis/audit"),
     "traces": Path("/var/lib/jarvis/traces"),
-    "codex_traces": Path("/var/lib/jarvis/codex-traces"),
     "google_traces": Path("/var/lib/jarvis/google-traces"),
     "deleted_conversations": Path("/var/lib/jarvis/deleted-conversations"),
 }
 PROTECTED_ADMIN_ROOTS = tuple(DEFAULT_ROOTS.values()) + (
     Path("/var/lib/jarvis/vault"),
-    Path("/srv/jarvis-workspace"),
     Path("/etc/jarvis"),
     Path("/run/credentials"),
     Path("/run/protocol"),

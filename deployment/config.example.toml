@@ -69,7 +69,6 @@ members = ["openwa", "inbound_receiver"]
 model_turn_seconds = 90
 read_connector_seconds = 20
 side_effect_connector_seconds = 30
-codex_seconds = 300
 terminal_seconds = 120
 active_request_seconds = 480
 

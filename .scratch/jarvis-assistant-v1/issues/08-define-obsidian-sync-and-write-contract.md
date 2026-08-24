@@ -21,7 +21,7 @@ outside Jarvis-readable paths.
 Authenticate with a dedicated SSH key whose write authority is limited to this
 one repository. Store the private key through Jarvis's root-owned, service-
 specific plaintext credential-file boundary and expose it only to the bounded Git process, never to arbitrary terminal
-actions, Windows, Codex, models, or other workers. Pin the remote host identity
+actions, Windows, models, or other workers. Pin the remote host identity
 with strict SSH host-key verification. Key rotation or revocation affects only
 Jarvis's vault access.
 

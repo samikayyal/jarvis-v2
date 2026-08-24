@@ -1,6 +1,6 @@
 ## Destination
 
-Produce an implementation-ready V1 specification and decision map for a reactive, single-operator WhatsApp assistant that connects to Google services and a Git-backed Obsidian vault, runs policy-controlled commands on Ubuntu and Windows, uses OpenAI for orchestration and Codex as a specialist, with security, approvals, memory, deployment, and verification boundaries fully decided.
+Produce an implementation-ready V1 specification and decision map for a reactive, single-operator WhatsApp assistant that connects to Google services and a Git-backed Obsidian vault, runs policy-controlled commands on Ubuntu and Windows, and uses OpenAI for orchestration, with security, approvals, memory, deployment, and verification boundaries fully decided.
 
 ## Notes
 
@@ -11,7 +11,7 @@ Produce an implementation-ready V1 specification and decision map for a reactive
 - Google is the first account ecosystem: Gmail, Google Calendar, and Google Drive. Reads are allowed; Gmail sends and Calendar changes are approval-gated; destructive Google and Drive actions are excluded.
 - The private Git-backed Obsidian knowledge vault is readable. Note writes use an exact approval-gated commit and push; deletion, force-push, history rewriting, and autonomous conflict resolution are excluded.
 - Terminal actions may target the always-on Ubuntu host or the authorized operator's personal Windows laptop when available. The orchestration agent selects the host from the natural-language request and known host purpose; Ubuntu is the default, and an unavailable selected host never silently fails over.
-- Terminal authorization is entirely deterministic in V1. Model-based command classification, including Gemini, is deferred to V2. Codex is available as a coding and terminal specialist but cannot override authorization policy.
+- Terminal authorization is entirely deterministic in V1. Model-based command classification, including Gemini, is deferred to V2.
 - Working sessions default to 60 minutes and are configurable through deterministic `/config` messages. V1 has one active request and one pending action at a time.
 - Natural confirmation messages are parsed deterministically. Pending actions expire after 10 minutes. Selecting a displayed exact-command session or persistent permission creates it immediately; every permission remains narrow, inspectable, and revocable.
 - Use `uv` for all Python dependency management and execution.
@@ -20,7 +20,7 @@ Produce an implementation-ready V1 specification and decision map for a reactive
 
 <!-- Resolved tickets are indexed here. -->
 
-- **Choose the agent runtime and Codex boundary** — Jarvis owns session and policy state; the Agents SDK over Responses owns orchestration and traces; Codex runs as a bounded server-side MCP specialist, with an SDK/app-server fallback when stronger interrupt control is required. [Ticket](issues/01-choose-agent-runtime-and-codex-boundary.md) · [Research](research/agent-runtime-and-codex-boundary.md)
+- **Choose the agent runtime** — Jarvis owns session and policy state while the Agents SDK over Responses owns orchestration and traces. [Ticket](issues/01-choose-agent-runtime.md) · [Research](research/agent-runtime.md)
 - **Define the Google access and OAuth boundary** — Use one External Web application authorization-code flow whose state-bound HTTPS callback is the sole public Jarvis endpoint, with one backend refresh-token record in a private plaintext file owned only by the Google connector; fixed read scopes and incremental `gmail.send` / `calendar.events` write scopes preserve V1 approvals, while Drive mutations and destructive Google actions remain excluded. [Ticket](issues/02-define-google-access-and-oauth-boundary.md) · [Research](research/google-access-and-oauth-boundary.md)
 - **Define the OpenWA assistant handoff** — Use a signed `message.received` webhook as the live inbound boundary; authorize by canonical direct-message JID, deduplicate assistant work by `(sessionId, message ID)`, reply via `/messages/reply`, and preserve OpenWA's current direct delivery and transport semantics. [Ticket](issues/03-define-openwa-assistant-handoff.md) · [Research](research/openwa-assistant-handoff.md)
 - **Choose the secure two-host execution transport** — Use a private overlay plus outbound mTLS bidirectional gRPC worker sessions; the agent routes natural-language work to default Ubuntu or the personal Windows laptop, an unavailable selected host never fails over, the worker protocol reports readiness/milestones/output and performs process-scope cancellation, and the control listener is overlay-only. [Ticket](issues/04-choose-secure-two-host-execution-transport.md) · [Research](research/secure-two-host-execution-transport.md)

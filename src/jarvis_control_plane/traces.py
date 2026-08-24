@@ -2,7 +2,7 @@
 
 Diagnostic traces are deliberately separate from :mod:`jarvis_control_plane`
 audit evidence.  Audit evidence is bounded and redacted; a diagnostic trace is
-the complete payload of one model, Codex, connector, or worker operation.  The
+the complete payload of one model, connector, or worker operation.  The
 store exposes only reservation and append operations to the control plane.  A
 separate ``ManualDiagnosticTraceBoundary`` is the only supported read/export
 surface.

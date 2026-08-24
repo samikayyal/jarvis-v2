@@ -29,7 +29,6 @@ _DATABASES = {
     "sessions": ("data/state/sessions.sqlite3", _unchanged),
     "audit": ("data/audit/audit.sqlite3", _unchanged),
     "traces": ("data/traces/traces.sqlite3", _unchanged),
-    "codex_traces": ("data/codex_traces/codex.sqlite3", _unchanged),
     "google_traces": ("data/google_traces/google.sqlite3", _unchanged),
     "deleted_conversations": (
         "data/deleted_conversations/deleted-conversations.sqlite3",

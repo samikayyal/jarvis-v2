@@ -73,7 +73,7 @@ V1 refuses these actions without offering approval:
   sender allowlist or webhook verification, audit service, connector operation
   allowlists, credential files or service identities, worker CA or host
   registration, service definitions, firewall, private-overlay grants, or public
-  endpoint configuration. Jarvis and Codex may inspect, prepare, and test source
+  endpoint configuration. Development tools may inspect, prepare, and test source
   changes in a development workspace; a manual administrator outside Jarvis must
   activate them.
 

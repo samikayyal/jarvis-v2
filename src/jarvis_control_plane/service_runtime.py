@@ -33,12 +33,6 @@ from .adapters import (
     SystemClock,
     UuidIdGenerator,
 )
-from .codex_runtime import CodexCliAdapter, GitCodexWorkspaceInspector
-from .codex_specialist import (
-    CodexSpecialist,
-    CodexSpecialistConfig,
-    CodexWorkspace,
-)
 from .control_grammar import ControlCommand, parse_control
 from .control_plane import (
     ControlPlaneConfig,
@@ -331,34 +325,9 @@ def _orchestration_operations(
         client_identity="jarvis-orchestration",
         server_role="knowledge_vault_connector",
     )
-    models = config.get("models")
     timeouts = config.get("timeouts")
-    if not isinstance(models, Mapping) or not isinstance(timeouts, Mapping):
-        raise CompositionError("Codex deployment configuration is incomplete")
-    _clock, _ids, trace = _service_trace(
-        config, "codex", root=Path("/var/lib/jarvis/codex-traces")
-    )
-    codex_specialist = CodexSpecialist(
-        config=CodexSpecialistConfig(
-            workspaces=(
-                CodexWorkspace(
-                    name="jarvis",
-                    host="ubuntu",
-                    cwd="/srv/jarvis-workspace",
-                ),
-            ),
-            model=_require_text(models.get("default_model"), "default_model"),
-            reasoning=_require_text(
-                models.get("default_reasoning"), "default_reasoning"
-            ),
-            timeout_seconds=float(timeouts.get("codex_seconds", 0)),
-        ),
-        adapter=CodexCliAdapter(
-            executable=Path("/usr/local/bin/codex"), api_key=api_key
-        ),
-        inspector=GitCodexWorkspaceInspector(),
-        trace=trace,
-    )
+    if not isinstance(timeouts, Mapping):
+        raise CompositionError("orchestration timeout configuration is incomplete")
 
     def read_vault(_request: object, typed_input: object, deadline: float) -> object:
         if not isinstance(typed_input, VaultReadInput):
@@ -383,7 +352,6 @@ def _orchestration_operations(
             handler=read_vault,  # type: ignore[arg-type]
         ),
         vault_write_enabled=True,
-        codex_specialist=codex_specialist,
         model_turn_timeout_seconds=float(timeouts.get("model_turn_seconds", 0)),
         run_config_factory=lambda **kwargs: RunConfig(
             model_provider=model_provider, **kwargs

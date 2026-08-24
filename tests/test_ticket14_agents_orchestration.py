@@ -7,13 +7,11 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event, Thread
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 from agents.exceptions import ModelBehaviorError
 from test_support import build_receiver_components
 
-from jarvis_control_plane.codex_specialist import CodexSpecialist
 from jarvis_control_plane.models import (
     InboundMessage,
     OrchestrationRequest,
@@ -218,7 +216,6 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
 ):
     captured: dict[str, object] = {}
     calls = 0
-    specialist = Mock(spec=CodexSpecialist)
 
     def unavailable_read(
         _request: OrchestrationRequest, _input: BoundedReadInput, _deadline: float
@@ -236,14 +233,6 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
         captured["output_schema"] = agent.tools[0].output_json_schema
         captured["second_tool_result"] = asyncio.run(
             agent.tools[0].on_invoke_tool(None, json.dumps({"max_chars": 8}))
-        )
-        captured["codex_result"] = asyncio.run(
-            agent.tools[1].on_invoke_tool(
-                None,
-                json.dumps(
-                    {"workspace": "jarvis", "operation": "inspect", "task": "status"}
-                ),
-            )
         )
         return SimpleNamespace(
             final_output=AgentsSdkPlan(
@@ -269,7 +258,6 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
             BoundedReadOutput,
             unavailable_read,
         ),
-        codex_specialist=specialist,
     ).run(_request("read disconnected data"))
 
     expected_tool_result = {
@@ -282,7 +270,6 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
     }
     assert captured["tool_result"] == expected_tool_result
     assert captured["second_tool_result"] == expected_tool_result
-    assert captured["codex_result"] == expected_tool_result
     from agents.items import ItemHelpers
     from openai.types.responses import ResponseFunctionToolCall
 
@@ -298,7 +285,6 @@ def test_agents_adapter_returns_safe_tool_result_when_remote_read_is_unavailable
     )
     assert json.loads(sdk_output["output"]) == expected_tool_result
     assert calls == 1
-    specialist.invoke.assert_not_called()
     assert result.outcome == "unavailable"
     assert result.reply_text == (
         "The requested request context read could not be completed because Google is "

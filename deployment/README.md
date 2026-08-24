@@ -73,18 +73,9 @@ mounted only into those two roles. A server selects the key by the claimed
 client identity and verifies the frame before admitting the operation, so a
 key for a read-only link cannot impersonate the capability broker.
 
-The orchestration image includes the reviewed `@openai/codex` CLI version from
-`artifacts.lock.json`; `codex/package-lock.json` verifies the package and
-platform artifact integrity during `npm ci`. The orchestration role mounts exactly one Git workspace
-at `/srv/jarvis-workspace` read-only and keeps its Codex traces in the
-UID-10003-owned `/var/lib/jarvis/codex-traces` directory. Codex receives the
-same service-scoped OpenAI API key as the orchestration SDK, but it receives no
-connector, worker, deployment, or activation credential.
 The Agents SDK model turn is cancelled at `timeouts.model_turn_seconds`, and
 the broker's authenticated orchestration link exposes a separate cancellation
-operation so `/cancel` also reaches an active remote SDK or Codex run. The Codex
-subprocess receives only its API key, basic process environment, and the reviewed
-`HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` route variables.
+operation so `/cancel` also reaches an active remote SDK run.
 
 The native Ubuntu and Windows workers are not Compose services. Before activation,
 a root administrator creates `/run/jarvis-worker`, starts the reviewed native
@@ -149,9 +140,8 @@ freshness is calculated on the host as `missing`, `current`, `stale`, or `invali
 from the local snapshot manifests without exposing backup contents.
 
 After activation, run real Google and vault checks from
-`google-vault-acceptance-runbook.md`. Run authenticated Ubuntu, Windows,
-terminal-authority, and bounded Codex checks from
-`terminal-codex-acceptance-runbook.md`. Both are human-supervised worksheets;
+`google-vault-acceptance-runbook.md`. Run authenticated Ubuntu, Windows, and
+terminal-authority checks from `terminal-acceptance-runbook.md`. Both are human-supervised worksheets;
 passing controlled tests is not production acceptance and neither worksheet
 authorizes deployment or trust-critical activation.
 
@@ -160,7 +150,7 @@ authorizes deployment or trust-critical activation.
 Run the backup command as the root administrator so SQLite can take online,
 transactionally consistent copies and the restore can preserve the original
 owners and modes. The fixed database inventory covers Jarvis state and sessions,
-append-only audit, broker/Codex/Google diagnostic traces, and the deleted-
+append-only audit, broker and Google diagnostic traces, and the deleted-
 conversation archive. The reviewed configuration, SQLite schema hashes, and
 artifact release metadata travel with every snapshot. The active `compose.yaml`
 and adjacent `image-digests.json` also travel with it; the digest file maps every
@@ -248,8 +238,8 @@ admits the exact active host allowlist (HTTPS port 443, or SSH port 22 for the
 vault). The vault adapter additionally forces Git SSH through its proxy command.
 
 Fresh persistent directories are also a manual activation prerequisite. Create
-the state/trace paths for UID 10002, Codex traces for UID 10003, audit for UID
-10004, Google trace and credential state for UID 10005, the vault clone for UID
+the state/trace paths for UID 10002, audit for UID 10004, Google trace and
+credential state for UID 10005, the vault clone for UID
 10006, and the deleted-conversation archive for UID 10010, all with the reviewed
 `0700` directory mode. Create `/run/jarvis/deleted-archive-ipc` for group 20000
 with mode `0770`. Only the broker's write-only authenticated archive client and
@@ -258,7 +248,6 @@ the retained archive database. The long-lived services never start as root and
 do not repair ownership themselves.
 
 The image build is reproducible from the Git-pinned application artifact, the
-digest-pinned Python and Node build bases, the pinned Codex CLI, and the
-hash-locked exported requirements. Building,
+digest-pinned Python build base, and the hash-locked exported requirements. Building,
 publishing, credential provisioning, worker installation, OpenWA attachment,
 and activation are separate manual-administration steps.

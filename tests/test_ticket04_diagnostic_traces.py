@@ -244,8 +244,8 @@ def test_trace_retains_complete_payloads_only_through_manual_boundary() -> None:
 
     returned = recorder.execute(
         request_id="request-004",
-        operation_id="request-004:codex",
-        operation_type="codex",
+        operation_id="request-004:model",
+        operation_type="model",
         input_payload={"prompt": SECRET},
         arguments={"api_key": SECRET},
         telemetry={"private_note": SECRET},
@@ -291,7 +291,7 @@ def test_trace_retains_complete_payloads_only_through_manual_boundary() -> None:
     traces = manual.list_traces(request_id="request-004")
     assert len(traces) == 1
     trace = traces[0]
-    assert trace.operation_type == "codex"
+    assert trace.operation_type == "model"
     assert mapping_value(trace.input_payload, "prompt") == SECRET
     assert mapping_value(trace.arguments, "api_key") == SECRET
     assert mapping_value(trace.output_payload, "output") == SECRET

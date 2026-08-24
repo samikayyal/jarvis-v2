@@ -403,7 +403,7 @@ diagnostic telemetry rather than a permanent audit event.
 _Avoid_: Conversation history, model trace, editable activity log
 
 **Diagnostic trace**:
-The complete permanent record of model, agent, Codex, connector, and worker run
+The complete permanent record of model, agent, connector, and worker run
 payloads and telemetry, including prompts, messages, inputs, outputs, arguments,
 results, terminal data, errors, and any credentials they contain. It is retained
 and backed up indefinitely, never redacted or automatically deleted, accessible

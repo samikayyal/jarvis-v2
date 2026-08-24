@@ -6,23 +6,13 @@ import json
 import shutil
 import stat
 import tomllib
-from io import BytesIO
 from pathlib import Path
 from threading import Event, Thread
-from time import monotonic
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from jarvis_control_plane.codex_runtime import (
-    CodexCliAdapter,
-    GitCodexWorkspaceInspector,
-)
-from jarvis_control_plane.codex_specialist import (
-    CodexExecutionEnvelope,
-    CodexVerificationError,
-)
 from jarvis_control_plane.deployment import (
     RESOURCE_LIMITS,
     BundleValidationError,
@@ -159,12 +149,11 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     }
 
 
-def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
+def test_bundle_separates_deleted_content() -> None:
     compose = yaml.safe_load((SHIPPED_BUNDLE / "compose.yaml").read_text("utf-8"))
     services = compose["services"]
     broker_mounts = tuple(services["capability_broker"]["volumes"])
     archive_mounts = tuple(services["deleted_conversation_archive"]["volumes"])
-    orchestration_mounts = tuple(services["orchestration_agent"]["volumes"])
 
     assert not any(
         mount.endswith(":/var/lib/jarvis/deleted-conversations")
@@ -176,46 +165,18 @@ def test_bundle_separates_deleted_content_and_composes_pinned_codex() -> None:
     )
     assert services["deleted_conversation_archive"]["user"] == "10010:20000"
     assert services["deleted_conversation_archive"]["network_mode"] == "none"
-    assert "/srv/jarvis-workspace:/srv/jarvis-workspace:ro" in orchestration_mounts
-
-    lock = yaml.safe_load((SHIPPED_BUNDLE / "artifacts.lock.json").read_text("utf-8"))
-    assert lock["codex_cli"] == {
-        "package": "@openai/codex",
-        "version": "0.147.0",
-        "integrity": (
-            "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlz"
-            "BEWbuEVQ76JePIbtTW/ihCkp1a7Z3w=="
-        ),
-        "package_lock_sha256": (
-            "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
-        ),
-    }
     config = (SHIPPED_BUNDLE / "config.example.toml").read_text("utf-8")
     assert "openidconnect.googleapis.com" in config
-    npm_lock = yaml.safe_load(
-        (SHIPPED_BUNDLE / "codex/package-lock.json").read_text("utf-8")
-    )
-    assert (
-        npm_lock["packages"]["node_modules/@openai/codex"]["integrity"]
-        == (lock["codex_cli"]["integrity"])
-    )
 
 
-def test_orchestration_composition_includes_the_codex_specialist(
+def test_orchestration_composition_uses_the_model_turn_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import jarvis_control_plane.service_runtime as runtime
 
     captured: dict[str, object] = {}
-    specialist = object()
     monkeypatch.setattr(runtime, "_credential_json", lambda _path: {"api_key": "key"})
     monkeypatch.setattr(runtime, "_client", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        runtime, "_service_trace", lambda *_args, **_kwargs: (None, None, object())
-    )
-    monkeypatch.setattr(runtime, "CodexCliAdapter", lambda **_kwargs: object())
-    monkeypatch.setattr(runtime, "GitCodexWorkspaceInspector", lambda: object())
-    monkeypatch.setattr(runtime, "CodexSpecialist", lambda **_kwargs: specialist)
 
     def orchestration(**kwargs: object) -> object:
         captured.update(kwargs)
@@ -227,205 +188,17 @@ def test_orchestration_composition_includes_the_codex_specialist(
     monkeypatch.setattr(runtime, "AgentsSdkOrchestrationAdapter", orchestration)
     operations = _orchestration_operations(
         {
-            "models": {
-                "default_model": "gpt-5.6-terra",
-                "default_reasoning": "medium",
-            },
-            "timeouts": {"codex_seconds": 300, "model_turn_seconds": 90},
+            "timeouts": {"model_turn_seconds": 90},
         }
     )
 
     assert operations.keys() == {"run", "cancel"}
-    assert captured["codex_specialist"] is specialist
     assert captured["model_turn_timeout_seconds"] == 90
     identities, allowlists = _service_access(
         "orchestration_agent", SERVICE_ROLES["orchestration_agent"]
     )
     assert identities == ("jarvis-broker",)
     assert allowlists["jarvis-broker"] == ("run", "cancel")
-
-
-def test_deployed_codex_cli_preserves_only_the_reviewed_proxy_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import jarvis_control_plane.codex_runtime as runtime
-
-    executable = tmp_path / "codex"
-    executable.write_text("pinned", encoding="utf-8")
-    captured: dict[str, object] = {}
-    final = json.dumps(
-        {
-            "status": "completed",
-            "summary": "Reviewed.",
-            "changed_paths": [],
-            "test_evidence": [],
-            "unresolved_questions": [],
-        }
-    )
-
-    class Process:
-        returncode = 0
-        pid = 1
-        stdin = BytesIO()
-        stdout = BytesIO(
-            "\n".join(
-                (
-                    json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                    json.dumps(
-                        {
-                            "type": "item.completed",
-                            "item": {"type": "agent_message", "text": final},
-                        }
-                    ),
-                )
-            ).encode()
-        )
-        stderr = BytesIO()
-
-        def wait(self, *, timeout: float | None = None) -> int:
-            return self.returncode
-
-    def popen(_command: object, **kwargs: object) -> Process:
-        captured.update(kwargs)
-        return Process()
-
-    monkeypatch.setenv("HTTPS_PROXY", "http://orchestration_egress_proxy:9080")
-    monkeypatch.setenv("HTTP_PROXY", "http://orchestration_egress_proxy:9080")
-    monkeypatch.setenv("NO_PROXY", "google_connector,knowledge_vault_connector")
-    monkeypatch.setenv("UNREVIEWED_SECRET", "must-not-cross")
-    monkeypatch.setattr(runtime.subprocess, "Popen", popen)
-    adapter = CodexCliAdapter(executable=executable, api_key="api-key")
-
-    adapter.invoke(
-        CodexExecutionEnvelope(
-            request_id="request-1",
-            task="Review the workspace.",
-            host="ubuntu",
-            cwd="/srv/jarvis-workspace",
-            model="gpt-5.6-terra",
-            reasoning="medium",
-            sandbox="read-only",
-            approval_policy="on-request",
-            timeout_seconds=300,
-            operation="review",
-            allowed_paths=(),
-            proposal_digest=None,
-        ),
-        deadline=monotonic() + 1,
-    )
-
-    environment = captured["env"]
-    assert isinstance(environment, dict)
-    assert environment["HTTPS_PROXY"] == "http://orchestration_egress_proxy:9080"
-    assert environment["HTTP_PROXY"] == "http://orchestration_egress_proxy:9080"
-    assert environment["NO_PROXY"] == "google_connector,knowledge_vault_connector"
-    assert "UNREVIEWED_SECRET" not in environment
-
-
-def test_deployed_codex_cli_stops_a_process_after_an_expired_deadline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import jarvis_control_plane.codex_runtime as runtime
-
-    executable = tmp_path / "codex"
-    executable.write_text("pinned", encoding="utf-8")
-
-    class Process:
-        returncode: int | None = None
-        pid = 1
-        stopped = False
-
-        def poll(self) -> int | None:
-            return self.returncode
-
-        def terminate(self) -> None:
-            self.stopped = True
-
-        def wait(self, *, timeout: float) -> int:
-            self.returncode = -15
-            return self.returncode
-
-        def communicate(self, _prompt: str, *, timeout: float) -> tuple[str, str]:
-            raise AssertionError("expired work must not be sent to Codex")
-
-    process = Process()
-    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *_args, **_kwargs: process)
-    monkeypatch.setattr(runtime, "monotonic", lambda: 2.0)
-    adapter = CodexCliAdapter(executable=executable, api_key="api-key")
-
-    with pytest.raises(TimeoutError, match="frozen deadline"):
-        adapter.invoke(
-            CodexExecutionEnvelope(
-                request_id="expired-request",
-                task="Review the workspace.",
-                host="ubuntu",
-                cwd="/srv/jarvis-workspace",
-                model="gpt-5.6-terra",
-                reasoning="medium",
-                sandbox="read-only",
-                approval_policy="on-request",
-                timeout_seconds=300,
-                operation="review",
-                allowed_paths=(),
-                proposal_digest=None,
-            ),
-            deadline=1.0,
-        )
-
-    assert process.stopped is True
-
-
-def test_deployed_codex_cli_bounds_each_output_stream(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    import jarvis_control_plane.codex_runtime as runtime
-
-    executable = tmp_path / "codex"
-    executable.write_text("pinned", encoding="utf-8")
-
-    class Process:
-        returncode = 0
-        pid = 1
-        stdin = BytesIO()
-        stdout = BytesIO(b"x" * 17)
-        stderr = BytesIO()
-
-        def poll(self) -> int:
-            return self.returncode
-
-        def wait(self, *, timeout: float) -> int:
-            return self.returncode
-
-    monkeypatch.setattr(runtime, "MAX_CODEX_OUTPUT_BYTES", 16)
-    monkeypatch.setattr(
-        runtime.subprocess, "Popen", lambda *_args, **_kwargs: Process()
-    )
-    adapter = CodexCliAdapter(executable=executable, api_key="api-key")
-
-    with pytest.raises(CodexVerificationError, match="output bound"):
-        adapter.invoke(
-            CodexExecutionEnvelope(
-                request_id="verbose-request",
-                task="Review the workspace.",
-                host="ubuntu",
-                cwd="/srv/jarvis-workspace",
-                model="gpt-5.6-terra",
-                reasoning="medium",
-                sandbox="read-only",
-                approval_policy="on-request",
-                timeout_seconds=300,
-                operation="review",
-                allowed_paths=(),
-                proposal_digest=None,
-            ),
-            deadline=monotonic() + 1,
-        )
-
-
-def test_git_inspection_disables_repository_fsmonitor_commands() -> None:
-    assert ("-c", "core.fsmonitor=false") == tuple(
-        GitCodexWorkspaceInspector._GIT_PREFIX[1:3]
-    )
 
 
 def test_working_session_store_is_usable_from_service_handler_threads(
@@ -1125,19 +898,6 @@ def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:
     )
 
 
-def test_bundle_binds_the_complete_codex_npm_lock(tmp_path: Path) -> None:
-    bundle = _copy_bundle(tmp_path)
-    lock_path = bundle / "codex/package-lock.json"
-    lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    lock["packages"]["node_modules/@openai/codex-linux-x64"]["integrity"] = "changed"
-    lock_path.write_text(json.dumps(lock), encoding="utf-8")
-
-    with pytest.raises(BundleValidationError) as raised:
-        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
-
-    assert "Codex npm lock digest differs from artifact lock" in raised.value.errors
-
-
 def test_bundle_rejects_security_network_and_resource_regressions(
     tmp_path: Path,
 ) -> None:
@@ -1233,7 +993,6 @@ def test_openwa_route_worker_overlay_and_docker_context_are_reviewed() -> None:
     assert "deployment/credentials" in dockerignore
     assert "deployment/credentials/**" in dockerignore
     dockerfile = (SHIPPED_BUNDLE / "Dockerfile").read_text("utf-8")
-    assert "RUN npm ci --omit=dev --ignore-scripts" in dockerfile
     assert (
         "useradd --uid 10006 --gid 20000 --home-dir /var/lib/jarvis/vault" in dockerfile
     )
@@ -1347,8 +1106,6 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "artifacts.lock.json",
         "compose.yaml",
         "config.example.toml",
-        "codex/package.json",
-        "codex/package-lock.json",
         "openwa-handoff.md",
         "requirements.lock",
         "systemd/jarvis-backup.service",

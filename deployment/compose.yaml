@@ -92,8 +92,6 @@ services:
       - /etc/jarvis/protocol/capability_broker--orchestration_agent.key:/run/protocol/capability_broker--orchestration_agent.key:ro
       - /etc/jarvis/protocol/orchestration_agent--google_connector.key:/run/protocol/orchestration_agent--google_connector.key:ro
       - /etc/jarvis/protocol/orchestration_agent--knowledge_vault_connector.key:/run/protocol/orchestration_agent--knowledge_vault_connector.key:ro
-      - /var/lib/jarvis/codex-traces:/var/lib/jarvis/codex-traces
-      - /srv/jarvis-workspace:/srv/jarvis-workspace:ro
     networks: [broker_orchestration, broker_google, broker_vault, orchestration_egress]
     pids_limit: 112
     deploy:

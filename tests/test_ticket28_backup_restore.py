@@ -36,10 +36,6 @@ DATABASES = {
         "traces.sqlite3",
         "CREATE TABLE diagnostic_traces (trace_id TEXT)",
     ),
-    "codex_traces": (
-        "codex.sqlite3",
-        "CREATE TABLE diagnostic_traces (trace_id TEXT)",
-    ),
     "google_traces": (
         "google.sqlite3",
         "CREATE TABLE diagnostic_traces (trace_id TEXT)",

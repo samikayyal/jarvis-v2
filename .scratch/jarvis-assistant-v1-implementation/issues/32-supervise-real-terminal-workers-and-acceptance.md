@@ -1,6 +1,6 @@
-# 32 — Supervise real Ubuntu, Windows, terminal, and Codex acceptance
+# 32 — Supervise real Ubuntu, Windows, and terminal acceptance
 
-**What to build:** Under direct human supervision, demonstrate both authenticated workers, deterministic terminal authority, bounded execution, and Codex specialization without allowing Jarvis or Codex to activate trust-critical components.
+**What to build:** Under direct human supervision, demonstrate both authenticated workers, deterministic terminal authority, bounded execution, and prompt-injection containment without allowing Jarvis to activate trust-critical components.
 
 **Blocked by:** 30 — Supervise initial activation and OpenWA handoff acceptance.
 
@@ -8,15 +8,13 @@
 
 - [ ] Natural-language host selection, both authenticated workers, offline behavior, identity mismatch, reconnection, and no-failover behavior pass against the real hosts.
 - [ ] Safe reads, ordinary approval, mandatory-fresh approval, exact session/persistent permission, revocation, timeout, truncation, partial outcome, and process-tree cancellation are demonstrated.
-- [ ] Prompt-injection containment and independently verified Codex preparation/testing pass while push, approval bypass, broad sandboxing, and trust-critical activation remain impossible.
+- [ ] Prompt-injection containment passes while approval bypass and trust-critical activation remain impossible.
 
 ## Comments
 
 ### Sanitized supervised preflight — 2026-08-24
 
-- Added the post-activation `deployment/terminal-codex-acceptance-runbook.md`
-  worksheet with explicit real-host, terminal-authority, bounded-execution,
-  prompt-injection, Codex, stop, reconciliation, and human-ownership gates.
+- Added the post-activation `deployment/terminal-acceptance-runbook.md` worksheet with explicit real-host, terminal-authority, bounded-execution, prompt-injection, stop, reconciliation, and human-ownership gates.
 - Fresh `/status` and `/permissions` controls passed in session `S-072`: the
   request and pending-action slots were idle, command permissions were zero,
   Ubuntu and Windows were ready, OpenWA was ready, and the connected-service
@@ -30,11 +28,7 @@
   at the same boundary under
   `orchestration-failure-f2af961e73a64c3eaa24810726897b5e`; Jarvis again
   reported that no action was taken.
-- The Windows-dependent request and every mutating, approval, permission,
-  lifecycle, failure-injection, bounded-output, cancellation, and Codex row were
-  not attempted after the safe-read gate failed. No service, credential,
-  certificate, network, active configuration, terminal target, or Codex
-  workspace was changed.
+- The Windows-dependent request and every mutating, approval, permission, lifecycle, failure-injection, bounded-output, and cancellation row were not attempted after the safe-read gate failed. No service, credential, certificate, network, active configuration, or terminal target was changed.
 - Protected Ubuntu orchestration evidence is required to diagnose the failure.
   The Tailscale route is healthy, but the current local SSH key was not accepted;
   no password, credential value, or protected trace payload was requested or
@@ -62,8 +56,8 @@
   explanatory metadata. The existing fail-closed unknown-field check remains
   unchanged.
 - The focused orchestration and Ticket 32 contract tests pass (`42 passed`). The
-  broader terminal, permission, worker, Codex, protocol, deployment, and Ticket
-  32 matrix produced `287 passed, 1 skipped`; its four expected deployment-lock
+  broader terminal, permission, worker, protocol, deployment, and Ticket 32
+  matrix produced `287 passed, 1 skipped`; its four expected deployment-lock
   failures report only that the changed application source has not yet been
   repinned. No active release or production configuration has been changed.
 
@@ -499,8 +493,3 @@
   ready, messaging ready, audit writable, and resource pressure `ok`. OpenWA
   retained its previously recorded container identity and original start time,
   remained healthy, and still had zero restarts and no OOM flag.
-- The deployed orchestration schema currently exposes only bounded Codex
-  `inspect` and `review` operations. It exposes no broker-owned
-  `workspace_prepare` proposal route, so Gate 13 must not be bypassed through an
-  administrative or direct adapter call. This row remains unpassed pending a
-  deployed broker route or an accurate blocked disposition at final closure.

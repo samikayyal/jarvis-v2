@@ -18,7 +18,6 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .codex_specialist import CodexInvocation, CodexSpecialist, CodexSpecialistError
 from .gmail_actions import (
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
@@ -304,30 +303,6 @@ class BoundedReadOutput(BaseModel):
     text: str = Field(min_length=1, max_length=_MAX_READ_CHARS)
 
 
-class CodexToolInput(BaseModel):
-    """Closed read-only input exposed to the orchestration model."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    workspace: str = Field(min_length=1, max_length=64)
-    operation: Literal["inspect", "review"]
-    task: str = Field(min_length=1, max_length=8_000)
-
-
-class CodexToolOutput(BaseModel):
-    """Bounded independently verified specialist output."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["completed", "incomplete", "failed"]
-    summary: str = Field(min_length=1, max_length=8_000)
-    changed_paths: tuple[str, ...] = Field(max_length=128)
-    test_evidence: tuple[str, ...] = Field(max_length=128)
-    unresolved_questions: tuple[str, ...] = Field(max_length=128)
-    thread_id: str = Field(min_length=1, max_length=256)
-    verified: Literal[True]
-
-
 @dataclass(frozen=True, slots=True)
 class BoundedReadTool:
     """Closed, typed read capability with no mutation or dispatch authority."""
@@ -429,7 +404,6 @@ class AgentsSdkOrchestrationAdapter:
         google_read_connector: object | None = None,
         vault_read_tool: BoundedReadTool | None = None,
         vault_write_enabled: bool = False,
-        codex_specialist: CodexSpecialist | None = None,
         model_turn_timeout_seconds: float | None = None,
     ) -> None:
         if (
@@ -448,10 +422,6 @@ class AgentsSdkOrchestrationAdapter:
             )
         if not isinstance(vault_write_enabled, bool):
             raise TypeError("vault_write_enabled must be a bool")
-        if codex_specialist is not None and not isinstance(
-            codex_specialist, CodexSpecialist
-        ):
-            raise TypeError("codex_specialist must be a CodexSpecialist")
         if run_sync is not None and run_async is not None:
             raise ValueError("provide only one Agents SDK runner")
         if model_turn_timeout_seconds is not None and (
@@ -514,7 +484,6 @@ class AgentsSdkOrchestrationAdapter:
             read_tools.append(vault_read_tool)
         self._read_tools = tuple(read_tools)
         self._vault_write_enabled = vault_write_enabled
-        self._codex_specialist = codex_specialist
         self._model_turn_timeout_seconds = model_turn_timeout_seconds
         if self._run_sync is not None and model_turn_timeout_seconds is not None:
             raise ValueError(
@@ -579,7 +548,6 @@ class AgentsSdkOrchestrationAdapter:
                         tool.name == "read_knowledge_vault" for tool in self._read_tools
                     ),
                     has_vault_write=self._vault_write_enabled,
-                    has_codex=self._codex_specialist is not None,
                 ),
                 model=request.model,
                 model_settings=self._model_settings_factory(
@@ -745,7 +713,7 @@ class AgentsSdkOrchestrationAdapter:
             ) from exc
 
     def cancel(self, *, request_id: str) -> bool:
-        """Cancel active model and Codex work only after model-task quiescence."""
+        """Cancel an active model turn only after model-task quiescence."""
 
         with self._cancellation_lock:
             self._cancelled_requests.add(request_id)
@@ -757,18 +725,13 @@ class AgentsSdkOrchestrationAdapter:
                     raise OrchestrationAdapterError(
                         "active Agents SDK model turn could not be cancelled"
                     ) from exc
-        codex_cancelled = (
-            self._codex_specialist.cancel(request_id)
-            if self._codex_specialist is not None
-            else False
-        )
         if active is not None and not active.quiesced.wait(
             timeout=_MODEL_CANCELLATION_GRACE_SECONDS
         ):
             raise OrchestrationAdapterError(
                 "active Agents SDK model turn did not establish quiescence"
             )
-        return active is not None or codex_cancelled
+        return active is not None
 
     def _request_is_cancelled(self, request_id: str) -> bool:
         with self._cancellation_lock:
@@ -894,73 +857,6 @@ class AgentsSdkOrchestrationAdapter:
                     needs_approval=False,
                     timeout_seconds=read_tool.timeout_seconds,
                     output_json_schema=read_tool.output_model.model_json_schema(),
-                )
-            )
-        if self._codex_specialist is not None:
-
-            async def invoke_codex(_context: Any, raw_input: str) -> object:
-                if unavailable_reads:
-                    return _READ_UNAVAILABLE_RESULT
-                budget.consume()
-                try:
-                    typed_input = CodexToolInput.model_validate_json(raw_input)
-                    specialist_result = await asyncio.to_thread(
-                        self._codex_specialist.invoke,
-                        CodexInvocation(
-                            request_id=request.state.request_id,
-                            workspace=typed_input.workspace,
-                            operation=typed_input.operation,
-                            task=typed_input.task,
-                        ),
-                        is_cancelled=lambda: self._request_is_cancelled(
-                            request.state.request_id
-                        ),
-                    )
-                    bounded_output = CodexToolOutput(
-                        status=specialist_result.status,
-                        summary=specialist_result.summary,
-                        changed_paths=specialist_result.changed_paths,
-                        test_evidence=specialist_result.test_evidence,
-                        unresolved_questions=specialist_result.unresolved_questions,
-                        thread_id=specialist_result.thread_id,
-                        verified=specialist_result.verified,
-                    )
-                except OrchestrationAdapterError:
-                    raise
-                except CodexSpecialistError as exc:
-                    raise OrchestrationAdapterError(
-                        "bounded Codex specialist invocation failed"
-                    ) from exc
-                except Exception as exc:
-                    raise OrchestrationAdapterError(
-                        "bounded Codex specialist returned malformed data"
-                    ) from exc
-                milestones.append(
-                    OrchestrationMilestone(
-                        stage="codex_specialist",
-                        message="Completed an independently verified Codex turn.",
-                    )
-                )
-                return bounded_output.model_dump(mode="json")
-
-            from agents import FunctionTool
-
-            tools.append(
-                FunctionTool(
-                    name="invoke_codex_specialist",
-                    description=(
-                        "Inspect or review one configured workspace through the bounded "
-                        "read-only Codex specialist."
-                    ),
-                    params_json_schema=CodexToolInput.model_json_schema(),
-                    on_invoke_tool=invoke_codex,
-                    strict_json_schema=True,
-                    needs_approval=False,
-                    # CodexSpecialist.invoke is the sole hard-deadline owner.
-                    # Its timeout path interrupts Codex and verifies the final
-                    # workspace snapshot before returning control.
-                    timeout_seconds=None,
-                    output_json_schema=CodexToolOutput.model_json_schema(),
                 )
             )
         return tools
@@ -1197,9 +1093,7 @@ def _model_input_with_history(request: OrchestrationRequest) -> str:
     return "\n\n".join(sections)
 
 
-def _instructions(
-    *, has_vault_read: bool, has_vault_write: bool, has_codex: bool = False
-) -> str:
+def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
     """Keep the model on a closed planning contract with no authority tools."""
 
     return (
@@ -1232,14 +1126,6 @@ def _instructions(
             "The read_knowledge_vault tool is a local, deterministic, read-only "
             "search of the configured vault and returns only bounded excerpts. "
             if has_vault_read
-            else ""
-        )
-        + (
-            "The invoke_codex_specialist tool may only inspect or review a configured "
-            "workspace. Jarvis freezes its host, cwd, model, reasoning, sandbox, "
-            "approval policy, timeout, and operation, then independently verifies "
-            "the workspace state; specialist prose is never execution evidence. "
-            if has_codex
             else ""
         )
         + (

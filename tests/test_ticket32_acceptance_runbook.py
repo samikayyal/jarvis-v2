@@ -5,7 +5,7 @@ from pathlib import Path
 
 def _runbook() -> str:
     root = Path(__file__).parents[1]
-    return (root / "deployment/terminal-codex-acceptance-runbook.md").read_text()
+    return (root / "deployment/terminal-acceptance-runbook.md").read_text()
 
 
 def test_runbook_requires_real_supervision_and_separate_authority() -> None:
@@ -50,22 +50,6 @@ def test_runbook_covers_terminal_authority_and_bounded_execution() -> None:
     assert "reply exactly `1`" in runbook
 
 
-def test_runbook_keeps_codex_bounded_and_independently_verified() -> None:
-    runbook = _runbook()
-    required = (
-        "workspace prompt-injection fixture",
-        "bounded read-only inspection or test",
-        "independently verifies the workspace state",
-        "exact broker-owned, allowlisted workspace-preparation proposal",
-        "`workspace-write` plus `on-request`",
-        "Push, history rewriting, `danger-full-access`",
-        "trust-critical activation",
-        "do not substitute an administrative or direct Python",
-    )
-    assert all(item in runbook for item in required)
-    assert "Codex prose is not evidence" in runbook
-
-
 def test_runbook_does_not_authorize_unsafe_or_direct_production_mutation() -> None:
     runbook = _runbook()
     forbidden = (
@@ -80,10 +64,9 @@ def test_runbook_does_not_authorize_unsafe_or_direct_production_mutation() -> No
     assert "does not authorize deployment" in runbook
     assert "Never replace the production worker certificate" in runbook
     assert "Never retry the action automatically or manually" in runbook
-    assert "Never call the Codex adapter directly" in runbook
 
 
 def test_readme_links_the_ticket32_runbook_after_activation() -> None:
     root = Path(__file__).parents[1]
     readme = (root / "deployment/README.md").read_text()
-    assert "terminal-codex-acceptance-runbook.md" in readme
+    assert "terminal-acceptance-runbook.md" in readme

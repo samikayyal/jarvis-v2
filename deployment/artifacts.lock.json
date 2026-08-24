@@ -4,14 +4,13 @@
     "name": "jarvis-v2",
     "version": "0.1.0",
     "git_revision": "141ac1f785e344d53cefe171b5df76ff1d0b2103",
-    "source_sha256": "3d58999d8a474b3033e2312943c983595c017beb59b10d804c4b79e2556e0c52"
+    "source_sha256": "49ef00507d55bd1390d16ed8fa91c87310befd3bce4e4bcc39942121d27dc589"
   },
   "database_schemas": {
     "state": "4c4e03d8f879ad235051543caa4ef7782f408c05953087d5cf0201c261a59c43",
     "sessions": "702f19c90b7c336532f4a7e598801150ac9f68bc3471b5d2b0e69317eb974470",
     "audit": "07918a1e796be9ed5f0c720fd490ca59354e39742eee2b9e77769f6ec1702648",
     "traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
-    "codex_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
     "google_traces": "c20e4c17acc056d1ea5ceb2723c607ff1c42c99febe2d6b4759863633cc47dbd",
     "deleted_conversations": "fb1b292ce25216b5f697aba99a90a83f77dbc6aba755c61ce69488748bef066d"
   },
@@ -20,15 +19,6 @@
   },
   "uv_build_image": {
     "reference": "ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664"
-  },
-  "node_build_image": {
-    "reference": "node:24-bookworm-slim@sha256:65932751ed4073ed02f5c04e494e4b2572a891b7dbea0568a863dc80341bf848"
-  },
-  "codex_cli": {
-    "package": "@openai/codex",
-    "version": "0.147.0",
-    "integrity": "sha512-EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w==",
-    "package_lock_sha256": "dde6c5ad754926cb15527a834225cd9983887c3c4b1894a42d6c3888d4621c22"
   },
   "os_packages": {
     "git": "1:2.39.5-0+deb12u3",

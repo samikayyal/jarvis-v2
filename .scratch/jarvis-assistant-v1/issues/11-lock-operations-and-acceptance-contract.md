@@ -82,7 +82,7 @@ A connector or worker may be unavailable without making safe unrelated reads
 unavailable. Degraded state is explicit in `/status` and `jarvisctl status`.
 There is no host failover. A restart marks active work interrupted, invalidates
 pending actions, revokes session permissions, and never resumes a model run,
-connector call, Codex task, terminal process, or ambiguous external side effect.
+connector call, terminal process, or ambiguous external side effect.
 
 Shutdown first stops admission, acknowledges already durably claimed inbound
 messages, cancels or interrupts current work within a bounded grace period,
@@ -257,7 +257,7 @@ Excluded or destructive behavior is verified only by rejection.
 | OpenWA preservation | After the one controlled network attachment, require Compose validation, container `healthy`, session `ready`, exact inbound text, confirmed outbound receipt, retained auth after controlled recreation, 45-second stop timeout, unchanged LAN/UFW exposure, and settled resource checks. `LOGOUT` stops testing without repeated recreation or re-pairing. |
 | Admission and replay | Verify every disposition and HTTP result for bad signature, malformed envelope, duplicate, wrong event/session, group, status, media, reaction, `fromMe`, blank text, unresolved identity, unauthorized sender, audit outage, and unwritable inbox; duplicate webhook and old approval replays create no duplicate work or side effect. |
 | Session and control grammar | Verify `/new`, `/status`, model/config commands, one active request, one pending action, ten-minute expiry, deterministic whole-message approval/rejection, unrelated-text blocking, the exact busy response with no queue or request mutation, cancellation, and permission list/revoke behavior. |
-| Agent and prompt-injection containment | Connected content, terminal output, quoted text, model output, and Codex output cannot create approval, policy, permission, identity, connector access, or side effects; malformed proposals fail schema validation. |
+| Agent and prompt-injection containment | Connected content, terminal output, quoted text, and model output cannot create approval, policy, permission, identity, connector access, or side effects; malformed proposals fail schema validation. |
 | Google reads | Real bounded Gmail, Calendar, and Drive reads succeed with fixed scopes and produce no side effect; wrong account, revoked token, missing scope, rate limit, timeout, and sanitized error behavior are exercised. |
 | Gmail and Calendar writes | Send one labeled email and create/update one labeled operator-owned calendar event only after exact approval; altered/expired/replayed approval fails; unknown outcome is not retried; destructive Google and Drive operations are unavailable. |
 | Vault | Real deterministic read succeeds; one labeled Markdown diff is approved against an exact base, committed as the configured Jarvis identity, and normally pushed; dirty clone, changed base, conflict, non-fast-forward, excluded path, deletion, force-push, and history rewrite fail closed. |

@@ -284,7 +284,6 @@ def _validate_candidate_schemas(candidate: Path, artifact_lock: Path) -> None:
         "sessions": candidate / "data/state/sessions.sqlite3",
         "audit": candidate / "data/audit/audit.sqlite3",
         "traces": candidate / "data/traces/traces.sqlite3",
-        "codex_traces": candidate / "data/codex_traces/codex.sqlite3",
         "google_traces": candidate / "data/google_traces/google.sqlite3",
         "deleted_conversations": candidate
         / "data/deleted_conversations/deleted-conversations.sqlite3",

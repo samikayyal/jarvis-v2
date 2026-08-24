@@ -258,15 +258,11 @@ Create and review these persistent boundaries before activation:
 | --- | --- | --- |
 | `/var/lib/jarvis/state` | UID 10002 | `0700` |
 | `/var/lib/jarvis/traces` | UID 10002 | `0700` |
-| `/var/lib/jarvis/codex-traces` | UID 10003 | `0700` |
 | `/var/lib/jarvis/audit` | UID 10004 | `0700` |
 | `/var/lib/jarvis/google-traces` | UID 10005 | `0700` |
 | `/var/lib/jarvis/vault` | UID 10006 | `0700` |
 | `/var/lib/jarvis/deleted-conversations` | UID 10010 | `0700` |
 | `/run/jarvis/deleted-archive-ipc` | UID 10010, GID 20000 | `0770` |
-
-Also confirm `/srv/jarvis-workspace` is the single reviewed, read-only Codex
-workspace and contains no activation credential.
 
 ## Phase 3: prepare workers, backups, and recovery
 
@@ -686,4 +682,4 @@ Only after every worksheet row passes:
 3. Set `Status: complete`. Do not use `ready-for-agent` or `ready-for-human` as a
    completion status.
 4. Keep tickets 31 and 32 open. Real Google/vault behavior and complete
-   Ubuntu/Windows/terminal/Codex behavior have their own supervised acceptance.
+   Ubuntu/Windows/terminal behavior have their own supervised acceptance.

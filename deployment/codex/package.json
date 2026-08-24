@@ -1,7 +1,0 @@
-{
-  "name": "jarvis-reviewed-codex-cli",
-  "private": true,
-  "dependencies": {
-    "@openai/codex": "0.147.0"
-  }
-}

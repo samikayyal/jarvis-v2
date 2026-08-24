@@ -30,10 +30,10 @@ These invariants are implementation requirements, not prompting guidance:
    canonical operator JID can create an operator control.
 2. Only the capability broker creates session, request, action, approval, and
    permission IDs or changes their lifecycle state.
-3. Model output, Codex output, connected-source content, quoted-message content,
+3. Model output, connected-source content, quoted-message content,
    and terminal output are never operator identity, approval, policy, or
    permission.
-4. The orchestration agent and Codex cannot connect directly to a side-effecting
+4. The orchestration agent cannot connect directly to a side-effecting
    connector or execution worker.
 5. Every connector exposes a closed typed operation set; no connector exposes a
    raw credential, arbitrary HTTP endpoint, arbitrary OAuth scope, generic shell,
@@ -70,7 +70,6 @@ preserve the identities and one-way authority relationships below.
 | Inbound receiver | Raw-body HMAC verification and defensive decoding of the local OpenWA webhook | Model execution, outbound messaging, connectors, shell |
 | Capability broker and state owner | Operator allowlist, atomic inbox, SQLite state, deterministic control grammar, policy, frozen actions, approvals, permissions, cancellation, and dispatch | Raw connector credentials, arbitrary shell, model judgment as authorization |
 | Agents SDK orchestration agent | Bounded current context, typed read/proposal tools, model configuration, handoffs, and an OpenAI API credential | Direct state writes, approval parsing, connector credentials, connector sockets, workers |
-| Codex specialist | Bounded coding/terminal analysis under its configured host, cwd, sandbox, and approval policy; read-only by default | Jarvis authority, direct connector or worker access, policy override |
 | Google connector | One configured Google identity, fixed Gmail/Calendar/Drive V1 methods, access-token refresh, and its token record | Arbitrary Google methods/scopes, Drive mutation, destructive Google operations, shell |
 | Vault connector | Dedicated clone, configured Markdown paths, repository-scoped SSH identity, exact approved commit/push sequence | Other clones/repos, force-push, history rewrite, automatic conflict resolution, arbitrary filesystem writes |
 | Terminal dispatcher | Authenticated worker registry, one frozen terminal action, execution/cancel protocol, bounded output | Host substitution, approval, arbitrary worker registration, connector credentials |
@@ -213,7 +212,7 @@ Every connector has a separate typed request schema and target allowlist:
   script path, arguments, canonical cwd, normalized compound structure, material
   stdin, and timeout. It has no general “run whatever the model sent” route.
 
-OAuth consent, connector availability, a model tool call, a Codex approval, a
+OAuth consent, connector availability, a model tool call, a
 worker response, and possession of an external credential are capabilities or
 signals—not Jarvis action approval.
 
@@ -276,7 +275,7 @@ On restart, the broker:
 - invalidates and removes any exact pending-action payload;
 - revokes session-scoped command permissions while retaining explicit persistent
   permissions;
-- does not resume model, connector, Codex, or worker operations; and
+- does not resume model, connector, or worker operations; and
 - reconciles durable inbox and dispatch records before accepting new work.
 
 Reconciliation marks every nonterminal request interrupted, including admitted
@@ -299,7 +298,7 @@ connector allowlists, credentials/service identities, worker CA/registration,
 systemd units, firewall, private-overlay grants, public endpoint configuration,
 or the installed Jarvis orchestration runtime is hard-prohibited through Jarvis.
 
-Jarvis and Codex may inspect, edit, and test development copies. A manual
+Development tools may inspect, edit, and test development copies. A manual
 administrator outside Jarvis reviews and activates any trust-critical change.
 This prevents a freshly approved terminal action from rewriting the component
 that evaluates later approvals.

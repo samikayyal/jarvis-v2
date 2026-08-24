@@ -1,6 +1,6 @@
 # 04 — Retain complete diagnostic traces and enforce trace capacity
 
-**What to build:** Model, Codex, connector, and worker operations retain complete payload traces indefinitely in the manual-administration boundary, including credential-like material, and new trace-producing work is admitted only when its trace can be retained.
+**What to build:** Model, connector, and worker operations retain complete payload traces indefinitely in the manual-administration boundary, including credential-like material, and new trace-producing work is admitted only when its trace can be retained.
 
 **Blocked by:** 01 — Establish the signed-message control-plane tracer bullet.
 
