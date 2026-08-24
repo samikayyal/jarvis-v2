@@ -234,3 +234,35 @@
   retried. Ticket 32 remains `ready-for-human` pending a fresh replacement
   cutover authorization and a new action-time confirmation for each WhatsApp
   acceptance message.
+
+### Authorized terminal-schema replacement cutover — 2026-08-24
+
+- The committed `3d07bab` archive matched SHA-256 `d8248ba46de0` across Windows
+  and Ubuntu and was installed as the root-owned release
+  `/opt/jarvis/releases/3d07babb34567395bb08cfacdcba7664fd20f96c`.
+  Artifact, active-configuration, base Compose, locked-venv, and image-internal
+  validation passed at 13 services, 1056 MiB, 1.80 CPU, and 512 PIDs.
+- The pre-cutover baseline had all 13 services healthy with zero restarts/OOMs,
+  both workers ready, messaging ready, audit writable, backup current, and
+  pressure `ok`. The verified pre-change backup is
+  `/var/backups/jarvis/20260824T043034.662946Z-pre-change`.
+- The active pointer now targets release `3d07bab`; `previous` targets rollback
+  release `aa9104e`. The active override SHA-256 is `187ca12e5a20`, the preserved
+  pending override remains `5f3079be2bbc`, and the exact running 13-image map is
+  installed at SHA-256 `1d4ca428fc16`. The verified candidate baseline backup is
+  `/var/backups/jarvis/20260824T095402.821387Z-nightly`.
+- All 13 candidate services are healthy with zero restarts and no OOM flags.
+  Administrative status reports application revision `0b203aa`, both workers
+  ready, messaging ready, audit writable, backup current, and pressure `ok`.
+  Three fixed-interval resource samples passed; the proxies remained stable near
+  34.9–35.3 MiB under 48 MiB, and host memory, swap, and disk headroom remained
+  acceptable. The post-cutover kernel OOM gate passed.
+- Running read-only filesystems, dropped capabilities, no-new-privileges,
+  non-root identities, restart policy, exact published ports, and reviewed
+  network member counts passed. OpenWA retained container ID `24fb501ab8eb`, its
+  original start time, healthy state, zero restarts, and one named session in
+  `ready`. The Funnel remains the exact `/callback` route.
+- The local and Ubuntu transfer archives were removed. No WhatsApp acceptance
+  message or terminal action was sent during cutover. Ticket 32 remains
+  `ready-for-human` for a new supervised behavioral worksheet; each message
+  requires fresh action-time confirmation.
