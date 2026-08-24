@@ -821,6 +821,157 @@ def test_v1_model_contract_states_the_exact_terminal_payload_shape() -> None:
     ):
         assert forbidden_metadata in instructions
 
+    output_type = captured["output_type"]
+    schema = output_type.json_schema()
+    terminal_payload = schema["$defs"]["_TerminalStructuredPayload"]
+    assert terminal_payload["additionalProperties"] is False
+    assert set(terminal_payload["required"]) == {
+        "host",
+        "executable",
+        "arguments",
+        "cwd",
+    }
+    assert set(terminal_payload["properties"]) == {
+        "host",
+        "executable",
+        "arguments",
+        "cwd",
+        "components",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "host": "ubuntu",
+            "executable": "/usr/bin/uname",
+            "arguments": ["-s"],
+        },
+        {
+            "host": "ubuntu",
+            "executable": "/usr/bin/uname",
+            "arguments": ["-s"],
+            "cwd": "/workspace",
+            "approval": "persistent",
+        },
+        {
+            "host": "ubuntu",
+            "executable": "/usr/bin/uname",
+            "arguments": "-s",
+            "cwd": "/workspace",
+        },
+    ),
+)
+def test_provider_schema_rejects_malformed_terminal_payloads(
+    payload: dict[str, object],
+) -> None:
+    captured: dict[str, object] = {}
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: captured.update(kwargs) or object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="No action was needed.")
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    adapter.run(_request("inspect the operating system"))
+
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        captured["output_type"].validate_json(
+            json.dumps(
+                {
+                    "reply_text": "I prepared the safe read.",
+                    "execution_host": "ubuntu",
+                    "host_reason_code": "default_ubuntu",
+                    "proposal": {
+                        "kind": "terminal",
+                        "preview": "Read the operating-system name.",
+                        "payload": payload,
+                    },
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "components",
+    (
+        None,
+        [
+            {
+                "executable": "/usr/bin/printf",
+                "arguments": ["Linux\\n"],
+            },
+            {
+                "executable": "/usr/bin/head",
+                "arguments": ["-n", "1"],
+                "operator_before": "|",
+                "redirections": [],
+            },
+        ],
+    ),
+)
+def test_provider_schema_accepts_valid_single_and_compound_terminal_payloads(
+    components: list[dict[str, object]] | None,
+) -> None:
+    captured: dict[str, object] = {}
+    payload: dict[str, object] = {
+        "host": "ubuntu",
+        "executable": ("/usr/bin/uname" if components is None else "/usr/bin/printf"),
+        "arguments": ["-s"] if components is None else ["Linux\\n"],
+        "cwd": "/workspace",
+    }
+    if components is not None:
+        payload["components"] = components
+
+    def run_sync(_agent: object, _text: str, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            final_output=captured["output_type"].validate_json(
+                json.dumps(
+                    {
+                        "reply_text": "I prepared the safe read.",
+                        "execution_host": "ubuntu",
+                        "host_reason_code": "default_ubuntu",
+                        "proposal": {
+                            "kind": "terminal",
+                            "preview": "Read the operating-system name.",
+                            "payload": payload,
+                        },
+                    }
+                )
+            )
+        )
+
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: captured.update(kwargs) or object(),
+        run_sync=run_sync,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("inspect the operating system"))
+
+    assert result.proposal is not None
+    frozen_payload = json.loads(result.proposal.payload)
+    assert {
+        field: frozen_payload[field]
+        for field in ("host", "executable", "arguments", "cwd")
+    } == {field: payload[field] for field in ("host", "executable", "arguments", "cwd")}
+    if components is None:
+        assert frozen_payload["components"] == []
+    else:
+        assert [
+            component["executable"] for component in frozen_payload["components"]
+        ] == [
+            "/usr/bin/printf",
+            "/usr/bin/head",
+        ]
+        assert frozen_payload["components"][1]["operator_before"] == "|"
+
 
 @pytest.mark.parametrize(
     ("request_text", "expected_reply"),

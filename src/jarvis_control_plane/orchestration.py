@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Event, Lock
 from time import monotonic
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -216,11 +216,37 @@ class AgentsSdkPlan(BaseModel):
     proposal: AgentsSdkProposal | None = None
 
 
+class _TerminalStructuredComponent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    executable: str = Field(min_length=1)
+    arguments: list[str]
+    operator_before: Literal["", "|", "&&", "||", ";"] = ""
+    redirections: list[str] = Field(default_factory=list)
+
+
+class _TerminalStructuredPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    host: Literal["ubuntu", "windows"]
+    executable: str = Field(min_length=1)
+    arguments: list[str]
+    cwd: str = Field(min_length=1)
+    components: list[_TerminalStructuredComponent] = Field(default_factory=list)
+
+
+class _TerminalStructuredProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["terminal"]
+    preview: str = Field(min_length=1, max_length=2_000)
+    payload: _TerminalStructuredPayload
+
+
 class _OtherStructuredProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal[
-        "terminal",
         "gmail_send",
         "gmail_reply",
         "knowledge_vault_write",
@@ -239,7 +265,13 @@ class _AgentsSdkStructuredPlan(BaseModel):
     host_reason_code: (
         Literal["default_ubuntu", "explicit_windows", "windows_dependency"] | None
     ) = None
-    proposal: _OtherStructuredProposal | None = None
+    proposal: (
+        Annotated[
+            _TerminalStructuredProposal | _OtherStructuredProposal,
+            Field(discriminator="kind"),
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="before")
     @classmethod
