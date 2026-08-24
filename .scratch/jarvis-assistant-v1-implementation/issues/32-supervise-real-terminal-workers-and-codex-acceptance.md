@@ -458,3 +458,35 @@
   `813 passed, 2 skipped` in 906.07 seconds; it was not repeated. Production
   remains on the healthy diagnostic release `b13ed77` pending a separately
   reconciled replacement cutover and one fresh supervised safe-read attempt.
+
+### Authorized broker-owned-cwd replacement cutover — 2026-08-24
+
+- Reviewed release `15c4bf6a66f34f771a56c441a9240949df77b2e8` was installed
+  immutably with all 13 candidate images. Its archive SHA-256 was
+  `a596b5f180ef`; its root-owned activation override SHA-256 is
+  `042b21067b09` and differs from the prior override only in the 13 image tags.
+  Locked dependencies, offline bundle verification, candidate Compose parsing,
+  image builds, and image-internal bundle verification passed before activation.
+- A fresh verified pre-change backup was created at
+  `/var/backups/jarvis/20260824T134818.275686Z-pre-change`. After explicit
+  release-specific authorization, all 13 replacement services became healthy
+  inside their reviewed cold-start windows with zero restarts and no OOM flags.
+- The active pointer now targets `15c4bf6`; `previous` preserves rollback
+  release `b13ed77`. The exact root-only running-image map has SHA-256
+  `489c5d137c14`; the pending override remains unchanged at `5f3079be2bbc`.
+  The verified post-cutover baseline backup is
+  `/var/backups/jarvis/20260824T140121.416922Z-nightly`.
+- Administrative status reports application revision `141ac1f785e344d53cefe171b5df76ff1d0b2103`,
+  every component ready, both workers ready, messaging ready, audit writable,
+  backup current, and resource pressure `ok`. Three settled resource samples,
+  exact listeners, worker socket identity, read-only filesystems, dropped
+  capabilities, no-new-privileges, non-root identities, restart policy, and the
+  enabled/active backup timer passed.
+- OpenWA was not recreated, modified, or re-paired. It retained container ID
+  `24fb501ab8eb`, its original start time, healthy state, zero restarts, and no
+  OOM. Transfer artifacts were removed after successful reconciliation.
+- The first confirmed post-cutover `/status` opened session `S-077` idle with
+  no pending action, zero command permissions, and Ubuntu, Windows, OpenWA, and
+  Google ready. Inactivity selected Terra with medium reasoning. Ticket 32
+  remains `ready-for-human` immediately before the required `/permissions`
+  control message; no later WhatsApp or terminal action has been sent.
