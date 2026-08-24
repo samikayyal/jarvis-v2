@@ -493,3 +493,68 @@
   ready, messaging ready, audit writable, and resource pressure `ok`. OpenWA
   retained its previously recorded container identity and original start time,
   remained healthy, and still had zero restarts and no OOM flag.
+
+### Codex-free release reconciliation — 2026-08-24
+
+- Codex was removed from the V1 source, deployment bundle, runtime exports,
+  documentation, and tests by application commit `7b332da`; bundle commit
+  `fa82b63` pins that exact application revision. Local and remote `main` were
+  fast-forwarded to the same bundle commit before production reconciliation.
+- The live host already had the 13 Codex-free images running, but the cutover
+  was incomplete: the installed release lacked its pinned host verification
+  environment, the root-only image map still described the preceding release,
+  and the rollback pointer skipped the immediately preceding compatible
+  release. Behavioral acceptance remained stopped while those invariants were
+  repaired.
+- The pinned Python 3.13 environment and 41 hash-locked dependencies were
+  installed in the immutable `fa82b63` release. The offline bundle and active
+  configuration verifier passed at 13 services, 1056 MiB, 1.80 CPU, and 512
+  PIDs. The exact 13-service running-image map was installed root-only at
+  SHA-256 `13a3026aed01`, and `previous` was corrected to release `15c4bf6`.
+- A verified Codex-free baseline backup was created at
+  `/var/backups/jarvis/20260824T175940.245415Z-nightly`. Administrative status
+  reported application revision `7b332da41e1e1e35be9105760337896db9b871f6`,
+  every component ready, both workers ready, messaging ready, audit writable,
+  backup current, and resource pressure `ok`.
+- Every Jarvis container was healthy, non-root, read-only, and running with zero
+  restarts and no OOM flag. Only the reviewed loopback callback and private
+  Tailscale worker-gateway ports were published. The handoff and API networks
+  each had exactly their two reviewed members, and the worker overlay had one.
+  OpenWA remained healthy with zero restarts/OOMs, a 45-second stop timeout, and
+  exactly one configured named session in `ready`. No WhatsApp message or
+  terminal action was sent during this reconciliation.
+
+### Exact Windows safe-read repair and replacement cutover — 2026-08-24
+
+- Pre-acceptance policy inspection found that the Windows safe-read executable
+  registry was empty, making the required automatic Windows read impossible by
+  construction. The repair registers only the native absolute executable
+  `C:\Windows\System32\hostname.exe` with no arguments; altered arguments or a
+  substituted path remain approval-gated. The orchestration contract names the
+  exact executable and canonical working directory, and broker-owned cwd repair
+  is limited to that exact safe-read shape.
+- Source commit `f079031` contains the repair; artifact-pin commit `37ad2b8`
+  locks application revision `f0790319ab71d450238e857a1abeacf6de578bfd` and
+  source SHA-256 `05701bfbe8df`. The focused terminal-policy and orchestration
+  files passed (`54 passed`); the deployment and Ticket 32 files passed (`60
+  passed`); Ruff, formatting, compilation, diff checking, and the offline
+  deployment verifier passed.
+- The candidate archive matched SHA-256 `624c9f772e21` across Windows and
+  Ubuntu. All 13 images built from the pinned bundle. After normalizing the
+  immutable release build-context paths, the rendered candidate differed from
+  production in exactly the 13 image references and no runtime field.
+- A verified pre-change backup was created at
+  `/var/backups/jarvis/20260824T182103.546608Z-pre-change`. Replacement release
+  `37ad2b8753ef4e3581bcadb57a2a618d7e3710e7` then became active with rollback
+  release `fa82b63`. All 13 services became healthy inside the reviewed window;
+  the exact running-image map was installed and a verified baseline backup was
+  created at `/var/backups/jarvis/20260824T182602.289855Z-nightly`.
+- Administrative status reports application revision `f0790319ab71d450238e857a1abeacf6de578bfd`,
+  every component ready, both workers ready, messaging ready, audit writable,
+  backup current, and resource pressure `ok`. Three settled runtime samples
+  passed with zero restarts and no OOM flags. OpenWA was not recreated,
+  modified, or re-paired. Transfer artifacts were removed.
+- Ticket 32 remains `ready-for-human`. The next action is the fresh `/status`,
+  `/permissions`, and `/revoke session` control sequence, which requires
+  action-time confirmation under the Browser safety boundary. No post-repair
+  WhatsApp acceptance message has been sent.
