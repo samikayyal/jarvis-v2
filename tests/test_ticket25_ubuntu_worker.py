@@ -657,6 +657,38 @@ def test_systemd_scope_requires_a_known_stopped_unit_state(
     assert stopped is expected
 
 
+def test_systemd_scope_waits_for_a_deactivating_unit_to_be_collected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = SystemdUbuntuProcessScope()
+    checks = iter(
+        (
+            subprocess.CompletedProcess([], 3, stdout="deactivating\n"),
+            subprocess.CompletedProcess([], 4, stdout="unknown\n"),
+        )
+    )
+
+    monkeypatch.setattr(
+        ubuntu_worker_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: next(checks),
+    )
+    running = ubuntu_worker_module._RunningSystemdScope(
+        unit_name="jarvis-action-test.service",
+        process=cast("subprocess.Popen[bytes]", object()),
+        cancel_requested=Event(),
+        termination_lock=RLock(),
+        unit_observed=Event(),
+    )
+
+    assert scope._unit_is_stopped(
+        running,
+        timeout_seconds=1,
+        wrapper_completed=True,
+    )
+    assert running.unit_observed.is_set()
+
+
 def test_systemd_scope_accepts_a_collected_unit_after_wait_wrapper_exits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

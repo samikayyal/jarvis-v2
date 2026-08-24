@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
 from threading import Event, RLock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from typing import BinaryIO, Protocol, cast
 
 from .ports import (
@@ -927,29 +927,40 @@ class SystemdUbuntuProcessScope:
     ) -> bool:
         if timeout_seconds <= 0:
             return False
-        try:
-            check = subprocess.run(
-                (
-                    self._systemctl_path,
-                    "--user",
-                    "is-active",
-                    running.unit_name,
-                ),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=timeout_seconds,
-                text=True,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        state = check.stdout.strip()
-        if state in {"active", "activating", "deactivating", "inactive", "failed"}:
-            running.unit_observed.set()
-        return (check.returncode == 3 and state in {"inactive", "failed"}) or (
-            wrapper_completed and check.returncode == 4 and state == "unknown"
-        )
+        deadline = monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                check = subprocess.run(
+                    (
+                        self._systemctl_path,
+                        "--user",
+                        "is-active",
+                        running.unit_name,
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=min(remaining, 0.25),
+                    text=True,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError:
+                return False
+            state = check.stdout.strip()
+            if state in {"active", "activating", "deactivating", "inactive", "failed"}:
+                running.unit_observed.set()
+            if check.returncode == 3 and state in {"inactive", "failed"}:
+                return True
+            if wrapper_completed and check.returncode == 4 and state == "unknown":
+                return True
+            if state not in {"active", "activating", "deactivating"}:
+                return False
+            sleep(min(0.05, max(deadline - monotonic(), 0)))
 
     @staticmethod
     def _unit_name(action_id: str) -> str:
