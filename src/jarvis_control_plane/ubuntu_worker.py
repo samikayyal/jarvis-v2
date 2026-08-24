@@ -357,6 +357,8 @@ class SystemdUbuntuProcessScope:
         self._systemd_run_path = systemd_run_path
         self._systemctl_path = systemctl_path
         self._process_limit = process_limit
+        runtime_uid = os.getuid() if hasattr(os, "getuid") else 0
+        self._user_runtime_directory = f"/run/user/{runtime_uid}"
         self._lock = RLock()
         self._running: dict[str, _RunningSystemdScope] = {}
         self._starting: dict[str, _StartingSystemdScope] = {}
@@ -418,7 +420,9 @@ class SystemdUbuntuProcessScope:
             "--property=RestrictNamespaces=yes",
             (
                 "--property=InaccessiblePaths=/run/systemd/private "
-                "/run/dbus/system_bus_socket %t/systemd/private %t/bus"
+                "/run/dbus/system_bus_socket "
+                f"{self._user_runtime_directory}/systemd/private "
+                f"{self._user_runtime_directory}/bus"
             ),
             f"--property=RuntimeMaxSec={invocation.deadline_seconds}s",
             f"--property=TimeoutStopSec={invocation.cancellation_grace_seconds}s",

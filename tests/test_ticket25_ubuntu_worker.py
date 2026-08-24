@@ -598,8 +598,10 @@ def test_systemd_scope_is_noninteractive_bounded_and_never_uses_a_shell() -> Non
         for argument in command
         if argument.startswith("--property=InaccessiblePaths=")
     )
-    assert "%t/systemd/private" in inaccessible
-    assert "%t/bus" in inaccessible
+    runtime_uid = os.getuid() if hasattr(os, "getuid") else 0
+    assert f"/run/user/{runtime_uid}/systemd/private" in inaccessible
+    assert f"/run/user/{runtime_uid}/bus" in inaccessible
+    assert "%t" not in inaccessible
     assert "--pipe" in command
     assert "--wait" in command
     assert command[-3:] == ("--", "/usr/bin/printf", "hello")
