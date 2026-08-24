@@ -390,3 +390,37 @@
   configuration, service, network, credential, OpenWA, terminal, or WhatsApp
   state changed during this repair. Ticket 32 remains `ready-for-human` pending
   an authorized replacement cutover and one fresh supervised safe-read attempt.
+
+### Authorized diagnostic-release replacement cutover — 2026-08-24
+
+- The synchronized `b13ed77` Git archive was installed as the immutable
+  root-owned release
+  `/opt/jarvis/releases/b13ed778ebf7c1c70adf01eb84e4b410eed321bb`.
+  Its canonical artifact-lock SHA-256 is `cbeb030ea4d8`; the installed
+  application revision is `d933131875d61cd0aea008bb827bb08be54a2a34`.
+  Candidate Compose parsing, all 13 image builds, and image-internal bundle
+  verification passed before replacement.
+- A fresh verified pre-change backup was created at
+  `/var/backups/jarvis/20260824T123124.814242Z-pre-change`. All 13 candidate
+  services then became healthy within their reviewed cold-start windows with
+  zero restarts and no OOM flags. Administrative status reports every component
+  ready, both workers ready, messaging ready, audit writable, backup current,
+  and resource pressure `ok`.
+- The active pointer now targets `b13ed77`; `previous` preserves rollback
+  release `711ba88`. The root-owned active override SHA-256 is
+  `4afa9c3ccd3a`; the pending override remains unchanged at `5f3079be2bbc`.
+  The exact 13-service running-image map is installed root-only with SHA-256
+  `2e2b85a502cf`. The verified post-cutover baseline backup is
+  `/var/backups/jarvis/20260824T124029.505996Z-nightly`.
+- Three settled resource samples passed. The three egress proxies remained
+  between 34.9 and 36.1 MiB under their 48 MiB limits; host memory, swap, disk,
+  and process limits remained acceptable. Read-only filesystems, dropped
+  capabilities, no-new-privileges, non-root identities, restart policy, exact
+  published ports, reviewed network membership, worker socket identity, and
+  the enabled/active backup timer all passed.
+- OpenWA was not recreated, modified, or re-paired. It retained container ID
+  `24fb501ab8eb`, its original start time, healthy state, zero restarts, no OOM,
+  and messaging readiness. No WhatsApp acceptance message or terminal action
+  was sent during the cutover. Ticket 32 remains `ready-for-human`; the next
+  action is the fresh `/status` control message, which requires action-time
+  confirmation under the Browser safety boundary.
