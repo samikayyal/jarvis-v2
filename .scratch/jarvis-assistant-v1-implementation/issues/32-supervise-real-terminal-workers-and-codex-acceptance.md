@@ -266,3 +266,38 @@
   message or terminal action was sent during cutover. Ticket 32 remains
   `ready-for-human` for a new supervised behavioral worksheet; each message
   requires fresh action-time confirmation.
+
+### Post-schema-cutover safe-read policy stop — 2026-08-24
+
+- Fresh supervised controls opened session `S-074` idle on Luna with medium
+  reasoning, no pending action, zero command permissions, and Ubuntu, Windows,
+  OpenWA, and Google ready. The persistent model default was not changed.
+- The exact host-neutral operating-system read selected Ubuntu with the displayed
+  default-host reason, but deterministic policy incorrectly presented proposal
+  `request-c47604e8168841f1a20d649b87579594` instead of auto-authorizing the
+  provably safe read. The proposal was rejected once with choice `4`; it was not
+  approved or retried.
+- A fresh `/status` containment check reported no active request, no pending
+  action, and zero command permissions. Both workers, OpenWA, and Google remained
+  ready. Gate 02's Ubuntu selection evidence passed, but Gate 05 failed because a
+  safe read produced a proposal, so every later worksheet specimen remained
+  stopped.
+- A deterministic broker regression reproduced the exact structured
+  `/usr/bin/uname -s` payload as `pending_action`. The provider schema already
+  accepts that payload, while terminal policy omitted both the exact executable
+  identity and its narrow safe argument form. The candidate repair registers
+  only `/usr/bin/uname` on Ubuntu and auto-authorizes only `-s`; broader
+  `uname -a` remains approval-gated. Focused terminal-policy and orchestration
+  coverage passes (`49 passed`); the expanded terminal, permission, gateway,
+  Ubuntu-worker, Windows-worker, and Ticket 32 matrix passes (`170 passed, 1
+  skipped`). Ruff, format, compilation, and diff checks pass.
+- The source repair is committed as `f609dc4`; artifact-pin commit `fcbd736`
+  locks that exact revision and source SHA-256 `ee7748f81da3`. The single final
+  full-suite run completed with `804 passed, 2 skipped, 4 failed` in 742.99
+  seconds. All four failures were the expected stale application-source pin
+  after the source edit; after pinning the exact commit, those four tests passed
+  together (`4 passed, 56 deselected`). The full suite was not repeated.
+- No production release, service, configuration, network, credential, OpenWA,
+  or WhatsApp state changed during the local repair. Ticket 32 remains
+  `ready-for-human` pending an authorized replacement cutover and a fresh
+  supervised retry.
