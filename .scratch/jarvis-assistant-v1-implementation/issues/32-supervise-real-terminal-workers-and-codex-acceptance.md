@@ -116,3 +116,34 @@
   The exact local and Ubuntu transfer archives were removed; the candidate
   release, candidate images, protected backups, and rollback evidence remain
   available for diagnosis. Ticket 32 remains `ready-for-human`.
+
+### Bounded egress-proxy resource repair — 2026-08-24
+
+- The reviewed repair raises all three structurally identical egress-proxy
+  memory limits from 32 MiB to 48 MiB. The aggregate Jarvis envelope is now
+  1056 MiB; CPU and PID budgets are unchanged. Direct regression coverage
+  asserts the 48 MiB limit for each proxy.
+- The source repair is committed as `bf91bb9`; artifact-pin commit `46d2edd`
+  locks that exact application revision and source hash. The focused deployment,
+  egress, and Ticket 32 matrix passed (`71 passed`), and Ruff, format, Python
+  compilation, and diff checks pass.
+- A disposable Ubuntu probe used the existing candidate Google proxy image with
+  the reviewed non-root identity, read-only filesystem, tmpfs cache, 0.03 CPU,
+  16 PIDs, a 48 MiB memory-and-swap cap, the active configuration read-only, and
+  `network none`. The active lightweight TCP readiness probe passed on attempt
+  15; the service remained running at 39.92 MiB of 48 MiB with zero restarts and
+  `oom_killed=false`. The explicitly named probe container was removed.
+- Two preliminary disposable probe invocations were inconclusive: one omitted
+  the active `UV_CACHE_DIR` and exited before application startup, and one used
+  the bundle's generic Python health command instead of the active lightweight
+  TCP override. Neither was OOM-killed, and both explicitly named containers
+  were removed before the successful probe.
+- The single final full-suite run after the repair passed with `802 passed, 2
+  skipped` in 605.21 seconds. No second full-suite run was started.
+- Post-probe verification found all 13 production containers still running; the
+  production Google proxy remained healthy at its rolled-back 32 MiB limit with
+  zero restarts and no OOM. OpenWA retained container ID `24fb501ab8eb`, its
+  original start time, healthy state, and zero restarts. No production release,
+  image map, network, credential, active configuration, service, or WhatsApp
+  side effect was changed. Ticket 32 remains `ready-for-human` pending a fresh
+  replacement-cutover authorization.
