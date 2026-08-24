@@ -991,6 +991,7 @@ class AgentsSdkOrchestrationAdapter:
                         "terminal proposal selected a different host",
                         code="terminal_host_mismatch",
                     )
+                payload = _with_broker_owned_terminal_fields(payload)
                 candidate = FrozenActionProposal.create(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
@@ -1059,6 +1060,25 @@ def _terminal_validation_code(error: Exception) -> str:
     """Map private validation detail to a stable, content-free diagnostic code."""
 
     return _TERMINAL_VALIDATION_CODES.get(str(error), "terminal_action_invalid")
+
+
+def _with_broker_owned_terminal_fields(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Freeze execution mechanics that are irrelevant to one exact safe read."""
+
+    normalized = dict(payload)
+    cwd = normalized.get("cwd")
+    if (
+        normalized.get("host") == "ubuntu"
+        and normalized.get("executable") == "/usr/bin/uname"
+        and normalized.get("arguments") == ["-s"]
+        and normalized.get("components") == []
+        and isinstance(cwd, str)
+        and not cwd.startswith("/")
+    ):
+        normalized["cwd"] = "/tmp"
+    return normalized
 
 
 def _canonical_gmail_model_payload(

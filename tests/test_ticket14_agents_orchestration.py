@@ -927,6 +927,76 @@ def test_semantically_invalid_terminal_proposal_has_a_stable_diagnostic_code() -
     assert caught.value.code == "terminal_executable_not_absolute"
 
 
+def test_operating_system_name_safe_read_uses_broker_owned_cwd() -> None:
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I read the operating-system name.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Read the operating-system name.",
+                    payload={
+                        "host": "ubuntu",
+                        "executable": "/usr/bin/uname",
+                        "arguments": ["-s"],
+                        "cwd": ".",
+                        "components": [],
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("inspect the operating system"))
+
+    assert result.proposal is not None
+    assert json.loads(result.proposal.payload) == {
+        "host": "ubuntu",
+        "executable": "/usr/bin/uname",
+        "arguments": ["-s"],
+        "cwd": "/tmp",
+        "components": [],
+    }
+
+
+def test_relative_cwd_still_fails_for_an_ordinary_terminal_action() -> None:
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the action.",
+                execution_host="ubuntu",
+                host_reason_code="default_ubuntu",
+                proposal=AgentsSdkProposal(
+                    kind="terminal",
+                    preview="Create the acceptance marker.",
+                    payload={
+                        "host": "ubuntu",
+                        "executable": "/usr/bin/touch",
+                        "arguments": ["/tmp/ticket32-marker"],
+                        "cwd": ".",
+                        "components": [],
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    with pytest.raises(OrchestrationAdapterError) as caught:
+        adapter.run(_request("create an acceptance marker"))
+
+    assert caught.value.code == "terminal_cwd_not_absolute"
+
+
 @pytest.mark.parametrize(
     "components",
     (
