@@ -956,7 +956,11 @@ class SystemdUbuntuProcessScope:
                 running.unit_observed.set()
             if check.returncode == 3 and state in {"inactive", "failed"}:
                 return True
-            if wrapper_completed and check.returncode == 4 and state == "unknown":
+            if (
+                wrapper_completed
+                and check.returncode == 4
+                and state in {"inactive", "unknown"}
+            ):
                 return True
             if state not in {"active", "activating", "deactivating"}:
                 return False

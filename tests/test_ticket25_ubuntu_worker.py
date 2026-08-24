@@ -622,6 +622,8 @@ def test_systemd_scope_rejects_an_invalid_process_tree_bound(
         (1, "", False, False),
         (3, "inactive\n", False, True),
         (3, "failed\n", False, True),
+        (4, "inactive\n", False, False),
+        (4, "inactive\n", True, True),
         (4, "unknown\n", False, False),
         (4, "unknown\n", True, True),
     ],
@@ -664,7 +666,7 @@ def test_systemd_scope_waits_for_a_deactivating_unit_to_be_collected(
     checks = iter(
         (
             subprocess.CompletedProcess([], 3, stdout="deactivating\n"),
-            subprocess.CompletedProcess([], 4, stdout="unknown\n"),
+            subprocess.CompletedProcess([], 4, stdout="inactive\n"),
         )
     )
 
