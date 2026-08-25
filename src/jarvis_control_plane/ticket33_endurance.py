@@ -328,6 +328,7 @@ def run(args: argparse.Namespace) -> int:
         if args.smoke:
             break
     if not failures:
+        time.sleep(max(0.0, started + args.run_seconds - time.monotonic()))
         time.sleep(args.settling_seconds)
     stop.set()
     sampler.join(timeout=args.sample_seconds + 5)
