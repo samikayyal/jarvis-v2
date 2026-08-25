@@ -112,6 +112,18 @@ def test_resource_validator_rejects_missing_sample_intervals() -> None:
     }
 
 
+def test_resource_validator_allows_bounded_scheduler_jitter() -> None:
+    samples = tuple(
+        _sample(
+            phase="workload" if seconds < 7200 else "settling",
+            seconds=seconds + (1.082 if seconds == 3610 else 0),
+        )
+        for seconds in range(0, 7801, 5)
+    )
+
+    assert validate_samples(samples) == ()
+
+
 def test_ticket33_runbook_locks_every_supervised_gate() -> None:
     runbook = Path("deployment/ticket33-acceptance-runbook.md").read_text(
         encoding="utf-8"

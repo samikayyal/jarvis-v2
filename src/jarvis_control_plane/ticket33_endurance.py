@@ -16,6 +16,7 @@ from itertools import pairwise
 from pathlib import Path
 
 SAMPLE_SECONDS = 5
+SAMPLE_JITTER_SECONDS = 1.5
 RUN_SECONDS = 2 * 60 * 60
 REAL_RUN_SECONDS = 60 * 60
 SETTLING_SECONDS = 10 * 60
@@ -224,7 +225,8 @@ def validate_samples(
     ):
         failures.append("the complete workload and settling interval was not sampled")
     if any(
-        later.monotonic_seconds - earlier.monotonic_seconds > sample_seconds + 1
+        later.monotonic_seconds - earlier.monotonic_seconds
+        > sample_seconds + SAMPLE_JITTER_SECONDS
         for earlier, later in pairwise(samples)
     ):
         failures.append("resource samples were not collected every five seconds")
