@@ -777,8 +777,6 @@ class GmailReadInput(BaseModel):
         single = {"messages_get": self.message_id, "threads_get": self.thread_id}
         if self.operation in single and not single[self.operation]:
             raise ValueError("single Gmail reads require the matching identifier")
-        if self.operation.endswith("list") and self.query is None:
-            raise ValueError("Gmail list reads require a query")
         return self
 
 

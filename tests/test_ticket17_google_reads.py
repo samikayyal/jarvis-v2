@@ -703,17 +703,18 @@ def test_google_read_audit_failure_prevents_the_provider_call() -> None:
     assert provider.calls == []
 
 
-def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -> None:
+def test_signed_unfiltered_gmail_list_reaches_closed_read_tool_through_broker() -> None:
     captured: dict[str, object] = {}
     audit = InMemoryAuditBoundary()
     clock = FixedClock(NOW)
     ids = DeterministicIdGenerator("ticket17-broker")
     trace_store = InMemoryDiagnosticTraceStore()
     trace = DiagnosticTraceRecorder(writer=trace_store.writer(), clock=clock, ids=ids)
+    provider = ControlledGoogleReadProvider(
+        result=GoogleReadProviderResult(items=("Subject: bounded mail",))
+    )
     connector = _connector(
-        provider=ControlledGoogleReadProvider(
-            result=GoogleReadProviderResult(items=("Subject: bounded mail",))
-        ),
+        provider=provider,
         audit=audit,
         trace=trace,
         clock=clock,
@@ -738,7 +739,6 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
                 json.dumps(
                     {
                         "operation": "messages_list",
-                        "query": "from:inbox",
                         "max_results": 1,
                     }
                 ),
@@ -781,6 +781,7 @@ def test_signed_request_reaches_only_closed_google_read_tools_through_broker() -
         "truncated": False,
         "continuation_available": False,
     }
+    assert provider.calls == [("gmail_messages_list", {"query": ""}, 1)]
     assert all(tool.needs_approval is False for tool in captured["tools"])
     assert all(tool.timeout_seconds == 20.0 for tool in captured["tools"])
     assert len(components.outbound.sent) == 1
