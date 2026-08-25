@@ -17,6 +17,7 @@ from pathlib import Path
 
 SAMPLE_SECONDS = 5
 RUN_SECONDS = 2 * 60 * 60
+REAL_RUN_SECONDS = 60 * 60
 SETTLING_SECONDS = 10 * 60
 MINIMUM_FREE_BYTES = 2 * 1024**3 + 16 * 1024**2
 MAX_SWAP_GROWTH_BYTES = 256 * 1024**2
@@ -256,13 +257,17 @@ def validate_samples(
 
 
 def run(args: argparse.Namespace) -> int:
+    required_run_seconds = REAL_RUN_SECONDS if args.external_workload else RUN_SECONDS
     if not args.smoke and (
-        args.run_seconds != RUN_SECONDS
+        args.run_seconds != required_run_seconds
         or args.settling_seconds != SETTLING_SECONDS
         or args.sample_seconds != SAMPLE_SECONDS
     ):
-        raise ValueError("acceptance timing must remain 7200s + 600s with 5s samples")
-    plan = workload_plan()
+        raise ValueError(
+            f"acceptance timing must remain {required_run_seconds}s + 600s "
+            "with 5s samples"
+        )
+    plan = () if args.external_workload else workload_plan()
     evidence = args.evidence.resolve()
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.touch(mode=0o600, exist_ok=False)
@@ -301,7 +306,7 @@ def run(args: argparse.Namespace) -> int:
 
     sampler = threading.Thread(target=sample_loop, daemon=True)
     sampler.start()
-    interval = args.run_seconds / len(plan)
+    interval = args.run_seconds / len(plan) if plan else 0
     for index, (kind, nodeid) in enumerate(plan, start=1):
         due = started + (index - 1) * interval
         if not args.smoke:
@@ -341,6 +346,7 @@ def run(args: argparse.Namespace) -> int:
         )
     )
     summary = {
+        "mode": "external" if args.external_workload else "controlled",
         "requests_planned": len(plan),
         "requests_completed": requests_completed,
         "samples": len(samples),
@@ -363,6 +369,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--settling-seconds", type=int, default=SETTLING_SECONDS)
     parser.add_argument("--sample-seconds", type=int, default=SAMPLE_SECONDS)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--external-workload", action="store_true")
     return parser
 
 

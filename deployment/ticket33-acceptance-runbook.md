@@ -66,6 +66,12 @@ attempt. Confirm the local administrative audit-safe read still works. Start
 `audit_service`, require audit writable and all services healthy, and reconcile
 the retained ingress record as blocked/interrupted without replay.
 
+For Gate 06, start a separate sampler with `--external-workload`,
+`--run-seconds 3600`, `--settling-seconds 600`, and `--sample-seconds 5`. This
+mode never invokes a controlled test; the worksheet and protected durable-state
+evidence prove the exact 20 real requests while the sampler proves the host and
+container resource envelope.
+
 ## Backup, upgrade, and rollback
 
 Create a fresh `pre-change` backup with the installed release command documented
