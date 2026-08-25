@@ -43,6 +43,13 @@ uv run python -m jarvis_control_plane.ticket33_endurance \
   --temporary-root /var/lib/jarvis/tmp
 ```
 
+For a detached host run, invoke the reviewed
+`ticket33-endurance-wrapper.sh` through a root-owned transient systemd unit. The
+wrapper validates the active Compose model, stops only `inbound_receiver`, and
+has a file-parsed exit trap that starts the same container on success, failure,
+or interruption. Never replace the wrapper with a nested inline `bash -lc`
+command; quoting damage can disable cleanup.
+
 The command refuses acceptance timing other than 7,200 seconds plus 600 seconds
 of settling with five-second samples. `--smoke` is only a development check and
 is never acceptance evidence. Separately compare initial/final `docker inspect`

@@ -135,3 +135,16 @@ def test_ticket33_runbook_locks_every_supervised_gate() -> None:
         "physical phone receipt",
     ):
         assert required in normalized
+
+
+def test_endurance_wrapper_restores_only_the_existing_receiver() -> None:
+    wrapper = Path("deployment/ticket33-endurance-wrapper.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "trap restore_admission EXIT" in wrapper
+    assert '"${compose[@]}" stop inbound_receiver' in wrapper
+    assert '"${compose[@]}" start inbound_receiver' in wrapper
+    assert "--force-recreate" not in wrapper
+    assert "--volumes" not in wrapper
+    assert "openwa" not in wrapper.lower()
