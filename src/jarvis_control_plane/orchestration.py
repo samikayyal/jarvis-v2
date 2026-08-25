@@ -32,7 +32,7 @@ from .models import (
 from .ports import OrchestrationAdapterError
 from .terminal_policy import terminal_action_from_proposal
 
-_MAX_TURNS = 4
+_MAX_TURNS = 5
 _MAX_TOOL_INVOCATIONS = 4
 _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000

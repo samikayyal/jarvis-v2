@@ -152,7 +152,7 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert captured["run_kwargs"]["previous_response_id"] is None
     assert captured["run_text"] == "inspect the repository"
     assert captured["run_kwargs"] == {
-        "max_turns": 4,
+        "max_turns": 5,
         "run_config": captured["run_kwargs"]["run_config"],
         "previous_response_id": None,
         "auto_previous_response_id": False,
@@ -166,6 +166,27 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert result.proposal is None
     assert result.execution_host is None
     assert result.host_reason_code is None
+
+
+def test_default_turn_budget_allows_four_sequential_tools_then_final_reply() -> None:
+    async def run_async(agent: object, _text: str, **kwargs: object) -> object:
+        for _ in range(4):
+            await agent.tools[0].on_invoke_tool(None, '{"max_chars":8}')
+        if kwargs["max_turns"] < 5:
+            raise RuntimeError("final reply turn was unavailable")
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Four bounded reads completed.")
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    ).run(_request("perform four sequential bounded reads"))
+
+    assert result.reply_text == "Four bounded reads completed."
 
 
 def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_and_final() -> (
