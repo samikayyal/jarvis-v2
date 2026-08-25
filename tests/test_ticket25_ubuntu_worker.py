@@ -807,11 +807,10 @@ def test_systemd_scope_runs_structured_compounds_inside_the_same_unit() -> None:
     separator = command.index("--")
     action_command = command[separator + 1 :]
 
-    assert action_command[:3] == (
-        sys.executable,
-        "-m",
-        "jarvis_control_plane.ubuntu_worker_runner",
-    )
+    assert action_command[0] == sys.executable
+    runner = Path(action_command[1])
+    assert runner.is_absolute()
+    assert runner.name == "ubuntu_worker_runner.py"
     assert all(
         cast(TerminalComponent, component).executable not in command
         for component in invocation.action.components

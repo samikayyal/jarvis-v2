@@ -20,7 +20,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from threading import Event, RLock, Thread
 from time import monotonic, sleep
 from typing import BinaryIO, Protocol, cast
@@ -451,8 +451,7 @@ class SystemdUbuntuProcessScope:
         ).decode()
         return (
             sys.executable,
-            "-m",
-            "jarvis_control_plane.ubuntu_worker_runner",
+            str(Path(__file__).with_name("ubuntu_worker_runner.py").resolve()),
             encoded,
         )
 
