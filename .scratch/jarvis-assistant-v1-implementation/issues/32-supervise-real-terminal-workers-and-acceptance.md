@@ -4,11 +4,11 @@
 
 **Blocked by:** 30 — Supervise initial activation and OpenWA handoff acceptance.
 
-**Status:** ready-for-human
+**Status:** complete
 
-- [ ] Natural-language host selection, both authenticated workers, offline behavior, identity mismatch, reconnection, and no-failover behavior pass against the real hosts.
-- [ ] Safe reads, ordinary approval, mandatory-fresh approval, exact session/persistent permission, revocation, timeout, truncation, partial outcome, and process-tree cancellation are demonstrated.
-- [ ] Prompt-injection containment passes while approval bypass and trust-critical activation remain impossible.
+- [x] Natural-language host selection, both authenticated workers, offline behavior, identity mismatch, reconnection, and no-failover behavior pass against the real hosts.
+- [x] Safe reads, ordinary approval, mandatory-fresh approval, exact session/persistent permission, revocation, timeout, truncation, partial outcome, and process-tree cancellation are demonstrated.
+- [x] Prompt-injection containment passes while approval bypass and trust-critical activation remain impossible.
 
 ## Comments
 
@@ -558,3 +558,72 @@
   `/permissions`, and `/revoke session` control sequence, which requires
   action-time confirmation under the Browser safety boundary. No post-repair
   WhatsApp acceptance message has been sent.
+
+### Final Codex-free runner repair and acceptance — 2026-08-25
+
+- The Codex-free candidate at release pin `e77d9f4` passed the real host-selection,
+  worker lifecycle and identity, safe-read, authority, permission, expiry,
+  truncation, timeout, cancellation, and prompt-injection rows. Its reviewed
+  partial-compound specimen stopped once with an `unknown` result and no
+  component start. Protected evidence identified a pre-start environment defect:
+  the transient user scope did not inherit the worker service's `PYTHONPATH`.
+  That unknown action was never retried.
+- Source commit `ae74cce` changes only the Ubuntu systemd compound-runner launch
+  from module discovery to the runner's absolute source-file path, with a focused
+  assertion for that invariant. The repaired real-host offline specimen passed
+  with `PYTHONPATH` absent and components `0,1` both started and completed. The
+  focused matrix passed (`154 passed, 1 skipped`); Ruff, formatting, compilation,
+  diff checking, and the offline deployment verifier passed. The one final suite
+  passed (`762 passed, 2 skipped`). Release-pin commit `96e0ade` locks application
+  revision `ae74cce42758ea63ee257f37f87a3d53e856fbca` and source SHA-256
+  `d865c29b590b`.
+- The reviewed archive matched SHA-256 `5b31823463c7` across Windows and Ubuntu.
+  All 13 images built from the pinned bundle, and the candidate Compose model
+  differed from production in exactly the 13 image references. A verified
+  pre-change backup was created at
+  `/var/backups/jarvis/20260825T143156.248703Z-pre-change`. Release `96e0ade`
+  became active with immediate rollback release `e77d9f4`; the exact running-image
+  map was installed and the verified baseline backup is
+  `/var/backups/jarvis/20260825T143945.510300Z-nightly`.
+- During cutover, the first release-local virtual environment resolved its Python
+  interpreter below a root-only directory, so the native Ubuntu worker failed
+  closed before accepting work and `worker_gateway` exited. The environment was
+  rebuilt against the reviewed shared Python 3.13.13 runtime, made root-owned and
+  read-only, and verified as the non-root worker identity before service start.
+  `worker_gateway` was then recreated once with the native socket ready. Final
+  settled evidence, rather than the failed startup attempt, shows all 13 current
+  containers healthy with zero restarts and no OOM flags in three consecutive
+  samples.
+- The active artifact-lock, activation-override, and image-map SHA-256 values are
+  `1756289b0a7e`, `58d347d5a827`, and `4379ddce5383`. Every Jarvis container is
+  non-root and read-only with all capabilities dropped and
+  `no-new-privileges`; only the reviewed loopback callback and private worker
+  gateway ports are published. The OpenWA API and handoff networks each retain
+  exactly two members and the worker network retains one. OpenWA was not
+  recreated or re-paired; its container is healthy with zero restarts/OOMs, its
+  stop timeout is 45 seconds, and its single configured named session is `ready`.
+- Administrative status reports every component ready, Ubuntu and Windows ready,
+  messaging ready, audit writable, backup current, and resource pressure `ok`.
+  Fresh WhatsApp controls opened session `S-081` idle, showed no pending action
+  and zero permissions, and found no session permission to revoke.
+- The repaired release then ran one separately approved, one-time partial-compound
+  specimen under request `request-5e528c89fb5b4e7fb0ba06713eb5e349`:
+  `/usr/bin/printf` with one non-sensitive marker in `/tmp`, followed
+  unconditionally by `/usr/bin/false`. The frozen payload had no shell,
+  redirection, environment addition, or standard input. Protected trace metadata
+  reports the expected failed final outcome with components `0,1` both started
+  and completed. The transient action scope disappeared, and independent process
+  inspection found zero marker or compound-runner processes.
+- The behavioral evidence carried from `e77d9f4` remains candidate-valid because
+  the application delta to `ae74cce` is limited to that exact compound-runner
+  launch seam and its assertion. Gate 10's affected partial-outcome specimen was
+  repeated successfully on `96e0ade`; the complete Gate 01 preflight and Gate 12
+  reconciliation were also repeated after replacement.
+- Final WhatsApp `/status` and `/permissions` controls show session `S-081` idle,
+  no active request, no pending action, zero command permissions, and Ubuntu,
+  Windows, OpenWA, and the connected service ready. Protected reconciliation
+  found no open action dispatch, outbound attempt, conversation outbox, transient
+  scope, acceptance process, or duplicate marker. The final three service samples
+  remained 13-of-13 healthy with zero restarts/OOMs; kernel OOM evidence was zero,
+  audit remained writable, the backup current, resource pressure `ok`, and the
+  single OpenWA session `ready`. Every terminal acceptance gate is satisfied.
