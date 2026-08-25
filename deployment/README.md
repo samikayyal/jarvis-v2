@@ -145,6 +145,10 @@ terminal-authority checks from `terminal-acceptance-runbook.md`. Both are human-
 passing controlled tests is not production acceptance and neither worksheet
 authorizes deployment or trust-critical activation.
 
+After both worksheets are complete, use `ticket33-acceptance-runbook.md` for
+the final endurance, degraded-mode, backup, upgrade, rollback, and full-host
+reboot acceptance. Its disruptive rows require a dedicated maintenance window.
+
 ## Administrative backup and isolated restore
 
 Run the backup command as the root administrator so SQLite can take online,
