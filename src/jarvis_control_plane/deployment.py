@@ -41,6 +41,7 @@ REQUIRED_FILES = (
     "artifacts.lock.json",
     "compose.yaml",
     "config.example.toml",
+    "health_probe.py",
     "openwa-handoff.md",
     "requirements.lock",
     "systemd/jarvis-backup.service",
@@ -619,8 +620,7 @@ def _validate_artifacts(
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
     if (
-        'ENTRYPOINT ["uv", "run", "--no-cache", "--no-project", "python", "-m", '
-        '"jarvis_control_plane.service_runtime"]'
+        'ENTRYPOINT ["python", "-m", "jarvis_control_plane.service_runtime"]'
     ) not in dockerfile:
         errors.append("Dockerfile must enter the role-specific service runtime")
     if lock.get("os_packages") != {
@@ -758,13 +758,8 @@ def _validate_compose(
         expected_healthcheck = {
             "test": [
                 "CMD",
-                "uv",
-                "run",
-                "--no-project",
                 "python",
-                "-m",
-                "jarvis_control_plane.service_runtime",
-                "proxy-health" if service.endswith("_egress_proxy") else "health",
+                "/opt/jarvis/deployment/health_probe.py",
             ],
             "interval": "30s",
             "timeout": "5s",

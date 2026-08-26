@@ -13,7 +13,7 @@ x-service-defaults: &service-defaults
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
   healthcheck: &healthcheck
-    test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, health]
+    test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
     interval: 30s
     timeout: 5s
     retries: 3
@@ -234,7 +234,7 @@ services:
     networks: [orchestration_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+      test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
       start_period: 10m
       start_interval: 30s
     pids_limit: 16
@@ -253,7 +253,7 @@ services:
     networks: [google_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+      test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
       start_period: 10m
       start_interval: 30s
     pids_limit: 16
@@ -272,7 +272,7 @@ services:
     networks: [vault_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, uv, run, --no-project, python, -m, jarvis_control_plane.service_runtime, proxy-health]
+      test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
       start_period: 10m
       start_interval: 30s
     pids_limit: 16
