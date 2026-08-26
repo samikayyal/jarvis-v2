@@ -767,7 +767,7 @@ def _validate_compose(
             "start_period": "10m" if service.endswith("_egress_proxy") else "5m",
         }
         if service.endswith("_egress_proxy"):
-            expected_healthcheck["start_interval"] = "30s"
+            expected_healthcheck["start_interval"] = "2m"
         if healthcheck is None:
             errors.append(f"{service} must define a healthcheck")
         elif healthcheck != expected_healthcheck:

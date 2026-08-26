@@ -237,7 +237,7 @@ services:
       test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
       timeout: 30s
       start_period: 10m
-      start_interval: 30s
+      start_interval: 2m
     pids_limit: 16
     deploy:
       resources:
@@ -257,7 +257,7 @@ services:
       test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
       timeout: 30s
       start_period: 10m
-      start_interval: 30s
+      start_interval: 2m
     pids_limit: 16
     deploy:
       resources:
@@ -277,7 +277,7 @@ services:
       test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
       timeout: 30s
       start_period: 10m
-      start_interval: 30s
+      start_interval: 2m
     pids_limit: 16
     deploy:
       resources:
