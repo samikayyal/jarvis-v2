@@ -764,7 +764,7 @@ def _validate_compose(
             "interval": "30s",
             "timeout": "5s",
             "retries": 3,
-            "start_period": "10m" if service.endswith("_egress_proxy") else "10s",
+            "start_period": "10m" if service.endswith("_egress_proxy") else "5m",
         }
         if service.endswith("_egress_proxy"):
             expected_healthcheck["start_interval"] = "30s"
