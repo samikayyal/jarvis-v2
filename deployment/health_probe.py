@@ -32,9 +32,7 @@ def main() -> None:
     if port is None:
         raise SystemExit("unknown service identity")
     with socket.create_connection(("127.0.0.1", port), timeout=2) as probe:
-        probe.sendall(
-            b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
+        probe.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
         response = probe.recv(128)
     if not response.startswith((b"HTTP/1.0 200 ", b"HTTP/1.1 200 ")):
         raise SystemExit("service is not healthy")
