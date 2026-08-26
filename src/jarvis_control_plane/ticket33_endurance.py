@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -124,6 +125,8 @@ class Sample:
     used_swap_bytes: int
     free_disk_bytes: int
     trace_bytes: int
+    trace_records: int
+    trace_payload_bytes: int
     temporary_bytes: int
     jarvis_cpu_percent: float
     jarvis_memory_bytes: int
@@ -141,6 +144,18 @@ def _tree_size(root: Path) -> int:
     if not root.exists():
         return 0
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+
+
+def _trace_facts(root: Path) -> tuple[int, int]:
+    database = root / "traces.sqlite3"
+    if not database.exists():
+        return 0, 0
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM diagnostic_traces"
+        ).fetchone()
+    assert row is not None
+    return int(row[0]), int(row[1])
 
 
 def _memory() -> tuple[int, int]:
@@ -192,6 +207,7 @@ def collect_sample(
 ) -> Sample:
     available, swap = _memory()
     cpu, memory, pids = _docker_stats(subprocess.run)
+    trace_records, trace_payload_bytes = _trace_facts(trace_root)
     return Sample(
         phase=phase,
         monotonic_seconds=round(time.monotonic() - started, 3),
@@ -200,6 +216,8 @@ def collect_sample(
         used_swap_bytes=swap,
         free_disk_bytes=shutil.disk_usage(trace_root).free,
         trace_bytes=_tree_size(trace_root),
+        trace_records=trace_records,
+        trace_payload_bytes=trace_payload_bytes,
         temporary_bytes=_tree_size(temporary_root),
         jarvis_cpu_percent=cpu,
         jarvis_memory_bytes=memory,
@@ -243,12 +261,17 @@ def validate_samples(
         > MAX_SWAP_GROWTH_BYTES
     ):
         failures.append("host swap grew by more than 256 MiB")
-    trace_deltas = [
-        later.trace_bytes - earlier.trace_bytes for earlier, later in pairwise(samples)
+    trace_record_deltas = [
+        later.trace_records - earlier.trace_records
+        for earlier, later in pairwise(samples)
     ]
-    if any(delta < 0 for delta in trace_deltas):
+    if any(delta < 0 for delta in trace_record_deltas):
         failures.append("diagnostic traces were deleted during endurance")
-    if any(delta > 16 * 1024**2 for delta in trace_deltas):
+    trace_payload_deltas = [
+        later.trace_payload_bytes - earlier.trace_payload_bytes
+        for earlier, later in pairwise(samples)
+    ]
+    if any(delta > 16 * 1024**2 for delta in trace_payload_deltas):
         failures.append("trace growth crossed the per-request reservation")
     settling = [item for item in samples if item.phase == "settling"]
     if settling[-1].used_swap_bytes > settling[0].used_swap_bytes:

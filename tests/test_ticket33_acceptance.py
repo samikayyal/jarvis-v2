@@ -21,6 +21,8 @@ def _sample(*, phase: str, seconds: float, **changes: object) -> Sample:
         used_swap_bytes=100,
         free_disk_bytes=MINIMUM_FREE_BYTES,
         trace_bytes=100,
+        trace_records=100,
+        trace_payload_bytes=100,
         temporary_bytes=100,
         jarvis_cpu_percent=100.0,
         jarvis_memory_bytes=1024**3,
@@ -76,6 +78,7 @@ def test_resource_validator_reports_each_protected_boundary() -> None:
             jarvis_pids=513,
             temporary_bytes=101,
             trace_bytes=16 * 1024**2 + 101,
+            trace_payload_bytes=16 * 1024**2 + 101,
         ),
         _sample(
             phase="settling",
@@ -83,6 +86,8 @@ def test_resource_validator_reports_each_protected_boundary() -> None:
             used_swap_bytes=MAX_SWAP_GROWTH_BYTES + 102,
             temporary_bytes=101,
             trace_bytes=100,
+            trace_records=99,
+            trace_payload_bytes=100,
         ),
     )
 
@@ -97,6 +102,16 @@ def test_resource_validator_reports_each_protected_boundary() -> None:
         "trace growth crossed the per-request reservation",
         "diagnostic traces were deleted during endurance",
     }
+
+
+def test_resource_validator_ignores_sqlite_journal_file_shrink() -> None:
+    samples = (
+        _sample(phase="workload", seconds=0, trace_bytes=20_000),
+        _sample(phase="settling", seconds=7200, trace_bytes=19_000),
+        _sample(phase="settling", seconds=7800, trace_bytes=19_000),
+    )
+
+    assert validate_samples(samples, sample_seconds=7200) == ()
 
 
 def test_resource_validator_rejects_missing_sample_intervals() -> None:
