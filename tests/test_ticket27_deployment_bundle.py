@@ -107,7 +107,7 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "worker_gateway",
     )
     assert report.aggregate_memory_mib == 1056
-    assert report.aggregate_cpus == pytest.approx(1.80)
+    assert report.aggregate_cpus == pytest.approx(1.89)
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
     assert report.host_mutations == ()

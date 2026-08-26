@@ -241,7 +241,7 @@ services:
     pids_limit: 16
     deploy:
       resources:
-        limits: {memory: 48M, cpus: "0.03", pids: 16}
+        limits: {memory: 48M, cpus: "0.06", pids: 16}
 
   google_egress_proxy:
     <<: *service-defaults
@@ -261,7 +261,7 @@ services:
     pids_limit: 16
     deploy:
       resources:
-        limits: {memory: 48M, cpus: "0.03", pids: 16}
+        limits: {memory: 48M, cpus: "0.06", pids: 16}
 
   vault_egress_proxy:
     <<: *service-defaults
@@ -281,7 +281,7 @@ services:
     pids_limit: 16
     deploy:
       resources:
-        limits: {memory: 48M, cpus: "0.03", pids: 16}
+        limits: {memory: 48M, cpus: "0.06", pids: 16}
 
 networks:
   ingress_broker: {internal: true}
