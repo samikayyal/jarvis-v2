@@ -755,19 +755,30 @@ def _validate_compose(
         ):
             errors.append(f"compose identity mismatch for {service}")
         healthcheck = raw.get("healthcheck")
-        expected_healthcheck = {
-            "test": [
+        probe = (
+            [
                 "CMD",
-                "python",
-                "/opt/jarvis/deployment/health_probe.py",
-            ],
+                "bash",
+                "-c",
+                (
+                    "exec 3<>/dev/tcp/127.0.0.1/9080; "
+                    'printf "GET /health HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n" '
+                    ">&3; IFS= read -r status <&3; "
+                    '[[ "$status" == "HTTP/1.1 200 OK"$\'\\r\' ]]'
+                ),
+            ]
+            if service.endswith("_egress_proxy")
+            else ["CMD", "python", "/opt/jarvis/deployment/health_probe.py"]
+        )
+        expected_healthcheck = {
+            "test": probe,
             "interval": "30s",
-            "timeout": "30s" if service.endswith("_egress_proxy") else "5s",
+            "timeout": "5s",
             "retries": 3,
             "start_period": "10m" if service.endswith("_egress_proxy") else "5m",
         }
         if service.endswith("_egress_proxy"):
-            expected_healthcheck["start_interval"] = "2m"
+            expected_healthcheck["start_interval"] = "30s"
         if healthcheck is None:
             errors.append(f"{service} must define a healthcheck")
         elif healthcheck != expected_healthcheck:

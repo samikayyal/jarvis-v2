@@ -234,10 +234,10 @@ services:
     networks: [orchestration_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
-      timeout: 30s
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
+      timeout: 5s
       start_period: 10m
-      start_interval: 2m
+      start_interval: 30s
     pids_limit: 16
     deploy:
       resources:
@@ -254,10 +254,10 @@ services:
     networks: [google_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
-      timeout: 30s
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
+      timeout: 5s
       start_period: 10m
-      start_interval: 2m
+      start_interval: 30s
     pids_limit: 16
     deploy:
       resources:
@@ -274,10 +274,10 @@ services:
     networks: [vault_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
-      timeout: 30s
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
+      timeout: 5s
       start_period: 10m
-      start_interval: 2m
+      start_interval: 30s
     pids_limit: 16
     deploy:
       resources:
