@@ -257,7 +257,7 @@ class _GmailReplyStructuredPayload(_GmailSendStructuredPayload):
     source_message_id: str
     source_thread_id: str
     in_reply_to: str
-    references: list[str]
+    references: list[str] = Field(min_length=1, max_length=20)
 
 
 class _GmailSendStructuredProposal(BaseModel):
@@ -1168,7 +1168,8 @@ def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
         "approval, permission, sandbox, or explanatory metadata to the payload. "
         "For Gmail new sends, the payload must contain exactly to, cc, bcc, "
         "subject, body, and mime_type; recipients are arrays and mime_type is "
-        "text/plain or text/html. For Gmail replies, add exactly "
+        "text/plain or text/html. Every recipient array entry must be a bare "
+        "mailbox address without a display name. For Gmail replies, add exactly "
         "source_message_id, source_thread_id, in_reply_to, and references to the "
         "six new-send fields. Never emit a separate thread_id field. Do not emit "
         "attachments, threading, or Google connection fields; those are "

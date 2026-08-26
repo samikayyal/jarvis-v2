@@ -368,6 +368,7 @@ def test_v1_model_contract_states_the_exact_gmail_reply_payload_shape() -> None:
         "add exactly source_message_id, source_thread_id, in_reply_to, and references"
     ) in instructions
     assert "Never emit a separate thread_id field" in instructions
+    assert "bare mailbox address without a display name" in instructions
 
     schema = captured["output_type"].json_schema()
     reply_payload = schema["$defs"]["_GmailReplyStructuredPayload"]
@@ -385,6 +386,35 @@ def test_v1_model_contract_states_the_exact_gmail_reply_payload_shape() -> None:
         "references",
     }
     assert "thread_id" not in reply_payload["properties"]
+    assert reply_payload["properties"]["references"]["minItems"] == 1
+    assert reply_payload["properties"]["references"]["maxItems"] == 20
+
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        captured["output_type"].validate_json(
+            json.dumps(
+                {
+                    "reply_text": "I prepared the reply.",
+                    "execution_host": None,
+                    "host_reason_code": None,
+                    "proposal": {
+                        "kind": "gmail_reply",
+                        "preview": "Reply to the source message.",
+                        "payload": {
+                            "to": ["recipient@example.com"],
+                            "cc": [],
+                            "bcc": [],
+                            "subject": "Re: Check-in",
+                            "body": "Thanks.",
+                            "mime_type": "text/plain",
+                            "source_message_id": "source-001",
+                            "source_thread_id": "thread-001",
+                            "in_reply_to": "<source-001@example.com>",
+                            "references": [],
+                        },
+                    },
+                }
+            )
+        )
 
 
 def test_provider_schema_rejects_redundant_gmail_reply_thread_id() -> None:
