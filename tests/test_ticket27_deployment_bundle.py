@@ -134,12 +134,12 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         for service in report.services
         if service.endswith("_egress_proxy")
     } == {
-        "google_egress_proxy": {"start_period": "10m", "start_interval": "30s"},
+        "google_egress_proxy": {"start_period": "10m", "start_interval": "2m"},
         "orchestration_egress_proxy": {
             "start_period": "10m",
-            "start_interval": "30s",
+            "start_interval": "2m",
         },
-        "vault_egress_proxy": {"start_period": "10m", "start_interval": "30s"},
+        "vault_egress_proxy": {"start_period": "10m", "start_interval": "2m"},
     }
     assert {
         service: compose["services"][service]["deploy"]["resources"]["limits"]["memory"]
