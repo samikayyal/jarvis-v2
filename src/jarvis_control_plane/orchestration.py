@@ -1172,7 +1172,11 @@ def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
         "source_message_id, source_thread_id, in_reply_to, and references to the "
         "six new-send fields. Never emit a separate thread_id field. Do not emit "
         "attachments, threading, or Google connection fields; those are "
-        "independently derived or bound. "
+        "independently derived or bound. source_message_id and source_thread_id "
+        "must exactly copy the selected Gmail message id and threadId. in_reply_to "
+        "must exactly copy its Message-ID header. references must contain its "
+        "existing References message identifiers in order, if any, followed by "
+        "that Message-ID; when References is absent, use only that Message-ID. "
         "it will still be independently checked and require the broker's approval flow. "
         "Every exposed read tool has a closed typed schema and bounded result. "
         + (

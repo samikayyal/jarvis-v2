@@ -563,6 +563,8 @@ def test_live_provider_reads_only_inline_textual_gmail_parts() -> None:
                         "mimeType": "multipart/mixed",
                         "headers": [
                             {"name": "Subject", "value": "Proposal"},
+                            {"name": "Message-ID", "value": "<m1@example.test>"},
+                            {"name": "References", "value": "<root@example.test>"},
                             {"name": "Bcc", "value": "never-returned@example.test"},
                         ],
                         "parts": [
@@ -598,10 +600,23 @@ def test_live_provider_reads_only_inline_textual_gmail_parts() -> None:
     request_query = parse_qs(urlparse(transport.calls[1]["url"]).query)  # type: ignore[arg-type]
     item = json.loads(result.items[0])
     assert request_query["format"] == ["full"]
+    assert request_query["metadataHeaders"] == [
+        "From",
+        "To",
+        "Cc",
+        "Subject",
+        "Date",
+        "Message-ID",
+        "References",
+    ]
     assert "body(size,data,attachmentId)" in request_query["fields"][0]
     assert item == {
         "body": "Please review the proposal.\n\nHTML fallback",
-        "headers": {"Subject": "Proposal"},
+        "headers": {
+            "Message-ID": "<m1@example.test>",
+            "References": "<root@example.test>",
+            "Subject": "Proposal",
+        },
         "id": "m1",
         "snippet": "Please review",
         "threadId": "t1",
