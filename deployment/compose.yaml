@@ -235,6 +235,7 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
+      timeout: 30s
       start_period: 10m
       start_interval: 30s
     pids_limit: 16
@@ -254,6 +255,7 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
+      timeout: 30s
       start_period: 10m
       start_interval: 30s
     pids_limit: 16
@@ -273,6 +275,7 @@ services:
     healthcheck:
       <<: *healthcheck
       test: [CMD, python, /opt/jarvis/deployment/health_probe.py]
+      timeout: 30s
       start_period: 10m
       start_interval: 30s
     pids_limit: 16

@@ -762,7 +762,7 @@ def _validate_compose(
                 "/opt/jarvis/deployment/health_probe.py",
             ],
             "interval": "30s",
-            "timeout": "5s",
+            "timeout": "30s" if service.endswith("_egress_proxy") else "5s",
             "retries": 3,
             "start_period": "10m" if service.endswith("_egress_proxy") else "5m",
         }
