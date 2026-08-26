@@ -159,6 +159,27 @@ def test_exact_path_read_preserves_complete_small_note_for_exact_write_context(
     assert excerpt.ends_with_newline is True
 
 
+def test_exact_path_read_preserves_complete_bounded_note_for_exact_write_context(
+    tmp_path: Path,
+) -> None:
+    _vault(tmp_path)
+    content = "# Acceptance\n\n" + ("bounded vault content\n" * 40)
+    exact_path = tmp_path / "Projects" / "Acceptance.md"
+    exact_path.write_text(content, encoding="utf-8", newline="")
+    connector = _connector(
+        tmp_path, ControlledVaultSynchronizer(last_synchronized_at=NOW)
+    )
+
+    result = connector.read(VaultReadInput(path="Projects/Acceptance.md"))
+
+    assert len(result.excerpts) == 1
+    excerpt = result.excerpts[0]
+    assert len(content) > 600
+    assert excerpt.text == content
+    assert excerpt.complete is True
+    assert excerpt.ends_with_newline is True
+
+
 def test_unavailable_sync_permits_only_a_clean_stale_read_with_age_disclosure(
     tmp_path: Path,
 ) -> None:
