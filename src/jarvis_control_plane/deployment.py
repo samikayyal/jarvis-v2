@@ -764,7 +764,7 @@ def _validate_compose(
                     "exec 3<>/dev/tcp/127.0.0.1/9080; "
                     'printf "GET /health HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n" '
                     ">&3; IFS= read -r status <&3; "
-                    '[[ "$status" == "HTTP/1.1 200 OK"$\'\\r\' ]]'
+                    '[[ "$$status" == "HTTP/1.1 200 OK"$\'\\r\' ]]'
                 ),
             ]
             if service.endswith("_egress_proxy")

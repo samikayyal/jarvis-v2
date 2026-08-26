@@ -234,7 +234,7 @@ services:
     networks: [orchestration_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
       timeout: 5s
       start_period: 10m
       start_interval: 30s
@@ -254,7 +254,7 @@ services:
     networks: [google_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
       timeout: 5s
       start_period: 10m
       start_interval: 30s
@@ -274,7 +274,7 @@ services:
     networks: [vault_egress, external_egress]
     healthcheck:
       <<: *healthcheck
-      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
+      test: [CMD, bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9080; printf "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; IFS= read -r status <&3; [[ "$$status" == "HTTP/1.1 200 OK"$''\r'' ]]']
       timeout: 5s
       start_period: 10m
       start_interval: 30s
