@@ -619,7 +619,7 @@ def _validate_artifacts(
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
     if (
-        'ENTRYPOINT ["uv", "run", "--no-project", "python", "-m", '
+        'ENTRYPOINT ["uv", "run", "--no-cache", "--no-project", "python", "-m", '
         '"jarvis_control_plane.service_runtime"]'
     ) not in dockerfile:
         errors.append("Dockerfile must enter the role-specific service runtime")

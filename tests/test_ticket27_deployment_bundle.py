@@ -88,6 +88,11 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     report = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT)
 
     assert report.release_id == "jarvis-assistant-v1"
+    assert (
+        'ENTRYPOINT ["uv", "run", "--no-cache", "--no-project", "python", "-m", '
+        '"jarvis_control_plane.service_runtime"]'
+        in (SHIPPED_BUNDLE / "Dockerfile").read_text(encoding="utf-8")
+    )
     assert report.services == (
         "audit_service",
         "capability_broker",

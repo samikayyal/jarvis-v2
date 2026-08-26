@@ -38,4 +38,4 @@ COPY deployment /opt/jarvis/deployment
 RUN uv run --no-project python -m jarvis_control_plane.deployment \
     /opt/jarvis/deployment --source-root /opt/jarvis
 
-ENTRYPOINT ["uv", "run", "--no-project", "python", "-m", "jarvis_control_plane.service_runtime"]
+ENTRYPOINT ["uv", "run", "--no-cache", "--no-project", "python", "-m", "jarvis_control_plane.service_runtime"]
