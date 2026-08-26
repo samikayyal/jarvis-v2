@@ -349,6 +349,86 @@ def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() ->
         adapter.run(_request("read an ambiguous title"))
 
 
+def test_v1_model_contract_states_the_exact_gmail_reply_payload_shape() -> None:
+    captured: dict[str, object] = {}
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: captured.update(kwargs) or object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="No Gmail action was needed.")
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    adapter.run(_request("prepare a reply"))
+
+    instructions = captured["instructions"]
+    assert isinstance(instructions, str)
+    assert (
+        "add exactly source_message_id, source_thread_id, in_reply_to, and references"
+    ) in instructions
+    assert "Never emit a separate thread_id field" in instructions
+
+    schema = captured["output_type"].json_schema()
+    reply_payload = schema["$defs"]["_GmailReplyStructuredPayload"]
+    assert reply_payload["additionalProperties"] is False
+    assert set(reply_payload["required"]) == {
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "body",
+        "mime_type",
+        "source_message_id",
+        "source_thread_id",
+        "in_reply_to",
+        "references",
+    }
+    assert "thread_id" not in reply_payload["properties"]
+
+
+def test_provider_schema_rejects_redundant_gmail_reply_thread_id() -> None:
+    captured: dict[str, object] = {}
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: captured.update(kwargs) or object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="No Gmail action was needed.")
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    adapter.run(_request("prepare a reply"))
+
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        captured["output_type"].validate_json(
+            json.dumps(
+                {
+                    "reply_text": "I prepared the reply.",
+                    "execution_host": None,
+                    "host_reason_code": None,
+                    "proposal": {
+                        "kind": "gmail_reply",
+                        "preview": "Reply to the source message.",
+                        "payload": {
+                            "to": ["recipient@example.com"],
+                            "cc": [],
+                            "bcc": [],
+                            "subject": "Re: Check-in",
+                            "body": "Thanks.",
+                            "mime_type": "text/plain",
+                            "thread_id": "wrong-thread",
+                            "source_message_id": "source-001",
+                            "source_thread_id": "thread-001",
+                            "in_reply_to": "<source-001@example.com>",
+                            "references": ["<source-001@example.com>"],
+                        },
+                    },
+                }
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("failure", "reason"),
     [
