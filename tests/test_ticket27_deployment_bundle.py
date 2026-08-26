@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 import shutil
 import stat
 import tomllib
@@ -441,6 +442,27 @@ def test_broker_state_uses_only_the_write_only_deleted_archive_client(
     assert captured["endpoint"] == "/run/jarvis-deleted/writer.sock"
     assert captured["deleted_archive"] is archive
     assert captured["database"] == tmp_path / "state.sqlite3"
+
+
+def test_deleted_archive_health_probe_does_not_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    health_probe = runpy.run_path(
+        str(Path(__file__).parents[1] / "deployment" / "health_probe.py")
+    )
+
+    monkeypatch.setattr(
+        health_probe["os"],
+        "stat",
+        lambda _endpoint: SimpleNamespace(st_mode=stat.S_IFSOCK | 0o660),
+    )
+    monkeypatch.setattr(
+        health_probe["socket"],
+        "socket",
+        lambda *_args, **_kwargs: pytest.fail("health probe must not connect"),
+    )
+
+    health_probe["deleted_archive_ready"]()
 
 
 def test_google_administration_is_authenticated_and_not_model_accessible() -> None:
@@ -1109,6 +1131,7 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "artifacts.lock.json",
         "compose.yaml",
         "config.example.toml",
+        "health_probe.py",
         "openwa-handoff.md",
         "requirements.lock",
         "systemd/jarvis-backup.service",

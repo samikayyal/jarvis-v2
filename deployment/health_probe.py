@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import stat
 
 HTTP_PORTS = {
     "jarvis-inbound": 9011,
@@ -21,12 +22,15 @@ HTTP_PORTS = {
 }
 
 
+def deleted_archive_ready(endpoint: str = "/run/jarvis-deleted/writer.sock") -> None:
+    if not stat.S_ISSOCK(os.stat(endpoint).st_mode):
+        raise SystemExit("deleted archive socket is unavailable")
+
+
 def main() -> None:
     identity = os.environ.get("JARVIS_SERVICE_IDENTITY", "")
     if identity == "jarvis-deleted-archive":
-        with socket.socket(socket.AF_UNIX) as probe:
-            probe.settimeout(2)
-            probe.connect("/run/jarvis-deleted/writer.sock")
+        deleted_archive_ready()
         return
     port = HTTP_PORTS.get(identity)
     if port is None:
