@@ -46,6 +46,7 @@ from jarvis_control_plane import (
     SignedInboundEvent,
     TraceReservation,
     TraceWriteError,
+    WorkerExecutionResult,
     create_gmail_new_send_proposal,
     create_gmail_reply_proposal,
     gmail_write_request_from_proposal,
@@ -1216,6 +1217,17 @@ def test_routed_action_surface_freezes_terminal_and_gmail_proposals() -> None:
     assert gmail_pending.disposition == "pending_action"
     assert gmail_approved.disposition == "action_dispatched"
     assert len(gmail_provider.calls) == 1
+
+
+def test_controlled_terminal_dispatch_returns_typed_result_only_for_terminal_actions() -> (
+    None
+):
+    terminal_result = ControlledActionDispatcher().dispatch(_terminal_proposal())
+
+    assert isinstance(terminal_result, WorkerExecutionResult)
+    assert terminal_result.status.value == "completed"
+    assert terminal_result.process_tree_stopped is True
+    assert ControlledActionDispatcher().dispatch(_proposal()) is None
 
 
 @pytest.mark.parametrize(

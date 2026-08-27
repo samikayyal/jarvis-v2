@@ -297,7 +297,9 @@ def test_broker_creates_a_session_permission_for_choice_two_then_dispatches() ->
     approved = components.receiver.receive(_event("2", "permission-approval"))
 
     assert pending.disposition == "pending_action"
-    assert "Allow for this session" in components.outbound.sent[-1].body
+    assert any(
+        "Allow for this session" in reply.body for reply in components.outbound.sent
+    )
     assert approved.disposition == "action_dispatched"
     assert len(dispatcher.dispatched) == 1
     permissions = components.broker.working_sessions.load().permissions

@@ -1,15 +1,171 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from jarvis_control_plane.ticket33_endurance import (
     MAX_SWAP_GROWTH_BYTES,
     MINIMUM_FREE_BYTES,
+    EnduranceConfig,
+    EnduranceDependencies,
+    ResourceMeasurement,
     Sample,
+    Sampling,
+    run_endurance,
     validate_samples,
     workload_plan,
 )
+
+
+class _OneSample:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def is_set(self) -> bool:
+        return self.stopped
+
+    def set(self) -> None:
+        self.stopped = True
+
+    def wait(self, timeout: float) -> bool:
+        del timeout
+        self.stopped = True
+        return True
+
+    def join(self, *, timeout: float) -> None:
+        del timeout
+
+
+class _SynchronousTiming:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def now(self) -> datetime:
+        return datetime.fromtimestamp(self.value, UTC)
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+    def start(self, target: Callable[[Sampling], None]) -> _OneSample:
+        sampler = _OneSample()
+        target(sampler)
+        return sampler
+
+
+class _Evidence:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def prepare(self) -> None:
+        return None
+
+    def write(self, record: dict[str, object]) -> None:
+        self.records.append(record)
+
+
+def _config(tmp_path: Path) -> EnduranceConfig:
+    return EnduranceConfig(
+        source_root=tmp_path,
+        python=Path("python"),
+        evidence=tmp_path / "evidence.jsonl",
+        trace_root=tmp_path,
+        temporary_root=tmp_path,
+        run_seconds=10,
+        settling_seconds=5,
+        sample_seconds=5,
+        smoke=True,
+    )
+
+
+def _dependencies(
+    timing: _SynchronousTiming,
+    evidence: _Evidence,
+    measure_host: Callable[..., ResourceMeasurement],
+    execute_workload: Callable[..., int],
+) -> EnduranceDependencies:
+    return EnduranceDependencies(
+        timing=timing,
+        execute_workload=execute_workload,
+        measure_host=measure_host,
+        prepare_evidence=evidence.prepare,
+        write_evidence=evidence.write,
+        validate_samples=lambda samples, **kwargs: (),
+    )
+
+
+def test_runner_measures_and_writes_samples_through_injected_adapters(
+    tmp_path: Path,
+) -> None:
+    evidence = _Evidence()
+    measurement = ResourceMeasurement(
+        available_memory_bytes=1024,
+        used_swap_bytes=100,
+        free_disk_bytes=MINIMUM_FREE_BYTES,
+        trace_bytes=100,
+        trace_records=100,
+        trace_payload_bytes=100,
+        temporary_bytes=100,
+        jarvis_cpu_percent=100.0,
+        jarvis_memory_bytes=1024,
+        jarvis_pids=400,
+    )
+    measured: list[tuple[Path, Path]] = []
+    executed: list[str] = []
+
+    def measure_host(*, trace_root: Path, temporary_root: Path) -> ResourceMeasurement:
+        measured.append((trace_root, temporary_root))
+        return measurement
+
+    def execute_workload(*, python: Path, source_root: Path, nodeid: str) -> int:
+        del python, source_root
+        executed.append(nodeid)
+        return 0
+
+    outcome = run_endurance(
+        _config(tmp_path),
+        dependencies=_dependencies(
+            _SynchronousTiming(), evidence, measure_host, execute_workload
+        ),
+    )
+
+    assert outcome.exit_code == 0
+    assert measured == [(tmp_path, tmp_path)]
+    assert len(executed) == 1
+    sample_record = evidence.records[0]["sample"]
+    assert isinstance(sample_record, dict)
+    for field, value in asdict(measurement).items():
+        assert sample_record[field] == value
+    assert evidence.records[-1] == {"summary": outcome.summary_record()}
+
+
+def test_runner_fails_closed_when_sampling_fails_and_records_outcome(
+    tmp_path: Path,
+) -> None:
+    evidence = _Evidence()
+
+    def measure_host(*, trace_root: Path, temporary_root: Path) -> ResourceMeasurement:
+        del trace_root, temporary_root
+        raise ValueError("host measurement unavailable")
+
+    def execute_workload(*, python: Path, source_root: Path, nodeid: str) -> int:
+        del python, source_root, nodeid
+        return 0
+
+    outcome = run_endurance(
+        _config(tmp_path),
+        dependencies=_dependencies(
+            _SynchronousTiming(), evidence, measure_host, execute_workload
+        ),
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.failures == ("sampling failed: ValueError",)
+    assert evidence.records[-1] == {"summary": outcome.summary_record()}
 
 
 def _sample(*, phase: str, seconds: float, **changes: object) -> Sample:

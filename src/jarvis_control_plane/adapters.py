@@ -66,6 +66,7 @@ from .ports import (
     StateStoreError,
 )
 from .sessions import ModelAvailability
+from .worker_gateway import WorkerExecutionResult
 
 SQLITE_OUTBOUND_ATTEMPT_MIGRATION_VERSION = 1
 _SQLITE_OUTBOUND_ATTEMPT_MIGRATION_NAME = "ticket12_outbound_attempt_state"
@@ -4649,14 +4650,14 @@ class _ControlledActionDispatch:
         self._started = False
         self._cancelled = False
 
-    def run(self) -> None:
+    def run(self) -> object | None:
         with self._lock:
             if self._cancelled:
                 self._owner._forget(self._action.action_id, self)
                 raise ActionDispatcherError("action was cancelled before dispatch")
             self._started = True
         try:
-            self._owner._dispatch(self._action)
+            return self._owner._dispatch(self._action)
         finally:
             self._owner._forget(self._action.action_id, self)
 
@@ -4693,10 +4694,10 @@ class ControlledActionDispatcher:
             self._prepared[action.action_id] = handle
         return handle
 
-    def dispatch(self, action: FrozenActionProposal) -> None:
+    def dispatch(self, action: FrozenActionProposal) -> object | None:
         """Compatibility helper for direct controlled-adapter callers."""
 
-        self.prepare(action).run()
+        return self.prepare(action).run()
 
     def cancel(self, *, action_id: str) -> ActionCancellationResult:
         with self._lock:
@@ -4708,12 +4709,15 @@ class ControlledActionDispatcher:
             return ActionCancellationResult(ActionCancellationStatus.UNKNOWN)
         return handle.cancel()
 
-    def _dispatch(self, action: FrozenActionProposal) -> None:
+    def _dispatch(self, action: FrozenActionProposal) -> object | None:
         if self.failure is not None:
             raise ActionDispatcherError(
                 self.failure, may_have_dispatched=self.failure_may_have_dispatched
             )
         self.dispatched.append(action)
+        if action.kind == "terminal":
+            return WorkerExecutionResult.completed()
+        return None
 
     def _forget(self, action_id: str, handle: _ControlledActionDispatch) -> None:
         with self._lock:

@@ -328,6 +328,69 @@ class _RunningSystemdScope:
     unit_observed: Event
 
 
+class _UbuntuProcessScopeAdapter(Protocol):
+    """Local seam for systemd unit observation and whole-unit signalling.
+
+    The process-scope policy remains in :class:`SystemdUbuntuProcessScope`:
+    it owns process launch, bounded stream capture, deadline handling, the
+    TERM-then-KILL sequence, and cleanup state.  Implementations here only
+    perform the systemd calls needed by that policy, which keeps those calls
+    replaceable by a deterministic adapter in contract tests.
+    """
+
+    def check_unit(
+        self, unit_name: str, *, timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]: ...
+
+    def signal_unit(
+        self, unit_name: str, signal: str, *, timeout_seconds: float
+    ) -> None: ...
+
+
+class _SystemdUbuntuProcessScopeAdapter:
+    """Production systemd implementation of the local process-scope seam."""
+
+    def __init__(self, *, systemctl_path: str) -> None:
+        self._systemctl_path = systemctl_path
+
+    def check_unit(
+        self, unit_name: str, *, timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            (
+                self._systemctl_path,
+                "--user",
+                "is-active",
+                unit_name,
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout_seconds,
+            text=True,
+        )
+
+    def signal_unit(
+        self, unit_name: str, signal: str, *, timeout_seconds: float
+    ) -> None:
+        subprocess.run(
+            (
+                self._systemctl_path,
+                "--user",
+                "kill",
+                "--kill-whom=all",
+                f"--signal={signal}",
+                unit_name,
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout_seconds,
+        )
+
+
 class SystemdUbuntuProcessScope:
     """Run one exact process in a least-privileged transient user service.
 
@@ -343,6 +406,7 @@ class SystemdUbuntuProcessScope:
         systemd_run_path: str = "/usr/bin/systemd-run",
         systemctl_path: str = "/usr/bin/systemctl",
         process_limit: int = 32,
+        systemd_adapter: _UbuntuProcessScopeAdapter | None = None,
     ) -> None:
         if isinstance(process_limit, bool) or not isinstance(process_limit, int):
             raise TypeError("Ubuntu process limit must be an integer")
@@ -355,7 +419,11 @@ class SystemdUbuntuProcessScope:
             if not isinstance(value, str) or not PurePosixPath(value).is_absolute():
                 raise ValueError(f"{name} path must be absolute")
         self._systemd_run_path = systemd_run_path
-        self._systemctl_path = systemctl_path
+        self._systemd_adapter = (
+            systemd_adapter
+            if systemd_adapter is not None
+            else _SystemdUbuntuProcessScopeAdapter(systemctl_path=systemctl_path)
+        )
         self._process_limit = process_limit
         runtime_uid = os.getuid() if hasattr(os, "getuid") else 0
         self._user_runtime_directory = f"/run/user/{runtime_uid}"
@@ -901,20 +969,10 @@ class SystemdUbuntuProcessScope:
     def _signal_unit(self, unit_name: str, signal: str, deadline: float) -> None:
         remaining = max(deadline - monotonic(), 0.001)
         try:
-            subprocess.run(
-                (
-                    self._systemctl_path,
-                    "--user",
-                    "kill",
-                    "--kill-whom=all",
-                    f"--signal={signal}",
-                    unit_name,
-                ),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=remaining,
+            self._systemd_adapter.signal_unit(
+                unit_name,
+                signal,
+                timeout_seconds=remaining,
             )
         except (OSError, subprocess.TimeoutExpired):
             return
@@ -934,19 +992,9 @@ class SystemdUbuntuProcessScope:
             if remaining <= 0:
                 return False
             try:
-                check = subprocess.run(
-                    (
-                        self._systemctl_path,
-                        "--user",
-                        "is-active",
-                        running.unit_name,
-                    ),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=min(remaining, 0.25),
-                    text=True,
+                check = self._systemd_adapter.check_unit(
+                    running.unit_name,
+                    timeout_seconds=min(remaining, 0.25),
                 )
             except subprocess.TimeoutExpired:
                 continue

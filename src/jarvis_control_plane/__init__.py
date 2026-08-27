@@ -17,7 +17,6 @@ from .adapters import (
     migrate_sqlite_outbound_conversation_attempts,
 )
 from .control_plane import (
-    ControlPlane,
     ControlPlaneConfig,
     DeterministicCapabilityBroker,
     SignedMessageReceiver,
@@ -294,7 +293,6 @@ __all__ = [
     "AuditFilter",
     "AuditWriteError",
     "BoundActionLifecycle",
-    "ControlPlane",
     "ControlPlaneConfig",
     "ControlPlaneError",
     "ControlledActionDispatcher",

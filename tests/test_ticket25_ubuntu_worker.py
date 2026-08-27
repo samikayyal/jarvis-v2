@@ -8,9 +8,10 @@ from collections.abc import Callable
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Protocol, cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -34,6 +35,7 @@ from jarvis_control_plane import (
     WorkerExecutionStatus,
     WorkerGateway,
     WorkerIdentity,
+    WorkerInvocation,
     WorkerOutputStream,
     WorkerProgressEvent,
     WorkerProgressKind,
@@ -50,6 +52,73 @@ class _CancellableHandle(Protocol):
     def run(self) -> object | None: ...
 
     def cancel(self) -> ActionCancellationResult: ...
+
+
+class _ControlledUbuntuProcessScopeAdapter:
+    """Script systemd observations while exercising the public scope API."""
+
+    def __init__(
+        self,
+        *checks: subprocess.CompletedProcess[str],
+    ) -> None:
+        self._checks = list(checks)
+        self._fallback = checks[-1] if checks else _unit_check(3, "inactive\n")
+        self.unit_checks: list[tuple[str, float]] = []
+        self.signals: list[tuple[str, str, float]] = []
+
+    def check_unit(
+        self, unit_name: str, *, timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        self.unit_checks.append((unit_name, timeout_seconds))
+        if self._checks:
+            return self._checks.pop(0)
+        return self._fallback
+
+    def signal_unit(
+        self, unit_name: str, signal: str, *, timeout_seconds: float
+    ) -> None:
+        self.signals.append((unit_name, signal, timeout_seconds))
+
+
+def _unit_check(return_code: int, state: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], return_code, stdout=state)
+
+
+class _ExitedProcess:
+    def __init__(
+        self,
+        *,
+        return_code: int = 0,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> None:
+        self.return_code = return_code
+        self.stdout = BytesIO(stdout)
+        self.stderr = BytesIO(stderr)
+
+    def poll(self) -> int:
+        return self.return_code
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        return self.return_code
+
+
+def _execute_systemd_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    scope: SystemdUbuntuProcessScope,
+    invocation: WorkerInvocation,
+    process: object,
+    progress: Callable[[WorkerProgressEvent], None] | None = None,
+) -> WorkerExecutionResult:
+    monkeypatch.setattr(ubuntu_worker_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        ubuntu_worker_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    scope.reserve(action_id=invocation.action_id)
+    return scope.execute(invocation, progress or (lambda _event: None))
 
 
 def _local_peer(
@@ -618,6 +687,67 @@ def test_systemd_scope_is_noninteractive_bounded_and_never_uses_a_shell() -> Non
     assert all("docker" not in argument for argument in command)
 
 
+def test_production_systemd_adapter_checks_one_unit_with_exact_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = subprocess.CompletedProcess(
+        ["/usr/bin/systemctl"], 3, stdout="inactive\n"
+    )
+    run = Mock(return_value=completed)
+    monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
+    adapter = ubuntu_worker_module._SystemdUbuntuProcessScopeAdapter(
+        systemctl_path="/usr/bin/systemctl"
+    )
+
+    observed = adapter.check_unit("jarvis-action-test.service", timeout_seconds=1.25)
+
+    assert observed is completed
+    run.assert_called_once_with(
+        (
+            "/usr/bin/systemctl",
+            "--user",
+            "is-active",
+            "jarvis-action-test.service",
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=1.25,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("signal", ["TERM", "KILL"])
+def test_production_systemd_adapter_signals_the_whole_unit_with_exact_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    signal: str,
+) -> None:
+    run = Mock()
+    monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
+    adapter = ubuntu_worker_module._SystemdUbuntuProcessScopeAdapter(
+        systemctl_path="/usr/bin/systemctl"
+    )
+
+    adapter.signal_unit("jarvis-action-test.service", signal, timeout_seconds=2.5)
+
+    run.assert_called_once_with(
+        (
+            "/usr/bin/systemctl",
+            "--user",
+            "kill",
+            "--kill-whom=all",
+            f"--signal={signal}",
+            "jarvis-action-test.service",
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=2.5,
+    )
+
+
 @pytest.mark.parametrize("process_limit", [0, 65, True])
 def test_systemd_scope_rejects_an_invalid_process_tree_bound(
     process_limit: object,
@@ -627,139 +757,93 @@ def test_systemd_scope_rejects_an_invalid_process_tree_bound(
 
 
 @pytest.mark.parametrize(
-    ("return_code", "state", "wrapper_completed", "expected"),
+    ("return_code", "state", "expected"),
     [
-        (1, "", False, False),
-        (3, "inactive\n", False, True),
-        (3, "failed\n", False, True),
-        (4, "inactive\n", False, False),
-        (4, "inactive\n", True, True),
-        (4, "unknown\n", False, False),
-        (4, "unknown\n", True, True),
+        (1, "", False),
+        (3, "inactive\n", True),
+        (3, "failed\n", True),
+        (4, "inactive\n", True),
+        (4, "unknown\n", True),
     ],
 )
-def test_systemd_scope_requires_a_known_stopped_unit_state(
+def test_systemd_scope_reports_unit_state_through_public_execution(
     monkeypatch: pytest.MonkeyPatch,
     return_code: int,
     state: str,
-    wrapper_completed: bool,
     expected: bool,
 ) -> None:
-    scope = SystemdUbuntuProcessScope()
-
-    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess([], return_code, stdout=state)
-
-    monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
-    observed = Event()
-    running = ubuntu_worker_module._RunningSystemdScope(
-        unit_name="jarvis-action-test.service",
-        process=cast("subprocess.Popen[bytes]", object()),
-        cancel_requested=Event(),
-        termination_lock=RLock(),
-        unit_observed=observed,
+    adapter = _ControlledUbuntuProcessScopeAdapter(_unit_check(return_code, state))
+    scope = SystemdUbuntuProcessScope(systemd_adapter=adapter)
+    invocation = _invocation(
+        "action-ubuntu-unit-state",
+        WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    result = _execute_systemd_scope(
+        monkeypatch,
+        scope,
+        invocation,
+        _ExitedProcess(return_code=return_code),
     )
 
-    stopped = scope._unit_is_stopped(
-        running,
-        timeout_seconds=1,
-        wrapper_completed=wrapper_completed,
-    )
-
-    assert stopped is expected
+    assert result.process_tree_stopped is expected
+    assert adapter.unit_checks
 
 
 def test_systemd_scope_waits_for_a_deactivating_unit_to_be_collected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scope = SystemdUbuntuProcessScope()
-    checks = iter(
-        (
-            subprocess.CompletedProcess([], 3, stdout="deactivating\n"),
-            subprocess.CompletedProcess([], 4, stdout="inactive\n"),
-        )
+    adapter = _ControlledUbuntuProcessScopeAdapter(
+        _unit_check(3, "deactivating\n"),
+        _unit_check(4, "inactive\n"),
+    )
+    scope = SystemdUbuntuProcessScope(systemd_adapter=adapter)
+    invocation = _invocation(
+        "action-ubuntu-deactivating",
+        WorkerIdentity(
+            host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+        ),
+    )
+    result = _execute_systemd_scope(
+        monkeypatch,
+        scope,
+        invocation,
+        _ExitedProcess(),
     )
 
-    monkeypatch.setattr(
-        ubuntu_worker_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: next(checks),
-    )
-    running = ubuntu_worker_module._RunningSystemdScope(
-        unit_name="jarvis-action-test.service",
-        process=cast("subprocess.Popen[bytes]", object()),
-        cancel_requested=Event(),
-        termination_lock=RLock(),
-        unit_observed=Event(),
-    )
-
-    assert scope._unit_is_stopped(
-        running,
-        timeout_seconds=1,
-        wrapper_completed=True,
-    )
-    assert running.unit_observed.is_set()
+    assert result.process_tree_stopped is True
+    assert len(adapter.unit_checks) >= 2
 
 
 def test_systemd_scope_accepts_a_collected_unit_after_wait_wrapper_exits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class ExitedWrapper:
-        def __init__(self) -> None:
-            self.stdout = BytesIO()
-            self.stderr = BytesIO()
-
-        @staticmethod
-        def poll() -> int:
-            return 0
-
-    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess([], 4, stdout="unknown\n")
-
-    scope = SystemdUbuntuProcessScope()
-    monkeypatch.setattr(ubuntu_worker_module.subprocess, "run", run)
-    running = ubuntu_worker_module._RunningSystemdScope(
-        unit_name="jarvis-action-collected.service",
-        process=cast("subprocess.Popen[bytes]", ExitedWrapper()),
-        cancel_requested=Event(),
-        termination_lock=RLock(),
-        unit_observed=Event(),
-    )
+    adapter = _ControlledUbuntuProcessScopeAdapter(_unit_check(4, "unknown\n"))
+    scope = SystemdUbuntuProcessScope(systemd_adapter=adapter)
     invocation = _invocation(
         "action-ubuntu-collected",
         WorkerIdentity(
             host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
         ),
     )
-
-    result = scope._observe(running, invocation, lambda _event: None)
+    result = _execute_systemd_scope(
+        monkeypatch,
+        scope,
+        invocation,
+        _ExitedProcess(),
+    )
 
     assert result.status is WorkerExecutionStatus.COMPLETED
     assert result.process_tree_stopped is True
-    assert not running.unit_observed.is_set()
+    assert len(adapter.unit_checks) >= 2
 
 
 def test_systemd_scope_reports_real_stream_truncation_facts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class ExitedWrapper:
-        def __init__(self) -> None:
-            self.stdout = BytesIO(b"A" * 33)
-            self.stderr = BytesIO(b"B" * 33)
-
-        @staticmethod
-        def poll() -> int:
-            return 0
-
-    scope = SystemdUbuntuProcessScope()
-    monkeypatch.setattr(scope, "_unit_is_stopped", lambda *_args, **_kwargs: True)
-    running = ubuntu_worker_module._RunningSystemdScope(
-        unit_name="jarvis-action-truncation.service",
-        process=cast("subprocess.Popen[bytes]", ExitedWrapper()),
-        cancel_requested=Event(),
-        termination_lock=RLock(),
-        unit_observed=Event(),
-    )
+    adapter = _ControlledUbuntuProcessScopeAdapter(_unit_check(3, "inactive\n"))
+    scope = SystemdUbuntuProcessScope(systemd_adapter=adapter)
     invocation = replace(
         _invocation(
             "action-ubuntu-truncation",
@@ -770,8 +854,12 @@ def test_systemd_scope_reports_real_stream_truncation_facts(
         stdout_limit_bytes=32,
         stderr_limit_bytes=32,
     )
-
-    result = scope._observe(running, invocation, lambda _event: None)
+    result = _execute_systemd_scope(
+        monkeypatch,
+        scope,
+        invocation,
+        _ExitedProcess(stdout=b"A" * 33, stderr=b"B" * 33),
+    )
 
     assert len(result.stdout.encode()) == 32
     assert len(result.stderr.encode()) == 32
@@ -779,6 +867,70 @@ def test_systemd_scope_reports_real_stream_truncation_facts(
     assert result.stderr.endswith("[output truncated]")
     assert result.stdout_truncated is True
     assert result.stderr_truncated is True
+
+
+def test_systemd_scope_reports_ambiguous_cancellation_until_unit_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RunningProcess:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.finished = Event()
+            self.stdout = BytesIO()
+            self.stderr = BytesIO()
+
+        def poll(self) -> int | None:
+            self.started.set()
+            return 0 if self.finished.is_set() else None
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.finished.wait(timeout=timeout):
+                return 0
+            raise subprocess.TimeoutExpired("controlled-process", timeout)
+
+    adapter = _ControlledUbuntuProcessScopeAdapter(
+        _unit_check(1, "unknown\n"),
+        _unit_check(1, "unknown\n"),
+        _unit_check(1, "unknown\n"),
+        _unit_check(1, "unknown\n"),
+        _unit_check(3, "inactive\n"),
+    )
+    scope = SystemdUbuntuProcessScope(systemd_adapter=adapter)
+    invocation = replace(
+        _invocation(
+            "action-ubuntu-ambiguous-cancel",
+            WorkerIdentity(
+                host="ubuntu", worker_id="ubuntu-01", connection_id="local-boot-01"
+            ),
+        ),
+        deadline_seconds=5,
+        cancellation_grace_seconds=1,
+    )
+    process = RunningProcess()
+    monkeypatch.setattr(ubuntu_worker_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        ubuntu_worker_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    scope.reserve(action_id=invocation.action_id)
+    results: list[WorkerExecutionResult] = []
+    execution = Thread(
+        target=lambda: results.append(scope.execute(invocation, lambda _event: None))
+    )
+    execution.start()
+    assert process.started.wait(timeout=2)
+
+    cancellation = scope.cancel(action_id=invocation.action_id, timeout_seconds=1)
+
+    assert cancellation.status is ActionCancellationStatus.UNKNOWN
+    assert [signal for _, signal, _ in adapter.signals] == ["TERM", "KILL"]
+
+    process.finished.set()
+    execution.join(timeout=2)
+    assert not execution.is_alive()
+    assert results[0].status is WorkerExecutionStatus.CANCELLED
+    assert results[0].process_tree_stopped is True
 
 
 def test_systemd_scope_runs_structured_compounds_inside_the_same_unit() -> None:
@@ -884,17 +1036,12 @@ def test_systemd_scope_deadline_applies_after_wrapper_exit_with_open_pipes(
         def poll() -> int:
             return 0
 
-    scope = SystemdUbuntuProcessScope()
-    wrapper = ExitedWrapper()
-    running_type = ubuntu_worker_module._RunningSystemdScope
-    running = running_type(
-        unit_name="jarvis-action-test.service",
-        process=cast("subprocess.Popen[bytes]", wrapper),
-        cancel_requested=Event(),
-        termination_lock=RLock(),
-        unit_observed=Event(),
+    scope = SystemdUbuntuProcessScope(
+        systemd_adapter=_ControlledUbuntuProcessScopeAdapter(
+            _unit_check(3, "inactive\n")
+        )
     )
-    monkeypatch.setattr(scope, "_stop_scope", lambda *_args: True)
+    wrapper = ExitedWrapper()
     invocation = replace(
         _invocation(
             "action-ubuntu-inherited-pipe",
@@ -907,7 +1054,7 @@ def test_systemd_scope_deadline_applies_after_wrapper_exit_with_open_pipes(
     )
 
     started = monotonic()
-    result = scope._observe(running, invocation, lambda _event: None)
+    result = _execute_systemd_scope(monkeypatch, scope, invocation, wrapper)
 
     assert monotonic() - started < 3
     assert result.status is WorkerExecutionStatus.TIMED_OUT
@@ -980,15 +1127,13 @@ def test_systemd_scope_honors_cancellation_that_arrives_during_process_start(
         assert release_start.wait(timeout=5)
         return process
 
-    scope = SystemdUbuntuProcessScope()
+    scope = SystemdUbuntuProcessScope(
+        systemd_adapter=_ControlledUbuntuProcessScopeAdapter(
+            _unit_check(3, "inactive\n")
+        )
+    )
     monkeypatch.setattr(ubuntu_worker_module.sys, "platform", "linux")
     monkeypatch.setattr(ubuntu_worker_module.subprocess, "Popen", start)
-    monkeypatch.setattr(scope, "_stop_scope", lambda *_args: True)
-    monkeypatch.setattr(
-        scope,
-        "_observe",
-        lambda *_args: pytest.fail("cancelled startup must not enter observation"),
-    )
     invocation = _invocation(
         "action-ubuntu-cancel-during-start",
         WorkerIdentity(
@@ -1161,18 +1306,13 @@ def test_observation_failure_stops_and_releases_the_process_scope(
             return 0
 
     process = ExitedProcess()
-    stopped: list[object] = []
-    scope = SystemdUbuntuProcessScope()
+    adapter = _ControlledUbuntuProcessScopeAdapter(_unit_check(3, "inactive\n"))
+    scope = SystemdUbuntuProcessScope(systemd_adapter=adapter)
     monkeypatch.setattr(ubuntu_worker_module.sys, "platform", "linux")
     monkeypatch.setattr(
         ubuntu_worker_module.subprocess,
         "Popen",
         lambda *_args, **_kwargs: process,
-    )
-    monkeypatch.setattr(
-        scope,
-        "_stop_scope",
-        lambda running, _timeout: stopped.append(running) is None or True,
     )
     invocation = _invocation(
         "action-ubuntu-progress-failure",
@@ -1188,7 +1328,7 @@ def test_observation_failure_stops_and_releases_the_process_scope(
             lambda _event: (_ for _ in ()).throw(RuntimeError("progress send failed")),
         )
 
-    assert len(stopped) == 1
+    assert adapter.unit_checks
     scope.reserve(action_id="action-ubuntu-after-progress-failure")
 
 

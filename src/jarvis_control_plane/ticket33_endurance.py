@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
+from typing import Literal, Protocol
 
 SAMPLE_SECONDS = 5
 SAMPLE_JITTER_SECONDS = 1.5
@@ -116,6 +117,30 @@ WORKLOADS: tuple[tuple[str, int, str], ...] = (
 )
 
 
+class Sampling(Protocol):
+    """Stop and join operations for one sampling loop."""
+
+    def is_set(self) -> bool: ...
+
+    def set(self) -> None: ...
+
+    def wait(self, timeout: float) -> bool: ...
+
+    def join(self, *, timeout: float) -> None: ...
+
+
+class Timing(Protocol):
+    """Clock plus local control of the sampling loop."""
+
+    def monotonic(self) -> float: ...
+
+    def now(self) -> datetime: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+    def start(self, target: Callable[[Sampling], None]) -> Sampling: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Sample:
     phase: str
@@ -131,6 +156,65 @@ class Sample:
     jarvis_cpu_percent: float
     jarvis_memory_bytes: int
     jarvis_pids: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceMeasurement:
+    """Resource values shared by production and controlled measurements."""
+
+    available_memory_bytes: int
+    used_swap_bytes: int
+    free_disk_bytes: int
+    trace_bytes: int
+    trace_records: int
+    trace_payload_bytes: int
+    temporary_bytes: int
+    jarvis_cpu_percent: float
+    jarvis_memory_bytes: int
+    jarvis_pids: int
+
+
+class HostMeasurer(Protocol):
+    """Collect the resource fields needed for one sample."""
+
+    def measure(
+        self, *, trace_root: Path, temporary_root: Path
+    ) -> ResourceMeasurement: ...
+
+
+class _ThreadSampling:
+    def __init__(self, target: Callable[[Sampling], None]) -> None:
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=lambda: target(self._stop), daemon=True)
+        self._thread.start()
+
+    def is_set(self) -> bool:
+        return self._stop.is_set()
+
+    def set(self) -> None:
+        self._stop.set()
+
+    def wait(self, timeout: float) -> bool:
+        return self._stop.wait(timeout)
+
+    def join(self, *, timeout: float) -> None:
+        self._thread.join(timeout=timeout)
+
+
+class SystemClock:
+    """Production clock and sampling scheduler."""
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def start(self, target: Callable[[Sampling], None]) -> Sampling:
+        return _ThreadSampling(target)
 
 
 def workload_plan() -> tuple[tuple[str, str], ...]:
@@ -202,26 +286,97 @@ def _docker_stats(
     return cpu, memory, pids
 
 
+class SubprocessWorkloadExecutor:
+    """Production adapter for one bounded pytest workload invocation."""
+
+    def __init__(
+        self,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        self._runner = subprocess.run if runner is None else runner
+
+    def execute(self, *, python: Path, source_root: Path, nodeid: str) -> int:
+        completed = self._runner(
+            [str(python), "-m", "pytest", "-q", nodeid],
+            cwd=source_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode
+
+
+class SystemHostMeasurer:
+    """Production adapter for host, container, trace, and temporary usage."""
+
+    def __init__(
+        self,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        self._runner = subprocess.run if runner is None else runner
+
+    def measure(self, *, trace_root: Path, temporary_root: Path) -> ResourceMeasurement:
+        available, swap = _memory()
+        cpu, memory, pids = _docker_stats(self._runner)
+        trace_records, trace_payload_bytes = _trace_facts(trace_root)
+        return ResourceMeasurement(
+            available_memory_bytes=available,
+            used_swap_bytes=swap,
+            free_disk_bytes=shutil.disk_usage(trace_root).free,
+            trace_bytes=_tree_size(trace_root),
+            trace_records=trace_records,
+            trace_payload_bytes=trace_payload_bytes,
+            temporary_bytes=_tree_size(temporary_root),
+            jarvis_cpu_percent=cpu,
+            jarvis_memory_bytes=memory,
+            jarvis_pids=pids,
+        )
+
+
+class JsonlEvidenceWriter:
+    """Create a private evidence file and append its stable JSONL records."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def prepare(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.touch(mode=0o600, exist_ok=False)
+
+    def write(self, record: dict[str, object]) -> None:
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def collect_sample(
-    *, phase: str, started: float, trace_root: Path, temporary_root: Path
+    *,
+    phase: str,
+    started: float,
+    trace_root: Path,
+    temporary_root: Path,
+    clock: Timing | None = None,
+    host_measurer: HostMeasurer | Callable[..., ResourceMeasurement] | None = None,
 ) -> Sample:
-    available, swap = _memory()
-    cpu, memory, pids = _docker_stats(subprocess.run)
-    trace_records, trace_payload_bytes = _trace_facts(trace_root)
+    clock = SystemClock() if clock is None else clock
+    selected_measurer = SystemHostMeasurer() if host_measurer is None else host_measurer
+    measure = (
+        selected_measurer if callable(selected_measurer) else selected_measurer.measure
+    )
+    measurement = measure(trace_root=trace_root, temporary_root=temporary_root)
     return Sample(
         phase=phase,
-        monotonic_seconds=round(time.monotonic() - started, 3),
-        occurred_at=datetime.now(UTC).isoformat(),
-        available_memory_bytes=available,
-        used_swap_bytes=swap,
-        free_disk_bytes=shutil.disk_usage(trace_root).free,
-        trace_bytes=_tree_size(trace_root),
-        trace_records=trace_records,
-        trace_payload_bytes=trace_payload_bytes,
-        temporary_bytes=_tree_size(temporary_root),
-        jarvis_cpu_percent=cpu,
-        jarvis_memory_bytes=memory,
-        jarvis_pids=pids,
+        monotonic_seconds=round(clock.monotonic() - started, 3),
+        occurred_at=clock.now().isoformat(),
+        available_memory_bytes=measurement.available_memory_bytes,
+        used_swap_bytes=measurement.used_swap_bytes,
+        free_disk_bytes=measurement.free_disk_bytes,
+        trace_bytes=measurement.trace_bytes,
+        trace_records=measurement.trace_records,
+        trace_payload_bytes=measurement.trace_payload_bytes,
+        temporary_bytes=measurement.temporary_bytes,
+        jarvis_cpu_percent=measurement.jarvis_cpu_percent,
+        jarvis_memory_bytes=measurement.jarvis_memory_bytes,
+        jarvis_pids=measurement.jarvis_pids,
     )
 
 
@@ -281,106 +436,222 @@ def validate_samples(
     return tuple(failures)
 
 
-def run(args: argparse.Namespace) -> int:
-    required_run_seconds = REAL_RUN_SECONDS if args.external_workload else RUN_SECONDS
-    if not args.smoke and (
-        args.run_seconds != required_run_seconds
-        or args.settling_seconds != SETTLING_SECONDS
-        or args.sample_seconds != SAMPLE_SECONDS
-    ):
-        raise ValueError(
-            f"acceptance timing must remain {required_run_seconds}s + 600s "
-            "with 5s samples"
-        )
-    plan = () if args.external_workload else workload_plan()
-    evidence = args.evidence.resolve()
-    evidence.parent.mkdir(parents=True, exist_ok=True)
-    evidence.touch(mode=0o600, exist_ok=False)
-    samples: list[Sample] = []
-    failures: list[str] = []
-    requests_completed = 0
-    started = time.monotonic()
-    stop = threading.Event()
+@dataclass(frozen=True, slots=True)
+class EnduranceConfig:
+    """Validated inputs for one controlled or supervised endurance run."""
 
-    def sample_loop() -> None:
-        next_sample = started
-        while not stop.is_set():
-            phase = (
-                "workload"
-                if time.monotonic() - started < args.run_seconds
-                else "settling"
-            )
-            try:
-                sample = collect_sample(
-                    phase=phase,
-                    started=started,
-                    trace_root=args.trace_root,
-                    temporary_root=args.temporary_root,
-                )
-                samples.append(sample)
-                with evidence.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps({"sample": asdict(sample)}, sort_keys=True) + "\n"
-                    )
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                failures.append(f"sampling failed: {type(exc).__name__}")
-                stop.set()
-                return
-            next_sample += args.sample_seconds
-            stop.wait(max(0.0, next_sample - time.monotonic()))
+    source_root: Path
+    python: Path
+    evidence: Path
+    trace_root: Path
+    temporary_root: Path
+    run_seconds: int = RUN_SECONDS
+    settling_seconds: int = SETTLING_SECONDS
+    sample_seconds: int = SAMPLE_SECONDS
+    smoke: bool = False
+    external_workload: bool = False
 
-    sampler = threading.Thread(target=sample_loop, daemon=True)
-    sampler.start()
-    interval = args.run_seconds / len(plan) if plan else 0
-    for index, (kind, nodeid) in enumerate(plan, start=1):
-        due = started + (index - 1) * interval
-        if not args.smoke:
-            time.sleep(max(0.0, due - time.monotonic()))
-        completed = subprocess.run(
-            [str(args.python), "-m", "pytest", "-q", nodeid],
-            cwd=args.source_root,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        record = {
-            "request": index,
-            "kind": kind,
-            "nodeid": nodeid,
-            "exit_code": completed.returncode,
-        }
-        with evidence.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-        if completed.returncode != 0:
-            failures.append(f"controlled request {index} failed")
-            break
-        requests_completed += 1
-        if args.smoke:
-            break
-    if not failures:
-        time.sleep(max(0.0, started + args.run_seconds - time.monotonic()))
-        time.sleep(args.settling_seconds)
-    stop.set()
-    sampler.join(timeout=args.sample_seconds + 5)
-    failures.extend(
-        validate_samples(
-            samples,
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> EnduranceConfig:
+        return cls(
+            source_root=args.source_root,
+            python=args.python,
+            evidence=args.evidence,
+            trace_root=args.trace_root,
+            temporary_root=args.temporary_root,
             run_seconds=args.run_seconds,
             settling_seconds=args.settling_seconds,
             sample_seconds=args.sample_seconds,
+            smoke=args.smoke,
+            external_workload=args.external_workload,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class EnduranceDependencies:
+    """Local adapters used by the endurance coordinator.
+
+    Keeping these dependencies in this module makes the acceptance harness
+    independently controllable without widening the application's ports.
+    """
+
+    timing: Timing
+    execute_workload: Callable[..., int]
+    measure_host: Callable[..., ResourceMeasurement]
+    prepare_evidence: Callable[[], None]
+    write_evidence: Callable[[dict[str, object]], None]
+    validate_samples: Callable[..., tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class EnduranceOutcome:
+    """Typed result that also retains the stable JSONL summary contract."""
+
+    mode: Literal["controlled", "external"]
+    requests_planned: int
+    requests_completed: int
+    samples: int
+    failures: tuple[str, ...]
+
+    @property
+    def exit_code(self) -> int:
+        return int(bool(self.failures))
+
+    def summary_record(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "requests_planned": self.requests_planned,
+            "requests_completed": self.requests_completed,
+            "samples": self.samples,
+            "failures": list(self.failures),
+        }
+
+
+def production_dependencies(config: EnduranceConfig) -> EnduranceDependencies:
+    """Compose the real system adapters used by the command-line entrypoint."""
+
+    evidence = JsonlEvidenceWriter(config.evidence.resolve())
+    return EnduranceDependencies(
+        timing=SystemClock(),
+        execute_workload=SubprocessWorkloadExecutor().execute,
+        measure_host=SystemHostMeasurer().measure,
+        prepare_evidence=evidence.prepare,
+        write_evidence=evidence.write,
+        validate_samples=validate_samples,
     )
-    summary = {
-        "mode": "external" if args.external_workload else "controlled",
-        "requests_planned": len(plan),
-        "requests_completed": requests_completed,
-        "samples": len(samples),
-        "failures": failures,
-    }
-    with evidence.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"summary": summary}, sort_keys=True) + "\n")
-    print(json.dumps(summary, sort_keys=True))
-    return int(bool(failures))
+
+
+class EnduranceRunner:
+    """Coordinate scheduling, workload execution, evidence, and validation."""
+
+    def __init__(self, dependencies: EnduranceDependencies) -> None:
+        self._dependencies = dependencies
+
+    def execute(self, config: EnduranceConfig) -> EnduranceOutcome:
+        required_run_seconds = (
+            REAL_RUN_SECONDS if config.external_workload else RUN_SECONDS
+        )
+        if not config.smoke and (
+            config.run_seconds != required_run_seconds
+            or config.settling_seconds != SETTLING_SECONDS
+            or config.sample_seconds != SAMPLE_SECONDS
+        ):
+            raise ValueError(
+                f"acceptance timing must remain {required_run_seconds}s + 600s "
+                "with 5s samples"
+            )
+
+        plan = () if config.external_workload else workload_plan()
+        dependencies = self._dependencies
+        dependencies.prepare_evidence()
+        samples: list[Sample] = []
+        failures: list[str] = []
+        requests_completed = 0
+        started = dependencies.timing.monotonic()
+
+        def sample_loop(stop: Sampling) -> None:
+            next_sample = started
+            while not stop.is_set():
+                phase = (
+                    "workload"
+                    if dependencies.timing.monotonic() - started < config.run_seconds
+                    else "settling"
+                )
+                try:
+                    sample = collect_sample(
+                        phase=phase,
+                        started=started,
+                        trace_root=config.trace_root,
+                        temporary_root=config.temporary_root,
+                        clock=dependencies.timing,
+                        host_measurer=dependencies.measure_host,
+                    )
+                    samples.append(sample)
+                    dependencies.write_evidence({"sample": asdict(sample)})
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    failures.append(f"sampling failed: {type(exc).__name__}")
+                    stop.set()
+                    return
+                next_sample += config.sample_seconds
+                stop.wait(max(0.0, next_sample - dependencies.timing.monotonic()))
+
+        sampler = dependencies.timing.start(sample_loop)
+        interval = config.run_seconds / len(plan) if plan else 0
+        for index, (kind, nodeid) in enumerate(plan, start=1):
+            due = started + (index - 1) * interval
+            if not config.smoke:
+                dependencies.timing.sleep(
+                    max(0.0, due - dependencies.timing.monotonic())
+                )
+            exit_code = dependencies.execute_workload(
+                python=config.python, source_root=config.source_root, nodeid=nodeid
+            )
+            dependencies.write_evidence(
+                {
+                    "request": index,
+                    "kind": kind,
+                    "nodeid": nodeid,
+                    "exit_code": exit_code,
+                }
+            )
+            if exit_code != 0:
+                failures.append(f"controlled request {index} failed")
+                break
+            requests_completed += 1
+            if config.smoke:
+                break
+        if not failures:
+            dependencies.timing.sleep(
+                max(
+                    0.0,
+                    started + config.run_seconds - dependencies.timing.monotonic(),
+                )
+            )
+            dependencies.timing.sleep(config.settling_seconds)
+        sampler.set()
+        sampler.join(timeout=config.sample_seconds + 5)
+        failures.extend(
+            dependencies.validate_samples(
+                samples,
+                run_seconds=config.run_seconds,
+                settling_seconds=config.settling_seconds,
+                sample_seconds=config.sample_seconds,
+            )
+        )
+        outcome = EnduranceOutcome(
+            mode="external" if config.external_workload else "controlled",
+            requests_planned=len(plan),
+            requests_completed=requests_completed,
+            samples=len(samples),
+            failures=tuple(failures),
+        )
+        dependencies.write_evidence({"summary": outcome.summary_record()})
+        print(json.dumps(outcome.summary_record(), sort_keys=True))
+        return outcome
+
+
+def run_endurance(
+    config: EnduranceConfig,
+    *,
+    dependencies: EnduranceDependencies | None = None,
+) -> EnduranceOutcome:
+    """Run Ticket 33 through typed local adapters and return its outcome."""
+
+    return EnduranceRunner(
+        production_dependencies(config) if dependencies is None else dependencies
+    ).execute(config)
+
+
+def run(
+    args: argparse.Namespace,
+    *,
+    dependencies: EnduranceDependencies | None = None,
+) -> int:
+    """CLI compatibility wrapper returning the historical process exit code."""
+
+    return run_endurance(
+        EnduranceConfig.from_namespace(args), dependencies=dependencies
+    ).exit_code
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -5305,13 +5305,3 @@ class SignedMessageReceiver:
             self._append_audit(**kwargs)  # ty:ignore[invalid-argument-type]
         except AuditWriteError:
             pass
-
-
-@dataclass(frozen=True, slots=True)
-class ControlPlane:
-    """Facade exposing only the receiver seam to callers."""
-
-    receiver: SignedMessageReceiver
-
-    def receive(self, event: SignedInboundEvent) -> ReceiveResult:
-        return self.receiver.receive(event)

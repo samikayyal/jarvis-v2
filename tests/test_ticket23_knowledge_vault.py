@@ -30,8 +30,8 @@ from jarvis_control_plane.models import OrchestrationRequest, RequestState
 from jarvis_control_plane.orchestration import (
     AgentsSdkOrchestrationAdapter,
     AgentsSdkPlan,
-    _instructions,
 )
+from jarvis_control_plane.proposal_translation import build_instructions
 
 NOW = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
 
@@ -637,7 +637,7 @@ def test_orchestration_refuses_a_non_markdown_vault_path_without_a_proposal(
 
 
 def test_vault_write_instructions_require_a_fresh_exact_path_read() -> None:
-    instructions = _instructions(
+    instructions = build_instructions(
         has_vault_read=True,
         has_vault_write=True,
     )
