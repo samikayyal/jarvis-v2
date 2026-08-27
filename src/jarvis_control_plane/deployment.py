@@ -1111,6 +1111,18 @@ def _validate_native_worker_artifacts(root: Path, errors: list[str]) -> None:
             "native Windows worker installer differs from reviewed boundaries"
         )
 
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    required_runtime_markers = (
+        "/opt/jarvis/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13",
+        'uv venv --python "$JARVIS_HOST_PYTHON"',
+        "systemd-run --wait --collect --unit=jarvis-python-mdwe-preflight",
+        "--property=MemoryDenyWriteExecute=yes",
+    )
+    if any(marker not in readme for marker in required_runtime_markers):
+        errors.append(
+            "native host runtime installation is not pinned and hardening-preflighted"
+        )
+
 
 def _memory_mib(value: str) -> int:
     return int(value.removesuffix("M"))

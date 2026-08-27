@@ -923,6 +923,30 @@ def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:
     )
 
 
+def test_bundle_rejects_unpinned_or_unpreflighted_native_python(
+    tmp_path: Path,
+) -> None:
+    bundle = _copy_bundle(tmp_path)
+    readme = bundle / "README.md"
+    readme.write_text(
+        readme.read_text(encoding="utf-8")
+        .replace(
+            "/opt/jarvis/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13",
+            "3.13",
+        )
+        .replace("--property=MemoryDenyWriteExecute=yes", ""),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    assert (
+        "native host runtime installation is not pinned and hardening-preflighted"
+        in raised.value.errors
+    )
+
+
 def test_bundle_rejects_security_network_and_resource_regressions(
     tmp_path: Path,
 ) -> None:

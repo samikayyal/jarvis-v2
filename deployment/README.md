@@ -169,9 +169,20 @@ service environment from the shipped hash-locked requirements; the timer never
 resolves or downloads dependencies:
 
 ```console
-uv venv --python 3.13 /opt/jarvis/current/.venv
+JARVIS_HOST_PYTHON=/opt/jarvis/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13
+test -x "$JARVIS_HOST_PYTHON"
+uv venv --python "$JARVIS_HOST_PYTHON" /opt/jarvis/current/.venv
 uv pip install --python /opt/jarvis/current/.venv/bin/python --require-hashes -r /opt/jarvis/current/deployment/requirements.lock
+systemd-run --wait --collect --unit=jarvis-python-mdwe-preflight \
+  --uid=jarvis-worker --gid=jarvis-worker \
+  --property=MemoryDenyWriteExecute=yes \
+  /opt/jarvis/current/.venv/bin/python -c pass
 ```
+
+The host runtime patch version must match the pinned `python_base_image` version
+in `artifacts.lock.json`. The hardening preflight must finish successfully before
+installing or restarting either native-worker service; a root-private uv runtime
+or a runtime that faults under `MemoryDenyWriteExecute=yes` is not releasable.
 
 During manual activation, record the exact activated `image@sha256:...` value
 for every Compose service in `/etc/jarvis/image-digests.json`, then make the
