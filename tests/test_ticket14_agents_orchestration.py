@@ -152,7 +152,7 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert captured["run_kwargs"]["previous_response_id"] is None
     assert captured["run_text"] == "inspect the repository"
     assert captured["run_kwargs"] == {
-        "max_turns": 4,
+        "max_turns": 5,
         "run_config": captured["run_kwargs"]["run_config"],
         "previous_response_id": None,
         "auto_previous_response_id": False,
@@ -166,6 +166,27 @@ def test_agents_adapter_uses_explicit_stateless_sequential_responses_settings() 
     assert result.proposal is None
     assert result.execution_host is None
     assert result.host_reason_code is None
+
+
+def test_default_turn_budget_allows_four_sequential_tools_then_final_reply() -> None:
+    async def run_async(agent: object, _text: str, **kwargs: object) -> object:
+        for _ in range(4):
+            await agent.tools[0].on_invoke_tool(None, '{"max_chars":8}')
+        if kwargs["max_turns"] < 5:
+            raise RuntimeError("final reply turn was unavailable")
+        return SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="Four bounded reads completed.")
+        )
+
+    result = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+        run_async=run_async,
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    ).run(_request("perform four sequential bounded reads"))
+
+    assert result.reply_text == "Four bounded reads completed."
 
 
 def test_agents_adapter_executes_one_closed_bounded_read_and_returns_milestone_and_final() -> (
@@ -326,6 +347,116 @@ def test_agents_adapter_does_not_mask_non_connectivity_remote_read_failures() ->
 
     with pytest.raises(OrchestrationAdapterError, match="returned malformed data"):
         adapter.run(_request("read an ambiguous title"))
+
+
+def test_v1_model_contract_states_the_exact_gmail_reply_payload_shape() -> None:
+    captured: dict[str, object] = {}
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: captured.update(kwargs) or object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="No Gmail action was needed.")
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    adapter.run(_request("prepare a reply"))
+
+    instructions = captured["instructions"]
+    assert isinstance(instructions, str)
+    assert (
+        "add exactly source_message_id, source_thread_id, in_reply_to, and references"
+    ) in instructions
+    assert "Never emit a separate thread_id field" in instructions
+    assert "bare mailbox address without a display name" in instructions
+
+    schema = captured["output_type"].json_schema()
+    reply_payload = schema["$defs"]["_GmailReplyStructuredPayload"]
+    assert reply_payload["additionalProperties"] is False
+    assert set(reply_payload["required"]) == {
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "body",
+        "mime_type",
+        "source_message_id",
+        "source_thread_id",
+        "in_reply_to",
+        "references",
+    }
+    assert "thread_id" not in reply_payload["properties"]
+    assert reply_payload["properties"]["references"]["minItems"] == 1
+    assert reply_payload["properties"]["references"]["maxItems"] == 20
+
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        captured["output_type"].validate_json(
+            json.dumps(
+                {
+                    "reply_text": "I prepared the reply.",
+                    "execution_host": None,
+                    "host_reason_code": None,
+                    "proposal": {
+                        "kind": "gmail_reply",
+                        "preview": "Reply to the source message.",
+                        "payload": {
+                            "to": ["recipient@example.com"],
+                            "cc": [],
+                            "bcc": [],
+                            "subject": "Re: Check-in",
+                            "body": "Thanks.",
+                            "mime_type": "text/plain",
+                            "source_message_id": "source-001",
+                            "source_thread_id": "thread-001",
+                            "in_reply_to": "<source-001@example.com>",
+                            "references": [],
+                        },
+                    },
+                }
+            )
+        )
+
+
+def test_provider_schema_rejects_redundant_gmail_reply_thread_id() -> None:
+    captured: dict[str, object] = {}
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **kwargs: captured.update(kwargs) or object(),
+        run_sync=lambda *_args, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(reply_text="No Gmail action was needed.")
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+    adapter.run(_request("prepare a reply"))
+
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON"):
+        captured["output_type"].validate_json(
+            json.dumps(
+                {
+                    "reply_text": "I prepared the reply.",
+                    "execution_host": None,
+                    "host_reason_code": None,
+                    "proposal": {
+                        "kind": "gmail_reply",
+                        "preview": "Reply to the source message.",
+                        "payload": {
+                            "to": ["recipient@example.com"],
+                            "cc": [],
+                            "bcc": [],
+                            "subject": "Re: Check-in",
+                            "body": "Thanks.",
+                            "mime_type": "text/plain",
+                            "thread_id": "wrong-thread",
+                            "source_message_id": "source-001",
+                            "source_thread_id": "thread-001",
+                            "in_reply_to": "<source-001@example.com>",
+                            "references": ["<source-001@example.com>"],
+                        },
+                    },
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(

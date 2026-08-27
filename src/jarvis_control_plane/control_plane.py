@@ -119,6 +119,7 @@ from .terminal_policy import (
     terminal_action_from_proposal,
 )
 from .traces import DiagnosticTraceRecorder
+from .worker_gateway import WorkerExecutionResult
 
 _MAX_RAW_INBOUND_BODY_BYTES = 128 * 1024
 _PROPOSAL_FRAGMENT_PAYLOAD_CHARS = 3_000
@@ -139,6 +140,23 @@ def _bounded_informational_reply(reply_text: str, *, request_id: str) -> str:
         - len(suffix)
     )
     return f"{reply_text[:content_limit]}{_INFORMATIONAL_TRUNCATION_MARKER}{suffix}"
+
+
+def _render_terminal_result(
+    terminal: TerminalAction, result: WorkerExecutionResult
+) -> str:
+    """Render exact bounded streams without confusing output with instructions."""
+
+    return "\n".join(
+        (
+            f"Execution host: {terminal.host}",
+            f"Execution status: {result.status.value}",
+            f"stdout_truncated: {str(result.stdout_truncated).lower()}",
+            f"stderr_truncated: {str(result.stderr_truncated).lower()}",
+            f"stdout JSON: {json.dumps(result.stdout, ensure_ascii=False)}",
+            f"stderr JSON: {json.dumps(result.stderr, ensure_ascii=False)}",
+        )
+    )
 
 
 def _deletion_payload(preview: ConversationDeletionPreview) -> dict[str, object]:
@@ -1136,6 +1154,33 @@ class DeterministicCapabilityBroker:
     ) -> ReceiveResult:
         """Send one terminal connector-action acknowledgement after reconciliation."""
 
+        if (
+            action_kind == "terminal"
+            and result.disposition == "action_dispatched"
+            and result.reason
+        ):
+            control_id = self.ids.new_id("action-ack")
+            acknowledgement = self._dispatch_control_text(
+                message,
+                body=_bounded_informational_reply(result.reason, request_id=control_id),
+                control_id=control_id,
+                disposition=result.disposition,
+            )
+            if acknowledgement.disposition in {"failed", "unknown"}:
+                return replace(
+                    result,
+                    request=acknowledgement.request,
+                    reply=acknowledgement.reply,
+                    reason=(
+                        "terminal action completed but its result acknowledgement "
+                        f"was {acknowledgement.disposition}"
+                    ),
+                )
+            return replace(
+                acknowledgement,
+                request=result.request,
+                reason=result.reason,
+            )
         service_name = self._action_ack_kind(action_kind)
         if service_name is None or result.disposition not in {
             "action_rejected",
@@ -1659,14 +1704,15 @@ class DeterministicCapabilityBroker:
     ) -> ReceiveResult:
         """Trace and await a prepared action after its cancellation barrier."""
 
+        execution_result: object | None = None
         try:
             if prepared.action.kind in {"gmail_send", "gmail_reply"}:
                 # Gmail owns the complete credential-bearing trace boundary.
                 # Re-wrapping it here would reserve a second trace and would
                 # change its definite pre-provider failure classification.
-                prepared.handle.run()
+                execution_result = prepared.handle.run()
             else:
-                self._trace.execute(
+                execution_result = self._trace.execute(
                     request_id=prepared.action.request_id,
                     operation_id=f"{prepared.action.action_id}:dispatch",
                     operation_type="worker",
@@ -1771,7 +1817,21 @@ class DeterministicCapabilityBroker:
                     "operation": _memory_action_operation(prepared.action.payload),
                 },
             )
-        return ReceiveResult(status_code=202, disposition="action_dispatched")
+        reason = None
+        if prepared.action.kind == "terminal":
+            if not isinstance(execution_result, WorkerExecutionResult):
+                return ReceiveResult(
+                    status_code=202,
+                    disposition="action_dispatch_unknown",
+                    reason="terminal action completed without a typed bounded result",
+                )
+            terminal = terminal_action_from_proposal(prepared.action)
+            reason = _render_terminal_result(terminal, execution_result)
+        return ReceiveResult(
+            status_code=202,
+            disposition="action_dispatched",
+            reason=reason,
+        )
 
     def _append_conversation_deletion_result(
         self,

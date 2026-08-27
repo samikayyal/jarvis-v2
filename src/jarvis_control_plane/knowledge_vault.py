@@ -29,6 +29,7 @@ from .knowledge_vault_common import (
 _MAX_QUERY_CHARS = 200
 _MAX_RETURNED_EXCERPTS = 8
 _MAX_EXCERPT_CHARS = 600
+_MAX_COMPLETE_NOTE_CHARS = 64 * 1024
 _MAX_NOTES_INSPECTED = 128
 _MAX_BYTES_PER_NOTE = 64 * 1024
 _MAX_TOTAL_BYTES_SCANNED = 512 * 1024
@@ -118,7 +119,7 @@ class VaultExcerpt(BaseModel):
     path: str = Field(min_length=1, max_length=512)
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
-    text: str = Field(min_length=1, max_length=_MAX_EXCERPT_CHARS)
+    text: str = Field(min_length=1, max_length=_MAX_COMPLETE_NOTE_CHARS)
     complete: bool = False
     ends_with_newline: bool | None = None
 
@@ -819,10 +820,10 @@ class KnowledgeVaultConnector:
     def _path_excerpt(
         self, note: Path, path: str, budget: _VaultReadBudget
     ) -> VaultExcerpt:
-        """Return a complete small exact-path note without widening searches."""
+        """Return a complete bounded exact-path note without widening searches."""
 
         content = budget.read(note)
-        if content and len(content) <= _MAX_EXCERPT_CHARS:
+        if content and len(content) <= _MAX_COMPLETE_NOTE_CHARS:
             return VaultExcerpt(
                 path=self._relative(note),
                 start_line=1,

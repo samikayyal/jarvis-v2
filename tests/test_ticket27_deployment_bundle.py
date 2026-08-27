@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 import shutil
 import stat
 import tomllib
@@ -88,6 +89,9 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
     report = verify_bundle(SHIPPED_BUNDLE, source_root=REPOSITORY_ROOT)
 
     assert report.release_id == "jarvis-assistant-v1"
+    assert 'ENTRYPOINT ["python", "-m", "jarvis_control_plane.service_runtime"]' in (
+        SHIPPED_BUNDLE / "Dockerfile"
+    ).read_text(encoding="utf-8")
     assert report.services == (
         "audit_service",
         "capability_broker",
@@ -104,7 +108,7 @@ def test_shipped_bundle_is_complete_pinned_and_unactivated() -> None:
         "worker_gateway",
     )
     assert report.aggregate_memory_mib == 1056
-    assert report.aggregate_cpus == pytest.approx(1.80)
+    assert report.aggregate_cpus == pytest.approx(1.89)
     assert report.aggregate_pids == 512
     assert report.openwa_handoff_activated is False
     assert report.host_mutations == ()
@@ -438,6 +442,27 @@ def test_broker_state_uses_only_the_write_only_deleted_archive_client(
     assert captured["endpoint"] == "/run/jarvis-deleted/writer.sock"
     assert captured["deleted_archive"] is archive
     assert captured["database"] == tmp_path / "state.sqlite3"
+
+
+def test_deleted_archive_health_probe_does_not_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    health_probe = runpy.run_path(
+        str(Path(__file__).parents[1] / "deployment" / "health_probe.py")
+    )
+
+    monkeypatch.setattr(
+        health_probe["os"],
+        "stat",
+        lambda _endpoint: SimpleNamespace(st_mode=stat.S_IFSOCK | 0o660),
+    )
+    monkeypatch.setattr(
+        health_probe["socket"],
+        "socket",
+        lambda *_args, **_kwargs: pytest.fail("health probe must not connect"),
+    )
+
+    health_probe["deleted_archive_ready"]()
 
 
 def test_google_administration_is_authenticated_and_not_model_accessible() -> None:
@@ -898,6 +923,30 @@ def test_bundle_rejects_floating_or_unlocked_artifacts(tmp_path: Path) -> None:
     )
 
 
+def test_bundle_rejects_unpinned_or_unpreflighted_native_python(
+    tmp_path: Path,
+) -> None:
+    bundle = _copy_bundle(tmp_path)
+    readme = bundle / "README.md"
+    readme.write_text(
+        readme.read_text(encoding="utf-8")
+        .replace(
+            "/opt/jarvis/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13",
+            "3.13",
+        )
+        .replace("--property=MemoryDenyWriteExecute=yes", ""),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BundleValidationError) as raised:
+        verify_bundle(bundle, source_root=REPOSITORY_ROOT)
+
+    assert (
+        "native host runtime installation is not pinned and hardening-preflighted"
+        in raised.value.errors
+    )
+
+
 def test_bundle_rejects_security_network_and_resource_regressions(
     tmp_path: Path,
 ) -> None:
@@ -1106,6 +1155,7 @@ def test_verification_is_static_and_declares_no_host_mutation_steps() -> None:
         "artifacts.lock.json",
         "compose.yaml",
         "config.example.toml",
+        "health_probe.py",
         "openwa-handoff.md",
         "requirements.lock",
         "systemd/jarvis-backup.service",

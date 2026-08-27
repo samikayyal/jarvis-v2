@@ -41,6 +41,7 @@ REQUIRED_FILES = (
     "artifacts.lock.json",
     "compose.yaml",
     "config.example.toml",
+    "health_probe.py",
     "openwa-handoff.md",
     "requirements.lock",
     "systemd/jarvis-backup.service",
@@ -74,9 +75,9 @@ RESOURCE_LIMITS: Mapping[str, ServiceResourceLimits] = MappingProxyType(
         "deleted_conversation_archive": ServiceResourceLimits(
             "48M", Decimal("0.10"), 32
         ),
-        "orchestration_egress_proxy": ServiceResourceLimits("48M", Decimal("0.03"), 16),
-        "google_egress_proxy": ServiceResourceLimits("48M", Decimal("0.03"), 16),
-        "vault_egress_proxy": ServiceResourceLimits("48M", Decimal("0.03"), 16),
+        "orchestration_egress_proxy": ServiceResourceLimits("48M", Decimal("0.06"), 16),
+        "google_egress_proxy": ServiceResourceLimits("48M", Decimal("0.06"), 16),
+        "vault_egress_proxy": ServiceResourceLimits("48M", Decimal("0.06"), 16),
     }
 )
 
@@ -619,8 +620,7 @@ def _validate_artifacts(
     if "RUN uv pip install" not in dockerfile or "RUN python -m pip" in dockerfile:
         errors.append("Dockerfile dependency installation must use uv")
     if (
-        'ENTRYPOINT ["uv", "run", "--no-project", "python", "-m", '
-        '"jarvis_control_plane.service_runtime"]'
+        'ENTRYPOINT ["python", "-m", "jarvis_control_plane.service_runtime"]'
     ) not in dockerfile:
         errors.append("Dockerfile must enter the role-specific service runtime")
     if lock.get("os_packages") != {
@@ -755,21 +755,27 @@ def _validate_compose(
         ):
             errors.append(f"compose identity mismatch for {service}")
         healthcheck = raw.get("healthcheck")
-        expected_healthcheck = {
-            "test": [
+        probe = (
+            [
                 "CMD",
-                "uv",
-                "run",
-                "--no-project",
-                "python",
-                "-m",
-                "jarvis_control_plane.service_runtime",
-                "proxy-health" if service.endswith("_egress_proxy") else "health",
-            ],
+                "bash",
+                "-c",
+                (
+                    "exec 3<>/dev/tcp/127.0.0.1/9080; "
+                    'printf "GET /health HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n" '
+                    ">&3; IFS= read -r status <&3; "
+                    '[[ "$$status" == "HTTP/1.1 200 OK"$\'\\r\' ]]'
+                ),
+            ]
+            if service.endswith("_egress_proxy")
+            else ["CMD", "python", "/opt/jarvis/deployment/health_probe.py"]
+        )
+        expected_healthcheck = {
+            "test": probe,
             "interval": "30s",
             "timeout": "5s",
             "retries": 3,
-            "start_period": "10m" if service.endswith("_egress_proxy") else "10s",
+            "start_period": "10m" if service.endswith("_egress_proxy") else "5m",
         }
         if service.endswith("_egress_proxy"):
             expected_healthcheck["start_interval"] = "30s"
@@ -1103,6 +1109,18 @@ def _validate_native_worker_artifacts(root: Path, errors: list[str]) -> None:
     if any(marker not in installer for marker in required_windows_markers):
         errors.append(
             "native Windows worker installer differs from reviewed boundaries"
+        )
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    required_runtime_markers = (
+        "/opt/jarvis/python/cpython-3.13.13-linux-x86_64-gnu/bin/python3.13",
+        'uv venv --python "$JARVIS_HOST_PYTHON"',
+        "systemd-run --wait --collect --unit=jarvis-python-mdwe-preflight",
+        "--property=MemoryDenyWriteExecute=yes",
+    )
+    if any(marker not in readme for marker in required_runtime_markers):
+        errors.append(
+            "native host runtime installation is not pinned and hardening-preflighted"
         )
 
 

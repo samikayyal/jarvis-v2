@@ -85,7 +85,9 @@ _TEXT_MEDIA_MIME_TYPES = frozenset(
     }
 )
 _GMAIL_TEXT_MIME_TYPES = frozenset({"text/plain", "text/html"})
-_GMAIL_METADATA_HEADERS = frozenset({"from", "to", "cc", "subject", "date"})
+_GMAIL_METADATA_HEADERS = frozenset(
+    {"from", "to", "cc", "subject", "date", "message-id", "references"}
+)
 
 # Kept as read-side aliases for existing callers; ownership now lives in the
 # neutral Google HTTP module rather than in this connector.
@@ -777,8 +779,6 @@ class GmailReadInput(BaseModel):
         single = {"messages_get": self.message_id, "threads_get": self.thread_id}
         if self.operation in single and not single[self.operation]:
             raise ValueError("single Gmail reads require the matching identifier")
-        if self.operation.endswith("list") and self.query is None:
-            raise ValueError("Gmail list reads require a query")
         return self
 
 
@@ -1044,7 +1044,15 @@ def _google_read_url(request: GoogleReadRequest) -> str:
             f"{_GMAIL_API_ROOT}/messages/{quote(arguments['message_id'], safe='')}",
             {
                 "format": "full",
-                "metadataHeaders": ("From", "To", "Cc", "Subject", "Date"),
+                "metadataHeaders": (
+                    "From",
+                    "To",
+                    "Cc",
+                    "Subject",
+                    "Date",
+                    "Message-ID",
+                    "References",
+                ),
                 "fields": _gmail_full_fields(),
             },
         )
@@ -1062,7 +1070,15 @@ def _google_read_url(request: GoogleReadRequest) -> str:
             f"{_GMAIL_API_ROOT}/threads/{quote(arguments['thread_id'], safe='')}",
             {
                 "format": "full",
-                "metadataHeaders": ("From", "To", "Cc", "Subject", "Date"),
+                "metadataHeaders": (
+                    "From",
+                    "To",
+                    "Cc",
+                    "Subject",
+                    "Date",
+                    "Message-ID",
+                    "References",
+                ),
                 "fields": "id,historyId,messages(" + _gmail_message_fields() + ")",
             },
         )

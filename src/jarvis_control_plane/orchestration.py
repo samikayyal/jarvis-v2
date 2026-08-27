@@ -32,7 +32,7 @@ from .models import (
 from .ports import OrchestrationAdapterError
 from .terminal_policy import terminal_action_from_proposal
 
-_MAX_TURNS = 4
+_MAX_TURNS = 5
 _MAX_TOOL_INVOCATIONS = 4
 _MAX_REPLY_CHARS = 3_000
 _MAX_READ_CHARS = 1_000
@@ -242,14 +242,44 @@ class _TerminalStructuredProposal(BaseModel):
     payload: _TerminalStructuredPayload
 
 
-class _OtherStructuredProposal(BaseModel):
+class _GmailSendStructuredPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal[
-        "gmail_send",
-        "gmail_reply",
-        "knowledge_vault_write",
-    ]
+    to: list[str]
+    cc: list[str]
+    bcc: list[str]
+    subject: str
+    body: str
+    mime_type: Literal["text/plain", "text/html"]
+
+
+class _GmailReplyStructuredPayload(_GmailSendStructuredPayload):
+    source_message_id: str
+    source_thread_id: str
+    in_reply_to: str
+    references: list[str] = Field(min_length=1, max_length=20)
+
+
+class _GmailSendStructuredProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["gmail_send"]
+    preview: str = Field(min_length=1, max_length=2_000)
+    payload: _GmailSendStructuredPayload
+
+
+class _GmailReplyStructuredProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["gmail_reply"]
+    preview: str = Field(min_length=1, max_length=2_000)
+    payload: _GmailReplyStructuredPayload
+
+
+class _VaultWriteStructuredProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["knowledge_vault_write"]
     preview: str = Field(min_length=1, max_length=2_000)
     payload: dict[str, object]
 
@@ -266,7 +296,10 @@ class _AgentsSdkStructuredPlan(BaseModel):
     ) = None
     proposal: (
         Annotated[
-            _TerminalStructuredProposal | _OtherStructuredProposal,
+            _TerminalStructuredProposal
+            | _GmailSendStructuredProposal
+            | _GmailReplyStructuredProposal
+            | _VaultWriteStructuredProposal,
             Field(discriminator="kind"),
         ]
         | None
@@ -1135,9 +1168,16 @@ def _instructions(*, has_vault_read: bool, has_vault_write: bool) -> str:
         "approval, permission, sandbox, or explanatory metadata to the payload. "
         "For Gmail new sends, the payload must contain exactly to, cc, bcc, "
         "subject, body, and mime_type; recipients are arrays and mime_type is "
-        "text/plain or text/html. For Gmail replies, add only the frozen source "
-        "message and thread header fields. Do not emit attachments, threading, "
-        "or Google connection fields; those are independently derived or bound. "
+        "text/plain or text/html. Every recipient array entry must be a bare "
+        "mailbox address without a display name. For Gmail replies, add exactly "
+        "source_message_id, source_thread_id, in_reply_to, and references to the "
+        "six new-send fields. Never emit a separate thread_id field. Do not emit "
+        "attachments, threading, or Google connection fields; those are "
+        "independently derived or bound. source_message_id and source_thread_id "
+        "must exactly copy the selected Gmail message id and threadId. in_reply_to "
+        "must exactly copy its Message-ID header. references must contain its "
+        "existing References message identifiers in order, if any, followed by "
+        "that Message-ID; when References is absent, use only that Message-ID. "
         "it will still be independently checked and require the broker's approval flow. "
         "Every exposed read tool has a closed typed schema and bounded result. "
         + (

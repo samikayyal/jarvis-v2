@@ -332,6 +332,16 @@ def test_worker_dispatch_result_is_retained_in_the_manual_trace_boundary() -> No
     result = components.receiver.receive(_event("show repo status", "trace"))
 
     assert result.disposition == "action_dispatched"
+    assert result.reason == (
+        "Execution host: ubuntu\n"
+        "Execution status: completed\n"
+        "stdout_truncated: false\n"
+        "stderr_truncated: false\n"
+        'stdout JSON: "bounded worker output"\n'
+        'stderr JSON: ""'
+    )
+    assert result.reply is not None
+    assert result.reply.body.startswith(result.reason)
     assert worker.finalizations == ["action-worker-trace"]
     assert components.trace_store is not None
     manual = _open_manual_trace_boundary(components.trace_store)
