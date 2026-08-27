@@ -4,7 +4,11 @@
 
 **Blocked by:** 31 — Supervise real Google and knowledge-vault acceptance; 32 — Supervise real Ubuntu, Windows, and terminal acceptance.
 
-**Status:** ready-for-human
+**Status:** complete
+
+Ticket 33 was administratively closed as `complete` by explicit operator direction on
+2026-08-27. This closure does not assert that the unchecked supervised acceptance
+rows below were executed or passed.
 
 - [ ] Automated and supervised endurance, low-disk, trace-capacity, audit-down, resource, and settling checks stay within the specified envelopes and block unsafe work correctly.
 - [ ] Backup recovery, a forced failed pinned upgrade, and rollback restore the compatible release and state without touching or replaying OpenWA work.
