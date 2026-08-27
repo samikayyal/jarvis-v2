@@ -185,7 +185,7 @@ class SessionConfig:
     """Validated persistent defaults used when a clean session is created."""
 
     operator_id: str
-    default_model: str = "gpt-5.6-terra"
+    default_model: str = "gpt-5.6-luna"
     default_reasoning: str = "medium"
     inactivity_minutes: int = DEFAULT_SESSION_MINUTES
 
@@ -1457,14 +1457,12 @@ def new_working_session(
         effects.append("invalidate_pending_action")
     if open_outbox:
         effects.append("close_action_dispatch")
-    effects.extend(
-        (
-            "revoke_session_permissions",
-            "end_working_session",
-            "start_clean_session",
-            "advance_cancellation_generation",
-        )
-    )
+    effects.extend((
+        "revoke_session_permissions",
+        "end_working_session",
+        "start_clean_session",
+        "advance_cancellation_generation",
+    ))
     after = WorkingSession(
         session_id=new_id,
         operator_id=session.operator_id,
