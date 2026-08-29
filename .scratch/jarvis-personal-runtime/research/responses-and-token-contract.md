@@ -118,9 +118,7 @@ while True:
     # Preserve every item, not only visible assistant text or function calls.
     input_items.extend(item.model_dump() for item in response.output)
 
-    tool_calls = [
-        item for item in response.output if item.type == "function_call"
-    ]
+    tool_calls = [item for item in response.output if item.type == "function_call"]
     if not tool_calls:
         final_text = response.output_text
         break
@@ -254,9 +252,9 @@ response; in the current Python implementation it provides:
 ```python
 raw = await client.responses.with_raw_response.create(**request)
 
-wire_request_body = raw.http_request.content       # bytes
-wire_response_body = await raw.text()               # async wrapper
-response = await raw.parse()                        # typed Responses object
+wire_request_body = raw.http_request.content  # bytes
+wire_response_body = await raw.text()  # async wrapper
+response = await raw.parse()  # typed Responses object
 ```
 
 For the synchronous client, `raw.text` and `raw.parse()` are synchronous.

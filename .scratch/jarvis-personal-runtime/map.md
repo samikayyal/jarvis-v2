@@ -26,6 +26,7 @@ Actually replace the existing Jarvis assistant control plane with a small native
 <!-- Resolved tickets are indexed here. -->
 
 - [Confirm the direct Responses and token-counting contract](issues/01-confirm-responses-and-token-contract.md) — Use a pinned direct stateless Responses loop that replays complete output items, locally cancels foreground work, traces every HTTP attempt, and gates each candidate request with a deterministic canonical `o200k_base` estimate rather than claiming an exact server token count.
+- [Inventory the replacement seam](issues/02-inventory-replacement-seam.md) — Add a wholly independent `jarvis_personal_runtime` package, retain the immutable legacy runtime only for rollback until live acceptance, preserve OpenWA and its pairing unchanged, reimplement only revalidated gateway facts, and defer removal of the complete old source/test/deployment boundary to the separately authorized retirement ticket.
 
 ## Not yet specified
 
