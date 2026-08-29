@@ -215,6 +215,7 @@ CONFIG_KEYS = frozenset(
         "release_id",
         "artifact_lock",
         "configuration_kind",
+        "acceptance_failpoint",
         "identities",
         "deployment",
         "models",
@@ -228,6 +229,8 @@ CONFIG_KEYS = frozenset(
         "resource_bounds",
     }
 )
+
+OPTIONAL_CONFIG_KEYS = frozenset({"acceptance_failpoint"})
 
 
 class BundleValidationError(ValueError):
@@ -334,7 +337,7 @@ def _load_mapping(path: Path, errors: list[str], label: str) -> dict[str, Any]:
 def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> None:
     for key in sorted(set(config) - CONFIG_KEYS):
         errors.append(f"unknown configuration key: {key}")
-    for key in sorted(CONFIG_KEYS - set(config)):
+    for key in sorted(CONFIG_KEYS - OPTIONAL_CONFIG_KEYS - set(config)):
         errors.append(f"missing configuration key: {key}")
     if config.get("schema_version") != 1:
         errors.append("configuration schema_version must be 1")
@@ -344,6 +347,58 @@ def _validate_configuration(config: Mapping[str, Any], errors: list[str]) -> Non
         errors.append("artifact_lock must reference artifacts.lock.json")
     if config.get("configuration_kind") not in {"example", "active"}:
         errors.append("configuration_kind must be example or active")
+
+    acceptance_failpoint = config.get("acceptance_failpoint")
+    if acceptance_failpoint is not None:
+        expected_failpoint_keys = {
+            "enabled",
+            "service",
+            "operation",
+            "action_id",
+            "review_id",
+        }
+        if not isinstance(acceptance_failpoint, Mapping) or set(
+            acceptance_failpoint
+        ) != expected_failpoint_keys:
+            errors.append("acceptance_failpoint must match the reviewed closed shape")
+        else:
+            enabled = acceptance_failpoint.get("enabled")
+            service = acceptance_failpoint.get("service")
+            operation = acceptance_failpoint.get("operation")
+            action_id = acceptance_failpoint.get("action_id")
+            review_id = acceptance_failpoint.get("review_id")
+            if not isinstance(enabled, bool):
+                errors.append("acceptance_failpoint.enabled must be boolean")
+            if enabled is True:
+                if not isinstance(service, str) or service not in {"gmail", "calendar"}:
+                    errors.append("acceptance_failpoint.service is invalid")
+                valid_operations = {
+                    "gmail": {"gmail_send", "gmail_reply"},
+                    "calendar": {"insert", "update", "patch"},
+                }
+                if (
+                    isinstance(service, str)
+                    and service in valid_operations
+                    and (
+                        not isinstance(operation, str)
+                        or operation not in valid_operations[service]
+                    )
+                ):
+                    errors.append("acceptance_failpoint.operation is invalid")
+                for name, value in (("action_id", action_id), ("review_id", review_id)):
+                    if (
+                        not isinstance(value, str)
+                        or not value
+                        or value.strip() != value
+                        or len(value) > 256
+                        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", value)
+                    ):
+                        errors.append(f"acceptance_failpoint.{name} is invalid")
+            elif enabled is False:
+                if any(value != "" for value in (service, operation, action_id, review_id)):
+                    errors.append(
+                        "disabled acceptance_failpoint target fields must be empty"
+                    )
 
     identities = config.get("identities")
     if not isinstance(identities, Mapping):

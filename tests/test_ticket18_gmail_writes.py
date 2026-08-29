@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from email import message_from_bytes
 from email.policy import SMTP
+from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -50,6 +51,11 @@ from jarvis_control_plane import (
     create_gmail_reply_proposal,
     gmail_write_request_from_proposal,
 )
+from jarvis_control_plane.acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailure,
+    ReviewedPostDispatchFailpointSpec,
+)
 from jarvis_control_plane.gmail_writes import _encode_rfc822
 from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.orchestration import (
@@ -57,7 +63,7 @@ from jarvis_control_plane.orchestration import (
     AgentsSdkPlan,
     AgentsSdkProposal,
 )
-from jarvis_control_plane.sessions import ReadinessState
+from jarvis_control_plane.sessions import DispatchStatus, ReadinessState
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 IDENTITY = "google-subject-123"
@@ -98,6 +104,7 @@ def _dispatcher(
     audit: InMemoryAuditBoundary | None = None,
     connection_state: object | None = None,
     trace: DiagnosticTraceRecorder | None = None,
+    acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
 ) -> GmailWriteConnector:
     connection_state = connection_state or (
         lambda: GoogleConnectionState(
@@ -123,6 +130,7 @@ def _dispatcher(
         clock=FixedClock(NOW),
         ids=DeterministicIdGenerator("ticket18-gmail"),
         connection_state=connection_state,  # type: ignore[arg-type]
+        acceptance_failpoint=acceptance_failpoint,
     )
 
 
@@ -169,6 +177,7 @@ def _components(
     *,
     audit: InMemoryAuditBoundary | None = None,
     trace: DiagnosticTraceRecorder | None = None,
+    proposal_action_id: str | None = None,
 ) -> object:
     from jarvis_control_plane import ControlledOrchestrationAdapter
 
@@ -181,7 +190,7 @@ def _components(
         audit=audit,
         orchestration=ControlledOrchestrationAdapter(
             proposal_factory=lambda request: FrozenActionProposal.create(
-                action_id=f"{request.state.request_id}:gmail",
+                action_id=proposal_action_id or f"{request.state.request_id}:gmail",
                 request_id=request.state.request_id,
                 kind=proposal.kind,
                 preview=proposal.preview,
@@ -431,6 +440,115 @@ def test_mismatched_thread_is_unknown_and_a_replay_never_sends_a_replacement() -
     assert mismatched.disposition == "action_dispatch_unknown"
     assert replay.disposition != "action_dispatched"
     assert len(provider.calls) == 1
+
+
+def test_gmail_post_dispatch_failpoint_is_unknown_reconciled_and_replay_free() -> None:
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="gmail",
+            operation="gmail_send",
+            action_id="gmail-action-failpoint",
+            review_id="ticket31-gmail-unknown",
+        )
+    )
+    provider = ControlledGmailWriteProvider(
+        result=GmailDeliveryResult(
+            message_id="sent-failpoint", thread_id="thread-new"
+        )
+    )
+    dispatcher = _dispatcher(provider, acceptance_failpoint=failpoint)
+    components = _components(
+        _proposal(),
+        dispatcher,
+        proposal_action_id="gmail-action-failpoint",
+    )
+
+    assert components.receiver.receive(_event("send", suffix="failpoint-01")).disposition == (
+        "pending_action"
+    )
+    unknown = components.receiver.receive(_event("yes", suffix="failpoint-02"))
+
+    assert unknown.disposition == "action_dispatch_unknown"
+    assert failpoint.consumed is True
+    assert len(provider.calls) == 1
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    assert session.active_request is None
+    assert session.pending_action is None
+    record = next(
+        record
+        for record in session.action_outbox
+        if record.action_id == "gmail-action-failpoint"
+    )
+    assert record.status is DispatchStatus.UNKNOWN
+    assert record.payload is None
+    assert record.preview is None
+
+    replay = components.receiver.receive(_event("yes", suffix="failpoint-03"))
+    assert replay.disposition != "action_dispatched"
+    assert len(provider.calls) == 1
+    if (session_after_replay := components.broker.working_sessions.load()) is not None:
+        if session_after_replay.active_request is not None:
+            cancelled = components.receiver.receive(
+                _event("/cancel", suffix="failpoint-cancel")
+            )
+            assert cancelled.disposition in {
+                "cancelled",
+                "control_sent",
+                "cancellation_unknown",
+            }
+    final_session = components.broker.working_sessions.load()
+    assert final_session is not None
+    assert final_session.active_request is None
+    assert final_session.pending_action is None
+
+
+def test_gmail_connector_rejects_a_calendar_acceptance_failpoint() -> None:
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="calendar",
+            operation="insert",
+            action_id="calendar-action-failpoint",
+            review_id="ticket31-calendar-unknown",
+        )
+    )
+
+    with pytest.raises(ValueError, match="Gmail acceptance failpoint"):
+        _dispatcher(
+            ControlledGmailWriteProvider(), acceptance_failpoint=failpoint
+        )
+
+
+def test_gmail_failpoint_consumption_marker_prevents_restart_rearm(
+    tmp_path: Path,
+) -> None:
+    spec = ReviewedPostDispatchFailpointSpec(
+        service="gmail",
+        operation="gmail_send",
+        action_id="gmail-action-restart-guard",
+        review_id="ticket31-gmail-restart-guard",
+    )
+    first = ReviewedPostDispatchFailpoint(
+        spec, consumption_root=tmp_path / "acceptance-failpoints"
+    )
+
+    with pytest.raises(ReviewedPostDispatchFailure):
+        first.raise_if_armed(
+            service="gmail",
+            operation="gmail_send",
+            action_id="gmail-action-restart-guard",
+        )
+    assert first.consumed is True
+
+    restarted = ReviewedPostDispatchFailpoint(
+        spec, consumption_root=tmp_path / "acceptance-failpoints"
+    )
+    restarted.raise_if_armed(
+        service="gmail",
+        operation="gmail_send",
+        action_id="gmail-action-restart-guard",
+    )
+    assert restarted.consumed is True
 
 
 def test_reconnected_google_generation_invalidates_a_frozen_gmail_action() -> None:

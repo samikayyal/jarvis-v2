@@ -771,6 +771,135 @@ def test_calendar_insert_gets_an_internal_generation_placeholder() -> None:
     assert '"connection_generation":0' in result.proposal.payload
 
 
+def test_calendar_insert_event_wrapper_is_normalized_before_freezing() -> None:
+    complete_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the Calendar event.",
+                proposal=AgentsSdkProposal(
+                    kind="calendar_insert",
+                    preview="Create the event.",
+                    payload={
+                        "calendar_id": "secondary-calendar",
+                        "event": complete_event,
+                        "notification": "none",
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("create a design review"))
+
+    assert result.proposal is not None
+    assert result.proposal.kind == "calendar_insert"
+    payload = json.loads(result.proposal.payload)
+    assert payload["calendar_id"] == "secondary-calendar"
+    assert payload["complete_event"] == complete_event
+    assert payload["notification"] == "none"
+
+
+@pytest.mark.parametrize("notification_field", ("sendUpdates", "send_updates"))
+def test_calendar_insert_google_notification_name_is_normalized(
+    notification_field: str,
+) -> None:
+    complete_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the Calendar event.",
+                proposal=AgentsSdkProposal(
+                    kind="calendar_insert",
+                    preview="Create the event.",
+                    payload={
+                        "calendar_id": "secondary-calendar",
+                        "event": complete_event,
+                        notification_field: "none",
+                    },
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    result = adapter.run(_request("create a design review"))
+
+    assert result.proposal is not None
+    assert json.loads(result.proposal.payload)["notification"] == "none"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"operation": "insert"},
+        {"schema": "calendar_write_v1"},
+        {"connection_generation": 7},
+        {"unexpected": "value"},
+    ),
+)
+def test_calendar_insert_normalization_rejects_untrusted_fields(
+    extra: dict[str, object],
+) -> None:
+    complete_event = {
+        "summary": "Design review",
+        "start": {"dateTime": "2026-08-10T10:00:00Z"},
+        "end": {"dateTime": "2026-08-10T11:00:00Z"},
+        "attendees": [],
+        "recurrence": [],
+        "reminders": {"useDefault": True, "overrides": []},
+        "visibility": "private",
+    }
+    payload = {
+        "calendar_id": "secondary-calendar",
+        "event": complete_event,
+        "notification": "none",
+        **extra,
+    }
+    adapter = AgentsSdkOrchestrationAdapter(
+        agent_factory=lambda **_kwargs: object(),
+        run_sync=lambda _agent, _text, **_kwargs: SimpleNamespace(
+            final_output=AgentsSdkPlan(
+                reply_text="I prepared the Calendar event.",
+                proposal=AgentsSdkProposal(
+                    kind="calendar_insert",
+                    preview="Create the event.",
+                    payload=payload,
+                ),
+            )
+        ),
+        model_settings_factory=_FakeModelSettings,
+        reasoning_factory=_FakeReasoning,
+        run_config_factory=_FakeRunConfig,
+    )
+
+    with pytest.raises(OrchestrationAdapterError):
+        adapter.run(_request("create a design review"))
+
+
 def test_calendar_model_contract_describes_the_closed_insert_shape() -> None:
     instructions = _instructions(has_vault_read=False, has_vault_write=False)
 

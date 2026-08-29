@@ -29,7 +29,12 @@ from jarvis_control_plane import (
     OAuthGrant,
     SignedInboundEvent,
 )
+from jarvis_control_plane.acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailpointSpec,
+)
 from jarvis_control_plane.google_calendar import GoogleCalendarWriteProviderError
+from jarvis_control_plane.manual_admin import _open_manual_trace_boundary
 from jarvis_control_plane.ports import ActionDispatcherError
 from jarvis_control_plane.sessions import DispatchStatus
 
@@ -52,7 +57,11 @@ def event(*, summary: str = "Design review") -> dict[str, object]:
     }
 
 
-def connected_dispatcher() -> tuple[
+def connected_dispatcher(
+    *,
+    acceptance_failpoint: ReviewedPostDispatchFailpoint | None = None,
+    trace_store: InMemoryDiagnosticTraceStore | None = None,
+) -> tuple[
     CalendarActionDispatcher,
     ControlledGoogleCalendarWriteProvider,
     InMemoryGoogleOAuthStateStore,
@@ -71,6 +80,7 @@ def connected_dispatcher() -> tuple[
         )
     )
     provider = ControlledGoogleCalendarWriteProvider()
+    trace_store = trace_store or InMemoryDiagnosticTraceStore()
     return (
         CalendarActionDispatcher(
             configured_identity=IDENTITY,
@@ -78,10 +88,11 @@ def connected_dispatcher() -> tuple[
             credential_store=credentials,
             provider=provider,
             trace=DiagnosticTraceRecorder(
-                writer=InMemoryDiagnosticTraceStore().writer(),
+                writer=trace_store.writer(),
                 clock=FixedClock(NOW),
                 ids=DeterministicIdGenerator("ticket19-calendar"),
             ),
+            acceptance_failpoint=acceptance_failpoint,
         ),
         provider,
         state,
@@ -597,6 +608,91 @@ def test_exact_broker_approval_dispatches_a_calendar_proposal_once() -> None:
     assert receive("create it", "1").disposition == "pending_action"
     assert receive("yes", "2").disposition == "action_dispatched"
     assert receive("yes", "3").disposition != "action_dispatched"
+    assert len(provider.calls) == 1
+
+
+def test_calendar_post_dispatch_failpoint_is_unknown_reconciled_and_replay_free() -> None:
+    failpoint = ReviewedPostDispatchFailpoint(
+        ReviewedPostDispatchFailpointSpec(
+            service="calendar",
+            operation="insert",
+            action_id="calendar-action-failpoint",
+            review_id="ticket19-calendar-unknown",
+        )
+    )
+    trace_store = InMemoryDiagnosticTraceStore()
+    dispatcher, provider, state = connected_dispatcher(
+        acceptance_failpoint=failpoint,
+        trace_store=trace_store,
+    )
+    orchestration = ControlledOrchestrationAdapter(
+        proposal_factory=lambda request: CalendarWriteProposal.insert(
+            action_id="calendar-action-failpoint",
+            request_id=request.state.request_id,
+            calendar_id="primary",
+            complete_event=event(),
+            notification="none",
+            connection_generation=state.get_connection().generation,
+        )
+    )
+    components = build_receiver_components(
+        operator_id="operator.test",
+        transport_session_id="session.test",
+        signing_secret=b"ticket19-failpoint-secret",
+        now=NOW,
+        id_prefix="ticket19-failpoint",
+        orchestration=orchestration,
+        action_dispatcher=dispatcher,
+        action_lifecycle=dispatcher,
+    )
+
+    def receive(text: str, suffix: str):
+        return components.receiver.receive(
+            SignedInboundEvent.from_message(
+                InboundMessage(
+                    event_type="message.received",
+                    session_id="session.test",
+                    event_id=f"event-{suffix}",
+                    message_id=f"message-{suffix}",
+                    sender_id="operator.test",
+                    chat_id="operator.test",
+                    chat_type="direct",
+                    message_type="text",
+                    from_me=False,
+                    text=text,
+                ),
+                b"ticket19-failpoint-secret",
+            )
+        )
+
+    assert receive("create it", "1").disposition == "pending_action"
+    unknown = receive("yes", "2")
+
+    assert unknown.disposition == "action_dispatch_unknown"
+    assert failpoint.consumed is True
+    assert len(provider.calls) == 1
+    session = components.broker.working_sessions.load()
+    assert session is not None
+    assert session.active_request is None
+    assert session.pending_action is None
+    record = next(
+        record
+        for record in session.action_outbox
+        if record.action_id == "calendar-action-failpoint"
+    )
+    assert record.status is DispatchStatus.UNKNOWN
+    assert record.payload is None
+    assert record.preview is None
+    traces = _open_manual_trace_boundary(trace_store).list_traces(
+        request_id=unknown.request_id,
+        operation_type="google_calendar_write",
+    )
+    assert len(traces) == 1
+    assert traces[0].outcome == "completed"
+    assert "Design review" in str(traces[0].result)
+
+    replay = receive("yes", "3")
+    assert replay.disposition != "action_dispatched"
     assert len(provider.calls) == 1
 
 

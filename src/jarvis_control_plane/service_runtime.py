@@ -21,6 +21,10 @@ from urllib.error import URLError
 from urllib.parse import parse_qsl, urlsplit
 from urllib.request import urlopen
 
+from .acceptance_failpoints import (
+    ReviewedPostDispatchFailpoint,
+    ReviewedPostDispatchFailpointSpec,
+)
 from .action_dispatch import RoutedActionDispatcher
 from .adapters import (
     FixedModelAvailabilityProvider,
@@ -877,6 +881,7 @@ def _google_operations(
         ids=ids,
         connection_binding=lifecycle.connection_binding,
         on_invalid_grant=lambda: lifecycle.handle_refresh_failure("invalid_grant"),
+        acceptance_failpoint=_configured_acceptance_failpoint(config, service="gmail"),
     )
     calendar = CalendarActionDispatcher(
         configured_identity=identity,
@@ -888,6 +893,9 @@ def _google_operations(
         trace=trace,
         on_invalid_grant=lambda generation: lifecycle.handle_refresh_failure(
             "invalid_grant", connection_generation=generation
+        ),
+        acceptance_failpoint=_configured_acceptance_failpoint(
+            config, service="calendar"
         ),
     )
     operations = {
@@ -918,6 +926,33 @@ def _google_operations(
         }
     )
     return operations
+
+
+def _configured_acceptance_failpoint(
+    config: Mapping[str, Any], *, service: str
+) -> ReviewedPostDispatchFailpoint | None:
+    """Load only the exact reviewed, one-shot fault for one Google service."""
+
+    raw = config.get("acceptance_failpoint")
+    if not isinstance(raw, Mapping) or raw.get("enabled") is not True:
+        return None
+    if raw.get("service") != service:
+        return None
+    try:
+        spec = ReviewedPostDispatchFailpointSpec(
+            service=raw["service"],
+            operation=raw["operation"],
+            action_id=raw["action_id"],
+            review_id=raw["review_id"],
+        )
+        return ReviewedPostDispatchFailpoint(
+            spec,
+            consumption_root=Path(
+                "/var/lib/jarvis/google-traces/acceptance-failpoints"
+            ).absolute(),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CompositionError("reviewed acceptance failpoint is invalid") from exc
 
 
 def _vault_operations(

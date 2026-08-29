@@ -834,15 +834,12 @@ class AgentsSdkOrchestrationAdapter:
                     **gmail_payload,
                 )
             elif plan.proposal.kind == "calendar_insert":
-                if "connection_generation" in payload:
-                    raise OrchestrationAdapterError(
-                        "model proposed connector-owned Calendar state"
-                    )
+                calendar_payload = _canonical_calendar_insert_payload(payload)
                 candidate = CalendarWriteProposal.insert(
                     action_id=f"{request.state.request_id}:proposal",
                     request_id=request.state.request_id,
                     connection_generation=0,
-                    **payload,
+                    **calendar_payload,
                 )
             elif plan.proposal.kind in {"calendar_update", "calendar_patch"}:
                 if "connection_generation" in payload:
@@ -903,6 +900,75 @@ class AgentsSdkOrchestrationAdapter:
                 "model returned a malformed action proposal"
             ) from exc
         return candidate
+
+
+def _canonical_calendar_insert_payload(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Normalize one model Calendar insert wrapper to the closed factory shape.
+
+    The Agents SDK proposal payload is intentionally open-ended because the
+    model emits nested JSON.  Calendar's factory, however, accepts the
+    canonical ``complete_event``/``notification`` names only.  Models that
+    describe the same Google request using the API's ``event`` and
+    ``sendUpdates`` names must be adapted before calling that factory; no
+    connector state or authority fields are accepted here.
+    """
+
+    allowed = {
+        "calendar_id",
+        "complete_event",
+        "event",
+        "notification",
+        "sendUpdates",
+        "send_updates",
+        "event_id",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        if "connection_generation" in unknown or {
+            "etag",
+            "schema",
+            "operation",
+        } & unknown:
+            raise OrchestrationAdapterError(
+                "model proposed connector-owned Calendar state"
+            )
+        raise OrchestrationAdapterError(
+            "model proposed Calendar fields outside the closed insert shape"
+        )
+
+    event_fields = {field for field in ("complete_event", "event") if field in payload}
+    if len(event_fields) != 1:
+        raise OrchestrationAdapterError(
+            "Calendar insert requires one complete event payload"
+        )
+
+    notification_fields = {
+        field
+        for field in ("notification", "sendUpdates", "send_updates")
+        if field in payload
+    }
+    if len(notification_fields) != 1:
+        raise OrchestrationAdapterError(
+            "Calendar insert requires one notification choice"
+        )
+
+    event = payload[next(iter(event_fields))]
+    if not isinstance(event, Mapping):
+        raise OrchestrationAdapterError(
+            "Calendar insert complete event must be an object"
+        )
+
+    notification = payload[next(iter(notification_fields))]
+    canonical: dict[str, object] = {
+        "calendar_id": payload.get("calendar_id"),
+        "complete_event": dict(event),
+        "notification": notification,
+    }
+    if "event_id" in payload:
+        canonical["event_id"] = payload["event_id"]
+    return canonical
 
 
 def _canonical_gmail_model_payload(
