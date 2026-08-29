@@ -16,7 +16,9 @@ from jarvis_control_plane.adapters import (
     InMemoryAuditBoundary,
 )
 from jarvis_control_plane.google_oauth import (
+    GoogleConnectionBinding,
     InMemoryGoogleCredentialStore,
+    InMemoryGoogleOAuthStateStore,
     OAuthCredentialRecord,
 )
 from jarvis_control_plane.google_reads import (
@@ -126,21 +128,30 @@ def _connector(
     credential_store: InMemoryGoogleCredentialStore | None = None,
     on_invalid_grant: object | None = None,
 ) -> GoogleReadConnector:
-    return GoogleReadConnector(
-        configured_identity=IDENTITY,
-        credential_store=credential_store
-        or InMemoryGoogleCredentialStore(
+    state_store = InMemoryGoogleOAuthStateStore()
+    state_store.set_connection(connected=True, granted_scopes=scopes)
+    connection = state_store.get_connection()
+    if credential_store is None:
+        credential_store = InMemoryGoogleCredentialStore(
             OAuthCredentialRecord(
                 subject=identity,
                 granted_scopes=scopes,
                 refresh_token="controlled-refresh-token",
+                connection_generation=connection.generation,
             )
-        ),
+        )
+    return GoogleReadConnector(
+        configured_identity=IDENTITY,
+        credential_store=credential_store,
         provider=provider or ControlledGoogleReadProvider(),
         audit=audit or InMemoryAuditBoundary(),
         trace=trace or _trace(),
         clock=clock or FixedClock(NOW),
         ids=ids or DeterministicIdGenerator("ticket17-google"),
+        connection_binding=GoogleConnectionBinding(
+            state_store=state_store,
+            credential_store=credential_store,
+        ),
         on_invalid_grant=on_invalid_grant,  # type: ignore[arg-type]
     )
 
@@ -258,12 +269,13 @@ def test_invalid_grant_discards_the_credential_before_reporting_disconnection() 
             subject=IDENTITY,
             granted_scopes=GOOGLE_READ_SCOPES,
             refresh_token="controlled-refresh-token",
+            connection_generation=1,
         )
     )
     invalidations: list[str] = []
 
     def invalidate(connection_generation: int) -> None:
-        assert connection_generation == 0
+        assert connection_generation == 1
         store.delete()
         invalidations.append("invalidated")
 
