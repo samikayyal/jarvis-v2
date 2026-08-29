@@ -16,6 +16,29 @@ Pairing, transport, persistence, readiness, and recovery for the messaging
 gateway. It does not decide how a message should be answered.
 _Avoid_: Assistant logic, agent behavior
 
+**Personal assistant runtime**:
+The single-operator process that receives admitted text from the messaging
+gateway, routes deterministic commands, and runs ordinary requests through the
+model-and-tool loop. It is a fresh replacement for the existing assistant
+control plane rather than a compatible revision of it.
+_Avoid_: Capability broker, enterprise control plane, messaging gateway
+
+**Deterministic command**:
+An exact slash-prefixed operator message handled by application code without
+asking the model to interpret or execute it.
+_Avoid_: Prompt, tool call, natural-language request
+
+**Prepared tool**:
+A named operation deliberately implemented and exposed to the model-and-tool
+loop, such as reading the knowledge vault.
+_Avoid_: Arbitrary capability, connector, terminal command
+
+**Model-and-tool loop**:
+The assistant cycle in which an ordinary operator message is sent to OpenAI,
+prepared tool calls are executed, their results are returned to the model, and
+the cycle ends with text for the operator.
+_Avoid_: Deterministic command, capability broker
+
 **Dedicated account**:
 The single WhatsApp account assigned to the messaging gateway.
 _Avoid_: User account, sender
@@ -47,9 +70,9 @@ unrequested interaction.
 _Avoid_: Automation, proactive monitoring, scheduled assistant behavior
 
 **Authorized operator**:
-The one person permitted to invoke assistant behavior, identified in V1 by an
-allowlisted personal WhatsApp number. Messages from any other sender must not
-invoke the assistant or disclose access to its connected services.
+The one person permitted to invoke assistant behavior, identified by one
+allowlisted personal WhatsApp number. Other senders, groups, self-authored
+messages, and non-text messages do not enter the personal assistant runtime.
 _Avoid_: Dedicated account, any WhatsApp sender
 
 **Ingress admission**:
@@ -78,27 +101,16 @@ action does not authorize a different or later action.
 _Avoid_: Autonomous action, standing permission, implicit approval
 
 **Pending action**:
-The one frozen approval-gated action awaiting a deterministic confirmation or
-rejection message from the authorized operator. V1 permits at most one pending
-action. It is bound to the exact working session and active request that created
-it, pauses that request, and prevents unrelated work until it is confirmed,
-rejected, cancelled, or expired. It becomes invalid when its session or request
-ends, and it expires without execution after 10 minutes. A service restart
-invalidates its executable confirmation state; the interrupted proposal remains
-only in the audit record, and execution requires a fresh proposal and approval.
-Its exact frozen target, operation, arguments, and preview persist only while the
-action is pending; once terminal, that payload is removed immediately and only
-redacted lifecycle metadata remains.
+The one exact mutating tool call or terminal command waiting for the authorized
+operator to choose `1` (approve once), `2` (approve and save), or `9` (reject).
+It pauses the active request without expiring; every other inbound message is
+ignored except `/cancel`, and a runtime restart discards it.
 _Avoid_: Working session, queued action, approved action
 
 **Active request**:
-The single authorized request Jarvis is currently processing within a working
-session. V1 does not queue or run a separate request in parallel with it. If the
-service restarts, an active request becomes interrupted and cannot resume
-execution without a new instruction from the authorized operator. Its persisted
-record is limited to a stable ID, originating-message ID, lifecycle status and
-phase, timestamps, cancellation or interruption reason, configuration snapshot,
-tool and action correlation IDs, and outbound-attempt status.
+The single authorized request currently being processed within a working
+session. Another ordinary message is refused rather than queued, and a restart
+discards the request instead of resuming it.
 _Avoid_: Pending action, working session, background automation
 
 **Operational state**:
@@ -224,12 +236,9 @@ cached excerpts, retrieval pointers, and generated summaries; only content-free
 tombstones remain accessible for message and audit references.
 _Avoid_: Permanently erased conversation, accessible conversation history
 
-**Terminal action**:
-A command the assistant proposes to run on one execution host. An exact terminal
-action is identified by its host, resolved executable or script path, complete
-arguments, canonical working directory, and normalized compound-command
-structure. Its inherited environment and the contents or metadata of files at
-those paths are not part of its identity.
+**Terminal command**:
+A shell command the personal assistant runtime proposes to run on the Ubuntu or
+Windows execution host, in a stated working directory.
 _Avoid_: Assistant response, tool suggestion
 
 **Protected resource**:
@@ -277,23 +286,10 @@ deterministic.
 _Avoid_: V1 authorization, final authorization, security policy
 
 **Command permission**:
-A deterministic, narrowly structured rule that permits matching terminal
-actions for one working session or until explicitly revoked. It cannot override
-a hard prohibition or mandatory-approval rule. A service restart revokes every
-session-scoped command permission but leaves a persistent permission intact
-until it is explicitly revoked. Selecting a displayed `Allow for this session`
-or `Allow every time` choice creates the exact permission immediately without a
-second confirmation. Every active permission is
-deterministically inspectable with its scope, creation time, and lifetime, and
-the authorized operator may revoke it immediately. Permission state contains only
-the exact normalized matching rule, lifetime, creation and authorization
-provenance, and revocation state; it never stores command output or credential
-values. It deliberately binds paths and command structure rather than executable
-or script contents, file metadata, or inherited environment values, so matching
-authority continues across changes to behavior at an allowed path. Revocation
-immediately removes the usable rule while the audit retains only redacted
-lifecycle metadata.
-_Avoid_: Approval-gated action, wildcard command approval, model decision
+A TOML rule that automatically permits a terminal command when its execution
+host and literal command prefix match. Choosing `2` saves the displayed rule;
+the authorized operator may inspect, edit, or revoke it later.
+_Avoid_: Read-only command rule, one-time approval, model decision
 
 **Knowledge vault**:
 The authorized operator's private, Git-backed Obsidian repository used as a
@@ -402,13 +398,12 @@ restarts; and security or degraded-state failures. Internal model reasoning is
 diagnostic telemetry rather than a permanent audit event.
 _Avoid_: Conversation history, model trace, editable activity log
 
-**Diagnostic trace**:
-The complete permanent record of model, agent, connector, and worker run
-payloads and telemetry, including prompts, messages, inputs, outputs, arguments,
-results, terminal data, errors, and any credentials they contain. It is retained
-and backed up indefinitely, never redacted or automatically deleted, accessible
-only through manual administration, and is not the security audit record.
-_Avoid_: Audit record, redacted telemetry, temporary trace
+**Runtime trace**:
+The rotating verbatim JSON Lines record of authorized messages, OpenAI request
+and response payloads, prepared-tool calls and results, terminal activity,
+approval choices, errors, and timing. It is operational evidence rather than an
+authorization authority or searchable conversation archive.
+_Avoid_: Audit record, hidden model reasoning, durable assistant memory
 
 **Execution host**:
 A named computer on which Jarvis may evaluate and run terminal actions. V1 has
@@ -427,20 +422,10 @@ and waits for further instruction; it never silently substitutes the other host.
 _Avoid_: Automatic failover host, any available computer
 
 **Working session**:
-The temporary conversational context that begins with an authorized request
-and ends on `/new` or after the configured inactivity boundary, which defaults
-to 60 minutes. The inactivity countdown is suspended while an active request is
-genuinely processing and restarts when Jarvis becomes idle; a pending action's
-separate 10-minute expiry is unaffected. Its lifecycle metadata, configuration,
-conversation-history reference, and request status survive a service restart,
-but interrupted model runs, tool calls, commands, and side effects do not resume
-automatically.
-Temporary model and reasoning choices belong to the working session; durable
-assistant memory does not. `/new` atomically cancels any active request,
-invalidates any pending action, revokes session-scoped command permissions, ends
-the current working session, and starts a clean one without deleting any
-separately durable state. Its persisted record is limited to a stable ID,
-operator ID, lifecycle timestamps, model and reasoning settings, conversation
-reference, current request and pending-action references, and session-scoped
-permission IDs.
+The in-memory conversational context that begins with an authorized request and
+ends on `/new`, configured inactivity expiry, or runtime restart. It contains at
+most one active request and one pending action and is never a durable conversation
+archive. Reaching the configurable 100,000-token context limit measured with
+`tiktoken` produces a deterministic notice and ends the session instead of
+trimming or summarizing it.
 _Avoid_: WhatsApp chat, messaging session, durable assistant memory
