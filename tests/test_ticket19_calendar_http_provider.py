@@ -19,6 +19,7 @@ from jarvis_control_plane import (
     FixedClock,
     GoogleApiCalendarWriteProvider,
     GoogleCalendarHttpResponse,
+    InMemoryAuditBoundary,
     InMemoryDiagnosticTraceStore,
     InMemoryGoogleCredentialStore,
     InMemoryGoogleOAuthStateStore,
@@ -359,12 +360,15 @@ def test_trace_admission_blocks_calendar_call_before_the_provider() -> None:
             )
         ),
         provider=provider,
+        audit=InMemoryAuditBoundary(),
         trace=DiagnosticTraceRecorder(
             writer=InMemoryDiagnosticTraceStore().writer(),
             clock=FixedClock(NOW),
             ids=DeterministicIdGenerator("trace-admission"),
             reservation_bytes=1,
         ),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("trace-admission-audit"),
     )
     proposal = CalendarWriteProposal.insert(
         action_id="calendar-trace-action",
@@ -410,11 +414,14 @@ def test_dispatch_lease_prevents_reconnection_from_interleaving_with_provider_ca
             )
         ),
         provider=provider,
+        audit=InMemoryAuditBoundary(),
         trace=DiagnosticTraceRecorder(
             writer=InMemoryDiagnosticTraceStore().writer(),
             clock=FixedClock(NOW),
             ids=DeterministicIdGenerator("dispatch-lease"),
         ),
+        clock=FixedClock(NOW),
+        ids=DeterministicIdGenerator("dispatch-lease-audit"),
     )
     proposal = CalendarWriteProposal.insert(
         action_id="calendar-lease-action",
