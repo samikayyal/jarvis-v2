@@ -86,5 +86,16 @@
       "suggestion": 0
     },
     "scope": "Ticket 15 PR 11 timeout ownership and exact text-patch invariants before repair"
+  },
+  {
+    "date": "2026-08-29",
+    "mode": "Full Sweep",
+    "score": 95,
+    "findings": {
+      "critical": 0,
+      "warning": 1,
+      "suggestion": 0
+    },
+    "scope": "D:\\Projects\\Jarvis-v2 (full repository)"
   }
 ]

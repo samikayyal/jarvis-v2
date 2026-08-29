@@ -1,0 +1,456 @@
+"""Small ports and errors for the ticket01-ticket04 control-plane seam."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from ...diagnostics.values import TraceReservation
+    from ...sessions import ModelAvailability
+    from ...traces import DiagnosticTrace
+
+from ...models import (
+    AuditEvidence,
+    AuditFilter,
+    ConversationDeletionPreview,
+    ConversationDeletionScope,
+    ConversationMessage,
+    ConversationTombstone,
+    DurableMemory,
+    FrozenActionProposal,
+    HistorySelection,
+    IngressAdmissionResult,
+    IngressClaim,
+    MemorySelection,
+    OrchestrationRequest,
+    OrchestrationResult,
+    OutboundAttemptRecord,
+    OutboundAttemptRecoveryProjection,
+    OutboundAttemptStatus,
+    OutboundDelivery,
+    OutboundReply,
+    RecoveryDegradedMarker,
+    RequestState,
+)
+from ...sessions import ServiceReadiness
+from .values import (  # noqa: F401
+    ActionCancellationResult,
+    ActionCancellationStatus,
+    ActionDispatcherError,
+    AuditWriteError,
+    ControlPlaneError,
+    DeletedConversationArchiveError,
+    DiagnosticTraceError,
+    InvalidEnvelopeError,
+    MemorySearchLimitExceeded,
+    OrchestrationAdapterError,
+    OutboundConnectorError,
+    StateStoreError,
+    TraceCapacityError,
+    TraceWriteError,
+)
+
+
+class AuditBoundary(Protocol):
+    """Append-only redacted audit boundary and safe local read surface."""
+
+    def append(self, evidence: AuditEvidence) -> None: ...
+
+    def append_batch(self, evidence: Sequence[AuditEvidence]) -> None: ...
+
+    def safe_view(
+        self, query: AuditFilter | None = None
+    ) -> tuple[AuditEvidence, ...]: ...
+
+    def export_json(self, query: AuditFilter | None = None) -> str: ...
+
+
+class DeletedConversationArchiveWriter(Protocol):
+    """Write-only capability for content removed from Jarvis-readable state.
+
+    The staged methods keep the large IPC transfer outside the live-state
+    transaction.  ``archive`` remains as a convenience for callers that do
+    not need to coordinate the finalization with another durable boundary.
+    """
+
+    def stage(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None: ...
+
+    def finalize(self, *, deletion_id: str) -> None: ...
+
+    def abort(self, *, deletion_id: str) -> None: ...
+
+    def archive(
+        self,
+        messages: Sequence[ConversationMessage],
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+        expected_count: int | None = None,
+        expected_digest: str | None = None,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class DurableStateStore(Protocol):
+    """Authoritative local state and replay-claim port."""
+
+    def admit_ingress(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        event_id: str,
+        claimed_at: datetime,
+        conversation_message: ConversationMessage | None,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+        terminal_disposition: str,
+        audit_blocked_disposition: str | None = None,
+    ) -> IngressAdmissionResult: ...
+
+    def claim_ingress(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        event_id: str,
+        claimed_at: datetime,
+        conversation_message: ConversationMessage | None = None,
+        disposition: str = "admitted",
+    ) -> bool: ...
+
+    def update_ingress_disposition(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None: ...
+
+    def begin_next_ingress_dispatch(self) -> ConversationMessage | None: ...
+
+    def begin_ingress_dispatch(
+        self, *, transport_session_id: str, message_id: str
+    ) -> bool: ...
+
+    def finish_ingress_dispatch(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        disposition: str,
+    ) -> None: ...
+
+    def reconcile_ingress_restart(
+        self,
+        *,
+        audit: AuditBoundary,
+        audit_evidence: AuditEvidence,
+    ) -> int: ...
+
+    def list_conversation_messages(self) -> tuple[ConversationMessage, ...]: ...
+
+    def append_conversation_message(self, message: ConversationMessage) -> None: ...
+
+    def reserve_outbound_conversation_message(
+        self, message: ConversationMessage
+    ) -> None: ...
+
+    def accept_reserved_outbound_conversation_message(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        terminal_at: datetime | None = None,
+        outbound_id: str | None = None,
+    ) -> None: ...
+
+    def terminalize_outbound_conversation_attempt(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        status: OutboundAttemptStatus | str,
+        terminal_at: datetime,
+        outbound_id: str | None = None,
+    ) -> None: ...
+
+    def mark_outbound_conversation_attempted(
+        self,
+        *,
+        transport_session_id: str,
+        message_id: str,
+        attempted_at: datetime,
+    ) -> None: ...
+
+    def list_outbound_conversation_attempts(
+        self,
+    ) -> tuple[OutboundAttemptRecord, ...]: ...
+
+    def list_outbound_conversation_attempt_recovery(
+        self,
+    ) -> tuple[OutboundAttemptRecoveryProjection, ...]: ...
+
+    def load_recovery_degraded_marker(self) -> RecoveryDegradedMarker | None: ...
+
+    def mark_recovery_degraded(self, *, reason: str, marked_at: datetime) -> None: ...
+
+    def acknowledge_recovery_degraded(self) -> None: ...
+
+    def reconcile_outbound_conversation_attempts(
+        self, *, interrupted_at: datetime
+    ) -> tuple[OutboundAttemptRecord, ...]: ...
+
+    def search_conversation_messages(
+        self,
+        *,
+        text: str | None = None,
+        working_session_id: str | None = None,
+        request_id: str | None = None,
+        direction: str | None = None,
+        history_ids: tuple[str, ...] = (),
+        limit: int = 50,
+    ) -> tuple[ConversationMessage, ...]: ...
+
+    def export_conversation_messages(self, **query: object) -> str: ...
+
+    def select_history_for_context(
+        self,
+        *,
+        text: str,
+        excluding_working_session_id: str,
+        limit: int = 5,
+    ) -> HistorySelection: ...
+
+    def preview_conversation_deletion(
+        self, scope: ConversationDeletionScope
+    ) -> ConversationDeletionPreview: ...
+
+    def delete_conversation_history(
+        self,
+        preview: ConversationDeletionPreview,
+        *,
+        deletion_id: str,
+        deleted_at: datetime,
+    ) -> tuple[ConversationTombstone, ...]: ...
+
+    def list_conversation_tombstones(
+        self, *, history_ids: tuple[str, ...] = ()
+    ) -> tuple[ConversationTombstone, ...]: ...
+
+    def list_memories(
+        self, *, include_terminal: bool = True, limit: int = 50
+    ) -> tuple[DurableMemory, ...]: ...
+
+    def get_memory(self, memory_id: str) -> DurableMemory | None: ...
+
+    def search_memories(
+        self,
+        *,
+        text: str | None = None,
+        memory_ids: tuple[str, ...] = (),
+        include_terminal: bool = True,
+        limit: int = 50,
+    ) -> tuple[DurableMemory, ...]: ...
+
+    def select_memories_for_context(
+        self, *, text: str, limit: int = 5
+    ) -> MemorySelection: ...
+
+    def create_memory(self, memory: DurableMemory) -> None: ...
+
+    def replace_memory(
+        self,
+        memory_id: str,
+        replacement: DurableMemory,
+        *,
+        expected_revision: str | None = None,
+    ) -> DurableMemory: ...
+
+    def forget_memory(
+        self,
+        memory_id: str,
+        *,
+        expected_revision: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> DurableMemory: ...
+
+    def has_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
+
+    def release_ingress_claim(self, *, session_id: str, message_id: str) -> bool: ...
+
+    def save_request(self, request: RequestState) -> None: ...
+
+    def delete_request(self, request_id: str) -> bool: ...
+
+    def update_request(self, request: RequestState) -> None: ...
+
+    def get_request(self, request_id: str) -> RequestState | None: ...
+
+    def list_requests(self) -> tuple[RequestState, ...]: ...
+
+    def list_ingress_claims(self) -> tuple[IngressClaim, ...]: ...
+
+    def load_knowledge_vault_synchronized_at(self) -> datetime | None: ...
+
+    def save_knowledge_vault_synchronized_at(
+        self, synchronized_at: datetime
+    ) -> None: ...
+
+
+class OrchestrationAdapter(Protocol):
+    """Non-authoritative planner boundary."""
+
+    def run(self, request: OrchestrationRequest) -> OrchestrationResult: ...
+
+
+@runtime_checkable
+class ActionDispatchHandle(Protocol):
+    """Prepared execution handle whose run waits for one bounded dispatch."""
+
+    def run(self) -> object | None: ...
+
+
+@runtime_checkable
+class ActionDispatcher(Protocol):
+    """Closed, cancellable side-effect boundary for a frozen action.
+
+    ``cancel`` must return ``NOT_STARTED`` only when the dispatcher can prove
+    that the operation never began, ``STOPPED`` only when it can prove that
+    the complete side-effect scope stopped, and ``UNKNOWN`` for every lost,
+    timed-out, or otherwise unconfirmed edge. A missing prepared handle is
+    not proof of ``NOT_STARTED`` because the operation may have completed
+    before its durable result was recorded.
+    """
+
+    def prepare(self, action: FrozenActionProposal) -> ActionDispatchHandle: ...
+
+    def cancel(self, *, action_id: str) -> ActionCancellationResult: ...
+
+
+@runtime_checkable
+class ActionFinalizer(Protocol):
+    """Optional retirement handshake for dispatchers with transport state."""
+
+    def finalize(self, *, action_id: str) -> None: ...
+
+
+@runtime_checkable
+class BoundActionLifecycle(Protocol):
+    """Optional connector lifecycle needed to bind and revalidate an action."""
+
+    def bind_proposal(self, action: FrozenActionProposal) -> FrozenActionProposal:
+        """Add immutable connector state before the proposal is presented."""
+        ...
+
+    def validate_pending_action(self, action: FrozenActionProposal) -> None:
+        """Reject a frozen action whose connector state changed after binding."""
+        ...
+
+
+class KnowledgeVaultWriteProposalPreparer(Protocol):
+    """Authoritative port that freezes one typed vault write intent."""
+
+    def propose(
+        self, *, request_id: str, changes: Mapping[str, str]
+    ) -> FrozenActionProposal: ...
+
+
+class ModelAvailabilityProvider(Protocol):
+    """Authoritative provider access/availability check for exact runtime choices."""
+
+    def current(self) -> ModelAvailability: ...
+
+
+@runtime_checkable
+class MessagingGatewayReadiness(Protocol):
+    """Safe aggregate derived from separate gateway/session observations."""
+
+    @property
+    def messaging_ready(self) -> bool: ...
+
+
+class MessagingGatewayReadinessProvider(Protocol):
+    def current(self) -> MessagingGatewayReadiness: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerReadiness:
+    """Safe broker-facing readiness for the two configured execution hosts."""
+
+    ubuntu: str
+    windows: str
+
+    def __post_init__(self) -> None:
+        allowed = {"ready", "unavailable"}
+        if self.ubuntu not in allowed or self.windows not in allowed:
+            raise ValueError("worker readiness must be ready or unavailable")
+
+
+class WorkerReadinessProvider(Protocol):
+    def current(self) -> WorkerReadiness: ...
+
+
+class ConnectedServiceReadinessProvider(Protocol):
+    """Safe readiness projection for one named connected service."""
+
+    def current(self) -> ServiceReadiness: ...
+
+
+class OutboundConnector(Protocol):
+    """Closed outbound capability with a side-effect-free admission check."""
+
+    def preflight(self, reply: OutboundReply) -> None: ...
+
+    def send(self, reply: OutboundReply) -> OutboundDelivery: ...
+
+
+class DiagnosticTraceStore(Protocol):
+    """Append-only full-payload trace store used before trace-producing work."""
+
+    def reserve(
+        self,
+        *,
+        request_id: str,
+        reservation_bytes: int | None = None,
+    ) -> TraceReservation: ...
+
+    def append(
+        self,
+        trace: DiagnosticTrace,
+        reservation: TraceReservation,
+    ) -> None: ...
+
+    def release(self, reservation: TraceReservation) -> None: ...
+
+
+class Clock(Protocol):
+    """Injectable time source."""
+
+    def now(self) -> datetime: ...
+
+
+class IdGenerator(Protocol):
+    """Injectable identifier source."""
+
+    def new_id(self, namespace: str) -> str: ...
+
+
+def require_non_empty(value: str, name: str) -> str:
+    """Validate configuration identifiers without normalizing them silently."""
+
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(f"{name} must be a non-empty canonical string")
+    return value
