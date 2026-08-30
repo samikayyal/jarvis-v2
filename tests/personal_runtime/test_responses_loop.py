@@ -1,0 +1,529 @@
+from __future__ import annotations
+
+import asyncio
+from functools import wraps
+
+import httpx
+import pytest
+
+from jarvis_personal_runtime.responses import (
+    DirectResponsesRunner,
+    OpenAIRawResponsesAdapter,
+    ResponsesResult,
+)
+
+
+def async_test(function):
+    @wraps(function)
+    def run(*args, **kwargs):
+        return asyncio.run(function(*args, **kwargs))
+
+    return run
+
+
+class FakeResponses:
+    def __init__(self, *results: ResponsesResult) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[dict[str, object], float]] = []
+
+    async def create(
+        self, request: dict[str, object], *, timeout: float
+    ) -> ResponsesResult:
+        self.calls.append((request, timeout))
+        return self.results.pop(0)
+
+
+class FakeTools:
+    definitions = (
+        {
+            "type": "function",
+            "name": "read_vault",
+            "description": "Read the vault.",
+            "parameters": {"type": "object"},
+            "strict": True,
+        },
+    )
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def execute(self, name: str, arguments: dict[str, object]) -> str:
+        self.calls.append((name, arguments))
+        return '{"text":"found"}'
+
+
+class FailingTools(FakeTools):
+    async def execute(self, name: str, arguments: dict[str, object]) -> str:
+        self.calls.append((name, arguments))
+        raise OSError("vault unavailable")
+
+
+class MemoryTrace:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def record(self, event: str, payload: dict[str, object]) -> None:
+        self.events.append((event, payload))
+
+
+class BlockingResponses:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def create(
+        self, request: dict[str, object], *, timeout: float
+    ) -> ResponsesResult:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+@async_test
+async def test_final_text_uses_the_direct_stateless_responses_contract() -> None:
+    responses = FakeResponses(
+        ResponsesResult(
+            output=({"type": "message", "id": "msg_1"},), output_text="Hello"
+        )
+    )
+    runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
+
+    result = await runner.run(
+        "Hi", model="gpt-5.6-luna", reasoning="medium", system_prompt="Be useful."
+    )
+
+    assert result.reply == "Hello"
+    request, timeout = responses.calls[0]
+    assert request == {
+        "model": "gpt-5.6-luna",
+        "instructions": "Be useful.",
+        "input": [{"role": "user", "content": "Hi"}],
+        "tools": [],
+        "reasoning": {"effort": "medium"},
+        "parallel_tool_calls": False,
+        "store": False,
+        "truncation": "disabled",
+    }
+    assert 0 < timeout <= 30
+
+
+@async_test
+async def test_one_tool_call_replays_complete_output_before_exact_result() -> None:
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "opaque-ciphertext",
+        "summary": [],
+    }
+    function_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_exact",
+        "name": "read_vault",
+        "arguments": '{"query":"roadmap"}',
+    }
+    responses = FakeResponses(
+        ResponsesResult(output=(reasoning_item, function_call), output_text=""),
+        ResponsesResult(
+            output=({"type": "message", "id": "msg_2"},),
+            output_text="I found it.",
+        ),
+    )
+    tools = FakeTools()
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(
+        responses,
+        tools=tools,
+        trace=trace,
+        request_timeout_seconds=30,
+        max_tool_rounds=2,
+    )
+
+    result = await runner.run(
+        "Find it", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+    )
+
+    assert result.reply == "I found it."
+    assert tools.calls == [("read_vault", {"query": "roadmap"})]
+    continuation, _ = responses.calls[1]
+    assert continuation["instructions"] == "Use tools."
+    assert continuation["input"] == [
+        {"role": "user", "content": "Find it"},
+        reasoning_item,
+        function_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call_exact",
+            "output": '{"text":"found"}',
+        },
+    ]
+    events = {event: payload for event, payload in trace.events}
+    assert events["responses_request"]["request"] == responses.calls[1][0]
+    assert events["responses_output"]["output"] == [{"type": "message", "id": "msg_2"}]
+    assert events["tool_call"] == {
+        "name": "read_vault",
+        "call_id": "call_exact",
+        "arguments": {"query": "roadmap"},
+    }
+    assert events["tool_result"] == {
+        "name": "read_vault",
+        "call_id": "call_exact",
+        "output": '{"text":"found"}',
+    }
+
+
+@async_test
+async def test_tool_error_is_returned_to_the_model_and_continuation_proceeds() -> None:
+    call = {
+        "type": "function_call",
+        "call_id": "call_failed",
+        "name": "read_vault",
+        "arguments": "{}",
+    }
+    responses = FakeResponses(
+        ResponsesResult(output=(call,), output_text=""),
+        ResponsesResult(output=(), output_text="The vault is unavailable."),
+    )
+    tools = FailingTools()
+    runner = DirectResponsesRunner(
+        responses, tools=tools, request_timeout_seconds=30, max_tool_rounds=2
+    )
+
+    result = await runner.run(
+        "Read it", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+    )
+
+    assert result.reply == "The vault is unavailable."
+    continuation, _ = responses.calls[1]
+    assert continuation["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call_failed",
+        "output": '{"error":"OSError: vault unavailable"}',
+    }
+
+
+@async_test
+async def test_malformed_tool_arguments_continue_as_a_tool_error() -> None:
+    call = {
+        "type": "function_call",
+        "call_id": "call_bad_json",
+        "name": "read_vault",
+        "arguments": "{not-json",
+    }
+    responses = FakeResponses(
+        ResponsesResult(output=(call,), output_text=""),
+        ResponsesResult(output=(), output_text="I could not use that tool call."),
+    )
+    tools = FakeTools()
+    runner = DirectResponsesRunner(
+        responses, tools=tools, request_timeout_seconds=30, max_tool_rounds=2
+    )
+
+    result = await runner.run(
+        "Read it", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+    )
+
+    assert result.reply == "I could not use that tool call."
+    assert tools.calls == []
+    continuation, _ = responses.calls[1]
+    assert continuation["input"][-1]["call_id"] == "call_bad_json"
+    assert "JSONDecodeError" in continuation["input"][-1]["output"]
+
+
+@async_test
+async def test_response_without_tool_call_or_final_text_is_rejected() -> None:
+    responses = FakeResponses(ResponsesResult(output=(), output_text=""))
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(responses, trace=trace, request_timeout_seconds=30)
+
+    with pytest.raises(RuntimeError, match="final text"):
+        await runner.run(
+            "Hello",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+
+    assert (
+        "provider_protocol_error",
+        {"reason": "missing_final_text"},
+    ) in trace.events
+
+
+@async_test
+async def test_multiple_function_calls_are_traced_and_rejected_without_execution() -> (
+    None
+):
+    calls = tuple(
+        {
+            "type": "function_call",
+            "call_id": f"call_{index}",
+            "name": "read_vault",
+            "arguments": "{}",
+        }
+        for index in range(2)
+    )
+    responses = FakeResponses(ResponsesResult(output=calls, output_text=""))
+    tools = FakeTools()
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(
+        responses,
+        tools=tools,
+        trace=trace,
+        request_timeout_seconds=30,
+        max_tool_rounds=2,
+    )
+
+    with pytest.raises(RuntimeError, match="multiple function calls"):
+        await runner.run(
+            "Read twice",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+
+    assert tools.calls == []
+    assert ("provider_protocol_error", {"function_call_count": 2}) in trace.events
+
+
+@async_test
+async def test_tool_round_limit_rejects_the_next_call_before_execution() -> None:
+    first = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "read_vault",
+        "arguments": '{"query":"one"}',
+    }
+    second = {
+        "type": "function_call",
+        "call_id": "call_2",
+        "name": "read_vault",
+        "arguments": '{"query":"two"}',
+    }
+    responses = FakeResponses(
+        ResponsesResult(output=(first,), output_text=""),
+        ResponsesResult(output=(second,), output_text=""),
+    )
+    tools = FakeTools()
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(
+        responses,
+        tools=tools,
+        trace=trace,
+        request_timeout_seconds=30,
+        max_tool_rounds=1,
+    )
+
+    with pytest.raises(RuntimeError, match="tool-round limit"):
+        await runner.run(
+            "Keep reading",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+
+    assert tools.calls == [("read_vault", {"query": "one"})]
+    assert trace.events[-1] == (
+        "request_error",
+        {"error": "RuntimeError: configured tool-round limit reached"},
+    )
+
+
+@async_test
+async def test_current_session_history_and_each_turns_overrides_are_replayed() -> None:
+    first_message = {"type": "message", "id": "msg_1", "role": "assistant"}
+    responses = FakeResponses(
+        ResponsesResult(output=(first_message,), output_text="First"),
+        ResponsesResult(output=(), output_text="Second"),
+    )
+    runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
+
+    await runner.run(
+        "One", model="gpt-5.6-luna", reasoning="medium", system_prompt="Always."
+    )
+    await runner.run(
+        "Two", model="gpt-5.6-sol", reasoning="max", system_prompt="Always."
+    )
+
+    request, _ = responses.calls[1]
+    assert request["model"] == "gpt-5.6-sol"
+    assert request["reasoning"] == {"effort": "max"}
+    assert request["instructions"] == "Always."
+    assert request["input"] == [
+        {"role": "user", "content": "One"},
+        first_message,
+        {"role": "user", "content": "Two"},
+    ]
+
+
+@async_test
+async def test_starting_a_new_session_discards_the_prior_transcript() -> None:
+    responses = FakeResponses(
+        ResponsesResult(output=({"type": "message", "id": "old"},), output_text="Old"),
+        ResponsesResult(output=(), output_text="New"),
+    )
+    runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
+    await runner.run(
+        "Old request",
+        model="gpt-5.6-luna",
+        reasoning="medium",
+        system_prompt="Always.",
+    )
+
+    runner.start_session()
+    await runner.run(
+        "New request",
+        model="gpt-5.6-luna",
+        reasoning="medium",
+        system_prompt="Always.",
+    )
+
+    request, _ = responses.calls[1]
+    assert request["input"] == [{"role": "user", "content": "New request"}]
+
+
+@async_test
+async def test_foreground_cancellation_is_traced_as_local_best_effort() -> None:
+    responses = BlockingResponses()
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(responses, trace=trace, request_timeout_seconds=30)
+    task = asyncio.create_task(
+        runner.run(
+            "Wait",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+    )
+    await responses.started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert trace.events[-1] == (
+        "foreground_cancelled",
+        {
+            "scope": "local_wait",
+            "provider_cancellation_confirmed": False,
+        },
+    )
+
+
+@async_test
+async def test_overall_deadline_bounds_the_whole_request() -> None:
+    responses = BlockingResponses()
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(responses, trace=trace, request_timeout_seconds=0.01)
+
+    with pytest.raises(TimeoutError):
+        await runner.run(
+            "Wait",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+
+    assert trace.events[-1] == (
+        "request_timeout",
+        {"timeout_seconds": 0.01},
+    )
+
+
+@async_test
+async def test_openai_adapter_traces_every_sdk_retry_attempt_and_raw_exchange() -> None:
+    attempts = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, json={"error": {"message": "retry"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Hello",
+                                "annotations": [],
+                                "logprobs": [],
+                            }
+                        ],
+                    }
+                ],
+                "parallel_tool_calls": False,
+                "store": False,
+                "tools": [],
+            },
+        )
+
+    trace = MemoryTrace()
+    adapter = OpenAIRawResponsesAdapter.from_api_key(
+        "sk-test", trace=trace, transport=httpx.MockTransport(handle)
+    )
+    try:
+        result = await adapter.create(
+            {
+                "model": "gpt-5.6-luna",
+                "instructions": "Help.",
+                "input": [{"role": "user", "content": "Hi"}],
+                "tools": [],
+                "reasoning": {"effort": "medium"},
+                "parallel_tool_calls": False,
+                "store": False,
+                "truncation": "disabled",
+            },
+            timeout=5,
+        )
+    finally:
+        await adapter.close()
+
+    assert result.output_text == "Hello"
+    assert attempts == 2
+    request_attempts = [p for e, p in trace.events if e == "http_attempt_request"]
+    response_attempts = [p for e, p in trace.events if e == "http_attempt_response"]
+    assert [item["attempt"] for item in request_attempts] == [1, 2]
+    assert [item["status_code"] for item in response_attempts] == [500, 200]
+    assert all("authorization" not in item["headers"] for item in request_attempts)
+    raw = [p for e, p in trace.events if e == "responses_raw_exchange"][-1]
+    assert '"store":false' in raw["request_body"].replace(" ", "")
+    assert '"id":"resp_1"' in raw["response_body"].replace(" ", "")
+
+
+@async_test
+async def test_sdk_retry_backoff_cannot_escape_the_runner_deadline() -> None:
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "retry"}})
+
+    trace = MemoryTrace()
+    adapter = OpenAIRawResponsesAdapter.from_api_key(
+        "sk-test", trace=trace, transport=httpx.MockTransport(unavailable)
+    )
+    runner = DirectResponsesRunner(adapter, trace=trace, request_timeout_seconds=0.5)
+    try:
+        with pytest.raises(TimeoutError):
+            await runner.run(
+                "Hi",
+                model="gpt-5.6-luna",
+                reasoning="medium",
+                system_prompt="Help.",
+            )
+    finally:
+        await adapter.close()
+
+    assert any(event == "http_attempt_request" for event, _ in trace.events)
+    assert trace.events[-1] == (
+        "request_timeout",
+        {"timeout_seconds": 0.5},
+    )

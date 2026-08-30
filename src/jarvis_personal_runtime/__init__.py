@@ -3,6 +3,12 @@
 from .config import ConfigError, RuntimeConfig, RuntimeSecrets, load_runtime_config
 from .dedup import CacheError, MessageIdCache
 from .permissions import PermissionRule, PermissionStoreError, TomlPermissionStore
+from .responses import (
+    DirectResponsesRunner,
+    OpenAIRawResponsesAdapter,
+    ResponsesResult,
+    build_direct_responses_runner,
+)
 from .runtime import (
     ApprovalDecision,
     ApprovalRequired,
@@ -24,18 +30,22 @@ __all__ = [
     "Completed",
     "ConfigError",
     "ContextLimitReached",
+    "DirectResponsesRunner",
     "InboundText",
     "MessageIdCache",
+    "OpenAIRawResponsesAdapter",
     "PendingAction",
     "PermissionRule",
     "PermissionStoreError",
     "PersonalRuntime",
+    "ResponsesResult",
     "RuntimeConfig",
     "RuntimeDisposition",
     "RuntimeResult",
     "RuntimeSecrets",
     "RuntimeStatus",
     "TomlPermissionStore",
+    "build_direct_responses_runner",
     "build_runtime",
     "load_runtime_config",
 ]

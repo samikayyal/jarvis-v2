@@ -46,6 +46,10 @@ class FakeRunner:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.wait = False
+        self.sessions_started = 0
+
+    def start_session(self) -> None:
+        self.sessions_started += 1
 
     async def run(
         self, text: str, *, model: str, reasoning: str, system_prompt: str
