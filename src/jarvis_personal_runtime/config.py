@@ -11,6 +11,7 @@ the configured vault may be an external absolute directory.
 from __future__ import annotations
 
 import ast
+import ipaddress
 import math
 import re
 import tomllib
@@ -60,6 +61,8 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "message_cache_retention_days": 7,
         "trace_path": "data/runtime-trace.jsonl",
         "trace_max_bytes": 10 * 1024 * 1024,
+        "listener_host": None,
+        "listener_port": None,
         "system_prompt_path": "SYSTEM.md",
         "vault_path": None,
         "openwa_api_base_url": None,
@@ -158,6 +161,8 @@ class RuntimeConfig:
     message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
     trace_path: Path = Path(DEFAULTS["trace_path"])
     trace_max_bytes: int = DEFAULTS["trace_max_bytes"]
+    listener_host: str | None = DEFAULTS["listener_host"]
+    listener_port: int | None = DEFAULTS["listener_port"]
     system_prompt_path: Path = Path(DEFAULTS["system_prompt_path"])
     vault_path: Path | None = DEFAULTS["vault_path"]
     openwa_api_base_url: str | None = DEFAULTS["openwa_api_base_url"]
@@ -253,6 +258,8 @@ _RUNTIME_KEYS = {
     "message_cache_retention_days",
     "trace_path",
     "trace_max_bytes",
+    "listener_host",
+    "listener_port",
     "system_prompt_path",
     "vault_path",
     "openwa_api_base_url",
@@ -570,6 +577,12 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         trace_max_bytes = _setting(
             values, "trace_max_bytes", default=DEFAULTS["trace_max_bytes"]
         )
+        listener_host_value = _setting(
+            values, "listener_host", default=DEFAULTS["listener_host"]
+        )
+        listener_port_value = _setting(
+            values, "listener_port", default=DEFAULTS["listener_port"]
+        )
         prompt_path_value = _setting(
             values, "system_prompt_path", default=DEFAULTS["system_prompt_path"]
         )
@@ -634,6 +647,29 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         output_limit = _positive_int(output_limit, path, "max_output_chars")
         retention = _positive_int(retention, path, "message_cache_retention_days")
         trace_max_bytes = _positive_int(trace_max_bytes, path, "trace_max_bytes")
+        listener_host = _optional_string(listener_host_value, path, "listener_host")
+        listener_port = listener_port_value
+        if (listener_host is None) != (listener_port is None):
+            raise ConfigError(
+                path, "listener_host and listener_port must be configured together"
+            )
+        if listener_host is not None:
+            try:
+                listener_address = ipaddress.IPv4Address(listener_host)
+            except ipaddress.AddressValueError as exc:
+                raise ConfigError(
+                    path, "listener_host must be a private IPv4 address"
+                ) from exc
+            private_networks = (
+                ipaddress.IPv4Network("10.0.0.0/8"),
+                ipaddress.IPv4Network("172.16.0.0/12"),
+                ipaddress.IPv4Network("192.168.0.0/16"),
+            )
+            if not any(listener_address in network for network in private_networks):
+                raise ConfigError(path, "listener_host must be a private IPv4 address")
+            listener_port = _positive_int(listener_port, path, "listener_port")
+            if listener_port > 65_535:
+                raise ConfigError(path, "listener_port must not exceed 65535")
         if retention != DEFAULTS["message_cache_retention_days"]:
             raise ConfigError(path, "message_cache_retention_days is fixed at 7")
         cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
@@ -728,6 +764,8 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         message_cache_retention_days=retention,
         trace_path=trace_path,
         trace_max_bytes=trace_max_bytes,
+        listener_host=listener_host,
+        listener_port=listener_port,
         system_prompt_path=prompt_path,
         vault_path=vault_path,
         openwa_api_base_url=openwa_api_base_url,

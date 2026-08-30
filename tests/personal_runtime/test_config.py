@@ -59,6 +59,8 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.message_cache_path == tmp_path / "data" / "message-cache.json"
     assert loaded.config.trace_path == tmp_path / "data" / "runtime-trace.jsonl"
     assert loaded.config.trace_max_bytes == 10 * 1024 * 1024
+    assert loaded.config.listener_host is None
+    assert loaded.config.listener_port is None
     assert loaded.config.vault_path is None
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
@@ -96,6 +98,8 @@ windows_read_only_prefixes = ["Get-ChildItem", "Get-Content"]
 message_cache_path = "state/message-ids.json"
 trace_path = "trace/events.jsonl"
 trace_max_bytes = 2048
+listener_host = "172.17.0.1"
+listener_port = 8787
 vault_path = "vault"
 """,
     )
@@ -125,6 +129,8 @@ vault_path = "vault"
     assert loaded.config.message_cache_path == tmp_path / "state" / "message-ids.json"
     assert loaded.config.trace_path == tmp_path / "trace" / "events.jsonl"
     assert loaded.config.trace_max_bytes == 2048
+    assert loaded.config.listener_host == "172.17.0.1"
+    assert loaded.config.listener_port == 8787
     assert loaded.config.vault_path == tmp_path / "vault"
 
 
@@ -181,6 +187,26 @@ def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:
         ('[runtime]\ntrace_path = "../outside.jsonl"\n', "trace_path"),
         ("[runtime]\nvault_path = 3\n", "vault_path"),
         ("[runtime]\ntrace_max_bytes = 0\n", "trace_max_bytes"),
+        (
+            '[runtime]\nlistener_host = "0.0.0.0"\nlistener_port = 8787\n',
+            "listener_host",
+        ),
+        (
+            '[runtime]\nlistener_host = "127.0.0.1"\nlistener_port = 8787\n',
+            "listener_host",
+        ),
+        (
+            '[runtime]\nlistener_host = "8.8.8.8"\nlistener_port = 8787\n',
+            "listener_host",
+        ),
+        (
+            '[runtime]\nlistener_host = "172.17.0.1"\n',
+            "listener_host and listener_port",
+        ),
+        (
+            '[runtime]\nlistener_host = "172.17.0.1"\nlistener_port = 70000\n',
+            "listener_port",
+        ),
         (
             "[runtime]\nmessage_cache_retention_days = 8\n",
             "message_cache_retention_days",

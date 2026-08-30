@@ -1,0 +1,43 @@
+[Unit]
+Description=Jarvis personal assistant runtime
+Documentation=file:/opt/jarvis-personal-runtime/current/deployment/personal-runtime/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=jarvis-personal-runtime
+Group=jarvis-personal-runtime
+UMask=0077
+WorkingDirectory=/var/lib/jarvis-personal-runtime
+ExecStartPre=/opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime --root /var/lib/jarvis-personal-runtime --check
+ExecStart=/opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime --root /var/lib/jarvis-personal-runtime
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarvis-personal-runtime
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/jarvis-personal-runtime
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

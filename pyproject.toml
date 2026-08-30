@@ -11,6 +11,9 @@ dependencies = [
     "tiktoken>=0.14.0",
 ]
 
+[project.scripts]
+jarvis-personal-runtime = "jarvis_personal_runtime.service:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
