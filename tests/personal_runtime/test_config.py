@@ -52,7 +52,6 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.message_cache_path == tmp_path / "data" / "message-cache.json"
     assert loaded.config.trace_path == tmp_path / "data" / "runtime-trace.jsonl"
     assert loaded.config.trace_max_bytes == 10 * 1024 * 1024
-    assert loaded.config.trace_backup_count == 5
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
     assert loaded.secrets.openai_api_key == "sk-test"
@@ -82,7 +81,6 @@ max_output_chars = 999
 message_cache_path = "state/message-ids.json"
 trace_path = "trace/events.jsonl"
 trace_max_bytes = 2048
-trace_backup_count = 3
 """,
     )
 
@@ -99,7 +97,6 @@ trace_backup_count = 3
     assert loaded.config.message_cache_path == tmp_path / "state" / "message-ids.json"
     assert loaded.config.trace_path == tmp_path / "trace" / "events.jsonl"
     assert loaded.config.trace_max_bytes == 2048
-    assert loaded.config.trace_backup_count == 3
 
 
 def test_openwa_handoff_identities_load_from_toml_not_the_secret_file(
@@ -141,7 +138,6 @@ openwa_operator_chat_id = "962790000000@c.us"
         ('[runtime]\nmessage_cache_path = "/outside.json"\n', "message_cache_path"),
         ('[runtime]\ntrace_path = "../outside.jsonl"\n', "trace_path"),
         ("[runtime]\ntrace_max_bytes = 0\n", "trace_max_bytes"),
-        ("[runtime]\ntrace_backup_count = 0\n", "trace_backup_count"),
         (
             "[runtime]\nmessage_cache_retention_days = 8\n",
             "message_cache_retention_days",

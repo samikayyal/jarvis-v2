@@ -130,9 +130,7 @@ async def test_trace_storage_failure_warns_operator_without_blocking_reply(
 ) -> None:
     parent_file = tmp_path / "not-a-directory"
     parent_file.write_text("occupied", encoding="utf-8")
-    trace = JsonlRuntimeTrace(
-        parent_file / "runtime.jsonl", max_bytes=1_000, backup_count=1
-    )
+    trace = JsonlRuntimeTrace(parent_file / "runtime.jsonl", max_bytes=1_000)
     runner = FakeRunner(Completed("done"))
     runtime = PersonalRuntime(request_runner=runner, clock=FakeClock(), trace=trace)
 

@@ -15,7 +15,7 @@ from openai import AsyncOpenAI
 
 from .config import RuntimeConfig
 from .runtime import Completed, ContextLimitReached
-from .trace import JsonlRuntimeTrace
+from .trace import build_runtime_trace
 
 
 def canonical_context(
@@ -469,11 +469,7 @@ def build_direct_responses_runner(
 ) -> DirectResponsesRunner:
     """Compose the pinned SDK adapter with the configured loop limits."""
 
-    sink = trace or JsonlRuntimeTrace(
-        config.trace_path,
-        max_bytes=config.trace_max_bytes,
-        backup_count=config.trace_backup_count,
-    )
+    sink = trace or build_runtime_trace(config)
     adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     return DirectResponsesRunner(
         adapter,

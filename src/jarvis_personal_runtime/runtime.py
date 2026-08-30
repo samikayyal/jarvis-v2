@@ -13,7 +13,7 @@ from uuid import uuid4
 from .config import LoadedRuntimeConfig, RuntimeConfig, load_runtime_config
 from .dedup import CacheError, MessageIdCache
 from .permissions import PermissionRule, TomlPermissionStore
-from .trace import JsonlRuntimeTrace
+from .trace import build_runtime_trace
 
 BUSY_NOTICE = "Jarvis is busy with another request. Use /cancel to stop it."
 CANCELLED_NOTICE = (
@@ -684,11 +684,7 @@ def build_runtime(
         clock=clock,
         trace=trace
         or getattr(request_runner, "trace", None)
-        or JsonlRuntimeTrace(
-            loaded.config.trace_path,
-            max_bytes=loaded.config.trace_max_bytes,
-            backup_count=loaded.config.trace_backup_count,
-        ),
+        or build_runtime_trace(loaded.config),
     )
 
 

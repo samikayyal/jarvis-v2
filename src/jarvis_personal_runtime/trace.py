@@ -10,6 +10,8 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .config import RuntimeConfig
+
 TRACE_FAILURE_WARNING = "Warning: runtime trace could not be written; work continued."
 
 
@@ -25,7 +27,6 @@ class JsonlRuntimeTrace:
         path: str | Path,
         *,
         max_bytes: int,
-        backup_count: int,
         warning: Callable[[str], object] | None = None,
         clock: Callable[[], datetime] = _system_now,
     ) -> None:
@@ -35,15 +36,8 @@ class JsonlRuntimeTrace:
             or max_bytes <= 0
         ):
             raise ValueError("max_bytes must be a positive integer")
-        if (
-            not isinstance(backup_count, int)
-            or isinstance(backup_count, bool)
-            or backup_count <= 0
-        ):
-            raise ValueError("backup_count must be a positive integer")
         self.path = Path(path)
         self.max_bytes = max_bytes
-        self.backup_count = backup_count
         self._warning = warning or (lambda message: print(message, file=sys.stderr))
         self._clock = clock
         self._warning_pending = False
@@ -90,13 +84,16 @@ class JsonlRuntimeTrace:
         return (serialized + "\n").encode("utf-8")
 
     def _rotate(self) -> None:
-        oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
-        oldest.unlink(missing_ok=True)
-        for index in range(self.backup_count - 1, 0, -1):
-            source = self.path.with_name(f"{self.path.name}.{index}")
-            if source.exists():
-                source.replace(self.path.with_name(f"{self.path.name}.{index + 1}"))
-        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
+        index = 1
+        while self.path.with_name(f"{self.path.name}.{index}").exists():
+            index += 1
+        self.path.replace(self.path.with_name(f"{self.path.name}.{index}"))
 
 
-__all__ = ["TRACE_FAILURE_WARNING", "JsonlRuntimeTrace"]
+def build_runtime_trace(config: RuntimeConfig) -> JsonlRuntimeTrace:
+    """Build the one trace sink shared by runtime adapters."""
+
+    return JsonlRuntimeTrace(config.trace_path, max_bytes=config.trace_max_bytes)
+
+
+__all__ = ["TRACE_FAILURE_WARNING", "JsonlRuntimeTrace", "build_runtime_trace"]

@@ -11,7 +11,7 @@ NOW = datetime(2026, 8, 30, 12, 34, 56, tzinfo=UTC)
 
 def test_trace_writes_verbatim_payload_as_one_json_line(tmp_path: Path) -> None:
     path = tmp_path / "trace" / "runtime.jsonl"
-    trace = JsonlRuntimeTrace(path, max_bytes=10_000, backup_count=2, clock=lambda: NOW)
+    trace = JsonlRuntimeTrace(path, max_bytes=10_000, clock=lambda: NOW)
 
     payload = {"message": "café\nsecond line", "items": [{"secret": "verbatim"}]}
     trace.record("authorized_message", payload)
@@ -29,7 +29,7 @@ def test_trace_rotates_complete_json_lines_before_crossing_size_limit(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "runtime.jsonl"
-    trace = JsonlRuntimeTrace(path, max_bytes=120, backup_count=2, clock=lambda: NOW)
+    trace = JsonlRuntimeTrace(path, max_bytes=120, clock=lambda: NOW)
 
     trace.record("first", {"value": "a" * 25})
     first_line = path.read_text(encoding="utf-8")
@@ -39,6 +39,22 @@ def test_trace_rotates_complete_json_lines_before_crossing_size_limit(
     assert json.loads(path.read_text(encoding="utf-8"))["event"] == "second"
 
 
+def test_trace_rotation_never_deletes_an_older_segment(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.jsonl"
+    trace = JsonlRuntimeTrace(path, max_bytes=120, clock=lambda: NOW)
+
+    for event in ("first", "second", "third", "fourth"):
+        trace.record(event, {"value": event * 6})
+
+    retained = [
+        json.loads((tmp_path / f"runtime.jsonl.{index}").read_text(encoding="utf-8"))[
+            "event"
+        ]
+        for index in (1, 2, 3)
+    ]
+    assert retained == ["first", "second", "third"]
+
+
 def test_trace_failure_warns_once_and_never_blocks_work(tmp_path: Path) -> None:
     parent_file = tmp_path / "not-a-directory"
     parent_file.write_text("occupied", encoding="utf-8")
@@ -46,7 +62,6 @@ def test_trace_failure_warns_once_and_never_blocks_work(tmp_path: Path) -> None:
     trace = JsonlRuntimeTrace(
         parent_file / "runtime.jsonl",
         max_bytes=1_000,
-        backup_count=1,
         warning=warnings.append,
         clock=lambda: NOW,
     )
