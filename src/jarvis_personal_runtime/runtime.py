@@ -672,6 +672,20 @@ def build_runtime(
     """Load all three runtime files and compose replacement-owned persistence."""
 
     loaded: LoadedRuntimeConfig = load_runtime_config(root)
+    return build_runtime_from_loaded(
+        loaded, request_runner=request_runner, clock=clock, trace=trace
+    )
+
+
+def build_runtime_from_loaded(
+    loaded: LoadedRuntimeConfig,
+    *,
+    request_runner: RequestRunner,
+    clock: Clock | None = None,
+    trace: RuntimeTrace | None = None,
+) -> PersonalRuntime:
+    """Compose a runtime from one already validated configuration snapshot."""
+
     return PersonalRuntime(
         loaded.config,
         request_runner=request_runner,
@@ -680,7 +694,7 @@ def build_runtime(
             loaded.config.message_cache_path,
             timedelta(days=loaded.config.message_cache_retention_days),
         ),
-        permission_store=TomlPermissionStore(Path(root) / "jarvis.toml"),
+        permission_store=TomlPermissionStore(loaded.config.root / "jarvis.toml"),
         clock=clock,
         trace=trace
         or getattr(request_runner, "trace", None)
@@ -725,4 +739,5 @@ __all__ = [
     "RuntimeResult",
     "RuntimeStatus",
     "build_runtime",
+    "build_runtime_from_loaded",
 ]

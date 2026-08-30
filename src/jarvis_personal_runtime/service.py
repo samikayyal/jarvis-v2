@@ -7,20 +7,17 @@ import asyncio
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
 from .config import ConfigError, LoadedRuntimeConfig, RuntimeConfig, load_runtime_config
-from .dedup import MessageIdCache
 from .openwa import (
     OpenWASettings,
     WebhookAcknowledgement,
     build_openwa_message_flow,
 )
-from .permissions import TomlPermissionStore
 from .responses import build_direct_responses_runner
-from .runtime import PersonalRuntime
+from .runtime import build_runtime_from_loaded
 from .trace import build_runtime_trace
 
 MAX_HEADER_BYTES = 16 * 1024
@@ -88,15 +85,9 @@ def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConf
     runner = build_direct_responses_runner(
         loaded.secrets.openai_api_key, config, trace=trace
     )
-    runtime = PersonalRuntime(
-        config,
+    runtime = build_runtime_from_loaded(
+        loaded,
         request_runner=runner,
-        system_prompt=loaded.system_prompt,
-        cache=MessageIdCache(
-            config.message_cache_path,
-            timedelta(days=config.message_cache_retention_days),
-        ),
-        permission_store=TomlPermissionStore(config.root / "jarvis.toml"),
         trace=trace,
     )
     flow = build_openwa_message_flow(loaded, runtime)

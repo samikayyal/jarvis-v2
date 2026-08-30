@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = ROOT / "deployment" / "personal-runtime"
+
+
+def test_replacement_package_has_valid_source_and_dependency_pins() -> None:
+    entries = (PACKAGE / "SHA256SUMS").read_text(encoding="ascii").splitlines()
+    pinned_paths = set()
+    for entry in entries:
+        expected, relative_path = entry.split("  ", 1)
+        pinned_paths.add(relative_path)
+        assert (
+            hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == expected
+        )
+
+    runtime_sources = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "src" / "jarvis_personal_runtime").glob("*.py")
+    }
+    assert runtime_sources <= pinned_paths
+    assert "pyproject.toml" in pinned_paths
+    assert "deployment/personal-runtime/requirements.lock" in pinned_paths
+
+    requirements = (PACKAGE / "requirements.lock").read_text(encoding="utf-8")
+    for requirement in ("httpx==0.28.1", "openai==2.53.0", "tiktoken==0.14.0"):
+        assert requirement in requirements
+    assert "--hash=sha256:" in requirements
 
 
 def test_native_service_runs_only_the_replacement_with_private_state() -> None:
@@ -23,7 +48,8 @@ def test_native_service_runs_only_the_replacement_with_private_state() -> None:
     )
     assert "StandardOutput=journal" in unit
     assert "StandardError=journal" in unit
-    assert "ProtectSystem=strict" in unit
+    assert "ProtectSystem=full" in unit
+    assert "ProtectHome=" not in unit
     assert "ReadWritePaths=/var/lib/jarvis-personal-runtime" in unit
     assert "jarvis_control_plane" not in unit
     assert "EnvironmentFile=" not in unit
@@ -46,7 +72,11 @@ def test_runbook_keeps_validation_inactive_and_documents_operations() -> None:
     runbook = (PACKAGE / "README.md").read_text(encoding="utf-8")
     required = (
         "Validation without activation",
-        "chmod 0600 .env jarvis.toml SYSTEM.md",
+        "sha256sum --check deployment/personal-runtime/SHA256SUMS",
+        "uv pip install --python .venv/bin/python --require-hashes",
+        "chown root:jarvis-personal-runtime .env",
+        "chmod 0440 .env",
+        "chmod 0600 jarvis.toml SYSTEM.md",
         "systemctl start jarvis-personal-runtime",
         "systemctl stop jarvis-personal-runtime",
         "systemctl status jarvis-personal-runtime",

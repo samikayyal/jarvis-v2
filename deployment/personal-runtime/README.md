@@ -5,10 +5,11 @@ It does not install, enable, start, stop, or replace any service by itself. Tick
 12 owns live installation and cutover with the authorized operator present.
 
 The service reads `.env`, `jarvis.toml`, and `SYSTEM.md` directly from
-`/var/lib/jarvis-personal-runtime`. The service account owns that directory. All
-three files use mode `0600`: `.env` is owner-readable only, while the operator may
-edit TOML and the system prompt through an administrative editor. The runtime
-changes only `[saved_permissions]` in TOML. The seven-day message-ID cache and
+`/var/lib/jarvis-personal-runtime`. The service account owns that directory. The
+static `.env` is root-owned, group-readable only by the consuming service, and
+mode `0440`. The service account owns the mode-`0600` TOML and system prompt;
+the operator may edit them through an administrative editor. The runtime changes
+only `[saved_permissions]` in TOML. The seven-day message-ID cache and
 the rotating verbatim JSON Lines trace live below `data/`; full rotated segments
 are retained as `runtime-trace.jsonl.N` rather than deleted.
 
@@ -25,10 +26,21 @@ uv run ruff check src/jarvis_personal_runtime tests/personal_runtime
 uv run ruff format --check src/jarvis_personal_runtime tests/personal_runtime
 ```
 
-On the target Ubuntu host, stage a candidate in a new release directory and build
-its virtual environment without changing the `current` symlink. Make a separate
-temporary runtime directory from the three examples, replace every placeholder
-with reviewed non-production validation values, and run:
+On the target Ubuntu host, stage the reviewed Git tree in a new release directory
+named by its commit and verify its replacement-specific checksums before building
+the hash-locked virtual environment. Do not change the `current` symlink:
+
+```console
+cd /opt/jarvis-personal-runtime/releases/CANDIDATE
+sha256sum --check deployment/personal-runtime/SHA256SUMS
+uv venv --python /usr/bin/python3.13 .venv
+uv pip install --python .venv/bin/python --require-hashes \
+  -r deployment/personal-runtime/requirements.lock
+uv pip install --python .venv/bin/python --no-deps .
+```
+
+Make a separate temporary runtime directory from the three examples, replace
+every placeholder with reviewed non-production validation values, and run:
 
 ```console
 /opt/jarvis-personal-runtime/releases/CANDIDATE/.venv/bin/jarvis-personal-runtime \
@@ -61,14 +73,26 @@ sudo install -d -o jarvis-personal-runtime -g jarvis-personal-runtime -m 0700 \
   /var/lib/jarvis-personal-runtime
 ```
 
+After the exact candidate is approved, atomically point `current` to its immutable
+commit-named release directory:
+
+```console
+sudo ln -sfn /opt/jarvis-personal-runtime/releases/CANDIDATE \
+  /opt/jarvis-personal-runtime/current.new
+sudo mv -T /opt/jarvis-personal-runtime/current.new \
+  /opt/jarvis-personal-runtime/current
+```
+
 Copy `.env.example` as `.env`, `jarvis.toml.example` as `jarvis.toml`, and
 `SYSTEM.md.example` as `SYSTEM.md`, then fill them through `sudoedit`. Never put
 real secrets in the repository, shell history, command output, or the journal.
 
 ```console
 cd /var/lib/jarvis-personal-runtime
-sudo chown jarvis-personal-runtime:jarvis-personal-runtime .env jarvis.toml SYSTEM.md
-sudo chmod 0600 .env jarvis.toml SYSTEM.md
+sudo chown root:jarvis-personal-runtime .env
+sudo chmod 0440 .env
+sudo chown jarvis-personal-runtime:jarvis-personal-runtime jarvis.toml SYSTEM.md
+sudo chmod 0600 jarvis.toml SYSTEM.md
 sudo -u jarvis-personal-runtime \
   /opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime \
   --root /var/lib/jarvis-personal-runtime --check
