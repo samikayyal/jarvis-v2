@@ -15,8 +15,10 @@ from jarvis_personal_runtime.runtime import (
     InboundText,
     PendingAction,
     PersonalRuntime,
+    RuntimeDisposition,
     build_runtime,
 )
+from jarvis_personal_runtime.trace import TRACE_FAILURE_WARNING, JsonlRuntimeTrace
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
@@ -120,6 +122,24 @@ async def test_ordinary_text_starts_one_request_and_returns_completed_reply() ->
     assert result.replies == ("done",)
     assert runner.calls == [("hello", "gpt-5.6-luna", "medium")]
     assert runtime.status().active_request is None
+
+
+@async_test
+async def test_trace_storage_failure_warns_operator_without_blocking_reply(
+    tmp_path: Path,
+) -> None:
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("occupied", encoding="utf-8")
+    trace = JsonlRuntimeTrace(
+        parent_file / "runtime.jsonl", max_bytes=1_000, backup_count=1
+    )
+    runner = FakeRunner(Completed("done"))
+    runtime = PersonalRuntime(request_runner=runner, clock=FakeClock(), trace=trace)
+
+    result = await runtime.receive(inbound("trace-failure", "hello"))
+
+    assert result.disposition is RuntimeDisposition.COMPLETED
+    assert result.replies == ("done", TRACE_FAILURE_WARNING)
 
 
 @async_test

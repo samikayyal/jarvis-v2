@@ -50,6 +50,9 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "max_output_chars": 65_536,
         "message_cache_path": "data/message-cache.json",
         "message_cache_retention_days": 7,
+        "trace_path": "data/runtime-trace.jsonl",
+        "trace_max_bytes": 10 * 1024 * 1024,
+        "trace_backup_count": 5,
         "system_prompt_path": "SYSTEM.md",
         "openwa_api_base_url": None,
         "openwa_internal_session_id": None,
@@ -138,6 +141,9 @@ class RuntimeConfig:
     max_output_chars: int = DEFAULTS["max_output_chars"]
     message_cache_path: Path = Path(DEFAULTS["message_cache_path"])
     message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
+    trace_path: Path = Path(DEFAULTS["trace_path"])
+    trace_max_bytes: int = DEFAULTS["trace_max_bytes"]
+    trace_backup_count: int = DEFAULTS["trace_backup_count"]
     system_prompt_path: Path = Path(DEFAULTS["system_prompt_path"])
     openwa_api_base_url: str | None = DEFAULTS["openwa_api_base_url"]
     openwa_internal_session_id: str | None = DEFAULTS["openwa_internal_session_id"]
@@ -223,6 +229,9 @@ _RUNTIME_KEYS = {
     "output_limit",
     "message_cache_path",
     "message_cache_retention_days",
+    "trace_path",
+    "trace_max_bytes",
+    "trace_backup_count",
     "system_prompt_path",
     "openwa_api_base_url",
     "openwa_internal_session_id",
@@ -472,6 +481,15 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             "message_cache_retention_days",
             default=DEFAULTS["message_cache_retention_days"],
         )
+        trace_path_value = _setting(
+            values, "trace_path", default=DEFAULTS["trace_path"]
+        )
+        trace_max_bytes = _setting(
+            values, "trace_max_bytes", default=DEFAULTS["trace_max_bytes"]
+        )
+        trace_backup_count = _setting(
+            values, "trace_backup_count", default=DEFAULTS["trace_backup_count"]
+        )
         prompt_path_value = _setting(
             values, "system_prompt_path", default=DEFAULTS["system_prompt_path"]
         )
@@ -532,9 +550,14 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_tool_rounds = _positive_int(max_tool_rounds, path, "max_tool_rounds")
         output_limit = _positive_int(output_limit, path, "max_output_chars")
         retention = _positive_int(retention, path, "message_cache_retention_days")
+        trace_max_bytes = _positive_int(trace_max_bytes, path, "trace_max_bytes")
+        trace_backup_count = _positive_int(
+            trace_backup_count, path, "trace_backup_count"
+        )
         if retention != DEFAULTS["message_cache_retention_days"]:
             raise ConfigError(path, "message_cache_retention_days is fixed at 7")
         cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
+        trace_path = _rooted_path(trace_path_value, root, path, "trace_path")
         prompt_path = _rooted_path(prompt_path_value, root, path, "system_prompt_path")
         openwa_api_base_url = _optional_string(
             openwa_api_base_url, path, "openwa_api_base_url"
@@ -572,6 +595,9 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_output_chars=output_limit,
         message_cache_path=cache_path,
         message_cache_retention_days=retention,
+        trace_path=trace_path,
+        trace_max_bytes=trace_max_bytes,
+        trace_backup_count=trace_backup_count,
         system_prompt_path=prompt_path,
         openwa_api_base_url=openwa_api_base_url,
         openwa_internal_session_id=openwa_internal_session_id,

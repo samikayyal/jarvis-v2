@@ -6,11 +6,15 @@ from functools import wraps
 import httpx
 import pytest
 
+import jarvis_personal_runtime.responses as responses_module
 from jarvis_personal_runtime.responses import (
     DirectResponsesRunner,
     OpenAIRawResponsesAdapter,
     ResponsesResult,
+    canonical_context,
+    local_input_tokens,
 )
+from jarvis_personal_runtime.runtime import ContextLimitReached
 
 
 def async_test(function):
@@ -86,6 +90,179 @@ class BlockingResponses:
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
+
+
+def test_candidate_context_uses_the_stable_research_serializer() -> None:
+    assert canonical_context(
+        instructions="Help café.",
+        tools=({"name": "z", "type": "function"},),
+        input_items=({"content": "<|endoftext|>", "role": "user"},),
+    ) == (
+        '{"input":[{"content":"<|endoftext|>","role":"user"}],'
+        '"instructions":"Help café.",'
+        '"tools":[{"name":"z","type":"function"}]}'
+    )
+
+
+def test_local_counter_treats_special_looking_text_as_ordinary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, tuple[str, ...]]] = []
+
+    class Encoding:
+        def encode(
+            self, text: str, *, disallowed_special: tuple[str, ...]
+        ) -> list[int]:
+            observed.append((text, disallowed_special))
+            return [1, 2, 3]
+
+    monkeypatch.setattr(responses_module, "_CONTEXT_ENCODING", Encoding())
+    candidate = {
+        "instructions": "Help.",
+        "tools": [],
+        "input": [{"role": "user", "content": "<|endoftext|>"}],
+    }
+
+    assert local_input_tokens(candidate) == 3
+    assert observed == [
+        (
+            (
+                '{"input":[{"content":"<|endoftext|>","role":"user"}],'
+                '"instructions":"Help.","tools":[]}'
+            ),
+            (),
+        )
+    ]
+
+
+@async_test
+async def test_exact_context_limit_ends_session_before_initial_provider_call() -> None:
+    responses = FakeResponses(ResponsesResult(output=(), output_text="not called"))
+    observed: list[dict[str, object]] = []
+
+    def count(candidate: dict[str, object]) -> int:
+        observed.append(candidate)
+        return 100_000
+
+    runner = DirectResponsesRunner(
+        responses,
+        request_timeout_seconds=30,
+        max_context_tokens=100_000,
+        context_counter=count,
+    )
+
+    result = await runner.run(
+        "Hi", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+    )
+
+    assert isinstance(result, ContextLimitReached)
+    assert responses.calls == []
+    assert observed == [
+        {
+            "instructions": "Help.",
+            "tools": [],
+            "input": [{"role": "user", "content": "Hi"}],
+        }
+    ]
+
+
+@async_test
+async def test_continuation_is_gated_with_complete_tool_result_context() -> None:
+    call = {
+        "type": "function_call",
+        "name": "read_vault",
+        "call_id": "call_1",
+        "arguments": '{"query":"notes"}',
+    }
+    responses = FakeResponses(ResponsesResult(output=(call,), output_text=""))
+    tools = FakeTools()
+    candidates: list[dict[str, object]] = []
+
+    def count(candidate: dict[str, object]) -> int:
+        candidates.append(candidate)
+        return 1 if len(candidates) == 1 else 2
+
+    runner = DirectResponsesRunner(
+        responses,
+        tools=tools,
+        request_timeout_seconds=30,
+        max_context_tokens=2,
+        context_counter=count,
+    )
+
+    result = await runner.run(
+        "Read", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+    )
+
+    assert isinstance(result, ContextLimitReached)
+    assert len(responses.calls) == 1
+    assert candidates[-1]["input"] == [
+        {"role": "user", "content": "Read"},
+        call,
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": '{"text":"found"}',
+        },
+    ]
+
+
+@async_test
+async def test_oversized_final_text_is_rejected_without_entering_transcript() -> None:
+    responses = FakeResponses(
+        ResponsesResult(
+            output=({"type": "message", "content": "123456"},),
+            output_text="123456",
+        ),
+        ResponsesResult(output=(), output_text="small"),
+    )
+    runner = DirectResponsesRunner(
+        responses, request_timeout_seconds=30, max_output_chars=5
+    )
+
+    with pytest.raises(RuntimeError, match="configured output character limit"):
+        await runner.run(
+            "First",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+
+    await runner.run(
+        "Second",
+        model="gpt-5.6-luna",
+        reasoning="medium",
+        system_prompt="Help.",
+    )
+    request, _ = responses.calls[-1]
+    assert request["input"] == [{"role": "user", "content": "Second"}]
+
+
+@async_test
+async def test_provider_usage_is_traced_next_to_the_local_estimate() -> None:
+    trace = MemoryTrace()
+    runner = DirectResponsesRunner(
+        FakeResponses(
+            ResponsesResult(
+                output=(),
+                output_text="done",
+                usage={"input_tokens": 43, "output_tokens": 2},
+            )
+        ),
+        trace=trace,
+        request_timeout_seconds=30,
+        context_counter=lambda _candidate: 41,
+    )
+
+    await runner.run(
+        "Hi", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+    )
+
+    output = next(
+        payload for event, payload in trace.events if event == "responses_output"
+    )
+    assert output["projected_input_tokens"] == 41
+    assert output["usage"] == {"input_tokens": 43, "output_tokens": 2}
 
 
 @async_test

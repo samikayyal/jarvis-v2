@@ -13,6 +13,7 @@ from uuid import uuid4
 from .config import LoadedRuntimeConfig, RuntimeConfig, load_runtime_config
 from .dedup import CacheError, MessageIdCache
 from .permissions import PermissionRule, TomlPermissionStore
+from .trace import JsonlRuntimeTrace
 
 BUSY_NOTICE = "Jarvis is busy with another request. Use /cancel to stop it."
 CANCELLED_NOTICE = (
@@ -156,6 +157,18 @@ class PermissionStore(Protocol):
     def remove(self, selector: str) -> bool: ...
 
 
+class RuntimeTrace(Protocol):
+    def record(self, event: str, payload: dict[str, object]) -> None: ...
+
+
+class _NoTrace:
+    def record(self, event: str, payload: dict[str, object]) -> None:
+        return None
+
+    def take_warning(self) -> str | None:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class ActiveRequestStatus:
     request_id: str
@@ -261,6 +274,7 @@ class PersonalRuntime:
         cache: ClaimCache | None = None,
         permission_store: PermissionStore | None = None,
         clock: Clock | None = None,
+        trace: RuntimeTrace | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.request_runner = request_runner
@@ -268,6 +282,7 @@ class PersonalRuntime:
         self.cache = cache or _MemoryCache()
         self.permission_store = permission_store or _MemoryPermissions()
         self.clock = clock or _SystemClock()
+        self.trace = trace or _NoTrace()
         self._lock = asyncio.Lock()
         self._session: _Session | None = None
         self._model = self.config.model
@@ -300,6 +315,14 @@ class PersonalRuntime:
 
     async def receive(self, message: InboundText) -> RuntimeResult:
         now = _utc(self.clock.now())
+        self.trace.record(
+            "authorized_message",
+            {
+                "message_id": message.message_id,
+                "text": message.text,
+                "received_at": message.received_at.isoformat(),
+            },
+        )
         try:
             if not self.cache.claim(message.message_id, now):
                 return self._result(RuntimeDisposition.DUPLICATE)
@@ -322,6 +345,14 @@ class PersonalRuntime:
                 active = _Active(uuid4().hex, now, asyncio.current_task())
                 session.active = active
                 session.last_activity_at = now
+                self.trace.record(
+                    "request_started",
+                    {
+                        "session_id": session.session_id,
+                        "request_id": active.request_id,
+                        "message_id": message.message_id,
+                    },
+                )
                 operation = ("run", message.text, active.request_id)
 
         if operation is None:
@@ -357,6 +388,18 @@ class PersonalRuntime:
             "2": ApprovalDecision.SAVE_PERMISSION,
             "9": ApprovalDecision.REJECT,
         }[choice]
+        self.trace.record(
+            "approval_choice",
+            {
+                "choice": choice,
+                "decision": decision.value,
+                "action": {
+                    "host": pending.action.host,
+                    "prefix": pending.action.prefix,
+                    "display": pending.action.display,
+                },
+            },
+        )
         return ("save" if choice == "2" else "resume", decision)
 
     async def _save_and_resume(self, decision: object) -> RuntimeResult:
@@ -608,6 +651,14 @@ class PersonalRuntime:
     def _result(
         self, disposition: RuntimeDisposition, replies: tuple[str, ...] = ()
     ) -> RuntimeResult:
+        self.trace.record(
+            "runtime_result",
+            {"disposition": disposition.value, "replies": list(replies)},
+        )
+        take_warning = getattr(self.trace, "take_warning", None)
+        warning = take_warning() if callable(take_warning) else None
+        if warning and warning not in replies:
+            replies = (*replies, warning)
         return RuntimeResult(disposition, replies, self.status())
 
 
@@ -616,6 +667,7 @@ def build_runtime(
     *,
     request_runner: RequestRunner,
     clock: Clock | None = None,
+    trace: RuntimeTrace | None = None,
 ) -> PersonalRuntime:
     """Load all three runtime files and compose replacement-owned persistence."""
 
@@ -630,6 +682,13 @@ def build_runtime(
         ),
         permission_store=TomlPermissionStore(Path(root) / "jarvis.toml"),
         clock=clock,
+        trace=trace
+        or getattr(request_runner, "trace", None)
+        or JsonlRuntimeTrace(
+            loaded.config.trace_path,
+            max_bytes=loaded.config.trace_max_bytes,
+            backup_count=loaded.config.trace_backup_count,
+        ),
     )
 
 

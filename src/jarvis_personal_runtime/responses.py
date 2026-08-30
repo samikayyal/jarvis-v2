@@ -5,14 +5,51 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+import tiktoken
 from openai import AsyncOpenAI
 
 from .config import RuntimeConfig
-from .runtime import Completed
+from .runtime import Completed, ContextLimitReached
+from .trace import JsonlRuntimeTrace
+
+
+def canonical_context(
+    *,
+    instructions: str,
+    tools: tuple[dict[str, object], ...] | list[dict[str, object]],
+    input_items: tuple[dict[str, object], ...] | list[dict[str, object]],
+) -> str:
+    """Serialize the complete candidate context using the research contract."""
+
+    return json.dumps(
+        {
+            "instructions": instructions,
+            "tools": list(tools),
+            "input": list(input_items),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+_CONTEXT_ENCODING = tiktoken.get_encoding("o200k_base")
+
+
+def local_input_tokens(candidate: dict[str, object]) -> int:
+    """Return Jarvis's deterministic local estimate, not a server token count."""
+
+    canonical = canonical_context(
+        instructions=str(candidate["instructions"]),
+        tools=candidate["tools"],  # type: ignore[arg-type]
+        input_items=candidate["input"],  # type: ignore[arg-type]
+    )
+    return len(_CONTEXT_ENCODING.encode(canonical, disallowed_special=()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +58,7 @@ class ResponsesResult:
 
     output: tuple[dict[str, object], ...]
     output_text: str
+    usage: dict[str, object] | None = None
 
 
 class RawResponsesAdapter(Protocol):
@@ -168,7 +206,14 @@ class OpenAIRawResponsesAdapter:
         parsed_response = parsed.model_dump(mode="json")
         self._trace.record("responses_parsed", {"response": parsed_response})
         output = tuple(item.model_dump() for item in parsed.output)
-        return ResponsesResult(output=output, output_text=parsed.output_text)
+        usage = (
+            parsed.usage.model_dump(mode="json") if parsed.usage is not None else None
+        )
+        return ResponsesResult(
+            output=output,
+            output_text=parsed.output_text,
+            usage=usage,
+        )
 
     async def close(self) -> None:
         if self._owned_http_client is not None:
@@ -186,6 +231,9 @@ class DirectResponsesRunner:
         trace: TraceSink | None = None,
         request_timeout_seconds: float,
         max_tool_rounds: int = 8,
+        max_context_tokens: int = 100_000,
+        max_output_chars: int = 65_536,
+        context_counter: Callable[[dict[str, object]], int] = local_input_tokens,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -196,7 +244,18 @@ class DirectResponsesRunner:
         if max_tool_rounds <= 0:
             raise ValueError("max_tool_rounds must be positive")
         self._max_tool_rounds = max_tool_rounds
+        if max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be positive")
+        self._max_context_tokens = max_context_tokens
+        if max_output_chars <= 0:
+            raise ValueError("max_output_chars must be positive")
+        self._max_output_chars = max_output_chars
+        self._context_counter = context_counter
         self._transcript: list[dict[str, object]] = []
+
+    @property
+    def trace(self) -> TraceSink:
+        return self._trace
 
     def start_session(self) -> None:
         """Start ownership of a fresh in-memory working-session transcript."""
@@ -210,7 +269,7 @@ class DirectResponsesRunner:
         model: str,
         reasoning: str,
         system_prompt: str,
-    ) -> Completed:
+    ) -> Completed | ContextLimitReached:
         try:
             return await self._run_loop(
                 text,
@@ -241,16 +300,40 @@ class DirectResponsesRunner:
         model: str,
         reasoning: str,
         system_prompt: str,
-    ) -> Completed:
+    ) -> Completed | ContextLimitReached:
         transcript = [*self._transcript, {"role": "user", "content": text}]
         tool_rounds = 0
         async with asyncio.timeout(self._request_timeout_seconds) as deadline:
             while True:
+                tools = list(self._tools.definitions)
+                candidate = {
+                    "instructions": system_prompt,
+                    "tools": tools,
+                    "input": transcript,
+                }
+                projected_tokens = self._context_counter(candidate)
+                self._trace.record(
+                    "context_estimate",
+                    {
+                        "encoding": "o200k_base",
+                        "projected_input_tokens": projected_tokens,
+                        "max_context_tokens": self._max_context_tokens,
+                    },
+                )
+                if projected_tokens >= self._max_context_tokens:
+                    self._trace.record(
+                        "context_limit_reached",
+                        {
+                            "projected_input_tokens": projected_tokens,
+                            "max_context_tokens": self._max_context_tokens,
+                        },
+                    )
+                    return ContextLimitReached()
                 request: dict[str, object] = {
                     "model": model,
                     "instructions": system_prompt,
                     "input": transcript,
-                    "tools": list(self._tools.definitions),
+                    "tools": tools,
                     "reasoning": {"effort": reasoning},
                     "parallel_tool_calls": False,
                     "store": False,
@@ -264,6 +347,8 @@ class DirectResponsesRunner:
                     {
                         "output": list(response.output),
                         "output_text": response.output_text,
+                        "usage": response.usage,
+                        "projected_input_tokens": projected_tokens,
                     },
                 )
                 transcript = [*transcript, *response.output]
@@ -279,6 +364,17 @@ class DirectResponsesRunner:
                             {"reason": "missing_final_text"},
                         )
                         raise RuntimeError("provider response has no final text")
+                    if len(response.output_text) > self._max_output_chars:
+                        self._trace.record(
+                            "output_limit_exceeded",
+                            {
+                                "output_characters": len(response.output_text),
+                                "max_output_chars": self._max_output_chars,
+                            },
+                        )
+                        raise RuntimeError(
+                            "provider response exceeded configured output character limit"
+                        )
                     self._transcript = transcript
                     return Completed(response.output_text)
                 if len(calls) != 1:
@@ -294,6 +390,10 @@ class DirectResponsesRunner:
                 output = await self._execute_tool(call)
                 if not isinstance(output, str):
                     raise TypeError("prepared tool output must be a string")
+                if len(output) > self._max_output_chars:
+                    raise RuntimeError(
+                        "prepared tool result exceeded configured output character limit"
+                    )
                 self._trace.record(
                     "tool_result",
                     {
@@ -369,13 +469,20 @@ def build_direct_responses_runner(
 ) -> DirectResponsesRunner:
     """Compose the pinned SDK adapter with the configured loop limits."""
 
-    adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=trace)
+    sink = trace or JsonlRuntimeTrace(
+        config.trace_path,
+        max_bytes=config.trace_max_bytes,
+        backup_count=config.trace_backup_count,
+    )
+    adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     return DirectResponsesRunner(
         adapter,
         tools=tools,
-        trace=trace,
+        trace=sink,
         request_timeout_seconds=config.request_timeout_seconds,
         max_tool_rounds=config.max_tool_rounds,
+        max_context_tokens=config.max_context_tokens,
+        max_output_chars=config.max_output_chars,
     )
 
 
@@ -387,4 +494,6 @@ __all__ = [
     "ResponsesResult",
     "TraceSink",
     "build_direct_responses_runner",
+    "canonical_context",
+    "local_input_tokens",
 ]

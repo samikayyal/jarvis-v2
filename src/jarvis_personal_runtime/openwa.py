@@ -17,7 +17,7 @@ from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import LoadedRuntimeConfig
-from .runtime import InboundText, PersonalRuntime, RuntimeResult
+from .runtime import InboundText, PersonalRuntime, RuntimeResult, RuntimeTrace
 
 
 def _required_text(value: str, name: str) -> str:
@@ -225,6 +225,7 @@ class OpenWAMessageFlow:
         runtime: PersonalRuntime,
         sender: OpenWASender,
         clock: Clock | None = None,
+        trace: RuntimeTrace | None = None,
     ) -> None:
         if not isinstance(signing_secret, bytes):
             raise TypeError("signing_secret must be bytes")
@@ -235,6 +236,7 @@ class OpenWAMessageFlow:
         self._runtime = runtime
         self._sender = sender
         self._clock = clock or _SystemClock()
+        self._trace = trace or runtime.trace
         self._tasks: set[asyncio.Task[MessageOutcome]] = set()
 
     def receive_webhook(
@@ -308,19 +310,38 @@ class OpenWAMessageFlow:
         )
         outbound_ids: list[str] = []
         for chunk in chunks:
+            self._trace.record(
+                "openwa_send_attempt",
+                {"message_id": message.message_id, "text": chunk},
+            )
             try:
-                outbound_ids.append(
-                    await asyncio.to_thread(
-                        self._sender.send_text,
-                        self.settings.operator_chat_id,
-                        chunk,
-                    )
+                outbound_id = await asyncio.to_thread(
+                    self._sender.send_text,
+                    self.settings.operator_chat_id,
+                    chunk,
+                )
+                outbound_ids.append(outbound_id)
+                self._trace.record(
+                    "openwa_send_result",
+                    {
+                        "message_id": message.message_id,
+                        "outbound_id": outbound_id,
+                        "disposition": DeliveryDisposition.SENT.value,
+                    },
                 )
             except OpenWASendError as exc:
                 delivery = (
                     DeliveryDisposition.UNKNOWN
                     if exc.may_have_sent
                     else DeliveryDisposition.FAILED
+                )
+                self._trace.record(
+                    "openwa_send_error",
+                    {
+                        "message_id": message.message_id,
+                        "code": exc.code,
+                        "may_have_sent": exc.may_have_sent,
+                    },
                 )
                 return MessageOutcome(
                     message.message_id, result, tuple(outbound_ids), delivery
@@ -350,6 +371,7 @@ def build_openwa_message_flow(
         runtime=runtime,
         sender=sender or OpenWAHttpSender(settings),
         clock=clock,
+        trace=runtime.trace,
     )
 
 
