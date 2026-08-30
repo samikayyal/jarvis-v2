@@ -29,3 +29,8 @@ contract.
 
 - Completed on 2026-08-30 with focused personal-runtime tests, Ruff, formatting,
   and compile checks passing before the final repository-wide gate.
+- The single final full-suite run completed with 890 passed and 2 skipped. Its
+  four Ticket 27 failures all reported `application source differs from the
+  pinned artifact`: the immutable legacy deployment lock covers all `src/**/*.py`,
+  while Issue 02 explicitly prohibits repinning that rollback bundle around the
+  in-progress replacement runtime.
