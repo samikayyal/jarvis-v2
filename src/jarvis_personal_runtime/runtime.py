@@ -126,8 +126,6 @@ RequestStep = Completed | ApprovalRequired | ContextLimitReached
 
 
 class RequestRunner(Protocol):
-    def start_session(self) -> None: ...
-
     async def run(
         self,
         text: str,
@@ -564,7 +562,9 @@ class PersonalRuntime:
 
     def _ensure_session(self, now: datetime) -> _Session:
         if self._session is None:
-            self.request_runner.start_session()
+            start_session = getattr(self.request_runner, "start_session", None)
+            if callable(start_session):
+                start_session()
             self._session = _Session(
                 uuid4().hex,
                 now,

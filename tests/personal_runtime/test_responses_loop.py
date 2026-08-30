@@ -33,6 +33,16 @@ class FakeResponses:
         return self.results.pop(0)
 
 
+class FailingResponses(FakeResponses):
+    async def create(
+        self, request: dict[str, object], *, timeout: float
+    ) -> ResponsesResult:
+        self.calls.append((request, timeout))
+        if self.results:
+            return self.results.pop(0)
+        raise OSError("provider unavailable")
+
+
 class FakeTools:
     definitions = (
         {
@@ -227,6 +237,47 @@ async def test_malformed_tool_arguments_continue_as_a_tool_error() -> None:
     continuation, _ = responses.calls[1]
     assert continuation["input"][-1]["call_id"] == "call_bad_json"
     assert "JSONDecodeError" in continuation["input"][-1]["output"]
+
+
+@async_test
+async def test_failed_continuation_preserves_observed_tool_turn_in_session() -> None:
+    call = {
+        "type": "function_call",
+        "call_id": "call_done",
+        "name": "read_vault",
+        "arguments": "{}",
+    }
+    responses = FailingResponses(ResponsesResult(output=(call,), output_text=""))
+    runner = DirectResponsesRunner(
+        responses, tools=FakeTools(), request_timeout_seconds=30
+    )
+
+    with pytest.raises(OSError, match="provider unavailable"):
+        await runner.run(
+            "First",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+    responses.results.append(ResponsesResult(output=(), output_text="Recovered"))
+    result = await runner.run(
+        "Continue",
+        model="gpt-5.6-luna",
+        reasoning="medium",
+        system_prompt="Help.",
+    )
+
+    assert result.reply == "Recovered"
+    assert responses.calls[-1][0]["input"] == [
+        {"role": "user", "content": "First"},
+        call,
+        {
+            "type": "function_call_output",
+            "call_id": "call_done",
+            "output": '{"text":"found"}',
+        },
+        {"role": "user", "content": "Continue"},
+    ]
 
 
 @async_test
@@ -499,6 +550,9 @@ async def test_openai_adapter_traces_every_sdk_retry_attempt_and_raw_exchange() 
     raw = [p for e, p in trace.events if e == "responses_raw_exchange"][-1]
     assert '"store":false' in raw["request_body"].replace(" ", "")
     assert '"id":"resp_1"' in raw["response_body"].replace(" ", "")
+    parsed = [p for e, p in trace.events if e == "responses_parsed"][-1]
+    assert parsed["response"]["id"] == "resp_1"
+    assert parsed["response"]["status"] == "completed"
 
 
 @async_test

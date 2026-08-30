@@ -165,6 +165,8 @@ class OpenAIRawResponsesAdapter:
                 {"error": f"{type(exc).__name__}: {exc}"},
             )
             raise
+        parsed_response = parsed.model_dump(mode="json")
+        self._trace.record("responses_parsed", {"response": parsed_response})
         output = tuple(item.model_dump() for item in parsed.output)
         return ResponsesResult(output=output, output_text=parsed.output_text)
 
@@ -285,6 +287,7 @@ class DirectResponsesRunner:
                         {"function_call_count": len(calls)},
                     )
                     raise RuntimeError("provider returned multiple function calls")
+                self._transcript = transcript
                 if tool_rounds >= self._max_tool_rounds:
                     raise RuntimeError("configured tool-round limit reached")
                 call = calls[0]
@@ -307,6 +310,7 @@ class DirectResponsesRunner:
                         "output": output,
                     },
                 ]
+                self._transcript = transcript
                 tool_rounds += 1
 
     async def _execute_tool(self, call: dict[str, object]) -> str:
