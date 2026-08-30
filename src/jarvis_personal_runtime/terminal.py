@@ -86,14 +86,12 @@ def _is_simple_command(command: str) -> bool:
         if quote:
             if character == quote:
                 quote = None
-            elif quote == '"' and (
-                character == "`" or command[index : index + 2] == "$("
-            ):
+            elif quote == '"' and character in {"$", "`"}:
                 return False
             continue
         if character in {"'", '"'}:
             quote = character
-        elif character in _COMPOUND or command[index : index + 2] == "$(":
+        elif character in _COMPOUND or character == "$":
             return False
     if quote is not None or escaped:
         return False
@@ -152,6 +150,8 @@ class RunTerminalTool:
         self._permission_store = permission_store
         self._executor = executor
         self._timeout_seconds = timeout_seconds
+        if max_output_chars < 2:
+            raise ValueError("terminal output limit must be at least 2 characters")
         self._max_output_chars = max_output_chars
         self._trace = trace or _NoTrace()
 
@@ -240,18 +240,7 @@ class RunTerminalTool:
                 "output_truncated": result.output_truncated,
             },
         )
-        return json.dumps(
-            {
-                "exit_code": result.exit_code,
-                "stderr": result.stderr,
-                "stdout": result.stdout,
-                "timed_out": result.timed_out,
-                "output_truncated": result.output_truncated,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        return self._bounded_result(result)
 
     async def resume(self, continuation: object, *, approved: bool) -> str:
         if not isinstance(continuation, TerminalContinuation):
@@ -259,6 +248,32 @@ class RunTerminalTool:
         if not approved:
             return json.dumps({"rejected": True}, separators=(",", ":"))
         return await self.run_approved(continuation.command)
+
+    def _bounded_result(self, result: CommandResult) -> str:
+        payload: dict[str, object] = {
+            "exit_code": result.exit_code,
+            "output_truncated": result.output_truncated,
+            "stderr": result.stderr,
+            "stdout": result.stdout,
+            "timed_out": result.timed_out,
+        }
+        while True:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(encoded) <= self._max_output_chars:
+                return encoded
+            payload["output_truncated"] = True
+            key = "stderr" if payload["stderr"] else "stdout"
+            value = str(payload[key])
+            if not value:
+                minimal = '{"output_truncated":true}'
+                return minimal if len(minimal) <= self._max_output_chars else "{}"
+            remove = min(len(value), max(1, len(encoded) - self._max_output_chars))
+            payload[key] = value[:-remove]
 
 
 @dataclass(slots=True)

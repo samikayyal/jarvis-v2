@@ -67,6 +67,19 @@ class BlockingExecutor(FakeExecutor):
         raise AssertionError("unreachable")
 
 
+class OversizedExecutor(FakeExecutor):
+    async def run(
+        self, command: str, *, cwd: Path, timeout: float, max_output_chars: int
+    ) -> CommandResult:
+        self.calls.append((command, cwd, timeout, max_output_chars))
+        return CommandResult(
+            exit_code=0,
+            stdout='"\\n' * 1000,
+            stderr="error" * 1000,
+            output_truncated=True,
+        )
+
+
 class MemoryTrace:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict[str, object]]] = []
@@ -103,6 +116,8 @@ def inbound(message_id: str, text: str, *, hours: int = 0) -> InboundText:
         "git status || id",
         "git status > result.txt",
         "git status $(id)",
+        "git status $HOME",
+        'git status "${HOME}"',
         'git status "`id`"',
         "git status\nid",
         "bash status.sh",
@@ -307,3 +322,24 @@ async def test_terminal_cancellation_is_local_best_effort_and_not_retried(
     assert len(executor.calls) == 1
     assert trace.events[-1][0] == "terminal_execution_cancelled"
     assert trace.events[-1][1]["scope"] == "local_best_effort"
+
+
+@async_test
+async def test_serialized_terminal_tool_result_stays_within_output_limit(
+    tmp_path: Path,
+) -> None:
+    store = TomlPermissionStore(tmp_path / "jarvis.toml")
+    tool = RunTerminalTool(
+        working_directory=tmp_path,
+        read_only_prefixes=("pwd",),
+        permission_store=store,
+        executor=OversizedExecutor(),
+        timeout_seconds=17,
+        max_output_chars=120,
+    )
+
+    output = await tool.execute("run_terminal", {"host": "ubuntu", "command": "pwd"})
+
+    assert isinstance(output, str)
+    assert len(output) <= 120
+    assert json.loads(output)["output_truncated"] is True
