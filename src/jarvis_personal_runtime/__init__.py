@@ -22,6 +22,7 @@ from .runtime import (
     RuntimeStatus,
     build_runtime,
 )
+from .vault import ReadVaultTool, VaultToolError
 
 __all__ = [
     "ApprovalDecision",
@@ -38,6 +39,7 @@ __all__ = [
     "PermissionRule",
     "PermissionStoreError",
     "PersonalRuntime",
+    "ReadVaultTool",
     "ResponsesResult",
     "RuntimeConfig",
     "RuntimeDisposition",
@@ -45,6 +47,7 @@ __all__ = [
     "RuntimeSecrets",
     "RuntimeStatus",
     "TomlPermissionStore",
+    "VaultToolError",
     "build_direct_responses_runner",
     "build_runtime",
     "load_runtime_config",

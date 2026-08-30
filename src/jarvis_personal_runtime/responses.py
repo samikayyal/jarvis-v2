@@ -470,6 +470,12 @@ def build_direct_responses_runner(
     """Compose the pinned SDK adapter with the configured loop limits."""
 
     sink = trace or build_runtime_trace(config)
+    if tools is None and config.vault_path is not None:
+        from .vault import ReadVaultTool
+
+        tools = ReadVaultTool(
+            config.vault_path, max_result_chars=config.max_output_chars
+        )
     adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     return DirectResponsesRunner(
         adapter,

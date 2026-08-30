@@ -4,7 +4,8 @@ The replacement runtime deliberately has a small configuration boundary.  The
 ``.env`` file is read as a source of credentials, ``jarvis.toml`` contains only
 non-secret runtime settings, and ``SYSTEM.md`` is the editable system prompt.
 Loading never mutates the process environment and no writer in this module can
-write the credential file.
+write the credential file. Runtime-owned paths stay beneath the runtime root;
+the configured vault may be an external absolute directory.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "trace_path": "data/runtime-trace.jsonl",
         "trace_max_bytes": 10 * 1024 * 1024,
         "system_prompt_path": "SYSTEM.md",
+        "vault_path": None,
         "openwa_api_base_url": None,
         "openwa_internal_session_id": None,
         "openwa_named_session": None,
@@ -143,6 +145,7 @@ class RuntimeConfig:
     trace_path: Path = Path(DEFAULTS["trace_path"])
     trace_max_bytes: int = DEFAULTS["trace_max_bytes"]
     system_prompt_path: Path = Path(DEFAULTS["system_prompt_path"])
+    vault_path: Path | None = DEFAULTS["vault_path"]
     openwa_api_base_url: str | None = DEFAULTS["openwa_api_base_url"]
     openwa_internal_session_id: str | None = DEFAULTS["openwa_internal_session_id"]
     openwa_named_session: str | None = DEFAULTS["openwa_named_session"]
@@ -230,6 +233,7 @@ _RUNTIME_KEYS = {
     "trace_path",
     "trace_max_bytes",
     "system_prompt_path",
+    "vault_path",
     "openwa_api_base_url",
     "openwa_internal_session_id",
     "openwa_named_session",
@@ -416,6 +420,20 @@ def _rooted_path(value: Any, root: Path, path: Path, name: str) -> Path:
     return resolved
 
 
+def _optional_configured_path(
+    value: Any, root: Path, path: Path, name: str
+) -> Path | None:
+    if value is None:
+        return None
+    candidate = Path(_string(value, path, name)).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return candidate.resolve()
+    except OSError as exc:
+        raise ConfigError(path, f"cannot resolve {name}: {exc}") from exc
+
+
 def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConfig:
     values = _collect_runtime_values(raw, path)
 
@@ -487,6 +505,9 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         prompt_path_value = _setting(
             values, "system_prompt_path", default=DEFAULTS["system_prompt_path"]
         )
+        vault_path_value = _setting(
+            values, "vault_path", default=DEFAULTS["vault_path"]
+        )
         openwa_api_base_url = _setting(
             values, "openwa_api_base_url", default=DEFAULTS["openwa_api_base_url"]
         )
@@ -550,6 +571,9 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
         trace_path = _rooted_path(trace_path_value, root, path, "trace_path")
         prompt_path = _rooted_path(prompt_path_value, root, path, "system_prompt_path")
+        vault_path = _optional_configured_path(
+            vault_path_value, root, path, "vault_path"
+        )
         openwa_api_base_url = _optional_string(
             openwa_api_base_url, path, "openwa_api_base_url"
         )
@@ -589,6 +613,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         trace_path=trace_path,
         trace_max_bytes=trace_max_bytes,
         system_prompt_path=prompt_path,
+        vault_path=vault_path,
         openwa_api_base_url=openwa_api_base_url,
         openwa_internal_session_id=openwa_internal_session_id,
         openwa_named_session=openwa_named_session,
@@ -600,8 +625,8 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
 def load_runtime_config(root: str | Path = ".") -> LoadedRuntimeConfig:
     """Load and validate ``.env``, ``jarvis.toml`` and ``SYSTEM.md``.
 
-    ``root`` is the directory containing those three files.  All paths exposed
-    by the returned RuntimeConfig are resolved beneath that directory.
+    ``root`` is the directory containing those three files. Runtime-owned paths
+    are resolved beneath it, while an external absolute ``vault_path`` is kept.
     """
 
     root_path = Path(root).expanduser()

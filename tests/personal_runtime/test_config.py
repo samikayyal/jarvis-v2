@@ -52,6 +52,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.message_cache_path == tmp_path / "data" / "message-cache.json"
     assert loaded.config.trace_path == tmp_path / "data" / "runtime-trace.jsonl"
     assert loaded.config.trace_max_bytes == 10 * 1024 * 1024
+    assert loaded.config.vault_path is None
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
     assert loaded.secrets.openai_api_key == "sk-test"
@@ -81,6 +82,7 @@ max_output_chars = 999
 message_cache_path = "state/message-ids.json"
 trace_path = "trace/events.jsonl"
 trace_max_bytes = 2048
+vault_path = "vault"
 """,
     )
 
@@ -97,6 +99,7 @@ trace_max_bytes = 2048
     assert loaded.config.message_cache_path == tmp_path / "state" / "message-ids.json"
     assert loaded.config.trace_path == tmp_path / "trace" / "events.jsonl"
     assert loaded.config.trace_max_bytes == 2048
+    assert loaded.config.vault_path == tmp_path / "vault"
 
 
 def test_openwa_handoff_identities_load_from_toml_not_the_secret_file(
@@ -124,6 +127,18 @@ openwa_operator_chat_id = "962790000000@c.us"
     assert loaded.secrets.openwa_api_key == "openwa-test"
 
 
+def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:
+    external_vault = tmp_path.parent / "external-vault"
+    _write_runtime_files(
+        tmp_path,
+        toml=f'[runtime]\nvault_path = "{external_vault.as_posix()}"\n',
+    )
+
+    loaded = load_runtime_config(tmp_path)
+
+    assert loaded.config.vault_path == external_vault.resolve()
+
+
 @pytest.mark.parametrize(
     ("toml", "needle"),
     [
@@ -137,6 +152,7 @@ openwa_operator_chat_id = "962790000000@c.us"
         ("[runtime]\nmax_output_chars = 0\n", "max_output_chars"),
         ('[runtime]\nmessage_cache_path = "/outside.json"\n', "message_cache_path"),
         ('[runtime]\ntrace_path = "../outside.jsonl"\n', "trace_path"),
+        ("[runtime]\nvault_path = 3\n", "vault_path"),
         ("[runtime]\ntrace_max_bytes = 0\n", "trace_max_bytes"),
         (
             "[runtime]\nmessage_cache_retention_days = 8\n",
