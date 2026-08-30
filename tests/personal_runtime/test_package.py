@@ -27,7 +27,12 @@ def test_replacement_package_has_valid_source_and_dependency_pins() -> None:
     assert "deployment/personal-runtime/requirements.lock" in pinned_paths
 
     requirements = (PACKAGE / "requirements.lock").read_text(encoding="utf-8")
-    for requirement in ("httpx==0.28.1", "openai==2.53.0", "tiktoken==0.14.0"):
+    for requirement in (
+        "httpx==0.28.1",
+        "openai==2.53.0",
+        "setuptools==80.10.2",
+        "tiktoken==0.14.0",
+    ):
         assert requirement in requirements
     assert "--hash=sha256:" in requirements
 

@@ -36,7 +36,7 @@ sha256sum --check deployment/personal-runtime/SHA256SUMS
 uv venv --python /usr/bin/python3.13 .venv
 uv pip install --python .venv/bin/python --require-hashes \
   -r deployment/personal-runtime/requirements.lock
-uv pip install --python .venv/bin/python --no-deps .
+uv pip install --python .venv/bin/python --no-deps --no-build-isolation .
 ```
 
 Make a separate temporary runtime directory from the three examples, replace
