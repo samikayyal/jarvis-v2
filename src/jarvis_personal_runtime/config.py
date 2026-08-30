@@ -53,7 +53,8 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "system_prompt_path": "SYSTEM.md",
         "openwa_api_base_url": None,
         "openwa_internal_session_id": None,
-        "openwa_authorized_sender": None,
+        "openwa_named_session": None,
+        "openwa_authorized_operator_number": None,
         "openwa_operator_chat_id": None,
     }
 )
@@ -140,7 +141,10 @@ class RuntimeConfig:
     system_prompt_path: Path = Path(DEFAULTS["system_prompt_path"])
     openwa_api_base_url: str | None = DEFAULTS["openwa_api_base_url"]
     openwa_internal_session_id: str | None = DEFAULTS["openwa_internal_session_id"]
-    openwa_authorized_sender: str | None = DEFAULTS["openwa_authorized_sender"]
+    openwa_named_session: str | None = DEFAULTS["openwa_named_session"]
+    openwa_authorized_operator_number: str | None = DEFAULTS[
+        "openwa_authorized_operator_number"
+    ]
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
 
     @property
@@ -222,7 +226,8 @@ _RUNTIME_KEYS = {
     "system_prompt_path",
     "openwa_api_base_url",
     "openwa_internal_session_id",
-    "openwa_authorized_sender",
+    "openwa_named_session",
+    "openwa_authorized_operator_number",
     "openwa_operator_chat_id",
 }
 
@@ -478,10 +483,15 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             "openwa_internal_session_id",
             default=DEFAULTS["openwa_internal_session_id"],
         )
-        openwa_authorized_sender = _setting(
+        openwa_named_session = _setting(
             values,
-            "openwa_authorized_sender",
-            default=DEFAULTS["openwa_authorized_sender"],
+            "openwa_named_session",
+            default=DEFAULTS["openwa_named_session"],
+        )
+        openwa_authorized_operator_number = _setting(
+            values,
+            "openwa_authorized_operator_number",
+            default=DEFAULTS["openwa_authorized_operator_number"],
         )
         openwa_operator_chat_id = _setting(
             values,
@@ -532,8 +542,13 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         openwa_internal_session_id = _optional_string(
             openwa_internal_session_id, path, "openwa_internal_session_id"
         )
-        openwa_authorized_sender = _optional_string(
-            openwa_authorized_sender, path, "openwa_authorized_sender"
+        openwa_named_session = _optional_string(
+            openwa_named_session, path, "openwa_named_session"
+        )
+        openwa_authorized_operator_number = _optional_string(
+            openwa_authorized_operator_number,
+            path,
+            "openwa_authorized_operator_number",
         )
         openwa_operator_chat_id = _optional_string(
             openwa_operator_chat_id, path, "openwa_operator_chat_id"
@@ -560,7 +575,8 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         system_prompt_path=prompt_path,
         openwa_api_base_url=openwa_api_base_url,
         openwa_internal_session_id=openwa_internal_session_id,
-        openwa_authorized_sender=openwa_authorized_sender,
+        openwa_named_session=openwa_named_session,
+        openwa_authorized_operator_number=openwa_authorized_operator_number,
         openwa_operator_chat_id=openwa_operator_chat_id,
     )
 

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from threading import Event
 from typing import Self
 from urllib.request import Request
 
@@ -56,12 +57,25 @@ class _RecordingSender:
         return f"outbound-{len(self.sent)}"
 
 
+class _BlockingSender(_RecordingSender):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def send_text(self, chat_id: str, text: str) -> str:
+        self.entered.set()
+        self.release.wait(timeout=2)
+        return super().send_text(chat_id, text)
+
+
 def _settings() -> OpenWASettings:
     return OpenWASettings(
         api_base_url="http://openwa.test:2785/api",
         api_key="owa_k1_replacement",
         internal_session_id=SESSION_ID,
-        authorized_sender=OPERATOR,
+        named_session="jarvis",
+        authorized_operator_number=OPERATOR,
         operator_chat_id=OPERATOR,
     )
 
@@ -139,7 +153,8 @@ def test_reply_chunks_are_sent_once_each_in_deterministic_order() -> None:
             api_base_url="http://openwa.test:2785/api",
             api_key="owa_k1_replacement",
             internal_session_id=SESSION_ID,
-            authorized_sender=OPERATOR,
+            named_session="jarvis",
+            authorized_operator_number=OPERATOR,
             operator_chat_id=OPERATOR,
             max_text_characters=12,
         )
@@ -165,6 +180,36 @@ def test_reply_chunks_are_sent_once_each_in_deterministic_order() -> None:
     asyncio.run(scenario())
 
 
+def test_stalled_outbound_send_does_not_delay_the_next_webhook_acknowledgement() -> (
+    None
+):
+    async def scenario() -> None:
+        runner = _BlockingRunner()
+        runner.release.set()
+        sender = _BlockingSender()
+        flow = OpenWAMessageFlow(
+            settings=_settings(),
+            signing_secret=SECRET,
+            runtime=PersonalRuntime(request_runner=runner, clock=_Clock()),
+            sender=sender,
+            clock=_Clock(),
+        )
+        first_body = _event(message_id="wa-inbound-001")
+        second_body = _event(message_id="wa-inbound-002")
+
+        flow.receive_webhook(first_body, _headers(first_body))
+        await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), timeout=1)
+
+        acknowledgement = flow.receive_webhook(second_body, _headers(second_body))
+
+        assert acknowledgement.status_code == 202
+        assert acknowledgement.disposition is WebhookDisposition.ADMITTED
+        sender.release.set()
+        await flow.drain()
+
+    asyncio.run(scenario())
+
+
 def test_uncertain_chunk_is_not_retried_and_later_chunks_are_not_attempted() -> None:
     async def scenario() -> None:
         runner = _BlockingRunner("alpha beta gamma delta epsilon")
@@ -174,7 +219,8 @@ def test_uncertain_chunk_is_not_retried_and_later_chunks_are_not_attempted() -> 
             api_base_url="http://openwa.test:2785/api",
             api_key="owa_k1_replacement",
             internal_session_id=SESSION_ID,
-            authorized_sender=OPERATOR,
+            named_session="jarvis",
+            authorized_operator_number=OPERATOR,
             operator_chat_id=OPERATOR,
             max_text_characters=12,
         )

@@ -33,7 +33,8 @@ class OpenWASettings:
     api_base_url: str
     api_key: str
     internal_session_id: str
-    authorized_sender: str
+    named_session: str
+    authorized_operator_number: str
     operator_chat_id: str
     max_text_characters: int = 4096
 
@@ -42,7 +43,8 @@ class OpenWASettings:
             "api_base_url",
             "api_key",
             "internal_session_id",
-            "authorized_sender",
+            "named_session",
+            "authorized_operator_number",
             "operator_chat_id",
         ):
             _required_text(getattr(self, name), name)
@@ -59,7 +61,8 @@ class OpenWASettings:
         values = {
             "api_base_url": config.openwa_api_base_url,
             "internal_session_id": config.openwa_internal_session_id,
-            "authorized_sender": config.openwa_authorized_sender,
+            "named_session": config.openwa_named_session,
+            "authorized_operator_number": config.openwa_authorized_operator_number,
             "operator_chat_id": config.openwa_operator_chat_id,
             "api_key": loaded.secrets.openwa_api_key,
         }
@@ -283,7 +286,7 @@ class OpenWAMessageFlow:
         if (
             payload.get("event") != "message.received"
             or payload.get("sessionId") != self.settings.internal_session_id
-            or data.get("from") != self.settings.authorized_sender
+            or data.get("from") != self.settings.authorized_operator_number
             or data.get("chatId") != self.settings.operator_chat_id
             or data.get("type") != "text"
             or data.get("fromMe") is not False
@@ -307,7 +310,11 @@ class OpenWAMessageFlow:
         for chunk in chunks:
             try:
                 outbound_ids.append(
-                    self._sender.send_text(self.settings.operator_chat_id, chunk)
+                    await asyncio.to_thread(
+                        self._sender.send_text,
+                        self.settings.operator_chat_id,
+                        chunk,
+                    )
                 )
             except OpenWASendError as exc:
                 delivery = (
