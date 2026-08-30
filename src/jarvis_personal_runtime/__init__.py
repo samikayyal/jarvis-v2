@@ -6,6 +6,7 @@ from .permissions import PermissionRule, PermissionStoreError, TomlPermissionSto
 from .responses import (
     DirectResponsesRunner,
     OpenAIRawResponsesAdapter,
+    PreparedToolCollection,
     ResponsesResult,
     build_direct_responses_runner,
 )
@@ -22,25 +23,30 @@ from .runtime import (
     RuntimeStatus,
     build_runtime,
 )
+from .terminal import CommandResult, NativeUbuntuExecutor, RunTerminalTool
 from .vault import ReadVaultTool, VaultToolError
 
 __all__ = [
     "ApprovalDecision",
     "ApprovalRequired",
     "CacheError",
+    "CommandResult",
     "Completed",
     "ConfigError",
     "ContextLimitReached",
     "DirectResponsesRunner",
     "InboundText",
     "MessageIdCache",
+    "NativeUbuntuExecutor",
     "OpenAIRawResponsesAdapter",
     "PendingAction",
     "PermissionRule",
     "PermissionStoreError",
     "PersonalRuntime",
+    "PreparedToolCollection",
     "ReadVaultTool",
     "ResponsesResult",
+    "RunTerminalTool",
     "RuntimeConfig",
     "RuntimeDisposition",
     "RuntimeResult",

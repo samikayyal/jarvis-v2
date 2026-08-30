@@ -86,6 +86,9 @@ class ReadVaultTool:
             raise VaultToolError("read_vault result exceeds the configured limit")
         return encoded
 
+    async def resume(self, continuation: object, *, approved: bool) -> str:
+        raise RuntimeError("read_vault never creates an approval continuation")
+
     def _read(self, value: str) -> dict[str, object]:
         note = self._exact_note(value)
         content = self._read_utf8(note)

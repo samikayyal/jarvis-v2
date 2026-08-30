@@ -48,6 +48,8 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.request_timeout_seconds == 600
     assert loaded.config.max_tool_rounds == 8
     assert loaded.config.command_timeout_seconds == 300
+    assert loaded.config.ubuntu_working_directory == tmp_path
+    assert loaded.config.ubuntu_read_only_prefixes == ()
     assert loaded.config.max_output_chars == 65_536
     assert loaded.config.message_cache_path == tmp_path / "data" / "message-cache.json"
     assert loaded.config.trace_path == tmp_path / "data" / "runtime-trace.jsonl"
@@ -79,6 +81,8 @@ request_timeout_seconds = 45
 max_tool_rounds = 3
 command_timeout_seconds = 17
 max_output_chars = 999
+ubuntu_working_directory = "work"
+ubuntu_read_only_prefixes = ["pwd", "git status"]
 message_cache_path = "state/message-ids.json"
 trace_path = "trace/events.jsonl"
 trace_max_bytes = 2048
@@ -96,6 +100,8 @@ vault_path = "vault"
     assert loaded.config.max_tool_rounds == 3
     assert loaded.config.command_timeout_seconds == 17
     assert loaded.config.max_output_chars == 999
+    assert loaded.config.ubuntu_working_directory == tmp_path / "work"
+    assert loaded.config.ubuntu_read_only_prefixes == ("pwd", "git status")
     assert loaded.config.message_cache_path == tmp_path / "state" / "message-ids.json"
     assert loaded.config.trace_path == tmp_path / "trace" / "events.jsonl"
     assert loaded.config.trace_max_bytes == 2048
@@ -150,6 +156,7 @@ def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:
         ("[runtime]\nmax_tool_rounds = 0\n", "max_tool_rounds"),
         ("[runtime]\ncommand_timeout_seconds = 0\n", "command_timeout_seconds"),
         ("[runtime]\nmax_output_chars = 0\n", "max_output_chars"),
+        ('[runtime]\nubuntu_read_only_prefixes = [""]\n', "ubuntu_read_only_prefixes"),
         ('[runtime]\nmessage_cache_path = "/outside.json"\n', "message_cache_path"),
         ('[runtime]\ntrace_path = "../outside.jsonl"\n', "trace_path"),
         ("[runtime]\nvault_path = 3\n", "vault_path"),

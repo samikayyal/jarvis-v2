@@ -14,7 +14,12 @@ import tiktoken
 from openai import AsyncOpenAI
 
 from .config import RuntimeConfig
-from .runtime import Completed, ContextLimitReached
+from .runtime import (
+    ApprovalDecision,
+    ApprovalRequired,
+    Completed,
+    ContextLimitReached,
+)
 from .trace import build_runtime_trace
 
 
@@ -96,7 +101,11 @@ def _tool_error(error: Exception) -> str:
 class PreparedTools(Protocol):
     definitions: tuple[dict[str, object], ...]
 
-    async def execute(self, name: str, arguments: dict[str, object]) -> str: ...
+    async def execute(
+        self, name: str, arguments: dict[str, object]
+    ) -> str | ApprovalRequired: ...
+
+    async def resume(self, continuation: object, *, approved: bool) -> str: ...
 
 
 class TraceSink(Protocol):
@@ -113,6 +122,61 @@ class _NoTools:
 
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
         raise RuntimeError(f"unknown prepared tool: {name}")
+
+    async def resume(self, continuation: object, *, approved: bool) -> str:
+        raise RuntimeError("unknown prepared tool continuation")
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedToolContinuation:
+    tool: PreparedTools
+    continuation: object
+
+
+class PreparedToolCollection:
+    """Expose a small fixed set of prepared tools as one Responses boundary."""
+
+    def __init__(self, *tools: PreparedTools) -> None:
+        self._tools = tools
+        definitions = tuple(
+            definition for tool in tools for definition in tool.definitions
+        )
+        names = [str(definition.get("name")) for definition in definitions]
+        if len(set(names)) != len(names):
+            raise ValueError("prepared tool names must be unique")
+        self.definitions = definitions
+
+    async def execute(
+        self, name: str, arguments: dict[str, object]
+    ) -> str | ApprovalRequired:
+        for tool in self._tools:
+            if any(definition.get("name") == name for definition in tool.definitions):
+                result = await tool.execute(name, arguments)
+                if isinstance(result, ApprovalRequired):
+                    return ApprovalRequired(
+                        result.action,
+                        _PreparedToolContinuation(tool, result.continuation),
+                    )
+                return result
+        raise RuntimeError(f"unknown prepared tool: {name}")
+
+    async def resume(self, continuation: object, *, approved: bool) -> str:
+        if not isinstance(continuation, _PreparedToolContinuation):
+            raise TypeError("invalid prepared tool continuation")
+        return await continuation.tool.resume(
+            continuation.continuation, approved=approved
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponsesContinuation:
+    transcript: tuple[dict[str, object], ...]
+    call: dict[str, object]
+    tool_continuation: object
+    model: str
+    reasoning: str
+    system_prompt: str
+    tool_rounds: int
 
 
 class OpenAIRawResponsesAdapter:
@@ -269,7 +333,7 @@ class DirectResponsesRunner:
         model: str,
         reasoning: str,
         system_prompt: str,
-    ) -> Completed | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached:
         try:
             return await self._run_loop(
                 text,
@@ -302,7 +366,23 @@ class DirectResponsesRunner:
         system_prompt: str,
     ) -> Completed | ContextLimitReached:
         transcript = [*self._transcript, {"role": "user", "content": text}]
-        tool_rounds = 0
+        return await self._continue_loop(
+            transcript,
+            model=model,
+            reasoning=reasoning,
+            system_prompt=system_prompt,
+            tool_rounds=0,
+        )
+
+    async def _continue_loop(
+        self,
+        transcript: list[dict[str, object]],
+        *,
+        model: str,
+        reasoning: str,
+        system_prompt: str,
+        tool_rounds: int,
+    ) -> Completed | ApprovalRequired | ContextLimitReached:
         async with asyncio.timeout(self._request_timeout_seconds) as deadline:
             while True:
                 tools = list(self._tools.definitions)
@@ -388,6 +468,19 @@ class DirectResponsesRunner:
                     raise RuntimeError("configured tool-round limit reached")
                 call = calls[0]
                 output = await self._execute_tool(call)
+                if isinstance(output, ApprovalRequired):
+                    return ApprovalRequired(
+                        output.action,
+                        _ResponsesContinuation(
+                            transcript=tuple(transcript),
+                            call=call,
+                            tool_continuation=output.continuation,
+                            model=model,
+                            reasoning=reasoning,
+                            system_prompt=system_prompt,
+                            tool_rounds=tool_rounds,
+                        ),
+                    )
                 if not isinstance(output, str):
                     raise TypeError("prepared tool output must be a string")
                 if len(output) > self._max_output_chars:
@@ -413,7 +506,7 @@ class DirectResponsesRunner:
                 self._transcript = transcript
                 tool_rounds += 1
 
-    async def _execute_tool(self, call: dict[str, object]) -> str:
+    async def _execute_tool(self, call: dict[str, object]) -> str | ApprovalRequired:
         raw_arguments = str(call["arguments"])
         try:
             arguments = json.loads(raw_arguments)
@@ -456,8 +549,59 @@ class DirectResponsesRunner:
             },
         )
 
-    async def resume(self, decision: object, continuation: object) -> Completed:
-        raise RuntimeError("the Responses loop has no pending approval to resume")
+    async def resume(
+        self, decision: ApprovalDecision, continuation: object
+    ) -> Completed | ApprovalRequired | ContextLimitReached:
+        if not isinstance(continuation, _ResponsesContinuation):
+            raise TypeError("invalid Responses approval continuation")
+        call = continuation.call
+        if decision is ApprovalDecision.REJECT:
+            output = json.dumps(
+                {"rejected": True}, sort_keys=True, separators=(",", ":")
+            )
+        else:
+            try:
+                output = await self._tools.resume(
+                    continuation.tool_continuation, approved=True
+                )
+            except Exception as exc:  # noqa: BLE001 - errors continue via model
+                self._trace.record(
+                    "tool_error",
+                    {
+                        "name": str(call["name"]),
+                        "call_id": str(call["call_id"]),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                output = _tool_error(exc)
+        if len(output) > self._max_output_chars:
+            raise RuntimeError(
+                "prepared tool result exceeded configured output character limit"
+            )
+        self._trace.record(
+            "tool_result",
+            {
+                "name": str(call["name"]),
+                "call_id": str(call["call_id"]),
+                "output": output,
+            },
+        )
+        transcript = [
+            *continuation.transcript,
+            {
+                "type": "function_call_output",
+                "call_id": str(call["call_id"]),
+                "output": output,
+            },
+        ]
+        self._transcript = transcript
+        return await self._continue_loop(
+            transcript,
+            model=continuation.model,
+            reasoning=continuation.reasoning,
+            system_prompt=continuation.system_prompt,
+            tool_rounds=continuation.tool_rounds + 1,
+        )
 
 
 def build_direct_responses_runner(
@@ -470,12 +614,30 @@ def build_direct_responses_runner(
     """Compose the pinned SDK adapter with the configured loop limits."""
 
     sink = trace or build_runtime_trace(config)
-    if tools is None and config.vault_path is not None:
+    if tools is None:
+        from .permissions import TomlPermissionStore
+        from .terminal import NativeUbuntuExecutor, RunTerminalTool
         from .vault import ReadVaultTool
 
-        tools = ReadVaultTool(
-            config.vault_path, max_result_chars=config.max_output_chars
+        configured_tools: list[PreparedTools] = []
+        if config.vault_path is not None:
+            configured_tools.append(
+                ReadVaultTool(
+                    config.vault_path, max_result_chars=config.max_output_chars
+                )
+            )
+        configured_tools.append(
+            RunTerminalTool(
+                working_directory=config.ubuntu_working_directory,
+                read_only_prefixes=config.ubuntu_read_only_prefixes,
+                permission_store=TomlPermissionStore(config.root / "jarvis.toml"),
+                executor=NativeUbuntuExecutor(),
+                timeout_seconds=config.command_timeout_seconds,
+                max_output_chars=config.max_output_chars,
+                trace=sink,
+            )
         )
+        tools = PreparedToolCollection(*configured_tools)
     adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     return DirectResponsesRunner(
         adapter,
@@ -491,6 +653,7 @@ def build_direct_responses_runner(
 __all__ = [
     "DirectResponsesRunner",
     "OpenAIRawResponsesAdapter",
+    "PreparedToolCollection",
     "PreparedTools",
     "RawResponsesAdapter",
     "ResponsesResult",

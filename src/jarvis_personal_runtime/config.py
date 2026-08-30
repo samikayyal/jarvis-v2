@@ -49,6 +49,8 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "max_tool_rounds": 8,
         "command_timeout_seconds": 300,
         "max_output_chars": 65_536,
+        "ubuntu_working_directory": ".",
+        "ubuntu_read_only_prefixes": (),
         "message_cache_path": "data/message-cache.json",
         "message_cache_retention_days": 7,
         "trace_path": "data/runtime-trace.jsonl",
@@ -140,6 +142,8 @@ class RuntimeConfig:
     max_tool_rounds: int = DEFAULTS["max_tool_rounds"]
     command_timeout_seconds: float = DEFAULTS["command_timeout_seconds"]
     max_output_chars: int = DEFAULTS["max_output_chars"]
+    ubuntu_working_directory: Path = Path(DEFAULTS["ubuntu_working_directory"])
+    ubuntu_read_only_prefixes: tuple[str, ...] = DEFAULTS["ubuntu_read_only_prefixes"]
     message_cache_path: Path = Path(DEFAULTS["message_cache_path"])
     message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
     trace_path: Path = Path(DEFAULTS["trace_path"])
@@ -228,6 +232,8 @@ _RUNTIME_KEYS = {
     "command_timeout",
     "max_output_chars",
     "output_limit",
+    "ubuntu_working_directory",
+    "ubuntu_read_only_prefixes",
     "message_cache_path",
     "message_cache_retention_days",
     "trace_path",
@@ -383,6 +389,22 @@ def _string_list(value: Any, path: Path, name: str) -> tuple[str, ...]:
     return result
 
 
+def _string_list_or_empty(value: Any, path: Path, name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(path, f"{name} must be an array of strings")
+    if not value:
+        return ()
+    result = tuple(_string(item, path, name) for item in value)
+    if len(set(result)) != len(result):
+        raise ConfigError(path, f"{name} must not contain duplicates")
+    if any(
+        any(ord(character) < 32 or ord(character) == 127 for character in item)
+        for item in result
+    ):
+        raise ConfigError(path, f"{name} must not contain control characters")
+    return result
+
+
 def _positive_int(value: Any, path: Path, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(path, f"{name} must be a positive integer")
@@ -485,6 +507,16 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             "output_limit",
             default=DEFAULTS["max_output_chars"],
         )
+        ubuntu_working_directory_value = _setting(
+            values,
+            "ubuntu_working_directory",
+            default=DEFAULTS["ubuntu_working_directory"],
+        )
+        ubuntu_read_only_prefixes_value = _setting(
+            values,
+            "ubuntu_read_only_prefixes",
+            default=list(DEFAULTS["ubuntu_read_only_prefixes"]),
+        )
         max_tool_rounds = _setting(
             values, "max_tool_rounds", default=DEFAULTS["max_tool_rounds"]
         )
@@ -571,6 +603,16 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
         trace_path = _rooted_path(trace_path_value, root, path, "trace_path")
         prompt_path = _rooted_path(prompt_path_value, root, path, "system_prompt_path")
+        ubuntu_working_directory = _optional_configured_path(
+            ubuntu_working_directory_value,
+            root,
+            path,
+            "ubuntu_working_directory",
+        )
+        assert ubuntu_working_directory is not None
+        ubuntu_read_only_prefixes = _string_list_or_empty(
+            ubuntu_read_only_prefixes_value, path, "ubuntu_read_only_prefixes"
+        )
         vault_path = _optional_configured_path(
             vault_path_value, root, path, "vault_path"
         )
@@ -608,6 +650,8 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_tool_rounds=max_tool_rounds,
         command_timeout_seconds=command_timeout,
         max_output_chars=output_limit,
+        ubuntu_working_directory=ubuntu_working_directory,
+        ubuntu_read_only_prefixes=ubuntu_read_only_prefixes,
         message_cache_path=cache_path,
         message_cache_retention_days=retention,
         trace_path=trace_path,
