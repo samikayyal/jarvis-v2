@@ -333,18 +333,21 @@ class NativeUbuntuExecutor:
         lock = asyncio.Lock()
         stdout_task = asyncio.create_task(_read_stream(process.stdout, budget, lock))
         stderr_task = asyncio.create_task(_read_stream(process.stderr, budget, lock))
+        wait_task = asyncio.create_task(process.wait())
+        tasks = {wait_task, stdout_task, stderr_task}
         timed_out = False
         try:
-            async with asyncio.timeout(timeout):
-                await process.wait()
-        except TimeoutError:
-            timed_out = True
-            await self._stop(process)
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                timed_out = True
+                await self._stop(process)
+                await self._settle(tasks)
         except asyncio.CancelledError:
             await self._stop(process)
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            await self._settle(tasks)
             raise
-        stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+        stdout = self._text_result(stdout_task)
+        stderr = self._text_result(stderr_task)
         return CommandResult(
             exit_code=process.returncode,
             stdout=stdout,
@@ -355,15 +358,20 @@ class NativeUbuntuExecutor:
 
     @staticmethod
     async def _stop(process: asyncio.subprocess.Process) -> None:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            await asyncio.sleep(0.1)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return
         if process.returncode is not None:
             return
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            return
+        process.terminate()
         try:
             async with asyncio.timeout(1):
                 await process.wait()
@@ -371,13 +379,24 @@ class NativeUbuntuExecutor:
         except TimeoutError:
             pass
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
+            process.kill()
         except ProcessLookupError:
             return
         await process.wait()
+
+    @staticmethod
+    async def _settle(tasks: set[asyncio.Task[object]]) -> None:
+        _, pending = await asyncio.wait(tasks, timeout=1)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @staticmethod
+    def _text_result(task: asyncio.Task[str]) -> str:
+        if task.cancelled() or not task.done() or task.exception() is not None:
+            return ""
+        return task.result()
 
 
 __all__ = [

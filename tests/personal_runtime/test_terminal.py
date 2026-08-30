@@ -343,3 +343,19 @@ async def test_serialized_terminal_tool_result_stays_within_output_limit(
     assert isinstance(output, str)
     assert len(output) <= 120
     assert json.loads(output)["output_truncated"] is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native Ubuntu process-group test")
+@async_test
+async def test_native_timeout_contains_background_child_holding_output_pipes(
+    tmp_path: Path,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    result = await NativeUbuntuExecutor().run(
+        "sleep 5 &", cwd=tmp_path, timeout=0.1, max_output_chars=100
+    )
+
+    assert result.timed_out
+    assert loop.time() - started < 2
