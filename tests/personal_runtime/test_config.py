@@ -93,6 +93,29 @@ message_cache_path = "state/message-ids.json"
     assert loaded.config.message_cache_path == tmp_path / "state" / "message-ids.json"
 
 
+def test_openwa_handoff_identities_load_from_toml_not_the_secret_file(
+    tmp_path: Path,
+) -> None:
+    _write_runtime_files(
+        tmp_path,
+        toml="""
+[runtime]
+openwa_api_base_url = "http://172.17.0.1:2785/api"
+openwa_internal_session_id = "session-001"
+openwa_authorized_sender = "962790000000@c.us"
+openwa_operator_chat_id = "962790000000@c.us"
+""",
+    )
+
+    loaded = load_runtime_config(tmp_path)
+
+    assert loaded.config.openwa_api_base_url == "http://172.17.0.1:2785/api"
+    assert loaded.config.openwa_internal_session_id == "session-001"
+    assert loaded.config.openwa_authorized_sender == "962790000000@c.us"
+    assert loaded.config.openwa_operator_chat_id == "962790000000@c.us"
+    assert loaded.secrets.openwa_api_key == "openwa-test"
+
+
 @pytest.mark.parametrize(
     ("toml", "needle"),
     [

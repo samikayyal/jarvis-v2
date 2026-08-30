@@ -51,6 +51,10 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "message_cache_path": "data/message-cache.json",
         "message_cache_retention_days": 7,
         "system_prompt_path": "SYSTEM.md",
+        "openwa_api_base_url": None,
+        "openwa_internal_session_id": None,
+        "openwa_authorized_sender": None,
+        "openwa_operator_chat_id": None,
     }
 )
 
@@ -134,6 +138,10 @@ class RuntimeConfig:
     message_cache_path: Path = Path(DEFAULTS["message_cache_path"])
     message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
     system_prompt_path: Path = Path(DEFAULTS["system_prompt_path"])
+    openwa_api_base_url: str | None = DEFAULTS["openwa_api_base_url"]
+    openwa_internal_session_id: str | None = DEFAULTS["openwa_internal_session_id"]
+    openwa_authorized_sender: str | None = DEFAULTS["openwa_authorized_sender"]
+    openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
 
     @property
     def reasoning(self) -> str:
@@ -212,6 +220,10 @@ _RUNTIME_KEYS = {
     "message_cache_path",
     "message_cache_retention_days",
     "system_prompt_path",
+    "openwa_api_base_url",
+    "openwa_internal_session_id",
+    "openwa_authorized_sender",
+    "openwa_operator_chat_id",
 }
 
 
@@ -362,6 +374,12 @@ def _positive_int(value: Any, path: Path, name: str) -> int:
     return value
 
 
+def _optional_string(value: Any, path: Path, name: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, path, name)
+
+
 def _positive_number(value: Any, path: Path, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(path, f"{name} must be a positive number")
@@ -452,6 +470,24 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         prompt_path_value = _setting(
             values, "system_prompt_path", default=DEFAULTS["system_prompt_path"]
         )
+        openwa_api_base_url = _setting(
+            values, "openwa_api_base_url", default=DEFAULTS["openwa_api_base_url"]
+        )
+        openwa_internal_session_id = _setting(
+            values,
+            "openwa_internal_session_id",
+            default=DEFAULTS["openwa_internal_session_id"],
+        )
+        openwa_authorized_sender = _setting(
+            values,
+            "openwa_authorized_sender",
+            default=DEFAULTS["openwa_authorized_sender"],
+        )
+        openwa_operator_chat_id = _setting(
+            values,
+            "openwa_operator_chat_id",
+            default=DEFAULTS["openwa_operator_chat_id"],
+        )
 
         model = _string(model, path, "model")
         allowed_models = _string_list(allowed_models_value, path, "allowed_models")
@@ -490,6 +526,18 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             raise ConfigError(path, "message_cache_retention_days is fixed at 7")
         cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
         prompt_path = _rooted_path(prompt_path_value, root, path, "system_prompt_path")
+        openwa_api_base_url = _optional_string(
+            openwa_api_base_url, path, "openwa_api_base_url"
+        )
+        openwa_internal_session_id = _optional_string(
+            openwa_internal_session_id, path, "openwa_internal_session_id"
+        )
+        openwa_authorized_sender = _optional_string(
+            openwa_authorized_sender, path, "openwa_authorized_sender"
+        )
+        openwa_operator_chat_id = _optional_string(
+            openwa_operator_chat_id, path, "openwa_operator_chat_id"
+        )
     except ConfigError:
         raise
     except ValueError as exc:
@@ -510,6 +558,10 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         message_cache_path=cache_path,
         message_cache_retention_days=retention,
         system_prompt_path=prompt_path,
+        openwa_api_base_url=openwa_api_base_url,
+        openwa_internal_session_id=openwa_internal_session_id,
+        openwa_authorized_sender=openwa_authorized_sender,
+        openwa_operator_chat_id=openwa_operator_chat_id,
     )
 
 

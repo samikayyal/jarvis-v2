@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: claimed
 Blocked by: 03
 
 ## Question
