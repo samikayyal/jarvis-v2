@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shlex
@@ -22,6 +23,7 @@ from jarvis_personal_runtime.runtime import (
 from jarvis_personal_runtime.terminal import (
     CommandResult,
     NativeUbuntuExecutor,
+    OpenSshWindowsExecutor,
     RunTerminalTool,
 )
 
@@ -103,8 +105,226 @@ class FakeResponses:
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
 
+class CompletedSshProcess:
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.stdout.feed_data(b"computer-name\r\n")
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        self.returncode = 0
+        return 0
+
+
+class RecordingSshFactory:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    async def __call__(self, *argv: str, **kwargs: object) -> CompletedSshProcess:
+        self.calls.append((argv, kwargs))
+        return CompletedSshProcess()
+
+
+class BlockingSshProcess:
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode: int | None = None
+        self.stopped = asyncio.Event()
+
+    async def wait(self) -> int:
+        await self.stopped.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self.stopped.set()
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+class DisconnectedSshProcess(CompletedSshProcess):
+    async def wait(self) -> int:
+        self.returncode = 255
+        return 255
+
+
 def inbound(message_id: str, text: str, *, hours: int = 0) -> InboundText:
     return InboundText(message_id, text, NOW + timedelta(hours=hours))
+
+
+@async_test
+async def test_windows_executor_uses_configured_identity_and_encoded_powershell(
+    tmp_path: Path,
+) -> None:
+    factory = RecordingSshFactory()
+    identity = tmp_path / "jarvis-windows"
+    executor = OpenSshWindowsExecutor(
+        host="desktop.tailnet.ts.net",
+        user="jarvis",
+        identity_file=identity,
+        process_factory=factory,
+    )
+
+    result = await executor.run(
+        "Get-ComputerInfo",
+        cwd=r"D:\Projects",
+        timeout=17,
+        max_output_chars=999,
+    )
+
+    assert result == CommandResult(exit_code=0, stdout="computer-name\r\n", stderr="")
+    argv, kwargs = factory.calls[0]
+    assert argv[:10] == (
+        "ssh",
+        "-i",
+        str(identity),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "--",
+        "jarvis@desktop.tailnet.ts.net",
+        "powershell.exe",
+    )
+    assert argv[10:13] == ("-NoLogo", "-NoProfile", "-NonInteractive")
+    assert argv[13] == "-EncodedCommand"
+    script = base64.b64decode(argv[14]).decode("utf-16-le")
+    assert script == "Set-Location -LiteralPath 'D:\\Projects'; Get-ComputerInfo"
+    assert kwargs == {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+
+
+@async_test
+async def test_windows_read_only_prefix_is_case_insensitive_but_compound_is_gated(
+    tmp_path: Path,
+) -> None:
+    windows = FakeExecutor()
+    tool = RunTerminalTool(
+        working_directory=tmp_path,
+        read_only_prefixes=(),
+        permission_store=TomlPermissionStore(tmp_path / "jarvis.toml"),
+        executor=FakeExecutor(),
+        windows_working_directory=r"D:\Projects",
+        windows_read_only_prefixes=("Get-ChildItem",),
+        windows_executor=windows,
+        timeout_seconds=17,
+        max_output_chars=999,
+    )
+
+    output = await tool.execute(
+        "run_terminal", {"host": "windows", "command": "get-childitem -Force"}
+    )
+    gated = [
+        await tool.execute("run_terminal", {"host": "windows", "command": command})
+        for command in (
+            "Get-ChildItem; Remove-Item marker",
+            "Get-ChildItem (Remove-Item marker)",
+            "Get-ChildItem { Remove-Item marker }",
+        )
+    ]
+
+    assert isinstance(output, str)
+    assert windows.calls == [("get-childitem -Force", r"D:\Projects", 17, 999)]
+    assert all(isinstance(result, ApprovalRequired) for result in gated)
+    assert all(result.action.host == "windows" for result in gated)
+    assert all(
+        'Working directory: "D:\\\\Projects"' in result.action.display
+        for result in gated
+    )
+
+
+@async_test
+async def test_windows_ssh_timeout_reports_remote_effect_uncertainty(
+    tmp_path: Path,
+) -> None:
+    process = BlockingSshProcess()
+
+    async def start(*args: str, **kwargs: object) -> BlockingSshProcess:
+        return process
+
+    executor = OpenSshWindowsExecutor(
+        host="desktop.tailnet.ts.net",
+        user="jarvis",
+        identity_file=tmp_path / "jarvis-windows",
+        process_factory=start,
+    )
+
+    result = await executor.run(
+        "Get-ComputerInfo", cwd=r"D:\Projects", timeout=0.01, max_output_chars=999
+    )
+
+    assert result.timed_out
+    assert result.remote_effect_uncertain
+    assert process.returncode == -15
+
+
+@async_test
+async def test_windows_ssh_transport_failure_reports_remote_effect_uncertainty(
+    tmp_path: Path,
+) -> None:
+    async def start(*args: str, **kwargs: object) -> DisconnectedSshProcess:
+        return DisconnectedSshProcess()
+
+    result = await OpenSshWindowsExecutor(
+        host="desktop.tailnet.ts.net",
+        user="jarvis",
+        identity_file=tmp_path / "jarvis-windows",
+        process_factory=start,
+    ).run("Get-ComputerInfo", cwd=r"D:\Projects", timeout=17, max_output_chars=999)
+
+    assert result.exit_code == 255
+    assert result.remote_effect_uncertain
+
+
+@async_test
+async def test_windows_cancellation_is_best_effort_and_remote_effect_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    windows = BlockingExecutor()
+    trace = MemoryTrace()
+    tool = RunTerminalTool(
+        working_directory=tmp_path,
+        read_only_prefixes=(),
+        permission_store=TomlPermissionStore(tmp_path / "jarvis.toml"),
+        executor=FakeExecutor(),
+        windows_working_directory=r"D:\Projects",
+        windows_read_only_prefixes=("Get-ComputerInfo",),
+        windows_executor=windows,
+        timeout_seconds=17,
+        max_output_chars=999,
+        trace=trace,
+    )
+    task = asyncio.create_task(
+        tool.execute("run_terminal", {"host": "windows", "command": "Get-ComputerInfo"})
+    )
+    await windows.started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(windows.calls) == 1
+    assert trace.events[-1] == (
+        "terminal_execution_cancelled",
+        {
+            "host": "windows",
+            "command": "Get-ComputerInfo",
+            "working_directory": r"D:\Projects",
+            "timeout_seconds": 17,
+            "scope": "local_best_effort",
+            "remote_effect_uncertain": True,
+        },
+    )
 
 
 @pytest.mark.parametrize(

@@ -51,6 +51,11 @@ DEFAULTS: Mapping[str, Any] = MappingProxyType(
         "max_output_chars": 65_536,
         "ubuntu_working_directory": ".",
         "ubuntu_read_only_prefixes": (),
+        "windows_ssh_host": None,
+        "windows_ssh_user": None,
+        "windows_ssh_identity_file": None,
+        "windows_working_directory": None,
+        "windows_read_only_prefixes": (),
         "message_cache_path": "data/message-cache.json",
         "message_cache_retention_days": 7,
         "trace_path": "data/runtime-trace.jsonl",
@@ -144,6 +149,11 @@ class RuntimeConfig:
     max_output_chars: int = DEFAULTS["max_output_chars"]
     ubuntu_working_directory: Path = Path(DEFAULTS["ubuntu_working_directory"])
     ubuntu_read_only_prefixes: tuple[str, ...] = DEFAULTS["ubuntu_read_only_prefixes"]
+    windows_ssh_host: str | None = DEFAULTS["windows_ssh_host"]
+    windows_ssh_user: str | None = DEFAULTS["windows_ssh_user"]
+    windows_ssh_identity_file: Path | None = DEFAULTS["windows_ssh_identity_file"]
+    windows_working_directory: str | None = DEFAULTS["windows_working_directory"]
+    windows_read_only_prefixes: tuple[str, ...] = DEFAULTS["windows_read_only_prefixes"]
     message_cache_path: Path = Path(DEFAULTS["message_cache_path"])
     message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
     trace_path: Path = Path(DEFAULTS["trace_path"])
@@ -234,6 +244,11 @@ _RUNTIME_KEYS = {
     "output_limit",
     "ubuntu_working_directory",
     "ubuntu_read_only_prefixes",
+    "windows_ssh_host",
+    "windows_ssh_user",
+    "windows_ssh_identity_file",
+    "windows_working_directory",
+    "windows_read_only_prefixes",
     "message_cache_path",
     "message_cache_retention_days",
     "trace_path",
@@ -517,6 +532,27 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             "ubuntu_read_only_prefixes",
             default=list(DEFAULTS["ubuntu_read_only_prefixes"]),
         )
+        windows_ssh_host_value = _setting(
+            values, "windows_ssh_host", default=DEFAULTS["windows_ssh_host"]
+        )
+        windows_ssh_user_value = _setting(
+            values, "windows_ssh_user", default=DEFAULTS["windows_ssh_user"]
+        )
+        windows_ssh_identity_file_value = _setting(
+            values,
+            "windows_ssh_identity_file",
+            default=DEFAULTS["windows_ssh_identity_file"],
+        )
+        windows_working_directory_value = _setting(
+            values,
+            "windows_working_directory",
+            default=DEFAULTS["windows_working_directory"],
+        )
+        windows_read_only_prefixes_value = _setting(
+            values,
+            "windows_read_only_prefixes",
+            default=list(DEFAULTS["windows_read_only_prefixes"]),
+        )
         max_tool_rounds = _setting(
             values, "max_tool_rounds", default=DEFAULTS["max_tool_rounds"]
         )
@@ -613,6 +649,37 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         ubuntu_read_only_prefixes = _string_list_or_empty(
             ubuntu_read_only_prefixes_value, path, "ubuntu_read_only_prefixes"
         )
+        windows_ssh_host = _optional_string(
+            windows_ssh_host_value, path, "windows_ssh_host"
+        )
+        windows_ssh_user = _optional_string(
+            windows_ssh_user_value, path, "windows_ssh_user"
+        )
+        windows_ssh_identity_file = _optional_configured_path(
+            windows_ssh_identity_file_value,
+            root,
+            path,
+            "windows_ssh_identity_file",
+        )
+        windows_working_directory = _optional_string(
+            windows_working_directory_value, path, "windows_working_directory"
+        )
+        windows_read_only_prefixes = _string_list_or_empty(
+            windows_read_only_prefixes_value, path, "windows_read_only_prefixes"
+        )
+        windows_connection = (
+            windows_ssh_host,
+            windows_ssh_user,
+            windows_ssh_identity_file,
+            windows_working_directory,
+        )
+        if any(value is not None for value in windows_connection) and any(
+            value is None for value in windows_connection
+        ):
+            raise ConfigError(
+                path,
+                "Windows SSH host, user, identity file, and working directory must be configured together",
+            )
         vault_path = _optional_configured_path(
             vault_path_value, root, path, "vault_path"
         )
@@ -652,6 +719,11 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_output_chars=output_limit,
         ubuntu_working_directory=ubuntu_working_directory,
         ubuntu_read_only_prefixes=ubuntu_read_only_prefixes,
+        windows_ssh_host=windows_ssh_host,
+        windows_ssh_user=windows_ssh_user,
+        windows_ssh_identity_file=windows_ssh_identity_file,
+        windows_working_directory=windows_working_directory,
+        windows_read_only_prefixes=windows_read_only_prefixes,
         message_cache_path=cache_path,
         message_cache_retention_days=retention,
         trace_path=trace_path,

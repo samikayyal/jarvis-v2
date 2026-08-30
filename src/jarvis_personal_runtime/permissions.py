@@ -61,9 +61,11 @@ class PermissionRule:
     def matches(self, host: str, command: str) -> bool:
         if not isinstance(command, str):
             return False
-        return normalize_host(host) == self.host and (
-            command == self.prefix or command.startswith(f"{self.prefix} ")
-        )
+        if normalize_host(host) != self.host:
+            return False
+        candidate = command.casefold() if self.host == "windows" else command
+        prefix = self.prefix.casefold() if self.host == "windows" else self.prefix
+        return candidate == prefix or candidate.startswith(f"{prefix} ")
 
 
 class TomlPermissionStore:

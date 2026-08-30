@@ -50,6 +50,11 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.command_timeout_seconds == 300
     assert loaded.config.ubuntu_working_directory == tmp_path
     assert loaded.config.ubuntu_read_only_prefixes == ()
+    assert loaded.config.windows_ssh_host is None
+    assert loaded.config.windows_ssh_user is None
+    assert loaded.config.windows_ssh_identity_file is None
+    assert loaded.config.windows_working_directory is None
+    assert loaded.config.windows_read_only_prefixes == ()
     assert loaded.config.max_output_chars == 65_536
     assert loaded.config.message_cache_path == tmp_path / "data" / "message-cache.json"
     assert loaded.config.trace_path == tmp_path / "data" / "runtime-trace.jsonl"
@@ -83,6 +88,11 @@ command_timeout_seconds = 17
 max_output_chars = 999
 ubuntu_working_directory = "work"
 ubuntu_read_only_prefixes = ["pwd", "git status"]
+windows_ssh_host = "desktop.tailnet.ts.net"
+windows_ssh_user = "jarvis"
+windows_ssh_identity_file = "credentials/jarvis-windows"
+windows_working_directory = 'D:\\Projects'
+windows_read_only_prefixes = ["Get-ChildItem", "Get-Content"]
 message_cache_path = "state/message-ids.json"
 trace_path = "trace/events.jsonl"
 trace_max_bytes = 2048
@@ -102,6 +112,16 @@ vault_path = "vault"
     assert loaded.config.max_output_chars == 999
     assert loaded.config.ubuntu_working_directory == tmp_path / "work"
     assert loaded.config.ubuntu_read_only_prefixes == ("pwd", "git status")
+    assert loaded.config.windows_ssh_host == "desktop.tailnet.ts.net"
+    assert loaded.config.windows_ssh_user == "jarvis"
+    assert loaded.config.windows_ssh_identity_file == (
+        tmp_path / "credentials" / "jarvis-windows"
+    )
+    assert loaded.config.windows_working_directory == r"D:\Projects"
+    assert loaded.config.windows_read_only_prefixes == (
+        "Get-ChildItem",
+        "Get-Content",
+    )
     assert loaded.config.message_cache_path == tmp_path / "state" / "message-ids.json"
     assert loaded.config.trace_path == tmp_path / "trace" / "events.jsonl"
     assert loaded.config.trace_max_bytes == 2048

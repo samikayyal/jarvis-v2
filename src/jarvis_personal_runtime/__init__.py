@@ -23,7 +23,12 @@ from .runtime import (
     RuntimeStatus,
     build_runtime,
 )
-from .terminal import CommandResult, NativeUbuntuExecutor, RunTerminalTool
+from .terminal import (
+    CommandResult,
+    NativeUbuntuExecutor,
+    OpenSshWindowsExecutor,
+    RunTerminalTool,
+)
 from .vault import ReadVaultTool, VaultToolError
 
 __all__ = [
@@ -39,6 +44,7 @@ __all__ = [
     "MessageIdCache",
     "NativeUbuntuExecutor",
     "OpenAIRawResponsesAdapter",
+    "OpenSshWindowsExecutor",
     "PendingAction",
     "PermissionRule",
     "PermissionStoreError",

@@ -616,7 +616,11 @@ def build_direct_responses_runner(
     sink = trace or build_runtime_trace(config)
     if tools is None:
         from .permissions import TomlPermissionStore
-        from .terminal import NativeUbuntuExecutor, RunTerminalTool
+        from .terminal import (
+            NativeUbuntuExecutor,
+            OpenSshWindowsExecutor,
+            RunTerminalTool,
+        )
         from .vault import ReadVaultTool
 
         configured_tools: list[PreparedTools] = []
@@ -626,12 +630,24 @@ def build_direct_responses_runner(
                     config.vault_path, max_result_chars=config.max_output_chars
                 )
             )
+        windows_executor = None
+        if config.windows_ssh_host is not None:
+            assert config.windows_ssh_user is not None
+            assert config.windows_ssh_identity_file is not None
+            windows_executor = OpenSshWindowsExecutor(
+                host=config.windows_ssh_host,
+                user=config.windows_ssh_user,
+                identity_file=config.windows_ssh_identity_file,
+            )
         configured_tools.append(
             RunTerminalTool(
                 working_directory=config.ubuntu_working_directory,
                 read_only_prefixes=config.ubuntu_read_only_prefixes,
                 permission_store=TomlPermissionStore(config.root / "jarvis.toml"),
                 executor=NativeUbuntuExecutor(),
+                windows_working_directory=config.windows_working_directory,
+                windows_read_only_prefixes=config.windows_read_only_prefixes,
+                windows_executor=windows_executor,
                 timeout_seconds=config.command_timeout_seconds,
                 max_output_chars=config.max_output_chars,
                 trace=sink,

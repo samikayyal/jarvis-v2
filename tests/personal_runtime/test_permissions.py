@@ -25,6 +25,13 @@ def test_rule_normalizes_host_and_matches_only_a_command_boundary() -> None:
     assert normalize_host(" Ubuntu.EXAMPLE. ") == "ubuntu.example"
 
 
+def test_windows_rule_matches_literal_prefix_case_insensitively() -> None:
+    rule = PermissionRule("windows", "Get-Content Important.txt")
+
+    assert rule.matches("WINDOWS", "get-content important.TXT -Raw")
+    assert not rule.matches("windows", "get-content important.txt.bak")
+
+
 @pytest.mark.parametrize("prefix", ["", "   ", "git\nstatus", "git\x00status"])
 def test_rule_rejects_empty_or_control_prefixes(prefix: str) -> None:
     with pytest.raises(ValueError):
