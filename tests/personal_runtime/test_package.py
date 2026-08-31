@@ -95,6 +95,10 @@ def test_runbook_keeps_validation_inactive_and_documents_operations() -> None:
         "Do not modify the live OpenWA project",
         "Do not change pairing state",
         "Do not change firewall rules",
+        "SSRF_ALLOWED_HOSTS=inbound-receiver,BRIDGE_GATEWAY",
+        "one controlled OpenWA recreation",
+        "fresh QR",
+        "LOGOUT",
         "previous runtime",
     )
 

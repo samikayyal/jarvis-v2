@@ -135,7 +135,23 @@ or firewall opening is part of this package.
 
 Before changing the handoff, verify and record OpenWA container identity, start
 time, volume, networks, health, named-session `ready` state, and absence of
-`LOGOUT`. Never recreate OpenWA, scan a new QR code, or change its Baileys data.
+`LOGOUT`. Inspect the effective OpenWA `SSRF_ALLOWED_HOSTS` value as well. The
+pinned gateway rejects private webhook destinations unless their literal host is
+on that allowlist. Preserve the legacy rollback hostname and add only the exact
+reviewed bridge gateway:
+
+```console
+SSRF_ALLOWED_HOSTS=inbound-receiver,BRIDGE_GATEWAY
+```
+
+This live OpenWA configuration change requires its own operator approval. Back up
+the root-owned Compose file, edit only that value, validate with `docker compose
+config --quiet`, and perform one controlled OpenWA recreation. Require the same
+`openwa-data` volume, `healthy` container state, configured named session `ready`,
+and absence of `LOGOUT` before changing the webhook. A fresh QR, pairing loss,
+identity mismatch, or any unexpected network/exposure change stops the cutover
+and restores the reviewed Compose backup. Do not scan a QR code or change Baileys
+data. Do not recreate OpenWA except for this explicitly approved allowlist change.
 
 ## Start, stop, and status
 
