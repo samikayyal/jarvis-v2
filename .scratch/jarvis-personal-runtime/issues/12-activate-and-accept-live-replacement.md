@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: complete
 Blocked by: 11
 
 ## Question
@@ -14,8 +14,9 @@ Stop for operator approval at credentials, installation/replacement, every mutat
   2026-09-01. Credential reuse, replacement installation, the one controlled
   OpenWA allowlist recreation, the exact source-specific UFW rule, and each
   mutating smoke-test proposal received operator approval before execution.
-- The final operator go/no-go remains pending. Keep this ticket open and retain
-  the complete stopped legacy runtime until that decision is recorded.
+- The authorized operator gave the final `GO` on 2026-09-01 after reviewing the
+  complete live, review, and final-suite evidence. Retain the complete stopped
+  legacy runtime until Ticket 13 separately authorizes retirement.
 
 ## Answer
 
@@ -67,9 +68,9 @@ formatting, compilation, package checks, and checksum validation pass.
 Production reconciliation is settled: replacement restart count zero, private
 listener and firewall rule exact, OpenWA healthy/ready with pairing retained,
 Windows key-only execution succeeds, legacy containers stopped and preserved,
-old worker inactive, disk use 9%, and host load low. Final lifecycle status and
-the map decision must be changed to `complete` only after the final operator
-go/no-go.
+old worker inactive, disk use 9%, and host load low. The authorized operator's
+final `GO` completed this ticket; legacy retirement remains out of scope until
+Ticket 13.
 
 The required two-axis review compared the complete change to fixed point
 `0e777cbdbfead143fdb8ad0d322ca985bcfbffc4`. The Standards axis found one

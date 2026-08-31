@@ -35,6 +35,7 @@ Actually replace the existing Jarvis assistant control plane with a small native
 - [Run approved Ubuntu commands](issues/08-run-approved-ubuntu-commands.md) — Expose `run_terminal` for the native Ubuntu host with strict simple-command read-only screening, exact host-plus-prefix approvals and saved permissions, resumable tool results, configured cwd/deadline/output limits, single-attempt execution, and best-effort process-group cancellation.
 - [Package the native service and private handoff](issues/10-package-native-service-and-private-handoff.md) — Ship one checksum-pinned native service template and bounded private webhook listener, keep target-host values deployment-discovered, and document inactive validation, installation, operation, and rollback without touching live OpenWA or the previous runtime.
 - [Prove the replacement contract](issues/11-prove-replacement-contract.md) — The complete focused replacement-runtime contract passes on the development host (139 passed, one expected POSIX-only skip), with no runtime-behavior defect found and no activation, removal, or repository-wide test run performed.
+- [Activate and accept the live replacement](issues/12-activate-and-accept-live-replacement.md) — The checksum-pinned native runtime is live on the private OpenWA handoff; real WhatsApp/OpenAI, Ubuntu, Windows, approval, rejection, cancellation, trace, readiness, pairing, phone-receipt, review, and final go/no-go gates passed while the stopped legacy runtime remains preserved for Ticket 13 retirement.
 
 ## Not yet specified
 
