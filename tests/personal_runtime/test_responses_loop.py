@@ -14,7 +14,11 @@ from jarvis_personal_runtime.responses import (
     canonical_context,
     local_input_tokens,
 )
-from jarvis_personal_runtime.runtime import ContextLimitReached
+from jarvis_personal_runtime.runtime import (
+    ApprovalRequired,
+    ContextLimitReached,
+    PendingAction,
+)
 
 
 def async_test(function):
@@ -70,6 +74,17 @@ class FailingTools(FakeTools):
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
         self.calls.append((name, arguments))
         raise OSError("vault unavailable")
+
+
+class ApprovalTools(FakeTools):
+    async def execute(
+        self, name: str, arguments: dict[str, object]
+    ) -> ApprovalRequired:
+        self.calls.append((name, arguments))
+        return ApprovalRequired(
+            PendingAction(host="ubuntu", prefix="touch", display="Run command?"),
+            object(),
+        )
 
 
 class MemoryTrace:
@@ -412,6 +427,57 @@ async def test_output_replay_omits_response_only_status() -> None:
             "call_id": "call_exact",
             "output": '{"text":"found"}',
         },
+    ]
+
+
+@async_test
+async def test_cancelling_pending_tool_keeps_next_request_transcript_valid() -> None:
+    function_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_pending",
+        "name": "read_vault",
+        "arguments": '{"query":"roadmap"}',
+        "status": "completed",
+    }
+    responses = FakeResponses(
+        ResponsesResult(output=(function_call,), output_text=""),
+        ResponsesResult(output=(), output_text="Next request completed."),
+    )
+    runner = DirectResponsesRunner(
+        responses,
+        tools=ApprovalTools(),
+        request_timeout_seconds=30,
+        max_tool_rounds=2,
+    )
+
+    pending = await runner.run(
+        "Find it", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+    )
+    assert isinstance(pending, ApprovalRequired)
+
+    runner.cancel_pending(pending.continuation)
+    result = await runner.run(
+        "Continue", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+    )
+
+    assert result.reply == "Next request completed."
+    continuation, _ = responses.calls[1]
+    assert continuation["input"] == [
+        {"role": "user", "content": "Find it"},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_pending",
+            "name": "read_vault",
+            "arguments": '{"query":"roadmap"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_pending",
+            "output": '{"cancelled":true}',
+        },
+        {"role": "user", "content": "Continue"},
     ]
 
 

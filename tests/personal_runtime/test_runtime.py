@@ -49,6 +49,7 @@ class FakeRunner:
         self.release = asyncio.Event()
         self.wait = False
         self.sessions_started = 0
+        self.cancelled_pending: list[object] = []
 
     def start_session(self) -> None:
         self.sessions_started += 1
@@ -66,6 +67,9 @@ class FakeRunner:
     async def resume(self, decision: ApprovalDecision, continuation: object) -> object:
         self.resumes.append((decision, continuation))
         return Completed("resumed")
+
+    def cancel_pending(self, continuation: object) -> None:
+        self.cancelled_pending.append(continuation)
 
 
 class FakePermissionStore:
@@ -287,6 +291,7 @@ async def test_pending_modal_suspends_inactivity_and_new_starts_fresh_session() 
     assert ignored_command.replies == ()
     cancelled = await runtime.receive(inbound("m4", "/cancel"))
     assert cancelled.disposition == "cancelled"
+    assert runner.cancelled_pending == ["continuation"]
     assert runtime.status().session_id == first_session
     reset = await runtime.receive(inbound("m5", "/new"))
     assert reset.disposition == "new_session"

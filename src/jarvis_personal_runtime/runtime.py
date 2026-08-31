@@ -127,6 +127,8 @@ RequestStep = Completed | ApprovalRequired | ContextLimitReached
 
 
 class RequestRunner(Protocol):
+    def cancel_pending(self, continuation: object) -> None: ...
+
     async def run(
         self,
         text: str,
@@ -376,6 +378,7 @@ class PersonalRuntime:
         pending = self._session.pending
         choice = text.strip()
         if choice == "/cancel":
+            self.request_runner.cancel_pending(pending.continuation)
             task = self._cancel_work(now)
             if task and task is not asyncio.current_task():
                 task.cancel()

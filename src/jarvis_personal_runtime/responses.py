@@ -556,6 +556,32 @@ class DirectResponsesRunner:
             },
         )
 
+    def cancel_pending(self, continuation: object) -> None:
+        if not isinstance(continuation, _ResponsesContinuation):
+            raise TypeError("invalid Responses approval continuation")
+        call = continuation.call
+        output = json.dumps({"cancelled": True}, sort_keys=True, separators=(",", ":"))
+        self._trace.record(
+            "pending_tool_cancelled",
+            {"name": str(call["name"]), "call_id": str(call["call_id"])},
+        )
+        self._trace.record(
+            "tool_result",
+            {
+                "name": str(call["name"]),
+                "call_id": str(call["call_id"]),
+                "output": output,
+            },
+        )
+        self._transcript = [
+            *continuation.transcript,
+            {
+                "type": "function_call_output",
+                "call_id": str(call["call_id"]),
+                "output": output,
+            },
+        ]
+
     async def resume(
         self, decision: ApprovalDecision, continuation: object
     ) -> Completed | ApprovalRequired | ContextLimitReached:
