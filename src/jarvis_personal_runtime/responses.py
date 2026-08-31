@@ -562,7 +562,7 @@ class DirectResponsesRunner:
         call = continuation.call
         output = json.dumps({"cancelled": True}, sort_keys=True, separators=(",", ":"))
         self._trace.record(
-            "pending_tool_cancelled",
+            "pending_action_cancelled",
             {"name": str(call["name"]), "call_id": str(call["call_id"])},
         )
         self._trace.record(

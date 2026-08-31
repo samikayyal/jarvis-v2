@@ -431,7 +431,7 @@ async def test_output_replay_omits_response_only_status() -> None:
 
 
 @async_test
-async def test_cancelling_pending_tool_keeps_next_request_transcript_valid() -> None:
+async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -> None:
     function_call = {
         "type": "function_call",
         "id": "fc_1",

@@ -206,5 +206,8 @@ sudo systemctl status RECORDED_PREVIOUS_SERVICE --no-pager
 Then re-verify OpenWA health plus named-session `ready`, unchanged container and
 volume identity, unchanged pairing state, no `LOGOUT`, and no message replay.
 Leave the failed replacement stopped and preserve its trace for diagnosis. A
-rollback never removes OpenWA volumes, re-pairs the account, changes firewall
-rules, deletes the candidate, or retires the previous runtime.
+rollback never removes OpenWA volumes, re-pairs the account, broadens firewall
+access, deletes the candidate, or retires the previous runtime. Keep the exact
+source-specific firewall rule while the replacement remains installed for
+diagnosis. If the replacement is abandoned, separately recheck its recorded rule
+number and, with operator approval, delete only that exact rule.
