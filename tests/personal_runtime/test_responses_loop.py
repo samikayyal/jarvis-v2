@@ -359,6 +359,50 @@ async def test_one_tool_call_replays_complete_output_before_exact_result() -> No
 
 
 @async_test
+async def test_function_call_replay_omits_response_only_status() -> None:
+    function_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_exact",
+        "name": "read_vault",
+        "arguments": '{"query":"roadmap"}',
+        "status": "completed",
+    }
+    responses = FakeResponses(
+        ResponsesResult(output=(function_call,), output_text=""),
+        ResponsesResult(output=(), output_text="Found it."),
+    )
+    runner = DirectResponsesRunner(
+        responses,
+        tools=FakeTools(),
+        request_timeout_seconds=30,
+        max_tool_rounds=2,
+    )
+
+    result = await runner.run(
+        "Find it", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+    )
+
+    assert result.reply == "Found it."
+    continuation, _ = responses.calls[1]
+    assert continuation["input"] == [
+        {"role": "user", "content": "Find it"},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_exact",
+            "name": "read_vault",
+            "arguments": '{"query":"roadmap"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_exact",
+            "output": '{"text":"found"}',
+        },
+    ]
+
+
+@async_test
 async def test_tool_error_is_returned_to_the_model_and_continuation_proceeds() -> None:
     call = {
         "type": "function_call",

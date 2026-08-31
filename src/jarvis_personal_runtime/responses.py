@@ -98,6 +98,12 @@ def _tool_error(error: Exception) -> str:
     )
 
 
+def _replay_output_item(item: dict[str, object]) -> dict[str, object]:
+    if item.get("type") == "function_call":
+        return {key: value for key, value in item.items() if key != "status"}
+    return item
+
+
 class PreparedTools(Protocol):
     definitions: tuple[dict[str, object], ...]
 
@@ -431,7 +437,10 @@ class DirectResponsesRunner:
                         "projected_input_tokens": projected_tokens,
                     },
                 )
-                transcript = [*transcript, *response.output]
+                transcript = [
+                    *transcript,
+                    *(_replay_output_item(item) for item in response.output),
+                ]
                 calls = [
                     item
                     for item in response.output
