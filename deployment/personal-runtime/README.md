@@ -130,8 +130,8 @@ Set `listener_host` to the exact RFC1918 IPv4 gateway address of the Docker brid
 that contains OpenWA, and set a reviewed unprivileged port. The runtime refuses
 wildcard, loopback, public, hostname, and IPv6 listener values. Configure OpenWA's
 single webhook destination as `http://BRIDGE_GATEWAY:PORT/webhook` only during the
-supervised cutover. No public reverse proxy, host-wide bind, new Compose service,
-or firewall opening is part of this package.
+supervised cutover. No public reverse proxy, host-wide bind, or new Compose service
+is part of this package.
 
 Before changing the handoff, verify and record OpenWA container identity, start
 time, volume, networks, health, named-session `ready` state, and absence of
@@ -152,6 +152,23 @@ and absence of `LOGOUT` before changing the webhook. A fresh QR, pairing loss,
 identity mismatch, or any unexpected network/exposure change stops the cutover
 and restores the reviewed Compose backup. Do not scan a QR code or change Baileys
 data. Do not recreate OpenWA except for this explicitly approved allowlist change.
+
+Before switching the webhook, probe the listener from the recreated OpenWA
+container. On a host with default-deny inbound filtering, a timeout with no
+runtime trace means the host firewall is blocking the container-to-gateway path.
+Record the exact bridge interface, bridge gateway, and recreated OpenWA handoff
+IP. With separate operator approval, add only this source-specific rule:
+
+```console
+sudo ufw allow in on BRIDGE_INTERFACE from OPENWA_HANDOFF_IP to BRIDGE_GATEWAY port PORT proto tcp comment 'Jarvis personal runtime from OpenWA only'
+```
+
+Do not allow the complete bridge subnet, another interface, LAN/Tailscale peers,
+or `Anywhere`. Re-probe from OpenWA and verify that the listener remains bound
+only to `BRIDGE_GATEWAY:PORT`. Record the added UFW rule number so rollback can
+delete that exact rule if the replacement is abandoned. A later OpenWA
+recreation must re-discover its handoff IP and revalidate this source-specific
+rule before changing the webhook.
 
 ## Start, stop, and status
 
