@@ -4,8 +4,8 @@ This directory packages the replacement as one native Ubuntu `systemd` service.
 It does not install, enable, start, stop, or replace any service by itself. Ticket
 12 owns live installation and cutover with the authorized operator present.
 
-The service reads `.env`, `jarvis.toml`, and `SYSTEM.md` directly from
-`/var/lib/jarvis-personal-runtime`. The service account owns that directory. The
+The rendered service reads `.env`, `jarvis.toml`, and `SYSTEM.md` directly from
+the discovered runtime root. The discovered service account owns that directory. The
 static `.env` is root-owned, group-readable only by the consuming service, and
 mode `0440`. The service account owns the mode-`0600` TOML and system prompt;
 the operator may edit them through an administrative editor. The runtime changes
@@ -26,12 +26,15 @@ uv run ruff check src/jarvis_personal_runtime tests/personal_runtime
 uv run ruff format --check src/jarvis_personal_runtime tests/personal_runtime
 ```
 
-On the target Ubuntu host, stage the reviewed Git tree in a new release directory
-named by its commit and verify its replacement-specific checksums before building
-the hash-locked virtual environment. Do not change the `current` symlink:
+On the target Ubuntu host, first discover and record the exact release root,
+runtime root, service user, service group, OpenWA Docker-bridge gateway, listener
+port, and private OpenWA API URL. This repository does not assume any of them.
+Stage the reviewed Git tree in a new commit-named directory below that recorded
+release root and verify its replacement-specific checksums before building the
+hash-locked virtual environment. Do not change the `current` symlink:
 
 ```console
-cd /opt/jarvis-personal-runtime/releases/CANDIDATE
+cd DISCOVERED_RELEASE_ROOT/releases/CANDIDATE
 sha256sum --check deployment/personal-runtime/SHA256SUMS
 uv venv --python /usr/bin/python3.13 .venv
 uv pip install --python .venv/bin/python --require-hashes \
@@ -43,10 +46,8 @@ Make a separate temporary runtime directory from the three examples, replace
 every placeholder with reviewed non-production validation values, and run:
 
 ```console
-/opt/jarvis-personal-runtime/releases/CANDIDATE/.venv/bin/jarvis-personal-runtime \
+DISCOVERED_RELEASE_ROOT/releases/CANDIDATE/.venv/bin/jarvis-personal-runtime \
   --root /path/to/inactive-validation-runtime --check
-systemd-analyze verify \
-  /opt/jarvis-personal-runtime/releases/CANDIDATE/deployment/personal-runtime/jarvis-personal-runtime.service
 ```
 
 `--check` parses the three files and validates the complete OpenWA and private
@@ -64,23 +65,24 @@ The following commands are for the approved Ticket 12 maintenance window, not
 for Ticket 10 validation. Record the exact immutable previous release, previous
 service name, and previous OpenWA webhook destination before any change.
 
-Create the unprivileged service identity and private runtime directory once:
+Confirm the recorded service identity and paths do not collide with the previous
+runtime. Create the approved unprivileged service identity if it does not already
+exist, then create the private runtime directory:
 
 ```console
-sudo useradd --system --home-dir /var/lib/jarvis-personal-runtime \
-  --shell /usr/sbin/nologin jarvis-personal-runtime
-sudo install -d -o jarvis-personal-runtime -g jarvis-personal-runtime -m 0700 \
-  /var/lib/jarvis-personal-runtime
+sudo useradd --system --home-dir DISCOVERED_RUNTIME_ROOT \
+  --shell /usr/sbin/nologin DISCOVERED_SERVICE_USER
+sudo install -d -o DISCOVERED_SERVICE_USER -g DISCOVERED_SERVICE_GROUP -m 0700 \
+  DISCOVERED_RUNTIME_ROOT
 ```
 
 After the exact candidate is approved, atomically point `current` to its immutable
 commit-named release directory:
 
 ```console
-sudo ln -sfn /opt/jarvis-personal-runtime/releases/CANDIDATE \
-  /opt/jarvis-personal-runtime/current.new
-sudo mv -T /opt/jarvis-personal-runtime/current.new \
-  /opt/jarvis-personal-runtime/current
+sudo ln -sfn DISCOVERED_RELEASE_ROOT/releases/CANDIDATE \
+  DISCOVERED_RELEASE_ROOT/current.new
+sudo mv -T DISCOVERED_RELEASE_ROOT/current.new DISCOVERED_RELEASE_ROOT/current
 ```
 
 Copy `.env.example` as `.env`, `jarvis.toml.example` as `jarvis.toml`, and
@@ -88,16 +90,33 @@ Copy `.env.example` as `.env`, `jarvis.toml.example` as `jarvis.toml`, and
 real secrets in the repository, shell history, command output, or the journal.
 
 ```console
-cd /var/lib/jarvis-personal-runtime
-sudo chown root:jarvis-personal-runtime .env
+cd DISCOVERED_RUNTIME_ROOT
+sudo chown root:DISCOVERED_SERVICE_GROUP .env
 sudo chmod 0440 .env
-sudo chown jarvis-personal-runtime:jarvis-personal-runtime jarvis.toml SYSTEM.md
+sudo chown DISCOVERED_SERVICE_USER:DISCOVERED_SERVICE_GROUP jarvis.toml SYSTEM.md
 sudo chmod 0600 jarvis.toml SYSTEM.md
-sudo -u jarvis-personal-runtime \
-  /opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime \
-  --root /var/lib/jarvis-personal-runtime --check
+sudo -u DISCOVERED_SERVICE_USER \
+  DISCOVERED_RELEASE_ROOT/current/.venv/bin/jarvis-personal-runtime \
+  --root DISCOVERED_RUNTIME_ROOT --check
+```
+
+Render the four `@...@` placeholders in `jarvis-personal-runtime.service` with
+the recorded values into an inactive temporary file. Reject values containing
+whitespace, `|`, `%`, or shell metacharacters; both roots must be absolute paths
+and the service identity must already exist. Review the complete rendered file,
+then verify and install it:
+
+```console
+sed \
+  -e 's|@SERVICE_USER@|DISCOVERED_SERVICE_USER|g' \
+  -e 's|@SERVICE_GROUP@|DISCOVERED_SERVICE_GROUP|g' \
+  -e 's|@RELEASE_ROOT@|DISCOVERED_RELEASE_ROOT|g' \
+  -e 's|@RUNTIME_ROOT@|DISCOVERED_RUNTIME_ROOT|g' \
+  DISCOVERED_RELEASE_ROOT/current/deployment/personal-runtime/jarvis-personal-runtime.service \
+  > /path/to/inactive-rendered-jarvis-personal-runtime.service
+systemd-analyze verify /path/to/inactive-rendered-jarvis-personal-runtime.service
 sudo install -o root -g root -m 0644 \
-  /opt/jarvis-personal-runtime/current/deployment/personal-runtime/jarvis-personal-runtime.service \
+  /path/to/inactive-rendered-jarvis-personal-runtime.service \
   /etc/systemd/system/jarvis-personal-runtime.service
 sudo systemctl daemon-reload
 ```

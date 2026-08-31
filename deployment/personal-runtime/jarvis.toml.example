@@ -10,10 +10,10 @@ max_tool_rounds = 8
 command_timeout_seconds = 300
 max_output_chars = 65536
 
-# Replace this example with the exact IPv4 gateway of OpenWA's Docker bridge.
+# Replace this placeholder with the exact IPv4 gateway of OpenWA's Docker bridge.
 # The loader rejects wildcard, loopback, public, hostname, and IPv6 listeners.
-listener_host = "172.17.0.1"
-listener_port = 8787
+listener_host = "REPLACE_WITH_DOCKER_BRIDGE_GATEWAY"
+listener_port = "REPLACE_WITH_LISTENER_PORT"
 
 message_cache_path = "data/message-cache.json"
 message_cache_retention_days = 7
@@ -21,7 +21,7 @@ trace_path = "data/runtime-trace.jsonl"
 trace_max_bytes = 10485760
 system_prompt_path = "SYSTEM.md"
 
-openwa_api_base_url = "http://172.17.0.2:2785/api"
+openwa_api_base_url = "REPLACE_WITH_PRIVATE_OPENWA_API_BASE_URL"
 openwa_internal_session_id = "replace-with-internal-session-id"
 openwa_named_session = "replace-with-named-session"
 openwa_authorized_operator_number = "replace-with-number@c.us"

@@ -1,17 +1,17 @@
 [Unit]
 Description=Jarvis personal assistant runtime
-Documentation=file:/opt/jarvis-personal-runtime/current/deployment/personal-runtime/README.md
+Documentation=file:@RELEASE_ROOT@/current/deployment/personal-runtime/README.md
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=jarvis-personal-runtime
-Group=jarvis-personal-runtime
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
 UMask=0077
-WorkingDirectory=/var/lib/jarvis-personal-runtime
-ExecStartPre=/opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime --root /var/lib/jarvis-personal-runtime --check
-ExecStart=/opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime --root /var/lib/jarvis-personal-runtime
+WorkingDirectory=@RUNTIME_ROOT@
+ExecStartPre=@RELEASE_ROOT@/current/.venv/bin/jarvis-personal-runtime --root @RUNTIME_ROOT@ --check
+ExecStart=@RELEASE_ROOT@/current/.venv/bin/jarvis-personal-runtime --root @RUNTIME_ROOT@
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -31,7 +31,7 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=full
-ReadWritePaths=/var/lib/jarvis-personal-runtime
+ReadWritePaths=@RUNTIME_ROOT@
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 LockPersonality=yes
