@@ -99,9 +99,7 @@ def _tool_error(error: Exception) -> str:
 
 
 def _replay_output_item(item: dict[str, object]) -> dict[str, object]:
-    if item.get("type") == "function_call":
-        return {key: value for key, value in item.items() if key != "status"}
-    return item
+    return {key: value for key, value in item.items() if key != "status"}
 
 
 class PreparedTools(Protocol):

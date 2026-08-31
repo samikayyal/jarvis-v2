@@ -359,7 +359,14 @@ async def test_one_tool_call_replays_complete_output_before_exact_result() -> No
 
 
 @async_test
-async def test_function_call_replay_omits_response_only_status() -> None:
+async def test_output_replay_omits_response_only_status() -> None:
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "opaque-ciphertext",
+        "summary": [],
+        "status": None,
+    }
     function_call = {
         "type": "function_call",
         "id": "fc_1",
@@ -369,7 +376,7 @@ async def test_function_call_replay_omits_response_only_status() -> None:
         "status": "completed",
     }
     responses = FakeResponses(
-        ResponsesResult(output=(function_call,), output_text=""),
+        ResponsesResult(output=(reasoning_item, function_call), output_text=""),
         ResponsesResult(output=(), output_text="Found it."),
     )
     runner = DirectResponsesRunner(
@@ -387,6 +394,12 @@ async def test_function_call_replay_omits_response_only_status() -> None:
     continuation, _ = responses.calls[1]
     assert continuation["input"] == [
         {"role": "user", "content": "Find it"},
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque-ciphertext",
+            "summary": [],
+        },
         {
             "type": "function_call",
             "id": "fc_1",
