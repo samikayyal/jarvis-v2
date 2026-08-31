@@ -33,6 +33,7 @@ Actually replace the existing Jarvis assistant control plane with a small native
 - [Enforce context, trace, and reply bounds](issues/06-enforce-context-trace-and-reply-bounds.md) — Gate every complete candidate context with the stable explicit `o200k_base` estimate, end the session at `>=` the configured limit, enforce configured output bounds and deterministic WhatsApp splitting, and retain rotating verbatim JSON Lines trace segments with non-blocking deterministic failure warnings.
 - [Add the read-vault tool](issues/07-add-read-vault-tool.md) — Expose one strict `read_vault` prepared tool with minimal `mode` and `value` inputs, exact safe Markdown reads, deterministic bounded local search, configured vault rooting, and rejection of traversal, writes, unsupported targets, and oversized data.
 - [Run approved Ubuntu commands](issues/08-run-approved-ubuntu-commands.md) — Expose `run_terminal` for the native Ubuntu host with strict simple-command read-only screening, exact host-plus-prefix approvals and saved permissions, resumable tool results, configured cwd/deadline/output limits, single-attempt execution, and best-effort process-group cancellation.
+- [Package the native service and private handoff](issues/10-package-native-service-and-private-handoff.md) — Ship one checksum-pinned native service template and bounded private webhook listener, keep target-host values deployment-discovered, and document inactive validation, installation, operation, and rollback without touching live OpenWA or the previous runtime.
 
 ## Not yet specified
 
