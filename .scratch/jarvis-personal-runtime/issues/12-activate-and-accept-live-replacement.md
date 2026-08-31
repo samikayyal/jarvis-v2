@@ -20,7 +20,7 @@ Stop for operator approval at credentials, installation/replacement, every mutat
 ## Answer
 
 The native personal assistant runtime is installed from immutable release
-`4137ee786be6de0bbbc4e3723a9f7384cfe0382c`, enabled, active, and listening only
+`2be9b5419e4b707caedb3fc3e0f0bc8d3310dab8`, enabled, active, and listening only
 on Docker bridge gateway `172.20.0.1:9011`. Its protected configuration remains
 root/service-owned with modes `0440`, `0600`, and `0600`. The previous 13-service
 Compose runtime and its immutable release remain installed and stopped; its
