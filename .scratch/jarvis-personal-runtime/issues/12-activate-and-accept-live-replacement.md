@@ -70,3 +70,16 @@ Windows key-only execution succeeds, legacy containers stopped and preserved,
 old worker inactive, disk use 9%, and host load low. Final lifecycle status and
 the map decision must be changed to `complete` only after the final operator
 go/no-go.
+
+The required two-axis review compared the complete change to fixed point
+`0e777cbdbfead143fdb8ad0d322ca985bcfbffc4`. The Standards axis found one
+canonical-language violation (`pending tool` instead of `pending action`); the
+Spec axis found contradictory firewall rollback guidance and the then-missing
+live evidence record. All findings were repaired before the final suite.
+
+The repository-wide suite was run exactly once at the end: 929 passed, three
+platform/host skips, and four failed in 807.07 seconds. All four failures are the
+preserved legacy Ticket 27 deployment checks rejecting the intentionally changed
+application source against its immutable rollback artifact lock with the single
+reason `application source differs from the pinned artifact`. The legacy lock was
+not weakened or repinned, and the full suite was not rerun.
