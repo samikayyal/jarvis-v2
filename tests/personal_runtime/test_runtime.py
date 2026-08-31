@@ -318,23 +318,36 @@ async def test_approval_once_rejection_and_context_limit_are_explicit() -> None:
 
 
 @async_test
-async def test_builder_loads_system_prompt_and_persists_message_ids(
+async def test_restart_discards_session_work_and_persists_message_ids(
     tmp_path: Path,
 ) -> None:
     (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-test\n", encoding="utf-8")
     (tmp_path / "jarvis.toml").write_text("", encoding="utf-8")
     (tmp_path / "SYSTEM.md").write_text("System instructions.\n", encoding="utf-8")
     clock = FakeClock()
-    first_runner = FakeRunner()
+    action = PendingAction(host="ubuntu", prefix="pwd", display="Run pwd?")
+    first_runner = FakeRunner(ApprovalRequired(action, "continuation"))
     first = build_runtime(tmp_path, request_runner=first_runner, clock=clock)
 
-    assert (
-        await first.receive(inbound("durable-id", "hello"))
-    ).disposition == "completed"
+    await first.receive(inbound("selection", "/model gpt-5.6-sol"))
+    assert (await first.receive(inbound("durable-id", "hello"))).disposition == (
+        "approval_required"
+    )
     assert first_runner.system_prompts == ["System instructions.\n"]
+    before_restart = first.status()
+    assert before_restart.session_id is not None
+    assert before_restart.model == "gpt-5.6-sol"
+    assert before_restart.active_request is not None
+    assert before_restart.pending_action == action
 
     restarted_runner = FakeRunner()
     restarted = build_runtime(tmp_path, request_runner=restarted_runner, clock=clock)
+    after_restart = restarted.status()
+    assert after_restart.session_id is None
+    assert after_restart.model == "gpt-5.6-luna"
+    assert after_restart.active_request is None
+    assert after_restart.pending_action is None
+
     duplicate = await restarted.receive(inbound("durable-id", "hello again"))
     assert duplicate.disposition == "duplicate"
     assert restarted_runner.calls == []

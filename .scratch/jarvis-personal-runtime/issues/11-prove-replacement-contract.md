@@ -23,8 +23,10 @@ Ubuntu command policy and execution, Windows OpenSSH behavior, in-memory restart
 loss, seven-day on-disk deduplication, and configured request, tool, command,
 output, and listener limits.
 
-No replacement defect was found, so no runtime or test code was changed. The
-repository-wide suite was not run, and neither the replacement nor the legacy
-runtime was activated, removed, or otherwise modified.
+No runtime-behavior defect was found. The existing reconstruction acceptance
+test was strengthened to prove that session selection, active work, and pending
+approval are lost while the message-ID cache survives. The repository-wide
+suite was not run, and neither the replacement nor the legacy runtime was
+activated, removed, or otherwise modified.
 
 ## Comments
