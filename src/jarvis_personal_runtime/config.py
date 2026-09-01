@@ -99,24 +99,23 @@ class ConfigError(ValueError):
 class RuntimeSecrets:
     """Credentials loaded from ``.env``.
 
-    Only the OpenAI credential is required by the foundation.  OpenWA
-    credentials are optional here because the gateway handoff is implemented
-    by a later slice and controlled deployments may provide it separately.
+    The runtime requires credentials for OpenAI and OpenWA, including the
+    webhook signing secret used to authenticate inbound messages.
     ``repr`` is redacted so an accidental diagnostic cannot print secrets.
     """
 
     openai_api_key: str = field(repr=False)
-    openwa_api_key: str | None = field(default=None, repr=False)
-    openwa_webhook_signing_secret: str | None = field(default=None, repr=False)
+    openwa_api_key: str = field(repr=False)
+    openwa_webhook_signing_secret: str = field(repr=False)
 
     @property
-    def webhook_signing_secret(self) -> str | None:
+    def webhook_signing_secret(self) -> str:
         """Compatibility spelling for the OpenWA signing secret."""
 
         return self.openwa_webhook_signing_secret
 
     @property
-    def openwa_webhook_secret(self) -> str | None:
+    def openwa_webhook_secret(self) -> str:
         return self.openwa_webhook_signing_secret
 
     def __repr__(self) -> str:
@@ -333,18 +332,26 @@ def _load_secrets(path: Path) -> RuntimeSecrets:
     openai = _env_value(values, path, "OPENAI_API_KEY", "JARVIS_OPENAI_API_KEY")
     if openai is None:
         raise ConfigError(path, "missing non-empty OPENAI_API_KEY")
+    openwa_api_key = _env_value(
+        values, path, "OPENWA_API_KEY", "OPENWA_API_MASTER_KEY"
+    )
+    if openwa_api_key is None:
+        raise ConfigError(path, "missing non-empty OPENWA_API_KEY")
+    openwa_webhook_signing_secret = _env_value(
+        values,
+        path,
+        "OPENWA_WEBHOOK_SIGNING_SECRET",
+        "OPENWA_WEBHOOK_SECRET",
+        "JARVIS_WEBHOOK_SIGNING_SECRET",
+    )
+    if openwa_webhook_signing_secret is None:
+        raise ConfigError(
+            path, "missing non-empty OPENWA_WEBHOOK_SIGNING_SECRET"
+        )
     return RuntimeSecrets(
         openai_api_key=openai,
-        openwa_api_key=_env_value(
-            values, path, "OPENWA_API_KEY", "OPENWA_API_MASTER_KEY"
-        ),
-        openwa_webhook_signing_secret=_env_value(
-            values,
-            path,
-            "OPENWA_WEBHOOK_SIGNING_SECRET",
-            "OPENWA_WEBHOOK_SECRET",
-            "JARVIS_WEBHOOK_SIGNING_SECRET",
-        ),
+        openwa_api_key=openwa_api_key,
+        openwa_webhook_signing_secret=openwa_webhook_signing_secret,
     )
 
 
