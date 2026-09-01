@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypedDict, cast
 
 DEFAULT_ALLOWED_MODELS = (
     "gpt-5.6-sol",
@@ -36,41 +36,78 @@ DEFAULT_ALLOWED_REASONING_EFFORTS = (
     "max",
 )
 
+# This is for typing
+class _RuntimeDefaults(TypedDict):
+    model: str
+    allowed_models: tuple[str, ...]
+    reasoning_effort: str
+    allowed_reasoning_efforts: tuple[str, ...]
+    inactivity_minutes: int
+    max_context_tokens: int
+    request_timeout_seconds: float
+    max_tool_rounds: int
+    command_timeout_seconds: float
+    max_output_chars: int
+    ubuntu_working_directory: str
+    ubuntu_read_only_prefixes: tuple[str, ...]
+    windows_ssh_host: None
+    windows_ssh_user: None
+    windows_ssh_identity_file: None
+    windows_working_directory: None
+    windows_read_only_prefixes: tuple[str, ...]
+    message_cache_path: str
+    message_cache_retention_days: int
+    trace_path: str
+    trace_max_bytes: int
+    listener_host: None
+    listener_port: None
+    system_prompt_path: str
+    vault_path: None
+    openwa_api_base_url: None
+    openwa_internal_session_id: None
+    openwa_named_session: None
+    openwa_authorized_operator_number: None
+    openwa_operator_chat_id: None
+
+
 # Keep defaults in one immutable mapping so a loader and callers constructing
 # a RuntimeConfig manually cannot accidentally drift apart.
-DEFAULTS: Mapping[str, Any] = MappingProxyType(
-    {
-        "model": "gpt-5.6-luna",
-        "allowed_models": DEFAULT_ALLOWED_MODELS,
-        "reasoning_effort": "medium",
-        "allowed_reasoning_efforts": DEFAULT_ALLOWED_REASONING_EFFORTS,
-        "inactivity_minutes": 60,
-        "max_context_tokens": 100_000,
-        "request_timeout_seconds": 600,
-        "max_tool_rounds": 8,
-        "command_timeout_seconds": 300,
-        "max_output_chars": 65_536,
-        "ubuntu_working_directory": ".",
-        "ubuntu_read_only_prefixes": (),
-        "windows_ssh_host": None,
-        "windows_ssh_user": None,
-        "windows_ssh_identity_file": None,
-        "windows_working_directory": None,
-        "windows_read_only_prefixes": (),
-        "message_cache_path": "data/message-cache.json",
-        "message_cache_retention_days": 7,
-        "trace_path": "data/runtime-trace.jsonl",
-        "trace_max_bytes": 10 * 1024 * 1024,
-        "listener_host": None,
-        "listener_port": None,
-        "system_prompt_path": "SYSTEM.md",
-        "vault_path": None,
-        "openwa_api_base_url": None,
-        "openwa_internal_session_id": None,
-        "openwa_named_session": None,
-        "openwa_authorized_operator_number": None,
-        "openwa_operator_chat_id": None,
-    }
+DEFAULTS: _RuntimeDefaults = cast(
+    _RuntimeDefaults,
+    MappingProxyType(
+        {
+            "model": "gpt-5.6-luna",
+            "allowed_models": DEFAULT_ALLOWED_MODELS,
+            "reasoning_effort": "medium",
+            "allowed_reasoning_efforts": DEFAULT_ALLOWED_REASONING_EFFORTS,
+            "inactivity_minutes": 60,
+            "max_context_tokens": 100_000,
+            "request_timeout_seconds": 600,
+            "max_tool_rounds": 8,
+            "command_timeout_seconds": 300,
+            "max_output_chars": 65_536,
+            "ubuntu_working_directory": ".",
+            "ubuntu_read_only_prefixes": (),
+            "windows_ssh_host": None,
+            "windows_ssh_user": None,
+            "windows_ssh_identity_file": None,
+            "windows_working_directory": None,
+            "windows_read_only_prefixes": (),
+            "message_cache_path": "data/message-cache.json",
+            "message_cache_retention_days": 7,
+            "trace_path": "data/runtime-trace.jsonl",
+            "trace_max_bytes": 10 * 1024 * 1024,
+            "listener_host": None,
+            "listener_port": None,
+            "system_prompt_path": "SYSTEM.md",
+            "vault_path": None,
+            "openwa_api_base_url": None,
+            "openwa_internal_session_id": None,
+            "openwa_named_session": None,
+            "openwa_authorized_operator_number": None,
+            "openwa_operator_chat_id": None,
+        }
+    ),
 )
 
 # Readable aliases are useful to downstream code, while DEFAULTS remains the
@@ -332,9 +369,7 @@ def _load_secrets(path: Path) -> RuntimeSecrets:
     openai = _env_value(values, path, "OPENAI_API_KEY", "JARVIS_OPENAI_API_KEY")
     if openai is None:
         raise ConfigError(path, "missing non-empty OPENAI_API_KEY")
-    openwa_api_key = _env_value(
-        values, path, "OPENWA_API_KEY", "OPENWA_API_MASTER_KEY"
-    )
+    openwa_api_key = _env_value(values, path, "OPENWA_API_KEY", "OPENWA_API_MASTER_KEY")
     if openwa_api_key is None:
         raise ConfigError(path, "missing non-empty OPENWA_API_KEY")
     openwa_webhook_signing_secret = _env_value(
@@ -345,9 +380,7 @@ def _load_secrets(path: Path) -> RuntimeSecrets:
         "JARVIS_WEBHOOK_SIGNING_SECRET",
     )
     if openwa_webhook_signing_secret is None:
-        raise ConfigError(
-            path, "missing non-empty OPENWA_WEBHOOK_SIGNING_SECRET"
-        )
+        raise ConfigError(path, "missing non-empty OPENWA_WEBHOOK_SIGNING_SECRET")
     return RuntimeSecrets(
         openai_api_key=openai,
         openwa_api_key=openwa_api_key,
