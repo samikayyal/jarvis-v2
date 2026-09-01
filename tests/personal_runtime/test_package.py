@@ -68,42 +68,50 @@ def test_example_configuration_carries_the_private_handoff_and_rotating_trace() 
     )["runtime"]
 
     assert config["listener_host"] == "REPLACE_WITH_DOCKER_BRIDGE_GATEWAY"
-    assert config["listener_port"] == "REPLACE_WITH_LISTENER_PORT"
+    assert config["listener_port"] == 9011
+    assert config["ubuntu_working_directory"] == "/srv/jarvis-workspace"
     assert config["trace_path"] == "data/runtime-trace.jsonl"
     assert config["trace_max_bytes"] > 0
     assert config["message_cache_retention_days"] == 7
     assert config["openwa_api_base_url"] == "REPLACE_WITH_PRIVATE_OPENWA_API_BASE_URL"
 
 
-def test_runbook_keeps_validation_inactive_and_documents_operations() -> None:
+def test_runbook_documents_active_native_operations_without_legacy_fallback() -> None:
     runbook = (PACKAGE / "README.md").read_text(encoding="utf-8")
     required = (
-        "Validation without activation",
-        "discover and record the exact release root",
-        "DISCOVERED_SERVICE_USER",
-        "DISCOVERED_RUNTIME_ROOT",
+        "Package verification",
+        "/opt/jarvis-personal-runtime/releases/COMMIT",
+        "/var/lib/jarvis-personal-runtime",
         "sha256sum --check deployment/personal-runtime/SHA256SUMS",
         "uv pip install --python .venv/bin/python --require-hashes",
-        "chown root:DISCOVERED_SERVICE_GROUP .env",
-        "chmod 0440 .env",
-        "chmod 0600 jarvis.toml SYSTEM.md",
+        "`root:jarvis-personal-runtime`, `0440`",
+        "`jarvis-personal-runtime:jarvis-personal-runtime`, `0600`",
         "systemctl start jarvis-personal-runtime",
         "systemctl stop jarvis-personal-runtime",
         "systemctl status jarvis-personal-runtime",
         "journalctl -u jarvis-personal-runtime",
-        "Rollback",
-        "Do not modify the live OpenWA project",
-        "Do not change pairing state",
-        "Do not change firewall rules",
-        "SSRF_ALLOWED_HOSTS=inbound-receiver,BRIDGE_GATEWAY",
-        "one controlled OpenWA recreation",
-        "ufw allow in on BRIDGE_INTERFACE from OPENWA_HANDOFF_IP",
+        "Roll back only by stopping the service",
+        "There is no legacy control-plane fallback",
+        "Preserve `openwa-data`",
+        "ufw allow in on BRIDGE_INTERFACE from OPENWA_CONTAINER_IP",
         "to BRIDGE_GATEWAY port PORT proto tcp",
-        "Do not allow the complete bridge subnet",
+        "Never allow the whole bridge subnet",
         "fresh QR",
         "LOGOUT",
-        "previous runtime",
     )
 
     for text in required:
         assert text in runbook
+
+
+def test_only_personal_runtime_source_and_dependencies_remain() -> None:
+    source_packages = {
+        path.parent.name for path in (ROOT / "src").glob("*/__init__.py")
+    }
+    assert source_packages == {"jarvis_personal_runtime"}
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["dependencies"] == [
+        "openai==2.53.0",
+        "tiktoken>=0.14.0",
+    ]

@@ -11,9 +11,10 @@ command_timeout_seconds = 300
 max_output_chars = 65536
 
 # Replace this placeholder with the exact IPv4 gateway of OpenWA's Docker bridge.
-# The loader rejects wildcard, loopback, public, hostname, and IPv6 listeners.
+# The active service must bind only this private address, never a wildcard, LAN,
+# Tailscale, public, hostname, loopback, or IPv6 address.
 listener_host = "REPLACE_WITH_DOCKER_BRIDGE_GATEWAY"
-listener_port = "REPLACE_WITH_LISTENER_PORT"
+listener_port = 9011
 
 message_cache_path = "data/message-cache.json"
 message_cache_retention_days = 7
@@ -27,11 +28,18 @@ openwa_named_session = "replace-with-named-session"
 openwa_authorized_operator_number = "replace-with-number@c.us"
 openwa_operator_chat_id = "replace-with-chat-id@c.us"
 
-ubuntu_working_directory = "."
+ubuntu_working_directory = "/srv/jarvis-workspace"
 ubuntu_read_only_prefixes = ["pwd", "git status"]
 
-# Add vault_path only after reviewing its exact read-only filesystem path.
-# Configure all four Windows SSH values together if Windows execution is enabled.
+# Add vault_path only after reviewing its exact read-only filesystem path, for
+# example: vault_path = "/srv/knowledge-vault"
+#
+# Configure all four Windows SSH values together if Windows execution is enabled:
+# windows_ssh_host = "REPLACE_WITH_TAILSCALE_HOST"
+# windows_ssh_user = "REPLACE_WITH_WINDOWS_USER"
+# windows_ssh_identity_file = "/var/lib/jarvis-personal-runtime/ssh/id_ed25519"
+# windows_working_directory = "D:\\Projects\\Jarvis-v2"
+# The service account's known_hosts file must already pin the exact SSH host key.
 windows_read_only_prefixes = []
 
 [saved_permissions]

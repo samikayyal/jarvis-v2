@@ -1,40 +1,28 @@
-# Native personal runtime package
+# Native personal runtime deployment
 
-This directory packages the replacement as one native Ubuntu `systemd` service.
-It does not install, enable, start, stop, or replace any service by itself. Ticket
-12 owns live installation and cutover with the authorized operator present.
+The supported deployment is one native Ubuntu `systemd` service. OpenWA remains
+a separate Docker Compose project and reaches the runtime through one private
+Docker host-bridge listener. Do not add the assistant to OpenWA's Compose graph.
 
-The rendered service reads `.env`, `jarvis.toml`, and `SYSTEM.md` directly from
-the discovered runtime root. The discovered service account owns that directory. The
-static `.env` is root-owned, group-readable only by the consuming service, and
-mode `0440`. The service account owns the mode-`0600` TOML and system prompt;
-the operator may edit them through an administrative editor. The runtime changes
-only `[saved_permissions]` in TOML. The seven-day message-ID cache and
-the rotating verbatim JSON Lines trace live below `data/`; full rotated segments
-are retained as `runtime-trace.jsonl.N` rather than deleted.
+## Package verification
 
-Ordinary process logs and uncaught errors go to `journald`. They are separate
-from the verbatim runtime trace.
-
-## Validation without activation
-
-From a clean repository checkout, these checks inspect development copies only:
+From a clean checkout, verify the surviving runtime before packaging:
 
 ```console
-uv run pytest tests/personal_runtime/test_config.py tests/personal_runtime/test_service.py tests/personal_runtime/test_package.py
+uv sync --locked
+uv run pytest tests/personal_runtime
 uv run ruff check src/jarvis_personal_runtime tests/personal_runtime
 uv run ruff format --check src/jarvis_personal_runtime tests/personal_runtime
+uv run python -m compileall -q src/jarvis_personal_runtime
 ```
 
-On the target Ubuntu host, first discover and record the exact release root,
-runtime root, service user, service group, OpenWA Docker-bridge gateway, listener
-port, and private OpenWA API URL. This repository does not assume any of them.
-Stage the reviewed Git tree in a new commit-named directory below that recorded
-release root and verify its replacement-specific checksums before building the
-hash-locked virtual environment. Do not change the `current` symlink:
+On Ubuntu, stage each reviewed Git revision in its own commit-named directory
+under `/opt/jarvis-personal-runtime/releases/`. Verify the replacement checksum
+manifest, build from the hash-locked requirements, and install the local package
+without resolving additional dependencies:
 
 ```console
-cd DISCOVERED_RELEASE_ROOT/releases/CANDIDATE
+cd /opt/jarvis-personal-runtime/releases/COMMIT
 sha256sum --check deployment/personal-runtime/SHA256SUMS
 uv venv --python /usr/bin/python3.13 .venv
 uv pip install --python .venv/bin/python --require-hashes \
@@ -42,172 +30,132 @@ uv pip install --python .venv/bin/python --require-hashes \
 uv pip install --python .venv/bin/python --no-deps --no-build-isolation .
 ```
 
-Make a separate temporary runtime directory from the three examples, replace
-every placeholder with reviewed non-production validation values, and run:
+Do not place credentials in the release directory. Do not change the active
+`current` symlink until the candidate, configuration, and rendered unit pass
+inactive validation.
+
+## Runtime root and configuration
+
+The service uses `/var/lib/jarvis-personal-runtime` as its private runtime root.
+Create `.env`, `jarvis.toml`, and `SYSTEM.md` there from the supplied examples.
+The files have distinct trust boundaries:
+
+| File | Contents | Required ownership and mode |
+| --- | --- | --- |
+| `.env` | OpenAI and OpenWA credentials | `root:jarvis-personal-runtime`, `0440` |
+| `jarvis.toml` | Non-secret settings and saved permissions | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
+| `SYSTEM.md` | Editable system prompt | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
+
+Jarvis never edits `.env` or `SYSTEM.md`; it writes only the
+`[saved_permissions]` section of `jarvis.toml`. Runtime-owned cache and trace
+paths must stay below the runtime root. An optional vault path may be an absolute
+read-only directory outside it.
+
+Required `.env` names are `OPENAI_API_KEY`, `OPENWA_API_KEY`, and
+`OPENWA_WEBHOOK_SIGNING_SECRET`. Required production TOML values include the
+private listener, OpenWA API and session identifiers, authorized operator and
+chat IDs, Ubuntu working directory, and read-only prefixes. Configure all four
+Windows SSH fields together when Windows execution is enabled. The identity file
+must be private to the service account and the SSH host key must already be
+pinned in that account's known-hosts file.
+
+Validate without binding a socket or contacting providers:
 
 ```console
-DISCOVERED_RELEASE_ROOT/releases/CANDIDATE/.venv/bin/jarvis-personal-runtime \
-  --root /path/to/inactive-validation-runtime --check
+sudo -u jarvis-personal-runtime \
+  /opt/jarvis-personal-runtime/releases/COMMIT/.venv/bin/jarvis-personal-runtime \
+  --root /var/lib/jarvis-personal-runtime --check
 ```
 
-`--check` parses the three files and validates the complete OpenWA and private
-listener configuration. It does not bind a socket, contact OpenAI or OpenWA,
-write state, modify a service, or alter a network.
+Never print `.env`, private keys, phone/chat identifiers, raw webhook payloads,
+or trace bodies during validation.
 
-Do not modify the live OpenWA project during Ticket 10 validation. Do not change pairing state.
-Do not change firewall rules. Do not install the unit, move the
-`current` symlink, or stop the previous runtime until Ticket 12 explicitly reaches
-those supervised steps.
+## Install or update the service
 
-## Installation preparation
-
-The following commands are for the approved Ticket 12 maintenance window, not
-for Ticket 10 validation. Record the exact immutable previous release, previous
-service name, and previous OpenWA webhook destination before any change.
-
-Confirm the recorded service identity and paths do not collide with the previous
-runtime. Create the approved unprivileged service identity if it does not already
-exist, then create the private runtime directory:
+Render the four `@...@` placeholders in
+`jarvis-personal-runtime.service` with the reviewed service user, group, release
+root, and runtime root. Reject whitespace, `%`, `|`, and shell metacharacters in
+rendered values. Review and verify the complete result before installation:
 
 ```console
-sudo useradd --system --home-dir DISCOVERED_RUNTIME_ROOT \
-  --shell /usr/sbin/nologin DISCOVERED_SERVICE_USER
-sudo install -d -o DISCOVERED_SERVICE_USER -g DISCOVERED_SERVICE_GROUP -m 0700 \
-  DISCOVERED_RUNTIME_ROOT
-```
-
-After the exact candidate is approved, atomically point `current` to its immutable
-commit-named release directory:
-
-```console
-sudo ln -sfn DISCOVERED_RELEASE_ROOT/releases/CANDIDATE \
-  DISCOVERED_RELEASE_ROOT/current.new
-sudo mv -T DISCOVERED_RELEASE_ROOT/current.new DISCOVERED_RELEASE_ROOT/current
-```
-
-Copy `.env.example` as `.env`, `jarvis.toml.example` as `jarvis.toml`, and
-`SYSTEM.md.example` as `SYSTEM.md`, then fill them through `sudoedit`. Never put
-real secrets in the repository, shell history, command output, or the journal.
-
-```console
-cd DISCOVERED_RUNTIME_ROOT
-sudo chown root:DISCOVERED_SERVICE_GROUP .env
-sudo chmod 0440 .env
-sudo chown DISCOVERED_SERVICE_USER:DISCOVERED_SERVICE_GROUP jarvis.toml SYSTEM.md
-sudo chmod 0600 jarvis.toml SYSTEM.md
-sudo -u DISCOVERED_SERVICE_USER \
-  DISCOVERED_RELEASE_ROOT/current/.venv/bin/jarvis-personal-runtime \
-  --root DISCOVERED_RUNTIME_ROOT --check
-```
-
-Render the four `@...@` placeholders in `jarvis-personal-runtime.service` with
-the recorded values into an inactive temporary file. Reject values containing
-whitespace, `|`, `%`, or shell metacharacters; both roots must be absolute paths
-and the service identity must already exist. Review the complete rendered file,
-then verify and install it:
-
-```console
-sed \
-  -e 's|@SERVICE_USER@|DISCOVERED_SERVICE_USER|g' \
-  -e 's|@SERVICE_GROUP@|DISCOVERED_SERVICE_GROUP|g' \
-  -e 's|@RELEASE_ROOT@|DISCOVERED_RELEASE_ROOT|g' \
-  -e 's|@RUNTIME_ROOT@|DISCOVERED_RUNTIME_ROOT|g' \
-  DISCOVERED_RELEASE_ROOT/current/deployment/personal-runtime/jarvis-personal-runtime.service \
-  > /path/to/inactive-rendered-jarvis-personal-runtime.service
-systemd-analyze verify /path/to/inactive-rendered-jarvis-personal-runtime.service
+systemd-analyze verify /path/to/rendered-jarvis-personal-runtime.service
 sudo install -o root -g root -m 0644 \
-  /path/to/inactive-rendered-jarvis-personal-runtime.service \
+  /path/to/rendered-jarvis-personal-runtime.service \
   /etc/systemd/system/jarvis-personal-runtime.service
 sudo systemctl daemon-reload
 ```
 
-Do not use `EnvironmentFile=` for `.env`: the application reads the private file
-itself, and the unit's `UMask=0077` keeps newly created runtime data private.
+For an update, validate the candidate against the live runtime root while the
+current service continues running. Then stop the service, atomically replace
+`/opt/jarvis-personal-runtime/current`, start it, and verify the exact target:
+
+```console
+sudo systemctl stop jarvis-personal-runtime
+sudo ln -sfn /opt/jarvis-personal-runtime/releases/COMMIT \
+  /opt/jarvis-personal-runtime/current.new
+sudo mv -T /opt/jarvis-personal-runtime/current.new \
+  /opt/jarvis-personal-runtime/current
+sudo systemctl start jarvis-personal-runtime
+sudo systemctl is-active jarvis-personal-runtime
+sudo systemctl is-enabled jarvis-personal-runtime
+sudo readlink -f /opt/jarvis-personal-runtime/current
+```
+
+Keep the prior commit-named replacement release until post-update WhatsApp and
+command checks pass. Roll back only by stopping the service, atomically restoring
+that prior replacement symlink, starting the service, and repeating every health
+gate. There is no legacy control-plane fallback.
 
 ## Private OpenWA handoff
 
-Set `listener_host` to the exact RFC1918 IPv4 gateway address of the Docker bridge
-that contains OpenWA, and set a reviewed unprivileged port. The runtime refuses
-wildcard, loopback, public, hostname, and IPv6 listener values. Configure OpenWA's
-single webhook destination as `http://BRIDGE_GATEWAY:PORT/webhook` only during the
-supervised cutover. No public reverse proxy, host-wide bind, or new Compose service
-is part of this package.
+Set `listener_host` to the exact RFC1918 gateway of OpenWA's Docker bridge and
+use a reviewed unprivileged port. The runtime rejects wildcard, loopback, public,
+hostname, and IPv6 listener values. OpenWA's only `message.received` webhook must
+target `http://BRIDGE_GATEWAY:PORT/webhook`.
 
-Before changing the handoff, verify and record OpenWA container identity, start
-time, volume, networks, health, named-session `ready` state, and absence of
-`LOGOUT`. Inspect the effective OpenWA `SSRF_ALLOWED_HOSTS` value as well. The
-pinned gateway rejects private webhook destinations unless their literal host is
-on that allowlist. Preserve the legacy rollback hostname and add only the exact
-reviewed bridge gateway:
+Before changing OpenWA or the firewall, record container identity, image digest,
+volume, networks, health, named-session readiness, webhook destination, bridge
+interface/gateway, and current OpenWA container address. Any OpenWA recreation or
+firewall change requires separate operator approval. Preserve `openwa-data`,
+Baileys pairing, the pinned image, and the existing private LAN exposure.
+
+If the host firewall defaults to deny, admit only the current OpenWA container
+address on the exact bridge interface:
 
 ```console
-SSRF_ALLOWED_HOSTS=inbound-receiver,BRIDGE_GATEWAY
+sudo ufw allow in on BRIDGE_INTERFACE from OPENWA_CONTAINER_IP \
+  to BRIDGE_GATEWAY port PORT proto tcp \
+  comment 'Jarvis personal runtime from OpenWA only'
 ```
 
-This live OpenWA configuration change requires its own operator approval. Back up
-the root-owned Compose file, edit only that value, validate with `docker compose
-config --quiet`, and perform one controlled OpenWA recreation. Require the same
-`openwa-data` volume, `healthy` container state, configured named session `ready`,
-and absence of `LOGOUT` before changing the webhook. A fresh QR, pairing loss,
-identity mismatch, or any unexpected network/exposure change stops the cutover
-and restores the reviewed Compose backup. Do not scan a QR code or change Baileys
-data. Do not recreate OpenWA except for this explicitly approved allowlist change.
+Never allow the whole bridge subnet, another interface, LAN/Tailscale peers, or
+`Anywhere`. After any OpenWA container recreation, rediscover its address and
+revalidate the source-specific rule before sending traffic.
 
-Before switching the webhook, probe the listener from the recreated OpenWA
-container. On a host with default-deny inbound filtering, a timeout with no
-runtime trace means the host firewall is blocking the container-to-gateway path.
-Record the exact bridge interface, bridge gateway, and recreated OpenWA handoff
-IP. With separate operator approval, add only this source-specific rule:
+## Operation and health
 
 ```console
-sudo ufw allow in on BRIDGE_INTERFACE from OPENWA_HANDOFF_IP to BRIDGE_GATEWAY port PORT proto tcp comment 'Jarvis personal runtime from OpenWA only'
-```
-
-Do not allow the complete bridge subnet, another interface, LAN/Tailscale peers,
-or `Anywhere`. Re-probe from OpenWA and verify that the listener remains bound
-only to `BRIDGE_GATEWAY:PORT`. Record the added UFW rule number so rollback can
-delete that exact rule if the replacement is abandoned. A later OpenWA
-recreation must re-discover its handoff IP and revalidate this source-specific
-rule before changing the webhook.
-
-## Start, stop, and status
-
-Use these only after the candidate, configuration, unit, and private handoff have
-been approved:
-
-```console
-sudo systemctl start jarvis-personal-runtime
-sudo systemctl stop jarvis-personal-runtime
-sudo systemctl restart jarvis-personal-runtime
 sudo systemctl status jarvis-personal-runtime --no-pager
 sudo journalctl -u jarvis-personal-runtime --since today --no-pager
+sudo ss -ltnp
+sudo docker compose -f /opt/openwa/compose.yaml ps
 ```
 
-Starting the service is not acceptance. Ticket 12 still requires phone receipt,
-real command and approval checks, trace evidence, preserved OpenWA readiness and
-pairing, and the operator's final go/no-go. Keep the previous runtime installed
-and stopped throughout those checks.
+A healthy assistant requires all of the following:
 
-## Rollback
+1. `jarvis-personal-runtime` is enabled and active with no restart loop.
+2. Its listener is bound only to the configured bridge gateway and port.
+3. OpenWA is `healthy` and the exact configured named session is `ready`.
+4. No QR, `LOGOUT`, pairing change, container/volume replacement, or exposure
+   broadening occurred.
+5. A real authorized message produces one expected phone reply, and traces show
+   one admitted request and one outbound attempt per chunk.
 
-If any replacement gate fails, stop the replacement first. Restore the recorded
-previous OpenWA webhook destination exactly, restore the `current` symlink only
-if the previous runtime used it, and start the immutable previous runtime by its
-recorded service name. Do not run both assistant runtimes against one handoff.
+`/api/health/ready` alone does not prove WhatsApp readiness. Query the
+authenticated session endpoint without echoing the API key. Treat `LOGOUT`, a
+fresh QR, identity mismatch, pairing loss, or ambiguous delivery as a hard stop;
+preserve evidence and do not repeatedly recreate or re-pair OpenWA.
 
-```console
-sudo systemctl stop jarvis-personal-runtime
-# Human: restore the exact recorded previous webhook destination.
-# Human: restore the recorded previous release pointer if applicable.
-sudo systemctl start RECORDED_PREVIOUS_SERVICE
-sudo systemctl status RECORDED_PREVIOUS_SERVICE --no-pager
-```
-
-Then re-verify OpenWA health plus named-session `ready`, unchanged container and
-volume identity, unchanged pairing state, no `LOGOUT`, and no message replay.
-Leave the failed replacement stopped and preserve its trace for diagnosis. A
-rollback never removes OpenWA volumes, re-pairs the account, broadens firewall
-access, deletes the candidate, or retires the previous runtime. Keep the exact
-source-specific firewall rule while the replacement remains installed for
-diagnosis. If the replacement is abandoned, separately recheck its recorded rule
-number and, with operator approval, delete only that exact rule.
+The runtime trace is verbatim and may contain message text, tool payloads,
+terminal output, and credentials supplied in conversation. Keep the runtime root
+private and exclude it from ordinary source-control and log collection.
