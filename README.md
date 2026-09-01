@@ -1,9 +1,10 @@
 # Jarvis personal runtime
 
 Jarvis is a single-operator personal assistant that runs as one native Python
-service on Ubuntu. A separately operated OpenWA messaging gateway admits direct
-WhatsApp text from the configured authorized operator. Deterministic slash
-commands are handled locally; ordinary text enters a sequential OpenAI Responses
+service on Ubuntu. A separately operated OpenWA messaging gateway hands direct
+WhatsApp messages to the runtime, which admits only text from the configured
+authorized operator. Deterministic slash commands are handled locally; other
+admitted text becomes an ordinary request in a sequential OpenAI Responses
 model-and-tool loop.
 
 The active runtime is intentionally small:
@@ -54,8 +55,8 @@ not sufficient: the configured named session must also be `ready`.
 
 Jarvis accepts only direct text from the configured authorized WhatsApp number.
 Groups, other senders, self-authored traffic, media, and malformed events do not
-enter the runtime. Runtime sessions are memory-only; the seven-day message-ID
-cache, saved permissions, and rotating verbatim JSON Lines trace are the only
-runtime-owned durable state.
+enter assistant work. The working session is memory-only; the seven-day
+message-ID cache, saved permissions, and rotating verbatim JSON Lines trace are
+the only runtime-owned durable state.
 
 Canonical domain language and trust boundaries live in [`CONTEXT.md`](CONTEXT.md).

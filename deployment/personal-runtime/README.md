@@ -53,8 +53,9 @@ read-only directory outside it.
 
 Required `.env` names are `OPENAI_API_KEY`, `OPENWA_API_KEY`, and
 `OPENWA_WEBHOOK_SIGNING_SECRET`. Required production TOML values include the
-private listener, OpenWA API and session identifiers, authorized operator and
-chat IDs, Ubuntu working directory, and read-only prefixes. Configure all four
+private listener, OpenWA API base URL, internal session ID, named session,
+authorized operator number and chat ID, Ubuntu working directory, and read-only
+prefixes. Configure all four
 Windows SSH fields together when Windows execution is enabled. The identity file
 must be private to the service account and the SSH host key must already be
 pinned in that account's known-hosts file.
@@ -145,14 +146,17 @@ A healthy assistant requires all of the following:
 
 1. `jarvis-personal-runtime` is enabled and active with no restart loop.
 2. Its listener is bound only to the configured bridge gateway and port.
-3. OpenWA is `healthy` and the exact configured named session is `ready`.
+3. OpenWA is `healthy` and the exact configured named session is `ready`; API
+   routes use the distinct configured internal session ID where required.
 4. No QR, `LOGOUT`, pairing change, container/volume replacement, or exposure
    broadening occurred.
 5. A real authorized message produces one expected phone reply, and traces show
-   one admitted request and one outbound attempt per chunk.
+   one admitted text, its expected deterministic-command handling or ordinary
+   request, and one outbound attempt per chunk.
 
 `/api/health/ready` alone does not prove WhatsApp readiness. Query the
-authenticated session endpoint without echoing the API key. Treat `LOGOUT`, a
+authenticated sessions endpoint, distinguish each named session from its
+internal session ID, and never echo the API key. Treat `LOGOUT`, a
 fresh QR, identity mismatch, pairing loss, or ambiguous delivery as a hard stop;
 preserve evidence and do not repeatedly recreate or re-pair OpenWA.
 
