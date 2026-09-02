@@ -36,6 +36,11 @@ DEFAULT_ALLOWED_REASONING_EFFORTS = (
     "xhigh",
     "max",
 )
+GOOGLE_MCP_ENDPOINTS = {
+    "google-gmail": "https://gmailmcp.googleapis.com/mcp/v1",
+    "google-drive": "https://drivemcp.googleapis.com/mcp/v1",
+    "google-calendar": "https://calendarmcp.googleapis.com/mcp/v1",
+}
 
 
 # This is for typing
@@ -593,6 +598,12 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
     ids = [service.id for service in configured_services]
     if len(ids) != len(set(ids)):
         raise ConfigError(path, "configured MCP service ids must be unique")
+    for service in configured_services:
+        if GOOGLE_MCP_ENDPOINTS.get(service.id) != service.endpoint:
+            raise ConfigError(
+                path,
+                f"{service.id} must use its official Google MCP endpoint",
+            )
 
     try:
         model = _setting(values, "model", default=DEFAULTS["model"])

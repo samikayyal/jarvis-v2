@@ -12,6 +12,7 @@ from jarvis_personal_runtime.openwa import (
 )
 from jarvis_personal_runtime.service import (
     WebhookHttpApplication,
+    build_service_async,
     start_listener,
     validate_service_config,
 )
@@ -121,3 +122,43 @@ def test_service_check_requires_an_explicit_private_listener(tmp_path: Path) -> 
 
     with pytest.raises(ConfigError, match="listener_host and listener_port"):
         validate_service_config(root)
+
+
+def test_async_service_composition_can_prepare_configured_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "runtime"
+    _write_service_config(root)
+    (root / ".env").write_text(
+        (root / ".env").read_text(encoding="utf-8")
+        + "GOOGLE_OAUTH_CLIENT_ID=client\n"
+        + "GOOGLE_OAUTH_CLIENT_SECRET=secret\n"
+        + "GOOGLE_OAUTH_REFRESH_TOKEN=refresh\n",
+        encoding="utf-8",
+    )
+    manifest = root / "calendar.json"
+    manifest.write_text(
+        (
+            Path(__file__).resolve().parents[2]
+            / "deployment/personal-runtime/manifests/google-calendar.json"
+        ).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    with (root / "jarvis.toml").open("a", encoding="utf-8") as output:
+        output.write(
+            '\n[[mcp_services]]\nid = "google-calendar"\n'
+            'endpoint = "https://calendarmcp.googleapis.com/mcp/v1"\n'
+            'manifest_path = "calendar.json"\nmax_output_chars = 20000\n'
+        )
+
+    async def prepared(configs: object, transport: object) -> tuple[object, ...]:
+        return ()
+
+    monkeypatch.setattr(
+        "jarvis_personal_runtime.service.prepare_configured_mcp_services", prepared
+    )
+
+    application, config = asyncio.run(build_service_async(root))
+
+    assert isinstance(application, WebhookHttpApplication)
+    assert len(config.mcp_services) == 1

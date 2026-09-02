@@ -8,6 +8,7 @@ import json
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -147,10 +148,14 @@ class HttpMcpTransport:
         self,
         tokens: _TokenProvider,
         *,
+        authorized_endpoints: Iterable[str],
         client: httpx.AsyncClient | None = None,
         trace: _Trace | None = None,
     ) -> None:
         self._tokens = tokens
+        self._authorized_endpoints = frozenset(authorized_endpoints)
+        if not self._authorized_endpoints:
+            raise ValueError("authorized_endpoints must be non-empty")
         self._client = client or httpx.AsyncClient(timeout=60)
         self._trace = trace or _NoTrace()
 
@@ -168,6 +173,10 @@ class HttpMcpTransport:
             "MCP-Protocol-Version": protocol_version,
         }
         if authorized:
+            if endpoint not in self._authorized_endpoints:
+                raise McpTransportError(
+                    "MCP endpoint is not authorized for credentials"
+                )
             headers["Authorization"] = f"Bearer {await self._tokens.access_token()}"
         try:
             response = await self._client.post(endpoint, headers=headers, json=payload)
@@ -520,6 +529,8 @@ class ConfiguredMcpService:
         if operation is None:
             raise ValueError(f"unknown prepared tool: {name}")
         _validate_arguments(arguments, operation.input_schema)
+        if name == "google_calendar_list":
+            _validate_calendar_window(arguments)
         connection = self._connection
         if connection is None:
             return _error("not_connected")
@@ -691,6 +702,22 @@ def _validate_schema(schema: dict[str, object], name: str) -> None:
 
 def _validate_arguments(arguments: object, schema: dict[str, object]) -> None:
     _validate_value(arguments, schema, "arguments")
+
+
+def _validate_calendar_window(arguments: dict[str, object]) -> None:
+    try:
+        start = datetime.fromisoformat(str(arguments["startTime"]))
+        end = datetime.fromisoformat(str(arguments["endTime"]))
+        bounded = (
+            start.tzinfo is not None
+            and end.tzinfo is not None
+            and start < end
+            and end - start <= timedelta(days=31)
+        )
+    except (KeyError, ValueError):
+        bounded = False
+    if not bounded:
+        raise ValueError("Google Calendar time window must be at most 31 days")
 
 
 def _matches_type(value: object, expected: str) -> bool:

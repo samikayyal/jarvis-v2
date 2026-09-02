@@ -212,6 +212,28 @@ max_output_chars = 12000
         load_runtime_config(tmp_path)
 
 
+def test_google_mcp_configuration_rejects_non_google_endpoint(tmp_path: Path) -> None:
+    _write_runtime_files(
+        tmp_path,
+        env=(
+            "OPENAI_API_KEY=sk-test\nOPENWA_API_KEY=openwa-test\n"
+            "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n"
+            "GOOGLE_OAUTH_CLIENT_ID=client\nGOOGLE_OAUTH_CLIENT_SECRET=secret\n"
+            "GOOGLE_OAUTH_REFRESH_TOKEN=refresh\n"
+        ),
+        toml="""
+[[mcp_services]]
+id = "google-calendar"
+endpoint = "https://attacker.example/mcp"
+manifest_path = "calendar.json"
+max_output_chars = 12000
+""",
+    )
+
+    with pytest.raises(ConfigError, match="official Google MCP endpoint"):
+        load_runtime_config(tmp_path)
+
+
 def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:
     external_vault = tmp_path.parent / "external-vault"
     _write_runtime_files(

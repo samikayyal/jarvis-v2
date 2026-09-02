@@ -418,7 +418,12 @@ def test_http_transport_uses_streamable_http_lifecycle_and_never_traces_bearer()
 
     trace = Trace()
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    transport = HttpMcpTransport(Tokens(), client=client, trace=trace)  # type: ignore[arg-type]
+    transport = HttpMcpTransport(
+        Tokens(),  # type: ignore[arg-type]
+        authorized_endpoints={"https://calendar.example/mcp"},
+        client=client,
+        trace=trace,
+    )
 
     async def scenario() -> None:
         discovery = await transport.discover(
@@ -441,6 +446,35 @@ def test_http_transport_uses_streamable_http_lifecycle_and_never_traces_bearer()
     assert "secret-access-token" not in json.dumps(trace.events)
     assert requests[-1].headers["authorization"] == "Bearer secret-access-token"
     assert requests[-1].headers["mcp-protocol-version"] == "2025-06-18"
+
+
+def test_http_transport_never_sends_google_token_to_an_unconfigured_endpoint() -> None:
+    class Tokens:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def access_token(self) -> str:
+            self.calls += 1
+            return "secret"
+
+    tokens = Tokens()
+    transport = HttpMcpTransport(
+        tokens,  # type: ignore[arg-type]
+        authorized_endpoints={"https://calendar.example/mcp"},
+    )
+
+    with pytest.raises(McpTransportError, match="not authorized"):
+        asyncio.run(
+            transport.call(
+                "https://attacker.example/mcp",
+                "2025-06-18",
+                "create_event",
+                event_args(),
+                McpConnection("link", "Google account"),
+            )
+        )
+
+    assert tokens.calls == 0
 
 
 def test_google_oauth_token_is_refreshed_after_expiry() -> None:
@@ -517,3 +551,41 @@ def test_checked_in_google_manifests_expose_only_bounded_selected_operations() -
         for operation in prepared["google-calendar"].operations
         if operation.mode == "write"
     } == {"google_calendar_create", "google_calendar_update"}
+
+
+def test_calendar_list_rejects_an_unbounded_or_reversed_time_window() -> None:
+    payload = manifest_payload(mode="read")
+    operation = payload["operations"][0]  # type: ignore[index]
+    operation["prepared"]["name"] = "google_calendar_list"  # type: ignore[index]
+    operation["prepared"]["input_schema"] = {  # type: ignore[index]
+        "type": "object",
+        "properties": {
+            "calendarId": {"type": "string", "enum": ["primary"], "maxLength": 7},
+            "startTime": {"type": "string", "maxLength": 64},
+            "endTime": {"type": "string", "maxLength": 64},
+            "pageSize": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+        "required": ["calendarId", "startTime", "endTime", "pageSize"],
+        "additionalProperties": False,
+    }
+    transport = FakeTransport()
+    service = build_service(payload, transport)
+    service.bind(McpConnection("link", "Google account"))
+
+    for end_time in (
+        "2026-08-01T00:00:00Z",
+        "2027-01-01T00:00:00Z",
+        "not-a-timestamp",
+    ):
+        with pytest.raises(ValueError, match="time window"):
+            asyncio.run(
+                service.execute(
+                    "google_calendar_list",
+                    {
+                        "calendarId": "primary",
+                        "startTime": "2026-09-01T00:00:00Z",
+                        "endTime": end_time,
+                        "pageSize": 20,
+                    },
+                )
+            )

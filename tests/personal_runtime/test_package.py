@@ -118,6 +118,7 @@ def test_only_personal_runtime_source_and_dependencies_remain() -> None:
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["dependencies"] == [
+        "httpx>=0.28.1",
         "openai==2.53.0",
         "tiktoken>=0.14.0",
     ]

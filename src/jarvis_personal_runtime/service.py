@@ -88,7 +88,9 @@ def _load_service_config(root: str | Path) -> LoadedRuntimeConfig:
     return loaded
 
 
-def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConfig]:
+async def build_service_async(
+    root: str | Path,
+) -> tuple[WebhookHttpApplication, RuntimeConfig]:
     """Compose the single replacement service from its runtime directory."""
 
     loaded = _load_service_config(root)
@@ -102,9 +104,13 @@ def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConf
         refresh_token = loaded.secrets.google_oauth_refresh_token
         assert client_id and client_secret and refresh_token
         tokens = GoogleOAuthTokenProvider(client_id, client_secret, refresh_token)
-        transport = HttpMcpTransport(tokens, trace=trace)
-        configured_services = asyncio.run(
-            prepare_configured_mcp_services(config.mcp_services, transport)
+        transport = HttpMcpTransport(
+            tokens,
+            authorized_endpoints={service.endpoint for service in config.mcp_services},
+            trace=trace,
+        )
+        configured_services = await prepare_configured_mcp_services(
+            config.mcp_services, transport
         )
         connections = GoogleConnectionManager(configured_services, tokens)
     runner = build_direct_responses_runner(
@@ -123,6 +129,12 @@ def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConf
     return WebhookHttpApplication(flow), config
 
 
+def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConfig]:
+    """Compose the service outside an already running event loop."""
+
+    return asyncio.run(build_service_async(root))
+
+
 async def start_listener(
     application: WebhookHttpApplication, host: str, port: int
 ) -> asyncio.Server:
@@ -137,7 +149,7 @@ async def start_listener(
 
 
 async def run_service(root: str | Path) -> None:
-    application, config = build_service(root)
+    application, config = await build_service_async(root)
     assert config.listener_host is not None
     assert config.listener_port is not None
     server = await start_listener(
@@ -277,6 +289,7 @@ __all__ = [
     "HttpResponse",
     "WebhookHttpApplication",
     "build_service",
+    "build_service_async",
     "main",
     "run_service",
     "start_listener",

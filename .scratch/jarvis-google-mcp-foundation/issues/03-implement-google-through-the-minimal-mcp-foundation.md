@@ -45,7 +45,7 @@ read-only until an official selected operation exists and its manifest is
 reviewed.
 
 Focused evidence before final review: 12 live prepared operations verified;
-`167 passed, 1 skipped` in `tests/personal_runtime`; Ruff check/format and
+`172 passed, 1 skipped` in `tests/personal_runtime`; Ruff check/format and
 Python compilation passed.
 
 ## Comments
