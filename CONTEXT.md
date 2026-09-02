@@ -84,10 +84,23 @@ One deliberately implemented operation exposed to the model-and-tool loop. The
 current prepared tools are `read_vault` and `run_terminal`.
 _Avoid_: Arbitrary capability, connector framework
 
+**Configured MCP service**:
+One explicitly configured remote service whose reviewed operation manifest
+selects the bounded operations Jarvis may expose as prepared tools. Discovery
+verifies that manifest; it never grants newly discovered operations authority.
+_Avoid_: Arbitrary MCP server, dynamic plugin marketplace, prepared tool
+
+**Google connection**:
+The current operator-authorized link between Jarvis and one Google account
+across its configured MCP services. Reauthorization replaces it; disconnection
+ends it, and either change invalidates pending Google actions from the prior link.
+_Avoid_: Configured Google identity, OAuth token, configured MCP service
+
 **Pending action**:
-The one exact terminal command waiting indefinitely for the authorized operator
-to choose `1` (approve once), `2` (approve and save), `9` (reject), or `/cancel`.
-All other messages are silently ignored while it is pending.
+The one exact terminal command or Google write waiting indefinitely for the
+authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
+`9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all
+other messages are silently ignored while either kind is pending.
 _Avoid_: Active request, saved permission, queued action
 
 **Saved permission**:
@@ -141,7 +154,7 @@ _Avoid_: Sanitized application log, hidden model reasoning
 | --- | --- | --- |
 | OpenWA | WhatsApp transport, message persistence, pairing, named-session readiness | Assistant decisions, command permissions, model transcript |
 | Personal assistant runtime | Admission filtering, sessions, commands, model-and-tool loop, approvals, replies | OpenWA pairing or container lifecycle, durable conversation history |
-| `.env` | OpenAI and OpenWA credentials | Non-secret settings, saved permissions |
+| `.env` | OpenAI, OpenWA, and Google OAuth credentials | Non-secret settings, saved permissions |
 | `jarvis.toml` | Non-secret limits, paths, identities, read-only prefixes, saved permissions | Credentials, message bodies, command output |
 | `SYSTEM.md` | Editable assistant instruction | Credentials, saved permissions |
 | Runtime data directory | Seven-day deduplication cache and verbatim rotating trace | OpenWA data or pairing state |
