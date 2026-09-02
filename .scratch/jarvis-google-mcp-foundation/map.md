@@ -76,6 +76,11 @@ existing WhatsApp, vault, or terminal paths.
   connection, exposes 10 bounded reads and two exact one-attempt Calendar
   writes, and keeps Gmail read-only because the official hosted service still
   has no send/reply operation.
+- [Prove the complete Google MCP contract](issues/04-prove-the-complete-google-mcp-contract.md)
+  — Focused contract and regression gates, static checks, and the one final
+  repository-wide suite prove the supportable official Google contract without
+  live authorization or production changes; the final suite passed with 172
+  tests and one existing platform-conditional skip.
 
 ## Not yet specified
 
