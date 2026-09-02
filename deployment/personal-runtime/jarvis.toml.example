@@ -42,5 +42,23 @@ ubuntu_read_only_prefixes = ["pwd", "git status"]
 # The service account's known_hosts file must already pin the exact SSH host key.
 windows_read_only_prefixes = []
 
+[[mcp_services]]
+id = "google-gmail"
+endpoint = "https://gmailmcp.googleapis.com/mcp/v1"
+manifest_path = "manifests/google-gmail.json"
+max_output_chars = 20000
+
+[[mcp_services]]
+id = "google-drive"
+endpoint = "https://drivemcp.googleapis.com/mcp/v1"
+manifest_path = "manifests/google-drive.json"
+max_output_chars = 20000
+
+[[mcp_services]]
+id = "google-calendar"
+endpoint = "https://calendarmcp.googleapis.com/mcp/v1"
+manifest_path = "manifests/google-calendar.json"
+max_output_chars = 20000
+
 [saved_permissions]
 rules = []

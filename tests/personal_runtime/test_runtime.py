@@ -215,6 +215,40 @@ async def test_pending_action_without_saved_permission_ignores_choice_two() -> N
 
 
 @async_test
+async def test_google_connection_commands_are_exact_and_deterministic() -> None:
+    class Connections:
+        def __init__(self) -> None:
+            self.connected = False
+
+        def status(self) -> str:
+            return f"Google: {'connected' if self.connected else 'disconnected'}"
+
+        async def connect(self) -> str:
+            self.connected = True
+            return "Connected Google account."
+
+        def disconnect(self) -> str:
+            self.connected = False
+            return "Disconnected Google account."
+
+    connections = Connections()
+    runtime = PersonalRuntime(
+        request_runner=FakeRunner(Completed("unused")),
+        connections=connections,
+    )
+
+    listed = await runtime.receive(inbound("m1", "/connections"))
+    connected = await runtime.receive(inbound("m2", "/connect google"))
+    malformed = await runtime.receive(inbound("m3", "/connect drive"))
+    disconnected = await runtime.receive(inbound("m4", "/disconnect google"))
+
+    assert listed.replies == ("Google: disconnected",)
+    assert connected.replies == ("Connected Google account.",)
+    assert malformed.disposition == "malformed_command"
+    assert disconnected.replies == ("Disconnected Google account.",)
+
+
+@async_test
 async def test_failed_permission_save_keeps_pending_action_and_does_not_resume() -> (
     None
 ):

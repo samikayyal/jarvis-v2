@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "service": {"id": "google-gmail", "endpoint": "https://gmailmcp.googleapis.com/mcp/v1", "protocol_version": "2025-06-18", "server_info": {"name": "StatelessServer", "version": "ESF"}},
+  "captured_at": "2026-09-02",
+  "operations": [
+    {"upstream": {"name": "search_threads", "sha256": "549338e79c93de11ef738bb3aa321c5491cde7abeffd22e503317d17fc90cdf5"}, "prepared": {"name": "google_gmail_search", "description": "Search at most 20 Gmail threads, excluding trash.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "maxLength": 500}, "pageSize": {"type": "integer", "minimum": 1, "maximum": 20}, "includeTrash": {"type": "boolean", "enum": [false]}, "view": {"type": "string", "enum": ["THREAD_VIEW_MINIMAL"], "maxLength": 32}}, "required": ["query", "pageSize", "includeTrash", "view"], "additionalProperties": false}}, "mode": "read"},
+    {"upstream": {"name": "get_thread", "sha256": "03dbe181cfe1d1bb8bc7cb1e09bf37202e82b4fb53cf9a8b1b8df32f44fb6f34"}, "prepared": {"name": "google_gmail_read_thread", "description": "Read one Gmail thread as plain text.", "input_schema": {"type": "object", "properties": {"threadId": {"type": "string", "maxLength": 256}, "messageFormat": {"type": "string", "enum": ["PLAIN_TEXT"], "maxLength": 16}}, "required": ["threadId", "messageFormat"], "additionalProperties": false}}, "mode": "read"},
+    {"upstream": {"name": "get_message", "sha256": "64061001163d1f1fa344d390628faaaca204331345b752623db8e27797f2adee"}, "prepared": {"name": "google_gmail_read_message", "description": "Read one Gmail message as plain text.", "input_schema": {"type": "object", "properties": {"messageId": {"type": "string", "maxLength": 256}, "messageFormat": {"type": "string", "enum": ["PLAIN_TEXT"], "maxLength": 16}}, "required": ["messageId", "messageFormat"], "additionalProperties": false}}, "mode": "read"}
+  ]
+}

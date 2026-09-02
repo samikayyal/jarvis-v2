@@ -642,6 +642,7 @@ def build_direct_responses_runner(
     config: RuntimeConfig,
     *,
     tools: PreparedTools | None = None,
+    additional_tools: tuple[PreparedTools, ...] = (),
     trace: TraceSink | None = None,
 ) -> DirectResponsesRunner:
     """Compose the pinned SDK adapter with the configured loop limits."""
@@ -686,7 +687,9 @@ def build_direct_responses_runner(
                 trace=sink,
             )
         )
-        tools = PreparedToolCollection(*configured_tools)
+        tools = PreparedToolCollection(*configured_tools, *additional_tools)
+    elif additional_tools:
+        raise ValueError("additional_tools cannot be combined with tools")
     adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     return DirectResponsesRunner(
         adapter,

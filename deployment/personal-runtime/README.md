@@ -42,7 +42,7 @@ The files have distinct trust boundaries:
 
 | File | Contents | Required ownership and mode |
 | --- | --- | --- |
-| `.env` | OpenAI and OpenWA credentials | `root:jarvis-personal-runtime`, `0440` |
+| `.env` | OpenAI, OpenWA, and Google OAuth credentials | `root:jarvis-personal-runtime`, `0440` |
 | `jarvis.toml` | Non-secret settings and saved permissions | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
 | `SYSTEM.md` | Editable system prompt | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
 
@@ -52,7 +52,11 @@ paths must stay below the runtime root. An optional vault path may be an absolut
 read-only directory outside it.
 
 Required `.env` names are `OPENAI_API_KEY`, `OPENWA_API_KEY`, and
-`OPENWA_WEBHOOK_SIGNING_SECRET`. Required production TOML values include the
+`OPENWA_WEBHOOK_SIGNING_SECRET`. When Google MCP services are configured, also
+provide `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
+`GOOGLE_OAUTH_REFRESH_TOKEN`; never print or copy them into TOML. Copy the three
+reviewed JSON manifests from `deployment/personal-runtime/manifests/` to the
+runtime root's private `manifests/` directory. Required production TOML values include the
 private listener, OpenWA API base URL, internal session ID, named session,
 authorized operator number and chat ID, Ubuntu working directory, and read-only
 prefixes. Configure all four
@@ -70,6 +74,22 @@ sudo -u jarvis-personal-runtime \
 
 Never print `.env`, private keys, phone/chat identifiers, raw webhook payloads,
 or trace bodies during validation.
+
+`--check` parses and validates every configured manifest without contacting
+Google. Normal startup additionally performs live MCP discovery and fails
+closed if a selected operation digest, protocol version, or server identity has
+changed. `/connect google` refreshes the configured OAuth grant and binds one
+in-memory Google connection; `/connections` reports its state and
+`/disconnect google` invalidates it. Connection replacement or disconnection
+also invalidates pending Google writes. Google writes accept only `1`, `9`, or
+`/cancel`, are attempted once, and are never automatically retried after an
+ambiguous outcome.
+
+The hosted Gmail MCP contract captured on 2026-09-02 exposes search/read and
+draft creation but no send or reply operation. This package therefore exposes
+only Gmail reads; it does not mislabel draft creation as sending. Calendar
+create/update use exact one-attempt approval. Re-capture and review the official
+contract before activation if Google adds Gmail send/reply.
 
 ## Install or update the service
 

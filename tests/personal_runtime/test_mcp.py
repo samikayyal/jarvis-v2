@@ -5,10 +5,14 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from jarvis_personal_runtime.mcp import (
     ConfiguredMcpService,
+    GoogleConnectionManager,
+    GoogleOAuthTokenProvider,
+    HttpMcpTransport,
     McpConnection,
     McpDiscovery,
     McpManifestError,
@@ -38,6 +42,8 @@ DISCOVERED_TOOL = {
     },
     "annotations": {"destructiveHint": False, "idempotentHint": False},
 }
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def manifest_payload(*, mode: str = "write") -> dict[str, object]:
@@ -359,3 +365,155 @@ def test_service_composes_with_runtime_and_choice_two_stays_terminal_only() -> N
 
     asyncio.run(scenario())
     assert len(transport.calls) == 1
+
+
+def test_http_transport_uses_streamable_http_lifecycle_and_never_traces_bearer() -> (
+    None
+):
+    requests: list[httpx.Request] = []
+    responses = iter(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "serverInfo": {"name": "StatelessServer", "version": "ESF"},
+                },
+            },
+            None,
+            {"jsonrpc": "2.0", "id": 2, "result": {"tools": [DISCOVERED_TOOL]}},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "serverInfo": {"name": "StatelessServer", "version": "ESF"},
+                },
+            },
+            None,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            },
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = next(responses)
+        return httpx.Response(202 if payload is None else 200, json=payload)
+
+    class Tokens:
+        async def access_token(self) -> str:
+            return "secret-access-token"
+
+    class Trace:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def record(self, event: str, payload: dict[str, object]) -> None:
+            self.events.append((event, payload))
+
+    trace = Trace()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = HttpMcpTransport(Tokens(), client=client, trace=trace)  # type: ignore[arg-type]
+
+    async def scenario() -> None:
+        discovery = await transport.discover(
+            "https://calendar.example/mcp", "2025-06-18"
+        )
+        assert discovery.tools == (DISCOVERED_TOOL,)
+        result = await transport.call(
+            "https://calendar.example/mcp",
+            "2025-06-18",
+            "create_event",
+            event_args(),
+            McpConnection("link", "Google account"),
+        )
+        assert result == {"content": [{"type": "text", "text": "ok"}]}
+        await client.aclose()
+
+    asyncio.run(scenario())
+
+    assert len(requests) == 6
+    assert "secret-access-token" not in json.dumps(trace.events)
+    assert requests[-1].headers["authorization"] == "Bearer secret-access-token"
+    assert requests[-1].headers["mcp-protocol-version"] == "2025-06-18"
+
+
+def test_google_oauth_token_is_refreshed_after_expiry() -> None:
+    issued = iter(("token-one", "token-two"))
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert b"refresh-token" in request.content
+        return httpx.Response(200, json={"access_token": next(issued), "expires_in": 0})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tokens = GoogleOAuthTokenProvider(
+        "client-id", "client-secret", "refresh-token", client=client
+    )
+
+    async def scenario() -> None:
+        assert await tokens.access_token() == "token-one"
+        assert await tokens.access_token() == "token-two"
+        await client.aclose()
+
+    asyncio.run(scenario())
+    assert calls == 2
+
+
+def test_google_connection_refreshes_once_and_disconnect_invalidates_services() -> None:
+    transport = FakeTransport()
+    service = build_service(manifest_payload(), transport)
+
+    class Tokens:
+        def __init__(self) -> None:
+            self.refreshes = 0
+
+        async def refresh(self) -> None:
+            self.refreshes += 1
+
+    tokens = Tokens()
+    connections = GoogleConnectionManager((service,), tokens)  # type: ignore[arg-type]
+
+    async def scenario() -> None:
+        assert connections.status() == "Google: disconnected"
+        assert await connections.connect() == "Connected Google account."
+        proposed = await service.execute("google_calendar_create_event", event_args())
+        assert isinstance(proposed, ApprovalRequired)
+        assert connections.disconnect() == "Disconnected Google account."
+        expired = await service.resume(proposed.continuation, approved=True)
+        assert json.loads(expired) == {"error": {"kind": "connection_changed"}}
+
+    asyncio.run(scenario())
+    assert tokens.refreshes == 1
+    assert transport.calls == []
+
+
+def test_checked_in_google_manifests_expose_only_bounded_selected_operations() -> None:
+    manifests = ROOT / "deployment" / "personal-runtime" / "manifests"
+    prepared = {
+        path.stem: load_operation_manifest(path) for path in manifests.glob("*.json")
+    }
+
+    assert set(prepared) == {"google-gmail", "google-drive", "google-calendar"}
+    assert {
+        operation.prepared_name for operation in prepared["google-gmail"].operations
+    } == {
+        "google_gmail_search",
+        "google_gmail_read_thread",
+        "google_gmail_read_message",
+    }
+    assert all(
+        operation.mode == "read" for operation in prepared["google-gmail"].operations
+    )
+    assert {
+        operation.prepared_name
+        for operation in prepared["google-calendar"].operations
+        if operation.mode == "write"
+    } == {"google_calendar_create", "google_calendar_update"}

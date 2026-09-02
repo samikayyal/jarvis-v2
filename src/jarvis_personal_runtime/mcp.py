@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from uuid import uuid4
 
+import httpx
+
+from .config import McpServiceConfig
 from .runtime import ApprovalRequired, PendingAction
 
 
@@ -25,27 +30,6 @@ class McpTransportError(RuntimeError):
             raise ValueError("unsupported MCP transport error kind")
         super().__init__(message)
         self.kind = kind
-
-
-@dataclass(frozen=True, slots=True)
-class McpServiceConfig:
-    id: str
-    endpoint: str
-    manifest_path: Path
-    max_output_chars: int
-
-    def __post_init__(self) -> None:
-        if not self.id.strip():
-            raise ValueError("configured MCP service id must be non-empty")
-        endpoint = urlsplit(self.endpoint)
-        if endpoint.scheme != "https" or not endpoint.netloc:
-            raise ValueError("configured MCP service endpoint must be an HTTPS URL")
-        if not self.manifest_path.name:
-            raise ValueError("configured MCP manifest path must identify a file")
-        if self.max_output_chars < 2:
-            raise ValueError(
-                "configured MCP output limit must be at least 2 characters"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +64,259 @@ class McpTransport(Protocol):
         arguments: dict[str, object],
         connection: McpConnection,
     ) -> object: ...
+
+
+class _TokenProvider(Protocol):
+    async def access_token(self) -> str: ...
+
+
+class _RefreshableTokenProvider(_TokenProvider, Protocol):
+    async def refresh(self) -> None: ...
+
+
+class _Trace(Protocol):
+    def record(self, event: str, payload: dict[str, object]) -> None: ...
+
+
+class _NoTrace:
+    def record(self, event: str, payload: dict[str, object]) -> None:
+        return None
+
+
+class GoogleOAuthTokenProvider:
+    """Keep Google OAuth material inside the HTTP boundary."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if not all(
+            value.strip() for value in (client_id, client_secret, refresh_token)
+        ):
+            raise ValueError("Google OAuth credentials must be non-empty")
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._refresh_token = refresh_token
+        self._client = client or httpx.AsyncClient(timeout=30)
+        self._access_token: str | None = None
+        self._expires_at = 0.0
+
+    async def refresh(self) -> None:
+        try:
+            response = await self._client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "refresh_token": self._refresh_token,
+                    "grant_type": "refresh_token",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise McpTransportError(
+                "Google authorization failed", kind="unauthorized"
+            ) from exc
+        token = payload.get("access_token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token:
+            raise McpTransportError(
+                "Google authorization returned no token", kind="unauthorized"
+            )
+        self._access_token = token
+        expires_in = payload.get("expires_in", 3600)
+        if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)):
+            expires_in = 3600
+        self._expires_at = time.monotonic() + max(0.0, float(expires_in) - 30.0)
+
+    async def access_token(self) -> str:
+        if self._access_token is None or time.monotonic() >= self._expires_at:
+            await self.refresh()
+        assert self._access_token is not None
+        return self._access_token
+
+
+class HttpMcpTransport:
+    """Stateless Streamable HTTP transport for configured remote services."""
+
+    def __init__(
+        self,
+        tokens: _TokenProvider,
+        *,
+        client: httpx.AsyncClient | None = None,
+        trace: _Trace | None = None,
+    ) -> None:
+        self._tokens = tokens
+        self._client = client or httpx.AsyncClient(timeout=60)
+        self._trace = trace or _NoTrace()
+
+    async def _post(
+        self,
+        endpoint: str,
+        protocol_version: str,
+        payload: dict[str, object],
+        *,
+        authorized: bool,
+    ) -> dict[str, object] | None:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": protocol_version,
+        }
+        if authorized:
+            headers["Authorization"] = f"Bearer {await self._tokens.access_token()}"
+        try:
+            response = await self._client.post(endpoint, headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            raise McpTransportError("remote MCP request failed") from exc
+        self._trace.record(
+            "mcp_exchange",
+            {
+                "endpoint": endpoint,
+                "method": str(payload.get("method")),
+                "status_code": response.status_code,
+            },
+        )
+        if response.status_code in {401, 403}:
+            raise McpTransportError(
+                "remote MCP authorization failed", kind="unauthorized"
+            )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise McpTransportError(
+                "remote MCP operation failed", kind="operation_failed"
+            ) from exc
+        if response.status_code == 202 or not response.content:
+            return None
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise McpTransportError("remote MCP returned invalid JSON") from exc
+        if not isinstance(body, dict):
+            raise McpTransportError("remote MCP returned an invalid envelope")
+        if "error" in body:
+            raise McpTransportError(
+                "remote MCP returned an operation error", kind="operation_failed"
+            )
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise McpTransportError("remote MCP returned no result")
+        return result
+
+    async def _initialize(
+        self, endpoint: str, protocol_version: str, *, authorized: bool
+    ) -> dict[str, object]:
+        result = await self._post(
+            endpoint,
+            protocol_version,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "jarvis", "version": "1"},
+                },
+            },
+            authorized=authorized,
+        )
+        if result is None:
+            raise McpTransportError("remote MCP initialization returned no result")
+        await self._post(
+            endpoint,
+            protocol_version,
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            authorized=authorized,
+        )
+        return result
+
+    async def discover(self, endpoint: str, protocol_version: str) -> McpDiscovery:
+        initialized = await self._initialize(
+            endpoint, protocol_version, authorized=False
+        )
+        result = await self._post(
+            endpoint,
+            protocol_version,
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            authorized=False,
+        )
+        tools = result.get("tools") if result else None
+        server_info = initialized.get("serverInfo")
+        negotiated = initialized.get("protocolVersion")
+        if (
+            not isinstance(tools, list)
+            or not isinstance(server_info, dict)
+            or not isinstance(negotiated, str)
+        ):
+            raise McpTransportError("remote MCP discovery returned an invalid contract")
+        if any(not isinstance(tool, dict) for tool in tools):
+            raise McpTransportError("remote MCP discovery returned invalid tools")
+        return McpDiscovery(negotiated, server_info, tuple(tools))
+
+    async def call(
+        self,
+        endpoint: str,
+        protocol_version: str,
+        operation: str,
+        arguments: dict[str, object],
+        connection: McpConnection,
+    ) -> object:
+        del connection
+        await self._initialize(endpoint, protocol_version, authorized=True)
+        result = await self._post(
+            endpoint,
+            protocol_version,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": operation, "arguments": arguments},
+            },
+            authorized=True,
+        )
+        if result is None:
+            raise McpTransportError("remote MCP call returned no result")
+        return result
+
+
+class GoogleConnectionManager:
+    """Own the one current Google connection across configured services."""
+
+    def __init__(
+        self,
+        services: Iterable[ConfiguredMcpService],
+        tokens: _RefreshableTokenProvider,
+    ) -> None:
+        self._services = tuple(services)
+        self._tokens = tokens
+        self._connection: McpConnection | None = None
+
+    def status(self) -> str:
+        return "Google: connected" if self._connection else "Google: disconnected"
+
+    async def connect(self) -> str:
+        await self._tokens.refresh()
+        self._connection = McpConnection(uuid4().hex, "Google account")
+        for service in self._services:
+            service.bind(self._connection)
+        return "Connected Google account."
+
+    def disconnect(self) -> str:
+        was_connected = self._connection is not None
+        self._connection = None
+        for service in self._services:
+            service.bind(None)
+        return (
+            "Disconnected Google account."
+            if was_connected
+            else "Google account is already disconnected."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,12 +393,23 @@ def load_operation_manifest(
         if set(operation) != {"upstream", "prepared", "mode"}:
             raise McpManifestError("operation has unknown or missing fields")
         upstream = _object(operation["upstream"], "operation upstream")
-        if not {"name", "description", "inputSchema", "annotations"} <= set(upstream):
-            raise McpManifestError("upstream operation contract is incomplete")
-        _text(upstream["name"], "upstream operation name")
-        _text(upstream["description"], "upstream operation description")
-        _object(upstream["inputSchema"], "upstream inputSchema")
-        _object(upstream["annotations"], "upstream annotations")
+        _text(upstream.get("name"), "upstream operation name")
+        if set(upstream) == {"name", "sha256"}:
+            digest = _text(upstream["sha256"], "upstream operation sha256")
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise McpManifestError(
+                    "upstream operation sha256 must be lowercase hex"
+                )
+        else:
+            if not {"name", "description", "inputSchema", "annotations"} <= set(
+                upstream
+            ):
+                raise McpManifestError("upstream operation contract is incomplete")
+            _text(upstream["description"], "upstream operation description")
+            _object(upstream["inputSchema"], "upstream inputSchema")
+            _object(upstream["annotations"], "upstream annotations")
         prepared = _object(operation["prepared"], "prepared operation")
         if set(prepared) != {"name", "description", "input_schema"}:
             raise McpManifestError("prepared operation has unknown or missing fields")
@@ -250,8 +498,7 @@ class ConfiguredMcpService:
             discovery.protocol_version == manifest.protocol_version
             and _canonical(discovery.server_info) == _canonical(manifest.server_info)
             and all(
-                _canonical(discovered.get(str(operation.upstream["name"])))
-                == _canonical(operation.upstream)
+                _operation_matches(discovered, operation)
                 for operation in manifest.operations
             )
         )
@@ -351,8 +598,44 @@ class ConfiguredMcpService:
         return encoded
 
 
+async def prepare_configured_mcp_services(
+    configs: Iterable[McpServiceConfig], transport: McpTransport
+) -> tuple[ConfiguredMcpService, ...]:
+    """Load and live-verify every explicitly configured service manifest."""
+
+    prepared: list[ConfiguredMcpService] = []
+    for config in configs:
+        manifest = load_operation_manifest(config.manifest_path)
+        prepared.append(await ConfiguredMcpService.prepare(config, manifest, transport))
+    return tuple(prepared)
+
+
+def validate_configured_mcp_manifests(
+    configs: Iterable[McpServiceConfig],
+) -> None:
+    for config in configs:
+        manifest = load_operation_manifest(config.manifest_path)
+        if config.id != manifest.service_id or config.endpoint != manifest.endpoint:
+            raise McpManifestError(
+                "configured service identity does not match manifest"
+            )
+
+
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _operation_matches(
+    discovered: dict[str, dict[str, object]], operation: _ManifestOperation
+) -> bool:
+    candidate = discovered.get(str(operation.upstream["name"]))
+    if candidate is None:
+        return False
+    digest = operation.upstream.get("sha256")
+    if isinstance(digest, str):
+        actual = hashlib.sha256(_canonical(candidate).encode("utf-8")).hexdigest()
+        return actual == digest
+    return _canonical(candidate) == _canonical(operation.upstream)
 
 
 def _error(kind: str) -> str:
@@ -478,6 +761,9 @@ def _validate_value(value: object, schema: dict[str, object], name: str) -> None
 
 __all__ = [
     "ConfiguredMcpService",
+    "GoogleConnectionManager",
+    "GoogleOAuthTokenProvider",
+    "HttpMcpTransport",
     "McpConnection",
     "McpDiscovery",
     "McpManifestError",
@@ -486,4 +772,6 @@ __all__ = [
     "McpTransportError",
     "OperationManifest",
     "load_operation_manifest",
+    "prepare_configured_mcp_services",
+    "validate_configured_mcp_manifests",
 ]

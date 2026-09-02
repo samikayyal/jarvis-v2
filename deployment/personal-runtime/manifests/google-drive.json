@@ -1,0 +1,11 @@
+{
+  "manifest_version": 1,
+  "service": {"id": "google-drive", "endpoint": "https://drivemcp.googleapis.com/mcp/v1", "protocol_version": "2025-06-18", "server_info": {"name": "StatelessServer", "version": "ESF"}},
+  "captured_at": "2026-09-02",
+  "operations": [
+    {"upstream": {"name": "search_files", "sha256": "6e7bf313827a4f4352687a5ffe31879494429aa9e714afb09ccfb0df8d5a03cb"}, "prepared": {"name": "google_drive_search", "description": "Search at most 20 Drive files without content snippets.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "maxLength": 500}, "pageSize": {"type": "integer", "minimum": 1, "maximum": 20}, "excludeContentSnippets": {"type": "boolean", "enum": [true]}}, "required": ["query", "pageSize", "excludeContentSnippets"], "additionalProperties": false}}, "mode": "read"},
+    {"upstream": {"name": "get_file_metadata", "sha256": "3a05ed42ba3d0672e6474c3125d4fd8ed6d6e91ff2c9f77ab73ea42a4d3fdada"}, "prepared": {"name": "google_drive_metadata", "description": "Read metadata for one Drive file.", "input_schema": {"type": "object", "properties": {"fileId": {"type": "string", "maxLength": 256}, "excludeContentSnippets": {"type": "boolean", "enum": [true]}}, "required": ["fileId", "excludeContentSnippets"], "additionalProperties": false}}, "mode": "read"},
+    {"upstream": {"name": "read_file_content", "sha256": "4f26a402ac1371a17ff031753b122483b07b00b3645b25423614c826099f83e9"}, "prepared": {"name": "google_drive_read_text", "description": "Read bounded text content from one Drive file without comments.", "input_schema": {"type": "object", "properties": {"fileId": {"type": "string", "maxLength": 256}, "includeComments": {"type": "boolean", "enum": [false]}}, "required": ["fileId", "includeComments"], "additionalProperties": false}}, "mode": "read"},
+    {"upstream": {"name": "download_file_content", "sha256": "ffe9fc313b6a7ebc7f38ede5e54f746cbcd154cc6a1e0623196714bb8718a08c"}, "prepared": {"name": "google_drive_export_text", "description": "Export one Drive file in an approved text format.", "input_schema": {"type": "object", "properties": {"fileId": {"type": "string", "maxLength": 256}, "exportMimeType": {"type": "string", "enum": ["text/plain", "text/csv"], "maxLength": 32}}, "required": ["fileId", "exportMimeType"], "additionalProperties": false}}, "mode": "read"}
+  ]
+}

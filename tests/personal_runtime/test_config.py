@@ -66,6 +66,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.listener_host is None
     assert loaded.config.listener_port is None
     assert loaded.config.vault_path is None
+    assert loaded.config.mcp_services == ()
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
     assert loaded.secrets.openai_api_key == "sk-test"
@@ -162,6 +163,53 @@ openwa_operator_chat_id = "962790000000@c.us"
     assert loaded.config.openwa_authorized_operator_number == "962790000000@c.us"
     assert loaded.config.openwa_operator_chat_id == "962790000000@c.us"
     assert loaded.secrets.openwa_api_key == "openwa-test"
+
+
+def test_configured_mcp_services_load_from_non_secret_toml(tmp_path: Path) -> None:
+    _write_runtime_files(
+        tmp_path,
+        env=(
+            "OPENAI_API_KEY=sk-test\n"
+            "OPENWA_API_KEY=openwa-test\n"
+            "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n"
+            "GOOGLE_OAUTH_CLIENT_ID=client-id\n"
+            "GOOGLE_OAUTH_CLIENT_SECRET=client-secret\n"
+            "GOOGLE_OAUTH_REFRESH_TOKEN=refresh-token\n"
+        ),
+        toml="""
+[[mcp_services]]
+id = "google-calendar"
+endpoint = "https://calendarmcp.googleapis.com/mcp/v1"
+manifest_path = "manifests/google-calendar.json"
+max_output_chars = 12000
+""",
+    )
+
+    loaded = load_runtime_config(tmp_path)
+
+    assert len(loaded.config.mcp_services) == 1
+    service = loaded.config.mcp_services[0]
+    assert service.id == "google-calendar"
+    assert service.manifest_path == tmp_path / "manifests" / "google-calendar.json"
+    assert loaded.secrets.google_oauth_client_id == "client-id"
+    assert "client-secret" not in repr(loaded.secrets)
+    assert "refresh-token" not in repr(loaded.secrets)
+
+
+def test_mcp_configuration_requires_complete_google_credentials(tmp_path: Path) -> None:
+    _write_runtime_files(
+        tmp_path,
+        toml="""
+[[mcp_services]]
+id = "google-calendar"
+endpoint = "https://calendarmcp.googleapis.com/mcp/v1"
+manifest_path = "manifests/google-calendar.json"
+max_output_chars = 12000
+""",
+    )
+
+    with pytest.raises(ConfigError, match="GOOGLE_OAUTH_CLIENT_ID"):
+        load_runtime_config(tmp_path)
 
 
 def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:

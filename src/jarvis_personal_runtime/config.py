@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypedDict, cast
+from urllib.parse import urlsplit
 
 DEFAULT_ALLOWED_MODELS = (
     "gpt-5.6-sol",
@@ -35,6 +36,7 @@ DEFAULT_ALLOWED_REASONING_EFFORTS = (
     "xhigh",
     "max",
 )
+
 
 # This is for typing
 class _RuntimeDefaults(TypedDict):
@@ -144,6 +146,9 @@ class RuntimeSecrets:
     openai_api_key: str = field(repr=False)
     openwa_api_key: str = field(repr=False)
     openwa_webhook_signing_secret: str = field(repr=False)
+    google_oauth_client_id: str | None = field(default=None, repr=False)
+    google_oauth_client_secret: str | None = field(default=None, repr=False)
+    google_oauth_refresh_token: str | None = field(default=None, repr=False)
 
     @property
     def webhook_signing_secret(self) -> str:
@@ -165,10 +170,34 @@ class RuntimeSecrets:
                     "openwa_webhook_signing_secret",
                     self.openwa_webhook_signing_secret,
                 ),
+                ("google_oauth_client_id", self.google_oauth_client_id),
+                ("google_oauth_client_secret", self.google_oauth_client_secret),
+                ("google_oauth_refresh_token", self.google_oauth_refresh_token),
             )
             if value
         )
         return f"RuntimeSecrets(present={present!r})"
+
+
+@dataclass(frozen=True, slots=True)
+class McpServiceConfig:
+    id: str
+    endpoint: str
+    manifest_path: Path
+    max_output_chars: int
+
+    def __post_init__(self) -> None:
+        if not self.id.strip():
+            raise ValueError("configured MCP service id must be non-empty")
+        endpoint = urlsplit(self.endpoint)
+        if endpoint.scheme != "https" or not endpoint.netloc:
+            raise ValueError("configured MCP service endpoint must be an HTTPS URL")
+        if not self.manifest_path.name:
+            raise ValueError("configured MCP manifest path must identify a file")
+        if self.max_output_chars < 2:
+            raise ValueError(
+                "configured MCP output limit must be at least 2 characters"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +237,7 @@ class RuntimeConfig:
         "openwa_authorized_operator_number"
     ]
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
+    mcp_services: tuple[McpServiceConfig, ...] = ()
 
     @property
     def reasoning(self) -> str:
@@ -385,6 +415,13 @@ def _load_secrets(path: Path) -> RuntimeSecrets:
         openai_api_key=openai,
         openwa_api_key=openwa_api_key,
         openwa_webhook_signing_secret=openwa_webhook_signing_secret,
+        google_oauth_client_id=_env_value(values, path, "GOOGLE_OAUTH_CLIENT_ID"),
+        google_oauth_client_secret=_env_value(
+            values, path, "GOOGLE_OAUTH_CLIENT_SECRET"
+        ),
+        google_oauth_refresh_token=_env_value(
+            values, path, "GOOGLE_OAUTH_REFRESH_TOKEN"
+        ),
     )
 
 
@@ -414,7 +451,7 @@ def _collect_runtime_values(raw: Mapping[str, Any], path: Path) -> dict[str, Any
 
     values: dict[str, Any] = {}
     for key, value in raw.items():
-        if key not in {"runtime", "saved_permissions"}:
+        if key not in {"runtime", "saved_permissions", "mcp_services"}:
             if key not in _RUNTIME_KEYS:
                 raise ConfigError(path, f"unknown top-level setting: {key}")
             values[key] = value
@@ -520,6 +557,42 @@ def _optional_configured_path(
 
 def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConfig:
     values = _collect_runtime_values(raw, path)
+
+    configured_services: list[McpServiceConfig] = []
+    raw_services = raw.get("mcp_services", [])
+    if not isinstance(raw_services, list):
+        raise ConfigError(path, "mcp_services must be an array of tables")
+    for index, raw_service in enumerate(raw_services):
+        service = _ensure_table(raw_service, path, f"mcp_services[{index}]")
+        if set(service) != {"id", "endpoint", "manifest_path", "max_output_chars"}:
+            raise ConfigError(
+                path, f"mcp_services[{index}] has unknown or missing fields"
+            )
+        try:
+            configured_services.append(
+                McpServiceConfig(
+                    id=_string(service["id"], path, f"mcp_services[{index}].id"),
+                    endpoint=_string(
+                        service["endpoint"], path, f"mcp_services[{index}].endpoint"
+                    ),
+                    manifest_path=_rooted_path(
+                        service["manifest_path"],
+                        root,
+                        path,
+                        f"mcp_services[{index}].manifest_path",
+                    ),
+                    max_output_chars=_positive_int(
+                        service["max_output_chars"],
+                        path,
+                        f"mcp_services[{index}].max_output_chars",
+                    ),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(path, str(exc)) from exc
+    ids = [service.id for service in configured_services]
+    if len(ids) != len(set(ids)):
+        raise ConfigError(path, "configured MCP service ids must be unique")
 
     try:
         model = _setting(values, "model", default=DEFAULTS["model"])
@@ -813,6 +886,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         openwa_named_session=openwa_named_session,
         openwa_authorized_operator_number=openwa_authorized_operator_number,
         openwa_operator_chat_id=openwa_operator_chat_id,
+        mcp_services=tuple(configured_services),
     )
 
 
@@ -835,6 +909,27 @@ def load_runtime_config(root: str | Path = ".") -> LoadedRuntimeConfig:
     toml_path = root_path / "jarvis.toml"
     raw = _load_toml(toml_path)
     config = _build_config(raw, root_path, toml_path)
+    if config.mcp_services:
+        google_credentials = (
+            secrets.google_oauth_client_id,
+            secrets.google_oauth_client_secret,
+            secrets.google_oauth_refresh_token,
+        )
+        if any(value is None for value in google_credentials):
+            missing = next(
+                name
+                for name, value in zip(
+                    (
+                        "GOOGLE_OAUTH_CLIENT_ID",
+                        "GOOGLE_OAUTH_CLIENT_SECRET",
+                        "GOOGLE_OAUTH_REFRESH_TOKEN",
+                    ),
+                    google_credentials,
+                    strict=True,
+                )
+                if value is None
+            )
+            raise ConfigError(root_path / ".env", f"missing non-empty {missing}")
     prompt = _read_utf8(config.system_prompt_path, kind="SYSTEM.md")
     if not prompt.strip():
         raise ConfigError(config.system_prompt_path, "SYSTEM.md must be non-empty")
@@ -853,6 +948,7 @@ __all__ = [
     "DEFAULT_ALLOWED_REASONING_EFFORTS",
     "ConfigError",
     "LoadedRuntimeConfig",
+    "McpServiceConfig",
     "RuntimeConfig",
     "RuntimeSecrets",
     "load_config",

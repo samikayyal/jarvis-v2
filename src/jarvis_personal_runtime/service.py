@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import ConfigError, LoadedRuntimeConfig, RuntimeConfig, load_runtime_config
+from .mcp import (
+    GoogleConnectionManager,
+    GoogleOAuthTokenProvider,
+    HttpMcpTransport,
+    McpManifestError,
+    prepare_configured_mcp_services,
+    validate_configured_mcp_manifests,
+)
 from .openwa import (
     OpenWASettings,
     WebhookAcknowledgement,
@@ -73,6 +81,10 @@ def _load_service_config(root: str | Path) -> LoadedRuntimeConfig:
             "listener_host and listener_port must be configured for the service",
         )
     OpenWASettings.from_loaded_config(loaded)
+    try:
+        validate_configured_mcp_manifests(loaded.config.mcp_services)
+    except McpManifestError as exc:
+        raise ConfigError(loaded.config.root / "jarvis.toml", str(exc)) from exc
     return loaded
 
 
@@ -82,13 +94,30 @@ def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConf
     loaded = _load_service_config(root)
     config = loaded.config
     trace = build_runtime_trace(config)
+    configured_services = ()
+    connections = None
+    if config.mcp_services:
+        client_id = loaded.secrets.google_oauth_client_id
+        client_secret = loaded.secrets.google_oauth_client_secret
+        refresh_token = loaded.secrets.google_oauth_refresh_token
+        assert client_id and client_secret and refresh_token
+        tokens = GoogleOAuthTokenProvider(client_id, client_secret, refresh_token)
+        transport = HttpMcpTransport(tokens, trace=trace)
+        configured_services = asyncio.run(
+            prepare_configured_mcp_services(config.mcp_services, transport)
+        )
+        connections = GoogleConnectionManager(configured_services, tokens)
     runner = build_direct_responses_runner(
-        loaded.secrets.openai_api_key, config, trace=trace
+        loaded.secrets.openai_api_key,
+        config,
+        trace=trace,
+        additional_tools=configured_services,
     )
     runtime = build_runtime_from_loaded(
         loaded,
         request_runner=runner,
         trace=trace,
+        connections=connections,
     )
     flow = build_openwa_message_flow(loaded, runtime)
     return WebhookHttpApplication(flow), config

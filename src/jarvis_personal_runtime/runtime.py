@@ -26,7 +26,8 @@ CONTEXT_LIMIT_NOTICE = (
 APPROVAL_SUFFIX = "Reply 1 to approve once, 2 to save permission, or 9 to reject."
 HELP_TEXT = (
     "Commands: /help, /new, /status, /cancel, /model, /reasoning, "
-    "/permissions, /forget-permission"
+    "/permissions, /forget-permission, /connections, /connect google, "
+    "/disconnect google"
 )
 
 
@@ -166,6 +167,25 @@ class RuntimeTrace(Protocol):
     def record(self, event: str, payload: dict[str, object]) -> None: ...
 
 
+class ConnectionControl(Protocol):
+    def status(self) -> str: ...
+
+    async def connect(self) -> str: ...
+
+    def disconnect(self) -> str: ...
+
+
+class _NoConnections:
+    def status(self) -> str:
+        return "Google: unavailable"
+
+    async def connect(self) -> str:
+        return "Google is not configured."
+
+    def disconnect(self) -> str:
+        return "Google is not configured."
+
+
 class _NoTrace:
     def record(self, event: str, payload: dict[str, object]) -> None:
         return None
@@ -280,6 +300,7 @@ class PersonalRuntime:
         permission_store: PermissionStore | None = None,
         clock: Clock | None = None,
         trace: RuntimeTrace | None = None,
+        connections: ConnectionControl | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.request_runner = request_runner
@@ -288,6 +309,7 @@ class PersonalRuntime:
         self.permission_store = permission_store or _MemoryPermissions()
         self.clock = clock or _SystemClock()
         self.trace = trace or _NoTrace()
+        self.connections = connections or _NoConnections()
         self._lock = asyncio.Lock()
         self._session: _Session | None = None
         self._model = self.config.model
@@ -339,6 +361,13 @@ class PersonalRuntime:
 
         async with self._lock:
             self._expire_idle_session(now)
+            connection_command = message.text.strip() in {
+                "/connections",
+                "/connect google",
+                "/disconnect google",
+            }
+            if connection_command:
+                return await self._command(message.text, now)
             if self._session and self._session.pending:
                 operation = self._claim_modal(message.text, now)
             elif message.text.startswith("/"):
@@ -530,6 +559,9 @@ class PersonalRuntime:
             "/reasoning",
             "/permissions",
             "/forget-permission",
+            "/connections",
+            "/connect",
+            "/disconnect",
         }
         if command not in known:
             return self._result(RuntimeDisposition.UNKNOWN_COMMAND, (HELP_TEXT,))
@@ -538,6 +570,23 @@ class PersonalRuntime:
         if command == "/status" and not args:
             return self._result(
                 RuntimeDisposition.COMMAND, (_status_text(self.status()),)
+            )
+        if command == "/connections" and not args:
+            return self._result(
+                RuntimeDisposition.COMMAND, (self.connections.status(),)
+            )
+        if command == "/connect" and args == ["google"]:
+            try:
+                reply = await self.connections.connect()
+            except Exception:  # noqa: BLE001 - credential/network details stay private
+                return self._result(
+                    RuntimeDisposition.FAILED,
+                    ("Google connection failed. Check the runtime trace.",),
+                )
+            return self._result(RuntimeDisposition.COMMAND, (reply,))
+        if command == "/disconnect" and args == ["google"]:
+            return self._result(
+                RuntimeDisposition.COMMAND, (self.connections.disconnect(),)
             )
         if command == "/new" and not args:
             task = self._clear_session()
@@ -682,12 +731,17 @@ def build_runtime(
     request_runner: RequestRunner,
     clock: Clock | None = None,
     trace: RuntimeTrace | None = None,
+    connections: ConnectionControl | None = None,
 ) -> PersonalRuntime:
     """Load all three runtime files and compose replacement-owned persistence."""
 
     loaded: LoadedRuntimeConfig = load_runtime_config(root)
     return build_runtime_from_loaded(
-        loaded, request_runner=request_runner, clock=clock, trace=trace
+        loaded,
+        request_runner=request_runner,
+        clock=clock,
+        trace=trace,
+        connections=connections,
     )
 
 
@@ -697,6 +751,7 @@ def build_runtime_from_loaded(
     request_runner: RequestRunner,
     clock: Clock | None = None,
     trace: RuntimeTrace | None = None,
+    connections: ConnectionControl | None = None,
 ) -> PersonalRuntime:
     """Compose a runtime from one already validated configuration snapshot."""
 
@@ -710,6 +765,7 @@ def build_runtime_from_loaded(
         ),
         permission_store=TomlPermissionStore(loaded.config.root / "jarvis.toml"),
         clock=clock,
+        connections=connections,
         trace=trace
         or getattr(request_runner, "trace", None)
         or build_runtime_trace(loaded.config),

@@ -70,6 +70,12 @@ existing WhatsApp, vault, or terminal paths.
   opaque Google connection, and reuses pending approvals while keeping `2` and
   saved permissions terminal-only; HTTP/OAuth and config-parser wiring remain
   with Ticket 03.
+- [Implement Google through the minimal MCP foundation](issues/03-implement-google-through-the-minimal-mcp-foundation.md)
+  — The native runtime now loads explicit remote services, validates checked-in
+  digest manifests against live discovery, binds one OAuth-backed Google
+  connection, exposes 10 bounded reads and two exact one-attempt Calendar
+  writes, and keeps Gmail read-only because the official hosted service still
+  has no send/reply operation.
 
 ## Not yet specified
 
