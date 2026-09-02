@@ -53,7 +53,8 @@ _Avoid_: Any authenticated event, queued request
 An exact slash-prefixed operator message handled by application code without
 asking the model to interpret it. The supported commands are `/help`, `/new`,
 `/status`, `/cancel`, `/model`, `/reasoning`, `/permissions`, and
-`/forget-permission`.
+`/forget-permission`, plus `/connections`, `/connect google`, and
+`/disconnect google` for the configured Google connection.
 _Avoid_: Prompt, prepared tool, ordinary request
 
 **Ordinary request**:
@@ -81,7 +82,9 @@ _Avoid_: Deterministic command, provider conversation object
 
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
-current prepared tools are `read_vault` and `run_terminal`.
+current prepared tools are `read_vault`, `run_terminal`, and the
+manifest-selected bounded Gmail, Drive, and Calendar operations of configured
+MCP services.
 _Avoid_: Arbitrary capability, connector framework
 
 **Configured MCP service**:
@@ -100,7 +103,9 @@ _Avoid_: Configured Google identity, OAuth token, configured MCP service
 The one exact terminal command or Google write waiting indefinitely for the
 authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
 `9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all
-other messages are silently ignored while either kind is pending.
+other messages are silently ignored while either kind is pending except the
+exact Google connection controls. Reauthorization or disconnection invalidates
+a pending Google write created under the prior connection.
 _Avoid_: Active request, saved permission, queued action
 
 **Saved permission**:
