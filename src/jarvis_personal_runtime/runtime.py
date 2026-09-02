@@ -86,11 +86,14 @@ class PendingAction:
     host: str
     prefix: str
     display: str
+    allow_save_permission: bool = True
 
     def __post_init__(self) -> None:
         _required_text(self.host, "host")
         _required_text(self.prefix, "prefix")
         _required_text(self.display, "display")
+        if not isinstance(self.allow_save_permission, bool):
+            raise TypeError("allow_save_permission must be a boolean")
 
 
 class ApprovalDecision(str, Enum):
@@ -383,7 +386,10 @@ class PersonalRuntime:
             if task and task is not asyncio.current_task():
                 task.cancel()
             return ("cancel", None)
-        if choice not in {"1", "2", "9"} or pending.claimed:
+        allowed = {"1", "9"}
+        if pending.action.allow_save_permission:
+            allowed.add("2")
+        if choice not in allowed or pending.claimed:
             return None
         pending.claimed = True
         decision = {
@@ -481,9 +487,14 @@ class PersonalRuntime:
                 self._session.active.phase = "awaiting_approval"
                 self._session.active.task = None
                 self._session.pending = _Pending(step.action, step.continuation)
+            suffix = (
+                APPROVAL_SUFFIX
+                if step.action.allow_save_permission
+                else "Reply 1 to approve once or 9 to reject."
+            )
             return self._result(
                 RuntimeDisposition.APPROVAL_REQUIRED,
-                (f"{step.action.display}\n{APPROVAL_SUFFIX}",),
+                (f"{step.action.display}\n{suffix}",),
             )
         if isinstance(step, Completed):
             return await self._finish(step)

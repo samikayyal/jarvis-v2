@@ -191,6 +191,30 @@ async def test_pending_modal_accepts_only_exact_choices_and_persists_before_resu
 
 
 @async_test
+async def test_pending_action_without_saved_permission_ignores_choice_two() -> None:
+    action = PendingAction(
+        host="google",
+        prefix="google_calendar_create_event",
+        display="Create the exact event?",
+        allow_save_permission=False,
+    )
+    runner = FakeRunner(ApprovalRequired(action, "continuation"))
+    permissions = FakePermissionStore()
+    runtime = PersonalRuntime(request_runner=runner, permission_store=permissions)
+
+    pending = await runtime.receive(inbound("m1", "create it"))
+    ignored = await runtime.receive(inbound("m2", "2"))
+
+    assert pending.replies == (
+        "Create the exact event?\nReply 1 to approve once or 9 to reject.",
+    )
+    assert ignored.disposition == "ignored"
+    assert runtime.status().pending_action == action
+    assert permissions.saved == []
+    assert runner.resumes == []
+
+
+@async_test
 async def test_failed_permission_save_keeps_pending_action_and_does_not_resume() -> (
     None
 ):
@@ -326,7 +350,12 @@ async def test_approval_once_rejection_and_context_limit_are_explicit() -> None:
 async def test_restart_discards_session_work_and_persists_message_ids(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-test\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=sk-test\n"
+        "OPENWA_API_KEY=openwa-test\n"
+        "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n",
+        encoding="utf-8",
+    )
     (tmp_path / "jarvis.toml").write_text("", encoding="utf-8")
     (tmp_path / "SYSTEM.md").write_text("System instructions.\n", encoding="utf-8")
     clock = FakeClock()

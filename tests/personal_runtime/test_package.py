@@ -8,6 +8,12 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = ROOT / "deployment" / "personal-runtime"
 
 
+def _source_bytes(path: Path) -> bytes:
+    """Match the LF bytes installed on the native Ubuntu target."""
+
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
 def test_replacement_package_has_valid_source_and_dependency_pins() -> None:
     entries = (PACKAGE / "SHA256SUMS").read_text(encoding="ascii").splitlines()
     pinned_paths = set()
@@ -15,7 +21,7 @@ def test_replacement_package_has_valid_source_and_dependency_pins() -> None:
         expected, relative_path = entry.split("  ", 1)
         pinned_paths.add(relative_path)
         assert (
-            hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == expected
+            hashlib.sha256(_source_bytes(ROOT / relative_path)).hexdigest() == expected
         )
 
     runtime_sources = {

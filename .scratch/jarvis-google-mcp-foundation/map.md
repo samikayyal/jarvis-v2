@@ -64,6 +64,12 @@ existing WhatsApp, vault, or terminal paths.
   currently supports search/read and draft creation but no send/reply, so the
   original Gmail-write acceptance remains blocked pending an explicit map
   amendment or a suitable official operation.
+- [Lock the minimal configured MCP service boundary](issues/02-lock-the-minimal-configured-mcp-service-boundary.md)
+  — A tested `ConfiguredMcpService` prototype now fails closed against exact
+  selected discovery, exposes only narrowed manifest operations, binds one
+  opaque Google connection, and reuses pending approvals while keeping `2` and
+  saved permissions terminal-only; HTTP/OAuth and config-parser wiring remain
+  with Ticket 03.
 
 ## Not yet specified
 

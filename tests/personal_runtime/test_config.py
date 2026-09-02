@@ -18,7 +18,11 @@ from jarvis_personal_runtime.config import (
 def _write_runtime_files(
     root: Path,
     *,
-    env: str = "OPENAI_API_KEY=sk-test\nOPENWA_API_KEY=openwa-test\n",
+    env: str = (
+        "OPENAI_API_KEY=sk-test\n"
+        "OPENWA_API_KEY=openwa-test\n"
+        "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n"
+    ),
     toml: str = "",
     system: str = "You are Jarvis.\n",
 ) -> None:
@@ -66,6 +70,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.system_prompt == "You are Jarvis.\n"
     assert loaded.secrets.openai_api_key == "sk-test"
     assert loaded.secrets.openwa_api_key == "openwa-test"
+    assert loaded.secrets.openwa_webhook_signing_secret == "signing-test"
 
     with pytest.raises(FrozenInstanceError):
         loaded.config.model = "gpt-5.6-sol"  # type: ignore[misc]
@@ -254,7 +259,14 @@ def test_system_prompt_must_be_nonempty_utf8(tmp_path: Path) -> None:
 
 
 def test_env_is_read_only_and_missing_secret_is_reported(tmp_path: Path) -> None:
-    _write_runtime_files(tmp_path, env="OPENAI_API_KEY=sk-original\n")
+    _write_runtime_files(
+        tmp_path,
+        env=(
+            "OPENAI_API_KEY=sk-original\n"
+            "OPENWA_API_KEY=openwa-test\n"
+            "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n"
+        ),
+    )
     before = (tmp_path / ".env").read_bytes()
 
     loaded = load_runtime_config(tmp_path)
