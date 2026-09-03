@@ -82,10 +82,16 @@ _Avoid_: Deterministic command, provider conversation object
 
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
-current prepared tools are `read_vault`, `run_terminal`, and the
-manifest-selected bounded Gmail, Drive, and Calendar operations of configured
-MCP services.
+current prepared tools are `read_vault`, `run_terminal`, the bounded Google API
+tools, and the manifest-selected bounded operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
+
+**Google API tools**:
+The bounded Gmail, Drive, and Calendar operations exposed through the one
+Google connection. They support the selected reads and approved Gmail and
+Calendar writes; Drive remains read-only, and no tool grants general Google
+access.
+_Avoid_: Configured MCP service, arbitrary Google API, connector framework
 
 **Configured MCP service**:
 One explicitly configured remote service whose reviewed operation manifest
@@ -94,9 +100,10 @@ verifies that manifest; it never grants newly discovered operations authority.
 _Avoid_: Arbitrary MCP server, dynamic plugin marketplace, prepared tool
 
 **Google connection**:
-The current operator-authorized link between Jarvis and one Google account
-across its configured MCP services. Reauthorization replaces it; disconnection
-ends it, and either change invalidates pending Google actions from the prior link.
+The current operator-authorized link between Jarvis and the exact configured
+Google account used by the Google API tools. Reauthorization replaces it;
+disconnection ends it, and either change invalidates pending Google actions from
+the prior link.
 _Avoid_: Configured Google identity, OAuth token, configured MCP service
 
 **Pending action**:
@@ -139,6 +146,9 @@ _Avoid_: Sanitized application log, hidden model reasoning
 - Jarvis reads credentials only from `.env`, non-secret settings and saved
   permissions from `jarvis.toml`, and its editable prompt from `SYSTEM.md`.
   Jarvis never edits `.env` or `SYSTEM.md`.
+- Google API tools use only the exact configured Google account. Gmail and
+  Calendar writes require exact operator approval and one attempt; Drive tools
+  cannot mutate data.
 - Configured simple read-only command prefixes may run automatically. Compound
   shell structure, scripts, unmatched commands, and mutating commands require
   exact approval or a matching saved permission.

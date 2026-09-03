@@ -42,7 +42,7 @@ The files have distinct trust boundaries:
 
 | File | Contents | Required ownership and mode |
 | --- | --- | --- |
-| `.env` | OpenAI, OpenWA, and Google OAuth credentials | `root:jarvis-personal-runtime`, `0440` |
+| `.env` | OpenAI, OpenWA, and Google API OAuth credentials | `root:jarvis-personal-runtime`, `0440` |
 | `jarvis.toml` | Non-secret settings and saved permissions | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
 | `SYSTEM.md` | Editable system prompt | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
 
@@ -52,11 +52,24 @@ paths must stay below the runtime root. An optional vault path may be an absolut
 read-only directory outside it.
 
 Required `.env` names are `OPENAI_API_KEY`, `OPENWA_API_KEY`, and
-`OPENWA_WEBHOOK_SIGNING_SECRET`. When Google MCP services are configured, also
-provide `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
-`GOOGLE_OAUTH_REFRESH_TOKEN`; never print or copy them into TOML. Copy the three
-reviewed JSON manifests from `deployment/personal-runtime/manifests/` to the
-runtime root's private `manifests/` directory. Required production TOML values include the
+`OPENWA_WEBHOOK_SIGNING_SECRET`. The active personal Google route also requires
+`GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
+`GOOGLE_OAUTH_REFRESH_TOKEN`; never print or copy these credentials into TOML.
+Set the exact authorized account in non-secret TOML:
+
+```toml
+[google]
+account = "kayyal.sami@gmail.com"
+```
+
+The supervised OAuth grant is expected to include `openid` and email identity,
+`gmail.readonly`, `gmail.send`, `drive.readonly`, and `calendar.events`.
+Credentials remain only in `.env`; OAuth tokens and authorization headers must
+never enter model context or runtime traces. Copy the three reviewed JSON
+manifests from `deployment/personal-runtime/manifests/` to the runtime root's
+private `manifests/` directory only when a separate generic MCP service is
+configured. The `[google]` section is the active personal route; do not model it
+as a `[[mcp_services]]` entry. Required production TOML values include the
 private listener, OpenWA API base URL, internal session ID, named session,
 authorized operator number and chat ID, Ubuntu working directory, and read-only
 prefixes. Configure all four
@@ -75,21 +88,33 @@ sudo -u jarvis-personal-runtime \
 Never print `.env`, private keys, phone/chat identifiers, raw webhook payloads,
 or trace bodies during validation.
 
-`--check` parses and validates every configured manifest without contacting
-Google. Normal startup additionally performs live MCP discovery and fails
-closed if a selected operation digest, protocol version, or server identity has
-changed. `/connect google` refreshes the configured OAuth grant and binds one
-in-memory Google connection; `/connections` reports its state and
-`/disconnect google` invalidates it. Connection replacement or disconnection
-also invalidates pending Google writes. Google writes accept only `1`, `9`, or
-`/cancel`, are attempted once, and are never automatically retried after an
-ambiguous outcome.
+`--check` parses and validates the Google configuration and every configured
+generic MCP manifest without contacting Google. Normal startup validates the
+Google API configuration; separately configured MCP services additionally
+perform live discovery and fail closed if a selected operation digest, protocol
+version, or server identity has changed. `/connect google` refreshes the
+configured OAuth grant and binds one in-memory Google connection;
+`/connections` reports its state and `/disconnect google` invalidates it.
+Connection replacement or disconnection also invalidates pending Google writes.
+Google writes accept only `1`, `9`, or `/cancel`, are attempted once, and are
+never automatically retried after an ambiguous outcome.
 
-The hosted Gmail MCP contract captured on 2026-09-02 exposes search/read and
-draft creation but no send or reply operation. This package therefore exposes
-only Gmail reads; it does not mislabel draft creation as sending. Calendar
-create/update use exact one-attempt approval. Re-capture and review the official
-contract before activation if Google adds Gmail send/reply.
+The active personal route uses Google's generally available official Gmail,
+Drive, and Calendar REST APIs. It exposes bounded Gmail search/read and
+send/reply, Drive search/metadata/text content/export only, and Calendar
+search/read plus create/update. Gmail and Calendar writes require exact
+one-attempt approval. Drive has no mutation or destructive operation, and no
+tool may select an arbitrary Google endpoint. The hosted Workspace Developer
+Preview MCP route is not used: personal Gmail cannot enroll in that program,
+and the hosted Gmail MCP has no send/reply operation. The generic configured MCP
+service capability remains available for separately configured services.
+
+Activate this route only under human supervision: verify the exact account and
+OAuth consent, validate the private configuration, prove restart persistence,
+run bounded reads, perform the approved real Gmail and Calendar acceptance
+fixtures, verify rejection and excluded mutations, test disconnect/reconnect,
+and confirm the unchanged WhatsApp, vault, and terminal paths before the human
+operator makes the final go/no-go decision.
 
 ## Install or update the service
 

@@ -1,10 +1,12 @@
 ## Destination
 
 Add the smallest reusable configured-MCP-service support to the native Jarvis
-personal assistant runtime, use it to connect one Google connection to bounded
-Gmail, Google Drive, and Google Calendar capabilities, pass focused and real
-supervised acceptance, and activate the integration without regressing the
-existing WhatsApp, vault, or terminal paths.
+personal assistant runtime as a generic capability. Use bounded Google API
+tools backed by Google's generally available official Gmail, Drive, and
+Calendar REST APIs for the exact personal account
+`kayyal.sami@gmail.com`. Pass focused and real supervised acceptance, and
+activate the integration without regressing the existing WhatsApp, vault, or
+terminal paths.
 
 ## Notes
 
@@ -21,10 +23,12 @@ existing WhatsApp, vault, or terminal paths.
   service is not a dynamically trusted plugin: one checked-in operation
   manifest selects which server operations Jarvis exposes as prepared tools.
 - Use remote Streamable HTTP for configured MCP services. Do not add a local
-  `stdio` transport or its server-lifecycle concerns.
-- Prefer Google's official Workspace MCP servers. Their Developer Preview
-  status is an explicit supervised activation risk, not a reason to adopt an
-  unofficial all-in-one server.
+  `stdio` transport or its server-lifecycle concerns. This generic MCP
+  capability is retained, but it is not the active route for personal Google.
+- Use Google's generally available official Gmail, Drive, and Calendar REST APIs
+  for the active personal Google route. Do not require Workspace Developer
+  Preview enrollment or route `kayyal.sami@gmail.com` through Google's hosted
+  preview MCP endpoints.
 - Maintain one Google connection. Reauthorization or disconnection invalidates
   pending Google actions created under the prior connection.
 - Initial reads are bounded Gmail search/read, Drive search/metadata/text
@@ -39,12 +43,13 @@ existing WhatsApp, vault, or terminal paths.
   deterministic connection controls. Do not add generic conversational MCP
   configuration.
 - Store non-secret server configuration and manifest paths in `jarvis.toml`.
-  Keep the OAuth client secret and refresh token only in `.env`, and keep all
-  OAuth material out of model context and runtime traces. Jarvis never edits
-  `.env`; any required writable token store needs an explicit domain amendment.
-- Use the existing runtime trace path for bounded MCP activity while excluding
-  OAuth tokens and authorization headers. Do not build a separate redaction or
-  security subsystem.
+  Store the exact Google account in the `[google]` section. Keep the OAuth
+  client secret and refresh token only in `.env`, and keep all OAuth material
+  out of model context and runtime traces. Jarvis never edits `.env`; any
+  required writable token store needs an explicit domain amendment.
+- Use the existing runtime trace path for bounded Google API and configured MCP
+  activity while excluding OAuth tokens and authorization headers. Do not build
+  a separate redaction or security subsystem.
 - Later services should normally require only pinned service configuration, an
   explicit operation manifest, a small prepared-tool adapter, contract tests,
   and supervised acceptance. A genuinely new approval or lifecycle primitive
@@ -58,12 +63,12 @@ existing WhatsApp, vault, or terminal paths.
 
 - [Confirm the official Google Workspace MCP contract](issues/01-confirm-official-google-workspace-mcp-contract.md)
   — Google's three service-specific hosted endpoints expose a stateless,
-  OAuth-protected Streamable HTTP tools contract that Jarvis can snapshot and
-  fail closed against, but Google publishes no production support or immutable
-  version contract for them. Calendar supports approved create/update; Gmail
-  currently supports search/read and draft creation but no send/reply, so the
-  original Gmail-write acceptance remains blocked pending an explicit map
-  amendment or a suitable official operation.
+  OAuth-protected Streamable HTTP tools contract that the generic configured MCP
+  capability can snapshot and fail closed against, but Google publishes no
+  production support or immutable version contract for them. Calendar supports
+  approved create/update; Gmail currently supports search/read and draft
+  creation but no send/reply. They are not the active route for the personal
+  Google account.
 - [Lock the minimal configured MCP service boundary](issues/02-lock-the-minimal-configured-mcp-service-boundary.md)
   — A tested `ConfiguredMcpService` prototype now fails closed against exact
   selected discovery, exposes only narrowed manifest operations, binds one
@@ -75,22 +80,30 @@ existing WhatsApp, vault, or terminal paths.
   digest manifests against live discovery, binds one OAuth-backed Google
   connection, exposes 10 bounded reads and two exact one-attempt Calendar
   writes, and keeps Gmail read-only because the official hosted service still
-  has no send/reply operation.
+  has no send/reply operation. This implementation remains available as the
+  generic configured MCP capability, not as the active personal Google route.
 - [Prove the complete Google MCP contract](issues/04-prove-the-complete-google-mcp-contract.md)
   — Focused contract and regression gates, static checks, and the one final
   repository-wide suite prove the supportable official Google contract without
   live authorization or production changes; the final suite passed with 172
-  tests and one existing platform-conditional skip.
+  tests and one existing platform-conditional skip. Those gates cover the
+  retained generic MCP capability.
+- Personal Google route amendment (2026-09-03) — The exact authorized identity
+  `kayyal.sami@gmail.com` cannot enroll in Google's Workspace Developer Preview
+  Program, and Google's hosted Gmail MCP has no send/reply operation. The
+  active route is therefore bounded Google API tools backed by the generally
+  available official Gmail, Drive, and Calendar REST APIs. The generic
+  `ConfiguredMcpService` capability remains separate and is not used for this
+  Google connection.
 
 ## Not yet specified
 
-- Production authorization and reconnect cannot be locked while Google
-  publishes no support/version contract for the hosted endpoints and Gmail
-  exposes no send/reply operation; Ticket 02 may prototype the verified OAuth
-  shape but cannot erase those activation blockers.
-- The exact target-host configuration values, credential paths, service
-  restart procedure, and rollback commands depend on the selected official
-  server deployment shape and the implemented runtime seam.
+- Production authorization and reconnect remain human-supervised. The exact
+  Google OAuth client configuration, consent flow, installation, restart
+  persistence, and real acceptance for the direct API route must still be
+  completed before activation.
+- The exact target-host configuration values, credential paths, service restart
+  procedure, and rollback commands depend on the implemented runtime seam.
 - The exact real Gmail, Drive, and Calendar acceptance fixtures will be chosen
   during supervised activation without placing private content in the repo.
 
@@ -104,7 +117,7 @@ existing WhatsApp, vault, or terminal paths.
 - Drive mutation or sharing, Gmail label/archive/trash/delete operations,
   Calendar deletion, account administration, and destructive Google actions.
 - Persistent approval for Google writes, automatic retry of ambiguous writes,
-  and automatic failover to alternate MCP servers or direct Google APIs.
+  and automatic failover between alternate Google routes or services.
 - Reintroducing the retired control plane, capability broker, durable proposal
   store, connector framework, audit subsystem, or public Jarvis OAuth callback
   unless official Google requirements later make that callback unavoidable and

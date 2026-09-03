@@ -5,10 +5,25 @@ Blocked by: 04
 ## Question
 
 With the operator supervising consent, real external writes, installation, and
-go/no-go, connect the exact Google identity; prove restart persistence, bounded
-Gmail/Drive/Calendar reads, one delivered Gmail write, one rejected write, one
-exact Calendar change, excluded mutations, disconnect/reconnect behavior, and
-unchanged WhatsApp/vault/terminal paths; then activate or roll back explicitly.
+go/no-go, connect the exact personal Google identity
+`kayyal.sami@gmail.com` through bounded Google API tools backed by the
+generally available official Gmail, Drive, and Calendar REST APIs; prove restart
+persistence, bounded Gmail/Drive/Calendar reads, one delivered Gmail write, one
+rejected write, one exact Calendar change, excluded mutations,
+disconnect/reconnect behavior, and unchanged WhatsApp/vault/terminal paths;
+then activate or roll back explicitly.
+
+## Amendment (2026-09-03)
+
+The active Google route is direct official Google APIs, not Google's hosted
+Workspace Developer Preview MCP endpoints. Personal Gmail identities cannot
+enroll in that preview program, and the hosted Gmail MCP has no send/reply
+operation. The generic `ConfiguredMcpService` capability remains implemented
+for separately configured services but is not the active route for this Google
+connection. The existing bounds, exact approval grammar, one-attempt writes,
+trace redaction, Drive read-only boundary, supervised OAuth and external writes,
+and human go/no-go remain unchanged. This issue stays `claimed` until real
+activation acceptance passes.
 
 ## Comments
 
@@ -55,3 +70,7 @@ unchanged WhatsApp/vault/terminal paths; then activate or roll back explicitly.
   `.env`/`jarvis.toml` contain no Google credentials or MCP services. Candidate
   OAuth material remains inactive in root-controlled files for a future eligible
   Workspace identity; it was neither printed nor copied into the repository.
+- The architecture was amended on 2026-09-03 for the personal account
+  `kayyal.sami@gmail.com`: implement the bounded direct Google API route with
+  OAuth scopes for identity, Gmail read/send, Drive read-only, and Calendar
+  events, then repeat the supervised acceptance before any activation.
