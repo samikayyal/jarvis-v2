@@ -31,3 +31,27 @@ unchanged WhatsApp/vault/terminal paths; then activate or roll back explicitly.
   environment variables. Exact Google identity, consent, credential placement,
   host-key trust, installation, external-write fixtures, and final go/no-go
   therefore remain operator-owned gates.
+- Supervised activation was attempted on 2026-09-03 with the operator's exact
+  authorization. The new release, private configuration, exact Google identity,
+  restart persistence, connection controls, and bounded no-content-output MCP
+  probes passed. A production Responses request initially exposed an invalid
+  strict-schema advertisement for Calendar writes; commits `92f2cde` and
+  `e5fa351` repaired and hardened it with regression coverage. The final suite
+  passed with 175 tests and one existing platform-conditional skip; both review
+  axes then reported no remaining finding.
+- Real WhatsApp acceptance reached all three official MCP tools. Google denied
+  Gmail and Calendar because Cloud project `915023365865` is not enrolled in
+  the Google Workspace Developer Preview Program, and denied Drive with `The
+  caller does not have permission`. No real read or write succeeded.
+- Google's official enrollment form explicitly rejects personal Gmail
+  identities and requires an email in a Google Workspace domain. The authorized
+  identity is a personal Gmail address, so this project cannot be enrolled with
+  that identity. Google documents that an eligible application normally takes
+  a couple of days to approve.
+- Because real acceptance could not pass, production was explicitly rolled back
+  to the verified pre-Google configuration and rebuilt Python 3.14-compatible
+  prior release. Jarvis returned active with zero restarts, OpenWA remained
+  healthy with zero restarts, the private listener returned, and the active
+  `.env`/`jarvis.toml` contain no Google credentials or MCP services. Candidate
+  OAuth material remains inactive in root-controlled files for a future eligible
+  Workspace identity; it was neither printed nor copied into the repository.
