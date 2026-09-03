@@ -207,6 +207,79 @@ def test_gmail_search_treats_no_content_as_an_empty_collection() -> None:
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "collection_key"),
+    [
+        (
+            "google_drive_search",
+            {
+                "query": "name = 'missing'",
+                "pageSize": 20,
+                "excludeContentSnippets": True,
+            },
+            "files",
+        ),
+        ("google_calendar_search", {"query": "missing", "pageSize": 20}, "items"),
+        (
+            "google_calendar_list",
+            {
+                "calendarId": "primary",
+                "startTime": "2026-09-01T00:00:00Z",
+                "endTime": "2026-09-02T00:00:00Z",
+                "pageSize": 20,
+            },
+            "items",
+        ),
+    ],
+)
+def test_drive_and_calendar_collection_reads_treat_no_content_as_empty(
+    tool_name: str, arguments: dict[str, object], collection_key: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"emailAddress": "person@example.com"})
+        return httpx.Response(204)
+
+    tools, _, client, _ = make_tools(handler)
+
+    async def scenario() -> None:
+        await tools.connect()
+        result = json.loads(await tools.execute(tool_name, arguments))
+        assert result == {"result": {collection_key: []}}
+        await client.aclose()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "google_drive_metadata",
+            {"fileId": "missing", "excludeContentSnippets": True},
+        ),
+        ("google_calendar_read", {"eventId": "missing", "calendarId": "primary"}),
+    ],
+)
+def test_single_resource_reads_fail_closed_on_no_content(
+    tool_name: str, arguments: dict[str, object]
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"emailAddress": "person@example.com"})
+        return httpx.Response(204)
+
+    tools, _, client, _ = make_tools(handler)
+
+    async def scenario() -> None:
+        await tools.connect()
+        result = json.loads(await tools.execute(tool_name, arguments))
+        assert result == {"error": {"kind": "operation_failed"}}
+        await client.aclose()
+
+    run(scenario())
+
+
 def test_gmail_read_decodes_inline_text_and_never_attachment_data() -> None:
     encode = lambda text: base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 
