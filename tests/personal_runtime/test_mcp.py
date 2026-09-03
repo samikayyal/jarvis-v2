@@ -153,6 +153,35 @@ def test_prepare_does_not_mark_a_schema_with_optional_properties_as_strict() -> 
     assert service.definitions[0]["strict"] is False
 
 
+def test_prepare_does_not_mark_nested_optional_properties_as_strict() -> None:
+    payload = manifest_payload()
+    schema = payload["operations"][0]["prepared"]["input_schema"]  # type: ignore[index]
+    schema["properties"]["details"] = {  # type: ignore[index]
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "maxLength": 2_000},
+            "location": {"type": "string", "maxLength": 500},
+        },
+        "required": ["description"],
+        "additionalProperties": False,
+    }
+    schema["required"].append("details")  # type: ignore[index]
+
+    service = build_service(payload, FakeTransport())
+
+    assert service.definitions[0]["strict"] is False
+
+
+def test_prepare_does_not_mark_duplicate_required_names_as_strict() -> None:
+    payload = manifest_payload()
+    schema = payload["operations"][0]["prepared"]["input_schema"]  # type: ignore[index]
+    schema["required"].append("summary")  # type: ignore[index]
+
+    service = build_service(payload, FakeTransport())
+
+    assert service.definitions[0]["strict"] is False
+
+
 @pytest.mark.parametrize("drift", ["protocol", "server", "schema", "annotations"])
 def test_prepare_fails_closed_on_selected_contract_drift(drift: str) -> None:
     transport = FakeTransport()

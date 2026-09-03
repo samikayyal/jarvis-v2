@@ -637,14 +637,27 @@ def _canonical(value: object) -> str:
 
 
 def _is_strict_function_schema(schema: Mapping[str, object]) -> bool:
-    properties = schema.get("properties")
-    required = schema.get("required")
-    return (
-        schema.get("type") == "object"
-        and schema.get("additionalProperties") is False
-        and isinstance(properties, dict)
-        and isinstance(required, list)
-        and set(required) == set(properties)
+    if schema.get("type") == "object":
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if (
+            schema.get("additionalProperties") is not False
+            or not isinstance(properties, dict)
+            or not isinstance(required, list)
+            or len(required) != len(set(required))
+            or set(required) != set(properties)
+        ):
+            return False
+    return all(
+        _is_strict_function_schema(value)
+        for value in schema.values()
+        if isinstance(value, dict)
+    ) and all(
+        _is_strict_function_schema(item)
+        for value in schema.values()
+        if isinstance(value, list)
+        for item in value
+        if isinstance(item, dict)
     )
 
 
