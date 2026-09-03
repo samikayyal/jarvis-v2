@@ -8,6 +8,7 @@ import pytest
 from jarvis_personal_runtime.config import (
     DEFAULTS,
     ConfigError,
+    GoogleApiConfig,
     LoadedRuntimeConfig,
     RuntimeConfig,
     RuntimeSecrets,
@@ -67,6 +68,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.listener_port is None
     assert loaded.config.vault_path is None
     assert loaded.config.mcp_services == ()
+    assert loaded.config.google is None
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
     assert loaded.secrets.openai_api_key == "sk-test"
@@ -231,6 +233,90 @@ max_output_chars = 12000
     )
 
     with pytest.raises(ConfigError, match="official Google MCP endpoint"):
+        load_runtime_config(tmp_path)
+
+
+def test_direct_google_api_configuration_loads_from_top_level_table(
+    tmp_path: Path,
+) -> None:
+    _write_runtime_files(
+        tmp_path,
+        env=(
+            "OPENAI_API_KEY=sk-test\n"
+            "OPENWA_API_KEY=openwa-test\n"
+            "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n"
+            "GOOGLE_OAUTH_CLIENT_ID=client-id\n"
+            "GOOGLE_OAUTH_CLIENT_SECRET=client-secret\n"
+            "GOOGLE_OAUTH_REFRESH_TOKEN=refresh-token\n"
+        ),
+        toml='[google]\naccount = "kayyal.sami@gmail.com"\nmax_output_chars = 20000\n',
+    )
+
+    loaded = load_runtime_config(tmp_path)
+
+    assert loaded.config.google == GoogleApiConfig(
+        account="kayyal.sami@gmail.com", max_output_chars=20000
+    )
+    assert loaded.config.mcp_services == ()
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [
+        '[google]\naccount = "kayyal.sami@gmail.com"\n',
+        "[google]\nmax_output_chars = 20000\n",
+        (
+            '[google]\naccount = "kayyal.sami@gmail.com"\n'
+            "max_output_chars = 20000\nextra = true\n"
+        ),
+    ],
+)
+def test_direct_google_api_table_requires_exact_fields(
+    tmp_path: Path, toml: str
+) -> None:
+    _write_runtime_files(tmp_path, toml=toml)
+
+    with pytest.raises(ConfigError, match="\\[google\\]"):
+        load_runtime_config(tmp_path)
+
+
+def test_direct_google_api_configuration_requires_complete_google_credentials(
+    tmp_path: Path,
+) -> None:
+    _write_runtime_files(
+        tmp_path,
+        toml='[google]\naccount = "kayyal.sami@gmail.com"\nmax_output_chars = 20000\n',
+    )
+
+    with pytest.raises(ConfigError, match="GOOGLE_OAUTH_CLIENT_ID"):
+        load_runtime_config(tmp_path)
+
+
+def test_direct_google_api_configuration_rejects_google_mcp_services(
+    tmp_path: Path,
+) -> None:
+    _write_runtime_files(
+        tmp_path,
+        env=(
+            "OPENAI_API_KEY=sk-test\n"
+            "OPENWA_API_KEY=openwa-test\n"
+            "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n"
+            "GOOGLE_OAUTH_CLIENT_ID=client\n"
+            "GOOGLE_OAUTH_CLIENT_SECRET=secret\n"
+            "GOOGLE_OAUTH_REFRESH_TOKEN=refresh\n"
+        ),
+        toml=(
+            '[google]\naccount = "kayyal.sami@gmail.com"\n'
+            "max_output_chars = 20000\n\n"
+            "[[mcp_services]]\n"
+            'id = "google-calendar"\n'
+            'endpoint = "https://calendarmcp.googleapis.com/mcp/v1"\n'
+            'manifest_path = "calendar.json"\n'
+            "max_output_chars = 20000\n"
+        ),
+    )
+
+    with pytest.raises(ConfigError, match="cannot be combined"):
         load_runtime_config(tmp_path)
 
 

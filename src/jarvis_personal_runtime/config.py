@@ -206,6 +206,31 @@ class McpServiceConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GoogleApiConfig:
+    """Non-secret settings for the direct Google API prepared tool."""
+
+    account: str
+    max_output_chars: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.account, str)
+            or not self.account.strip()
+            or self.account.count("@") != 1
+            or any(character.isspace() for character in self.account)
+        ):
+            raise ValueError("configured Google account must be an email address")
+        if (
+            isinstance(self.max_output_chars, bool)
+            or not isinstance(self.max_output_chars, int)
+            or self.max_output_chars < 2
+        ):
+            raise ValueError(
+                "configured Google output limit must be at least 2 characters"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     """Validated, non-secret settings for one runtime process."""
 
@@ -243,6 +268,7 @@ class RuntimeConfig:
     ]
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
     mcp_services: tuple[McpServiceConfig, ...] = ()
+    google: GoogleApiConfig | None = None
 
     @property
     def reasoning(self) -> str:
@@ -456,7 +482,7 @@ def _collect_runtime_values(raw: Mapping[str, Any], path: Path) -> dict[str, Any
 
     values: dict[str, Any] = {}
     for key, value in raw.items():
-        if key not in {"runtime", "saved_permissions", "mcp_services"}:
+        if key not in {"runtime", "saved_permissions", "mcp_services", "google"}:
             if key not in _RUNTIME_KEYS:
                 raise ConfigError(path, f"unknown top-level setting: {key}")
             values[key] = value
@@ -604,6 +630,28 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
                 path,
                 f"{service.id} must use its official Google MCP endpoint",
             )
+
+    google: GoogleApiConfig | None = None
+    if "google" in raw:
+        google_table = _ensure_table(raw["google"], path, "[google]")
+        if set(google_table) != {"account", "max_output_chars"}:
+            raise ConfigError(path, "[google] has unknown or missing fields")
+        try:
+            google = GoogleApiConfig(
+                account=_string(google_table["account"], path, "google.account"),
+                max_output_chars=_positive_int(
+                    google_table["max_output_chars"],
+                    path,
+                    "google.max_output_chars",
+                ),
+            )
+        except ValueError as exc:
+            raise ConfigError(path, str(exc)) from exc
+    if google is not None and configured_services:
+        raise ConfigError(
+            path,
+            "[google] cannot be combined with configured Google MCP services",
+        )
 
     try:
         model = _setting(values, "model", default=DEFAULTS["model"])
@@ -898,6 +946,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         openwa_authorized_operator_number=openwa_authorized_operator_number,
         openwa_operator_chat_id=openwa_operator_chat_id,
         mcp_services=tuple(configured_services),
+        google=google,
     )
 
 
@@ -920,7 +969,7 @@ def load_runtime_config(root: str | Path = ".") -> LoadedRuntimeConfig:
     toml_path = root_path / "jarvis.toml"
     raw = _load_toml(toml_path)
     config = _build_config(raw, root_path, toml_path)
-    if config.mcp_services:
+    if config.mcp_services or config.google is not None:
         google_credentials = (
             secrets.google_oauth_client_id,
             secrets.google_oauth_client_secret,
@@ -958,6 +1007,7 @@ __all__ = [
     "DEFAULT_ALLOWED_MODELS",
     "DEFAULT_ALLOWED_REASONING_EFFORTS",
     "ConfigError",
+    "GoogleApiConfig",
     "LoadedRuntimeConfig",
     "McpServiceConfig",
     "RuntimeConfig",

@@ -60,6 +60,7 @@ Set the exact authorized account in non-secret TOML:
 ```toml
 [google]
 account = "kayyal.sami@gmail.com"
+max_output_chars = 20000
 ```
 
 The supervised OAuth grant is expected to include `openid` and email identity,

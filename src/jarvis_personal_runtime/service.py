@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import ConfigError, LoadedRuntimeConfig, RuntimeConfig, load_runtime_config
+from .google import GoogleApiTools
 from .mcp import (
     GoogleConnectionManager,
     GoogleOAuthTokenProvider,
@@ -97,8 +98,23 @@ async def build_service_async(
     config = loaded.config
     trace = build_runtime_trace(config)
     configured_services = ()
+    additional_tools = ()
     connections = None
-    if config.mcp_services:
+    if config.google is not None:
+        client_id = loaded.secrets.google_oauth_client_id
+        client_secret = loaded.secrets.google_oauth_client_secret
+        refresh_token = loaded.secrets.google_oauth_refresh_token
+        assert client_id and client_secret and refresh_token
+        tokens = GoogleOAuthTokenProvider(client_id, client_secret, refresh_token)
+        google_tools = GoogleApiTools(
+            tokens,
+            expected_email=config.google.account,
+            max_output_chars=config.google.max_output_chars,
+            trace=trace,
+        )
+        additional_tools = (google_tools,)
+        connections = google_tools
+    elif config.mcp_services:
         client_id = loaded.secrets.google_oauth_client_id
         client_secret = loaded.secrets.google_oauth_client_secret
         refresh_token = loaded.secrets.google_oauth_refresh_token
@@ -112,12 +128,13 @@ async def build_service_async(
         configured_services = await prepare_configured_mcp_services(
             config.mcp_services, transport
         )
+        additional_tools = configured_services
         connections = GoogleConnectionManager(configured_services, tokens)
     runner = build_direct_responses_runner(
         loaded.secrets.openai_api_key,
         config,
         trace=trace,
-        additional_tools=configured_services,
+        additional_tools=additional_tools,
     )
     runtime = build_runtime_from_loaded(
         loaded,

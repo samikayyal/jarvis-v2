@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import jarvis_personal_runtime.service as service_module
 from jarvis_personal_runtime.config import ConfigError
 from jarvis_personal_runtime.openwa import (
     WebhookAcknowledgement,
@@ -162,3 +163,85 @@ def test_async_service_composition_can_prepare_configured_services(
 
     assert isinstance(application, WebhookHttpApplication)
     assert len(config.mcp_services) == 1
+
+
+def test_async_service_composition_uses_one_direct_google_api_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "runtime"
+    _write_service_config(root)
+    (root / ".env").write_text(
+        (root / ".env").read_text(encoding="utf-8")
+        + "GOOGLE_OAUTH_CLIENT_ID=client\n"
+        + "GOOGLE_OAUTH_CLIENT_SECRET=secret\n"
+        + "GOOGLE_OAUTH_REFRESH_TOKEN=refresh\n",
+        encoding="utf-8",
+    )
+    with (root / "jarvis.toml").open("a", encoding="utf-8") as output:
+        output.write(
+            '\n[google]\naccount = "kayyal.sami@gmail.com"\nmax_output_chars = 20000\n'
+        )
+
+    class _FakeGoogleApiTools:
+        def __init__(
+            self,
+            tokens: object,
+            *,
+            expected_email: str,
+            max_output_chars: int,
+            trace: object,
+        ) -> None:
+            self.tokens = tokens
+            self.expected_email = expected_email
+            self.max_output_chars = max_output_chars
+            self.trace = trace
+
+        definitions: tuple[dict[str, object], ...] = ()
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(service_module, "GoogleApiTools", _FakeGoogleApiTools)
+
+    def runner(
+        api_key: str,
+        config: object,
+        *,
+        trace: object,
+        additional_tools: tuple[object, ...],
+    ) -> object:
+        captured["api_key"] = api_key
+        captured["config"] = config
+        captured["trace"] = trace
+        captured["additional_tools"] = additional_tools
+        return object()
+
+    monkeypatch.setattr(service_module, "build_direct_responses_runner", runner)
+    real_build_runtime = service_module.build_runtime_from_loaded
+
+    def runtime(
+        loaded: object,
+        *,
+        request_runner: object,
+        trace: object,
+        connections: object,
+    ) -> object:
+        captured["connections"] = connections
+        return real_build_runtime(
+            loaded,
+            request_runner=request_runner,
+            trace=trace,
+            connections=connections,
+        )
+
+    monkeypatch.setattr(service_module, "build_runtime_from_loaded", runtime)
+
+    application, config = asyncio.run(build_service_async(root))
+
+    assert isinstance(application, WebhookHttpApplication)
+    assert config.google is not None
+    tools = captured["additional_tools"]
+    assert isinstance(tools, tuple) and len(tools) == 1
+    assert tools[0] is captured["connections"]
+    google_tools = tools[0]
+    assert isinstance(google_tools, _FakeGoogleApiTools)
+    assert google_tools.expected_email == "kayyal.sami@gmail.com"
+    assert google_tools.max_output_chars == 20000
