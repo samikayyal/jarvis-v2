@@ -830,6 +830,7 @@ class GoogleApiTools:
                     "fields": "threads(id,snippet),nextPageToken",
                 },
                 retry_401=True,
+                empty_collection_key="threads",
             )
             return _collection(payload, "threads")
         if name == "google_gmail_read_message":
@@ -872,6 +873,7 @@ class GoogleApiTools:
                     "fields": "files(id,name,mimeType,description,modifiedTime,size,webViewLink),nextPageToken",
                 },
                 retry_401=True,
+                empty_collection_key="files",
             )
             return _collection(payload, "files")
         if name == "google_drive_metadata":
@@ -910,6 +912,7 @@ class GoogleApiTools:
                     "fields": "items(id,status,summary,description,location,start,end,attendees,organizer,recurrence,updated),nextPageToken",
                 },
                 retry_401=True,
+                empty_collection_key="items",
             )
             return _collection(payload, "items")
         if name == "google_calendar_list":
@@ -925,6 +928,7 @@ class GoogleApiTools:
                     "fields": "items(id,status,summary,description,location,start,end,attendees,organizer,recurrence,updated),nextPageToken",
                 },
                 retry_401=True,
+                empty_collection_key="items",
             )
             return _collection(payload, "items")
         if name == "google_calendar_read":
@@ -1078,8 +1082,11 @@ class GoogleApiTools:
         *,
         params: Mapping[str, object] | None = None,
         retry_401: bool,
+        empty_collection_key: str | None = None,
     ) -> object:
         response = await self._request(method, url, params=params, retry_401=retry_401)
+        if response.status_code == 204 and empty_collection_key is not None:
+            return {empty_collection_key: []}
         if response.status_code != 200:
             raise _KnownFailure(_status_kind(response.status_code))
         try:

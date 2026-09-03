@@ -173,6 +173,40 @@ def test_gmail_search_uses_official_endpoint_and_canonical_bounded_result() -> N
     assert query["includeSpamTrash"] == ["false"]
 
 
+def test_gmail_search_treats_no_content_as_an_empty_collection() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/profile"):
+            return httpx.Response(200, json={"emailAddress": "person@example.com"})
+        return httpx.Response(204)
+
+    tools, _, client, _ = make_tools(handler)
+
+    async def scenario() -> None:
+        await tools.connect()
+        result = json.loads(
+            await tools.execute(
+                "google_gmail_search",
+                {
+                    "query": "from:nobody@example.com",
+                    "pageSize": 20,
+                    "includeTrash": False,
+                    "view": "THREAD_VIEW_MINIMAL",
+                },
+            )
+        )
+        assert result == {"result": {"threads": []}}
+        single_resource = json.loads(
+            await tools.execute(
+                "google_gmail_read_message",
+                {"messageId": "missing", "messageFormat": "PLAIN_TEXT"},
+            )
+        )
+        assert single_resource == {"error": {"kind": "operation_failed"}}
+        await client.aclose()
+
+    run(scenario())
+
+
 def test_gmail_read_decodes_inline_text_and_never_attachment_data() -> None:
     encode = lambda text: base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 
