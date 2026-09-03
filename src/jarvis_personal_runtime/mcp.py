@@ -482,7 +482,7 @@ class ConfiguredMcpService:
                 "type": "function",
                 "name": operation.prepared_name,
                 "description": operation.prepared_description,
-                "strict": True,
+                "strict": _is_strict_function_schema(operation.input_schema),
                 "parameters": copy.deepcopy(operation.input_schema),
             }
             for operation in manifest.operations
@@ -634,6 +634,18 @@ def validate_configured_mcp_manifests(
 
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _is_strict_function_schema(schema: Mapping[str, object]) -> bool:
+    properties = schema.get("properties")
+    required = schema.get("required")
+    return (
+        schema.get("type") == "object"
+        and schema.get("additionalProperties") is False
+        and isinstance(properties, dict)
+        and isinstance(required, list)
+        and set(required) == set(properties)
+    )
 
 
 def _operation_matches(

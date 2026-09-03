@@ -136,7 +136,21 @@ def test_prepare_exposes_only_manifest_selected_operations_after_exact_discovery
     assert [definition["name"] for definition in service.definitions] == [
         "google_calendar_create_event"
     ]
+    assert service.definitions[0]["strict"] is True
     assert service.definitions[0]["parameters"]["additionalProperties"] is False
+
+
+def test_prepare_does_not_mark_a_schema_with_optional_properties_as_strict() -> None:
+    payload = manifest_payload()
+    schema = payload["operations"][0]["prepared"]["input_schema"]  # type: ignore[index]
+    schema["properties"]["description"] = {  # type: ignore[index]
+        "type": "string",
+        "maxLength": 2_000,
+    }
+
+    service = build_service(payload, FakeTransport())
+
+    assert service.definitions[0]["strict"] is False
 
 
 @pytest.mark.parametrize("drift", ["protocol", "server", "schema", "annotations"])
