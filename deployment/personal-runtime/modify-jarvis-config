@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+service=jarvis-personal-runtime
+service_user=jarvis-personal-runtime
+runtime_root=/var/lib/jarvis-personal-runtime
+config_link=/etc/jarvis/jarvis.toml
+config_target=/etc/jarvis/personal-runtime/jarvis.toml
+backup_root=/var/backups/jarvis/config-edits
+candidate=
+
+if (( EUID != 0 )); then
+  exec sudo -- "$0" "$@"
+fi
+
+if (( $# != 0 )); then
+  printf 'usage: modify-jarvis-config\n' >&2
+  exit 2
+fi
+
+cleanup() {
+  local status=$?
+  if [[ -n "$candidate" && -e "$candidate" ]]; then
+    rm -f -- "$candidate"
+  fi
+  if (( status != 0 )) && ! systemctl is-active --quiet "$service"; then
+    systemctl start "$service" || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+[[ -L "$config_link" ]] || {
+  printf '%s must be the managed configuration symlink\n' "$config_link" >&2
+  exit 1
+}
+[[ "$(readlink -f "$config_link")" == "$config_target" ]] || {
+  printf '%s does not resolve to %s\n' "$config_link" "$config_target" >&2
+  exit 1
+}
+[[ -x /opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime ]] || {
+  printf 'active Jarvis runtime executable is missing\n' >&2
+  exit 1
+}
+
+install -d -o root -g root -m 0700 "$backup_root"
+systemctl stop "$service"
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup="$backup_root/jarvis.toml.$stamp"
+install -o root -g root -m 0600 "$config_target" "$backup"
+candidate=$(mktemp "$config_target.edit.XXXXXX")
+install -o "$service_user" -g "$service_user" -m 0600 \
+  "$config_target" "$candidate"
+
+printf 'Editing %s. Save and exit Nano to validate and restart Jarvis.\n' \
+  "$config_link"
+editor=${VISUAL:-${EDITOR:-nano}}
+command -v "$editor" >/dev/null || {
+  printf 'editor not found: %s\n' "$editor" >&2
+  exit 1
+}
+if ! sudo -u "$service_user" "$editor" "$candidate"; then
+  printf 'Editor failed; the active configuration was not changed.\n' >&2
+  exit 1
+fi
+
+if cmp -s "$candidate" "$config_target"; then
+  systemctl start "$service"
+  printf 'Configuration unchanged; Jarvis restarted with the existing file.\n'
+  exit 0
+fi
+
+runtime=/opt/jarvis-personal-runtime/current/.venv/bin/jarvis-personal-runtime
+if ! sudo -u "$service_user" "$runtime" \
+  --root "$runtime_root" --config "$candidate" --check; then
+  rejected="$backup_root/jarvis.toml.$stamp.rejected"
+  install -o root -g root -m 0600 "$candidate" "$rejected"
+  printf 'Validation failed. Jarvis will keep the previous configuration.\n' >&2
+  printf 'Rejected edit saved at %s for inspection.\n' "$rejected" >&2
+  exit 1
+fi
+
+chown "$service_user:$service_user" "$candidate"
+chmod 0600 "$candidate"
+mv -f -- "$candidate" "$config_target"
+candidate=
+
+if ! systemctl start "$service"; then
+  install -o "$service_user" -g "$service_user" -m 0600 \
+    "$backup" "$config_target"
+  systemctl start "$service"
+  printf 'Startup failed; restored %s and restarted Jarvis.\n' "$backup" >&2
+  exit 1
+fi
+
+systemctl is-active --quiet "$service"
+printf 'Configuration valid; Jarvis restarted successfully. Backup: %s\n' \
+  "$backup"

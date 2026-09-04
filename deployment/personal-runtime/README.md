@@ -74,6 +74,19 @@ service before changing trust-critical identities, listener values, paths, or
 command permissions, validate the edited file, and restart only after
 validation succeeds.
 
+Install the transactional editor once:
+
+```console
+sudo install -o root -g root -m 0755 \
+  deployment/personal-runtime/modify-jarvis-config \
+  /usr/local/bin/modify-jarvis-config
+```
+
+Thereafter run `modify-jarvis-config`. It stops Jarvis to prevent concurrent
+saved-permission writes, edits a temporary copy, validates it, atomically
+promotes it, and restarts the service. Invalid edits are retained only in the
+root-only backup directory and the prior valid configuration is restarted.
+
 Required `.env` names are `OPENAI_API_KEY`, `OPENWA_API_KEY`, and
 `OPENWA_WEBHOOK_SIGNING_SECRET`. The active personal Google route also requires
 `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
