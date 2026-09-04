@@ -68,14 +68,16 @@ def test_native_service_runs_only_the_replacement_with_private_state() -> None:
     assert "/var/lib/jarvis-personal-runtime" not in unit
 
 
-def test_transactional_config_editor_validates_before_replacing_and_restarting() -> None:
+def test_transactional_config_editor_validates_before_replacing_and_restarting() -> (
+    None
+):
     editor = (PACKAGE / "modify-jarvis-config").read_text(encoding="utf-8")
 
-    assert "systemctl stop \"$service\"" in editor
+    assert 'systemctl stop "$service"' in editor
     assert '"$editor" "$candidate"' in editor
     assert '--root "$runtime_root" --config "$candidate" --check' in editor
     assert 'mv -f -- "$candidate" "$config_target"' in editor
-    assert "systemctl start \"$service\"" in editor
+    assert 'systemctl start "$service"' in editor
     assert '"$backup" "$config_target"' in editor
 
 
