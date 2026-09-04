@@ -88,6 +88,11 @@ terminal paths.
   live authorization or production changes; the final suite passed with 172
   tests and one existing platform-conditional skip. Those gates cover the
   retained generic MCP capability.
+- [Supervise Google authorization and activation](issues/05-supervise-google-mcp-authorization-and-activation.md)
+  — The exact personal account is active through bounded official Gmail, Drive,
+  and Calendar REST APIs after supervised OAuth, live reads and writes,
+  excluded-mutation checks, reconnect and restart invalidation, unchanged-path
+  acceptance, production reconciliation, and the operator's explicit go.
 - Personal Google route amendment (2026-09-03) — The exact authorized identity
   `kayyal.sami@gmail.com` cannot enroll in Google's Workspace Developer Preview
   Program, and Google's hosted Gmail MCP has no send/reply operation. The
@@ -98,14 +103,8 @@ terminal paths.
 
 ## Not yet specified
 
-- Production authorization and reconnect remain human-supervised. The exact
-  Google OAuth client configuration, consent flow, installation, restart
-  persistence, and real acceptance for the direct API route must still be
-  completed before activation.
-- The exact target-host configuration values, credential paths, service restart
-  procedure, and rollback commands depend on the implemented runtime seam.
-- The exact real Gmail, Drive, and Calendar acceptance fixtures will be chosen
-  during supervised activation without placing private content in the repo.
+- No remaining item in this effort. Any expansion beyond the activated fixed
+  personal Google tool set requires a separate decision.
 
 ## Out of scope
 
