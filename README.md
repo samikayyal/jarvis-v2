@@ -36,12 +36,15 @@ uv run ruff format --check src/jarvis_personal_runtime tests/personal_runtime
 The service entry point is:
 
 ```console
-uv run jarvis-personal-runtime --root /path/to/runtime-root --check
-uv run jarvis-personal-runtime --root /path/to/runtime-root
+uv run jarvis-personal-runtime --root /path/to/runtime-root \
+  --config /etc/jarvis/jarvis.toml --check
+uv run jarvis-personal-runtime --root /path/to/runtime-root \
+  --config /etc/jarvis/jarvis.toml
 ```
 
-The runtime root must contain `.env`, `jarvis.toml`, and `SYSTEM.md`. Keep
-credentials out of Git and shell output. See
+The runtime root contains `.env`, `SYSTEM.md`, state, and traces. The single
+active TOML is `/etc/jarvis/jarvis.toml`. Keep credentials out of Git and shell
+output. See
 [`deployment/personal-runtime/README.md`](deployment/personal-runtime/README.md)
 for installation, configuration, private OpenWA handoff, operation, update, and
 recovery procedures.

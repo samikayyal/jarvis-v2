@@ -71,6 +71,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.google is None
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
+    assert loaded.toml_path == tmp_path / "jarvis.toml"
     assert loaded.secrets.openai_api_key == "sk-test"
     assert loaded.secrets.openwa_api_key == "openwa-test"
     assert loaded.secrets.openwa_webhook_signing_secret == "signing-test"
@@ -81,6 +82,21 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
         loaded.secrets.openai_api_key = "changed"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         loaded.system_prompt = "changed"  # type: ignore[misc]
+
+
+def test_toml_may_be_loaded_outside_the_runtime_root(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    _write_runtime_files(root)
+    external_config = tmp_path / "etc" / "jarvis" / "jarvis.toml"
+    external_config.parent.mkdir(parents=True)
+    external_config.write_text('[runtime]\nmodel = "gpt-5.6-sol"\n', encoding="utf-8")
+
+    loaded = load_runtime_config(root, config_path=external_config)
+
+    assert loaded.toml_path == external_config
+    assert loaded.config.root == root
+    assert loaded.config.model == "gpt-5.6-sol"
+    assert loaded.config.message_cache_path == root / "data" / "message-cache.json"
 
 
 def test_toml_overrides_are_validated_and_paths_are_rooted(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ import itertools
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -641,6 +642,7 @@ def build_direct_responses_runner(
     api_key: str,
     config: RuntimeConfig,
     *,
+    config_path: str | Path | None = None,
     tools: PreparedTools | None = None,
     additional_tools: tuple[PreparedTools, ...] = (),
     trace: TraceSink | None = None,
@@ -677,7 +679,11 @@ def build_direct_responses_runner(
             RunTerminalTool(
                 working_directory=config.ubuntu_working_directory,
                 read_only_prefixes=config.ubuntu_read_only_prefixes,
-                permission_store=TomlPermissionStore(config.root / "jarvis.toml"),
+                permission_store=TomlPermissionStore(
+                    Path(config_path)
+                    if config_path is not None
+                    else config.root / "jarvis.toml"
+                ),
                 executor=NativeUbuntuExecutor(),
                 windows_working_directory=config.windows_working_directory,
                 windows_read_only_prefixes=config.windows_read_only_prefixes,
