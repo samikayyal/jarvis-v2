@@ -787,6 +787,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         )
 
         model = _string(model, path, "model")
+        model = f"gpt-5.6-{model}" if model in {"luna", "sol", "terra"} else model
         allowed_models = _string_list(allowed_models_value, path, "allowed_models")
         if any(item not in DEFAULT_ALLOWED_MODELS for item in allowed_models):
             raise ConfigError(path, "allowed_models contains an unsupported model")

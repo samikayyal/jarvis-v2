@@ -294,7 +294,7 @@ async def test_model_and_reasoning_commands_are_deterministic_and_slash_unknown_
     runner = FakeRunner()
     runtime = PersonalRuntime(request_runner=runner)
 
-    model = await runtime.receive(inbound("m1", "/model gpt-5.6-sol"))
+    model = await runtime.receive(inbound("m1", "/model sol"))
     reasoning = await runtime.receive(inbound("m2", "/reasoning max"))
     malformed = await runtime.receive(inbound("m3", "/model gpt-5.6-sol extra"))
     unknown = await runtime.receive(inbound("m4", "/not-a-command"))

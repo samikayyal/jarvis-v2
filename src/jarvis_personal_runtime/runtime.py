@@ -646,6 +646,7 @@ class PersonalRuntime:
                 ("Model and reasoning cannot change during an active request.",),
             )
         value = args[0]
+        value = f"gpt-5.6-{value}" if value in {"luna", "sol", "terra"} else value
         allowed = (
             self.config.allowed_models
             if command == "/model"

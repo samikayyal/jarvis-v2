@@ -89,7 +89,7 @@ def test_toml_may_be_loaded_outside_the_runtime_root(tmp_path: Path) -> None:
     _write_runtime_files(root)
     external_config = tmp_path / "etc" / "jarvis" / "jarvis.toml"
     external_config.parent.mkdir(parents=True)
-    external_config.write_text('[runtime]\nmodel = "gpt-5.6-sol"\n', encoding="utf-8")
+    external_config.write_text('[runtime]\nmodel = "sol"\n', encoding="utf-8")
 
     loaded = load_runtime_config(root, config_path=external_config)
 
