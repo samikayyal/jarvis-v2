@@ -17,13 +17,12 @@ uv run python -m compileall -q src/jarvis_personal_runtime
 ```
 
 On Ubuntu, stage each reviewed Git revision in its own commit-named directory
-under `/opt/jarvis-personal-runtime/releases/`. Verify the replacement checksum
-manifest, build from the hash-locked requirements, and install the local package
-without resolving additional dependencies:
+under `/opt/jarvis-personal-runtime/releases/`. Build from the hash-locked
+requirements and install the local package without resolving additional
+dependencies:
 
 ```console
 cd /opt/jarvis-personal-runtime/releases/COMMIT
-sha256sum --check deployment/personal-runtime/SHA256SUMS
 uv venv --python /usr/bin/python3.13 .venv
 uv pip install --python .venv/bin/python --require-hashes \
   -r deployment/personal-runtime/requirements.lock
