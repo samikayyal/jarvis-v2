@@ -36,20 +36,43 @@ inactive validation.
 
 ## Runtime root and configuration
 
-The service uses `/var/lib/jarvis-personal-runtime` as its private runtime root.
-Create `.env`, `jarvis.toml`, and `SYSTEM.md` there from the supplied examples.
-The files have distinct trust boundaries:
+The service uses `/var/lib/jarvis-personal-runtime` as its private runtime root
+and `/etc/jarvis/jarvis.toml` as its one active TOML configuration. There is no
+pending configuration file. Create the files from the supplied examples. They
+have distinct trust boundaries:
 
 | File | Contents | Required ownership and mode |
 | --- | --- | --- |
 | `.env` | OpenAI, OpenWA, and Google API OAuth credentials | `root:jarvis-personal-runtime`, `0440` |
-| `jarvis.toml` | Non-secret settings and saved permissions | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
+| `/etc/jarvis/jarvis.toml` | Non-secret settings and saved permissions | symlink to service-owned `personal-runtime/jarvis.toml`, `0600` |
 | `SYSTEM.md` | Editable system prompt | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
 
 Jarvis never edits `.env` or `SYSTEM.md`; it writes only the
-`[saved_permissions]` section of `jarvis.toml`. Runtime-owned cache and trace
-paths must stay below the runtime root. An optional vault path may be an absolute
-read-only directory outside it.
+`[saved_permissions]` section of `/etc/jarvis/jarvis.toml`. Runtime-owned cache
+and trace paths must stay below the runtime root. An optional vault path may be
+an absolute read-only directory outside it.
+
+Keep `/etc/jarvis` root-owned because it may contain unrelated protected files.
+Install the configuration in a dedicated service-owned subdirectory and expose
+the one operator-facing path with a stable symlink. The loader resolves the
+symlink before Jarvis atomically updates saved permissions:
+
+```console
+sudo install -d -o root -g root -m 0755 /etc/jarvis
+sudo install -d -o jarvis-personal-runtime -g jarvis-personal-runtime -m 0700 \
+  /etc/jarvis/personal-runtime
+sudo install -o jarvis-personal-runtime -g jarvis-personal-runtime -m 0600 \
+  deployment/personal-runtime/jarvis.toml.example \
+  /etc/jarvis/personal-runtime/jarvis.toml
+sudo ln -sfn personal-runtime/jarvis.toml /etc/jarvis/jarvis.toml
+sudo -u jarvis-personal-runtime nano /etc/jarvis/jarvis.toml
+```
+
+Always edit that file directly. Do not create `jarvis.toml.pending` or another
+working copy, and do not edit the symlink target by its internal path. Stop the
+service before changing trust-critical identities, listener values, paths, or
+command permissions, validate the edited file, and restart only after
+validation succeeds.
 
 Required `.env` names are `OPENAI_API_KEY`, `OPENWA_API_KEY`, and
 `OPENWA_WEBHOOK_SIGNING_SECRET`. The active personal Google route also requires
@@ -83,7 +106,8 @@ Validate without binding a socket or contacting providers:
 ```console
 sudo -u jarvis-personal-runtime \
   /opt/jarvis-personal-runtime/releases/COMMIT/.venv/bin/jarvis-personal-runtime \
-  --root /var/lib/jarvis-personal-runtime --check
+  --root /var/lib/jarvis-personal-runtime \
+  --config /etc/jarvis/jarvis.toml --check
 ```
 
 Never print `.env`, private keys, phone/chat identifiers, raw webhook payloads,

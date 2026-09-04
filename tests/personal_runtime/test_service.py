@@ -117,6 +117,23 @@ def test_service_check_validates_without_writing_or_contacting_dependencies(
     assert {path.name: path.read_bytes() for path in root.iterdir()} == before
 
 
+def test_service_check_uses_the_explicit_toml_path(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    _write_service_config(root, include_listener=False)
+    external_config = tmp_path / "etc" / "jarvis.toml"
+    external_config.parent.mkdir()
+    external_config.write_text(
+        (root / "jarvis.toml").read_text(encoding="utf-8")
+        + 'listener_host = "172.17.0.1"\nlistener_port = 8787\n',
+        encoding="utf-8",
+    )
+
+    config = validate_service_config(root, config_path=external_config)
+
+    assert config.listener_host == "172.17.0.1"
+    assert config.message_cache_path == root / "data" / "message-cache.json"
+
+
 def test_service_check_requires_an_explicit_private_listener(tmp_path: Path) -> None:
     root = tmp_path / "runtime"
     _write_service_config(root, include_listener=False)
@@ -205,11 +222,13 @@ def test_async_service_composition_uses_one_direct_google_api_tool(
         api_key: str,
         config: object,
         *,
+        config_path: Path,
         trace: object,
         additional_tools: tuple[object, ...],
     ) -> object:
         captured["api_key"] = api_key
         captured["config"] = config
+        captured["config_path"] = config_path
         captured["trace"] = trace
         captured["additional_tools"] = additional_tools
         return object()
@@ -238,6 +257,7 @@ def test_async_service_composition_uses_one_direct_google_api_tool(
 
     assert isinstance(application, WebhookHttpApplication)
     assert config.google is not None
+    assert captured["config_path"] == root / "jarvis.toml"
     tools = captured["additional_tools"]
     assert isinstance(tools, tuple) and len(tools) == 1
     assert tools[0] is captured["connections"]

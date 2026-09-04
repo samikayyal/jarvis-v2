@@ -763,7 +763,7 @@ def build_runtime_from_loaded(
             loaded.config.message_cache_path,
             timedelta(days=loaded.config.message_cache_retention_days),
         ),
-        permission_store=TomlPermissionStore(loaded.config.root / "jarvis.toml"),
+        permission_store=TomlPermissionStore(loaded.toml_path),
         clock=clock,
         connections=connections,
         trace=trace

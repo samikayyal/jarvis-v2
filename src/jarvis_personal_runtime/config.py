@@ -301,11 +301,12 @@ class RuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoadedRuntimeConfig:
-    """The complete immutable configuration loaded from one runtime root."""
+    """The complete immutable configuration loaded for one runtime root."""
 
     config: RuntimeConfig
     secrets: RuntimeSecrets
     system_prompt: str
+    toml_path: Path
 
     @property
     def runtime(self) -> RuntimeConfig:
@@ -950,11 +951,14 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
     )
 
 
-def load_runtime_config(root: str | Path = ".") -> LoadedRuntimeConfig:
+def load_runtime_config(
+    root: str | Path = ".", *, config_path: str | Path | None = None
+) -> LoadedRuntimeConfig:
     """Load and validate ``.env``, ``jarvis.toml`` and ``SYSTEM.md``.
 
-    ``root`` is the directory containing those three files. Runtime-owned paths
-    are resolved beneath it, while an external absolute ``vault_path`` is kept.
+    ``root`` contains ``.env`` and ``SYSTEM.md`` and anchors runtime-owned
+    paths. ``config_path`` may place ``jarvis.toml`` elsewhere; it defaults to
+    the runtime root. An external absolute ``vault_path`` is kept.
     """
 
     root_path = Path(root).expanduser()
@@ -966,7 +970,15 @@ def load_runtime_config(root: str | Path = ".") -> LoadedRuntimeConfig:
         raise ConfigError(root_path, "runtime root must be a directory")
 
     secrets = _load_secrets(root_path / ".env")
-    toml_path = root_path / "jarvis.toml"
+    toml_path = (
+        root_path / "jarvis.toml"
+        if config_path is None
+        else Path(config_path).expanduser()
+    )
+    try:
+        toml_path = toml_path.resolve()
+    except OSError as exc:
+        raise ConfigError(toml_path, f"cannot resolve jarvis.toml: {exc}") from exc
     raw = _load_toml(toml_path)
     config = _build_config(raw, root_path, toml_path)
     if config.mcp_services or config.google is not None:
@@ -993,7 +1005,12 @@ def load_runtime_config(root: str | Path = ".") -> LoadedRuntimeConfig:
     prompt = _read_utf8(config.system_prompt_path, kind="SYSTEM.md")
     if not prompt.strip():
         raise ConfigError(config.system_prompt_path, "SYSTEM.md must be non-empty")
-    return LoadedRuntimeConfig(config=config, secrets=secrets, system_prompt=prompt)
+    return LoadedRuntimeConfig(
+        config=config,
+        secrets=secrets,
+        system_prompt=prompt,
+        toml_path=toml_path,
+    )
 
 
 def load_config(root: str | Path = ".") -> LoadedRuntimeConfig:

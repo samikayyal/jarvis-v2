@@ -67,34 +67,40 @@ class WebhookHttpApplication:
         return HttpResponse(acknowledgement.status_code)
 
 
-def validate_service_config(root: str | Path) -> RuntimeConfig:
+def validate_service_config(
+    root: str | Path, *, config_path: str | Path | None = None
+) -> RuntimeConfig:
     """Validate the service configuration without writes or network I/O."""
 
-    loaded = _load_service_config(root)
+    loaded = _load_service_config(root, config_path=config_path)
     return loaded.config
 
 
-def _load_service_config(root: str | Path) -> LoadedRuntimeConfig:
-    loaded = load_runtime_config(root)
+def _load_service_config(
+    root: str | Path, *, config_path: str | Path | None = None
+) -> LoadedRuntimeConfig:
+    loaded = load_runtime_config(root, config_path=config_path)
     if loaded.config.listener_host is None or loaded.config.listener_port is None:
         raise ConfigError(
-            loaded.config.root / "jarvis.toml",
+            loaded.toml_path,
             "listener_host and listener_port must be configured for the service",
         )
     OpenWASettings.from_loaded_config(loaded)
     try:
         validate_configured_mcp_manifests(loaded.config.mcp_services)
     except McpManifestError as exc:
-        raise ConfigError(loaded.config.root / "jarvis.toml", str(exc)) from exc
+        raise ConfigError(loaded.toml_path, str(exc)) from exc
     return loaded
 
 
 async def build_service_async(
     root: str | Path,
+    *,
+    config_path: str | Path | None = None,
 ) -> tuple[WebhookHttpApplication, RuntimeConfig]:
     """Compose the single replacement service from its runtime directory."""
 
-    loaded = _load_service_config(root)
+    loaded = _load_service_config(root, config_path=config_path)
     config = loaded.config
     trace = build_runtime_trace(config)
     configured_services = ()
@@ -133,6 +139,7 @@ async def build_service_async(
     runner = build_direct_responses_runner(
         loaded.secrets.openai_api_key,
         config,
+        config_path=loaded.toml_path,
         trace=trace,
         additional_tools=additional_tools,
     )
@@ -146,10 +153,12 @@ async def build_service_async(
     return WebhookHttpApplication(flow), config
 
 
-def build_service(root: str | Path) -> tuple[WebhookHttpApplication, RuntimeConfig]:
+def build_service(
+    root: str | Path, *, config_path: str | Path | None = None
+) -> tuple[WebhookHttpApplication, RuntimeConfig]:
     """Compose the service outside an already running event loop."""
 
-    return asyncio.run(build_service_async(root))
+    return asyncio.run(build_service_async(root, config_path=config_path))
 
 
 async def start_listener(
@@ -165,8 +174,10 @@ async def start_listener(
     )
 
 
-async def run_service(root: str | Path) -> None:
-    application, config = await build_service_async(root)
+async def run_service(
+    root: str | Path, *, config_path: str | Path | None = None
+) -> None:
+    application, config = await build_service_async(root, config_path=config_path)
     assert config.listener_host is not None
     assert config.listener_port is not None
     server = await start_listener(
@@ -279,6 +290,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Jarvis personal runtime")
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument(
+        "--config",
+        type=Path,
+        help="jarvis.toml path (defaults to ROOT/jarvis.toml)",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="validate configuration without binding or contacting dependencies",
@@ -287,9 +303,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
         if arguments.check:
-            validate_service_config(arguments.root)
+            validate_service_config(arguments.root, config_path=arguments.config)
             return 0
-        asyncio.run(run_service(arguments.root))
+        asyncio.run(run_service(arguments.root, config_path=arguments.config))
     except KeyboardInterrupt:
         return 0
     except Exception:

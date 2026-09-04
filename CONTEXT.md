@@ -144,7 +144,8 @@ _Avoid_: Sanitized application log, hidden model reasoning
 - The seven-day OpenWA message-ID cache prevents duplicate admission. It is not
   conversation history.
 - Jarvis reads credentials only from `.env`, non-secret settings and saved
-  permissions from `jarvis.toml`, and its editable prompt from `SYSTEM.md`.
+  permissions from `/etc/jarvis/jarvis.toml`, and its editable prompt from
+  `SYSTEM.md`.
   Jarvis never edits `.env` or `SYSTEM.md`.
 - Google API tools use only the exact configured Google account. Gmail and
   Calendar writes require exact operator approval and one attempt; Drive tools
@@ -170,7 +171,7 @@ _Avoid_: Sanitized application log, hidden model reasoning
 | OpenWA | WhatsApp transport, message persistence, pairing, named-session readiness | Assistant decisions, command permissions, model transcript |
 | Personal assistant runtime | Admission filtering, sessions, commands, model-and-tool loop, approvals, replies | OpenWA pairing or container lifecycle, durable conversation history |
 | `.env` | OpenAI, OpenWA, and Google OAuth credentials | Non-secret settings, saved permissions |
-| `jarvis.toml` | Non-secret limits, paths, identities, read-only prefixes, saved permissions | Credentials, message bodies, command output |
+| `/etc/jarvis/jarvis.toml` | Non-secret limits, paths, identities, read-only prefixes, saved permissions | Credentials, message bodies, command output |
 | `SYSTEM.md` | Editable assistant instruction | Credentials, saved permissions |
 | Runtime data directory | Seven-day deduplication cache and verbatim rotating trace | OpenWA data or pairing state |
 
