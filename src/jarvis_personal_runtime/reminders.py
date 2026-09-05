@@ -287,7 +287,7 @@ class ReminderStore:
         return self._from_row(row) if row is not None else None
 
     def begin_due_attempt(self, reminder_id: str, *, now: datetime) -> Reminder | None:
-        """Atomically terminalize and return one due Reminder for its only send."""
+        """Atomically claim and return one due Reminder for its only send."""
 
         attempted_at = _utc(now, "now")
         attempted_timestamp = _timestamp(attempted_at)
