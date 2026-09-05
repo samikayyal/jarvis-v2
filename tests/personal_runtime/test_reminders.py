@@ -467,3 +467,267 @@ def test_direct_responses_rejection_is_traced_by_the_reminder_operation(
         "reminder_create_approval",
         {"id": "a1b2c3d4", "outcome": "rejected"},
     ) in trace.events
+
+
+@pytest.mark.parametrize(
+    ("body", "due_local", "expected_body", "expected_time"),
+    [
+        ("Reworded reminder", None, "Reworded reminder", "12:00:00"),
+        (None, "2026-09-06T14:30", "Original reminder", "14:30:00"),
+        ("Changed together", "2026-09-07T08:15", "Changed together", "08:15:00"),
+    ],
+)
+def test_edit_pending_reminder_preserves_id_and_supports_each_change_shape(
+    tmp_path: Path,
+    body: str | None,
+    due_local: str | None,
+    expected_body: str,
+    expected_time: str,
+) -> None:
+    _store, tools, _, _ = make_tools(tmp_path)
+    created = execute(
+        tools,
+        "create_reminder",
+        {"body": "Original reminder", "due_local": "2026-09-06T12:00"},
+    )
+    assert isinstance(created, ApprovalRequired)
+    resume(tools, created.continuation, True)
+
+    proposed = execute(
+        tools,
+        "edit_reminder",
+        {"reminder_id": "a1b2c3d4", "body": body, "due_local": due_local},
+    )
+
+    assert isinstance(proposed, ApprovalRequired)
+    assert proposed.action.allow_save_permission is False
+    assert proposed.action.display == (
+        "Edit reminder?\n"
+        "ID: a1b2c3d4\n"
+        f"Body: {expected_body}\n"
+        f"Date: {'2026-09-07' if expected_time == '08:15:00' else '2026-09-06'}\n"
+        f"Time: {expected_time}\n"
+        "Timezone: Asia/Amman"
+    )
+    before = listed(tools)["reminders"][0]
+    assert before["body"] == "Original reminder"
+    result = resume(tools, proposed.continuation, True)
+    after = listed(tools)["reminders"][0]
+
+    assert result == {"edited": True, "id": "a1b2c3d4"}
+    assert after["id"] == "a1b2c3d4"
+    assert after["body"] == expected_body
+    assert after["due"]["time"] == expected_time
+    assert resume(tools, proposed.continuation, True) == {"error": "already_resolved"}
+    assert listed(tools)["reminders"][0] == after
+
+
+def test_rejected_and_expired_edits_leave_existing_reminder_unchanged(
+    tmp_path: Path,
+) -> None:
+    store, tools, clock, trace = make_tools(tmp_path)
+    created = execute(
+        tools,
+        "create_reminder",
+        {"body": "Keep exact bytes", "due_local": "2026-09-06T12:00"},
+    )
+    assert isinstance(created, ApprovalRequired)
+    resume(tools, created.continuation, True)
+    original = store.list()[0]
+
+    rejected = execute(
+        tools,
+        "edit_reminder",
+        {"reminder_id": original.id, "body": "Rejected", "due_local": None},
+    )
+    assert isinstance(rejected, ApprovalRequired)
+    assert resume(tools, rejected.continuation, False) == {"rejected": True}
+    assert store.list()[0] == original
+
+    expired = execute(
+        tools,
+        "edit_reminder",
+        {"reminder_id": original.id, "body": None, "due_local": "2026-09-05T13:01"},
+    )
+    assert isinstance(expired, ApprovalRequired)
+    clock.value = datetime(2026, 9, 5, 10, 1, tzinfo=UTC)
+    assert resume(tools, expired.continuation, True) == {"error": "due_time_not_future"}
+    assert store.list()[0] == original
+    outcomes = [
+        payload["outcome"]
+        for event, payload in trace.events
+        if event == "reminder_edit_approval"
+    ]
+    assert outcomes == ["rejected", "expired"]
+
+
+@pytest.mark.parametrize("status", ["sent", "failed", "unknown", "cancelled"])
+def test_edit_rejects_missing_and_terminal_targets(tmp_path: Path, status: str) -> None:
+    store, tools, clock, trace = make_tools(tmp_path)
+    with pytest.raises(ReminderError, match="not found"):
+        execute(
+            tools,
+            "edit_reminder",
+            {"reminder_id": "missing1", "body": "No target", "due_local": None},
+        )
+
+    terminal = Reminder(
+        id="terminal",
+        body="Historical",
+        due_at=clock.now() + timedelta(days=1),
+        timezone="Asia/Amman",
+        status=status,
+        created_at=clock.now(),
+        updated_at=clock.now(),
+        attempt_at=clock.now() if status != "cancelled" else None,
+        completed_at=clock.now(),
+        outbound_message_id="out-1" if status == "sent" else None,
+        failure_classification=status if status in {"failed", "unknown"} else None,
+    )
+    store.save(terminal, now=clock.now())
+
+    with pytest.raises(ReminderError, match="not pending"):
+        execute(
+            tools,
+            "edit_reminder",
+            {"reminder_id": "terminal", "body": "Rewrite", "due_local": None},
+        )
+    assert [event for event, _ in trace.events].count(
+        "reminder_edit_validation_failed"
+    ) == 2
+
+
+def test_edit_validates_complete_result_and_requires_a_replacement(
+    tmp_path: Path,
+) -> None:
+    _store, tools, _, trace = make_tools(tmp_path)
+    created = execute(
+        tools,
+        "create_reminder",
+        {"body": "Valid original", "due_local": "2026-09-06T12:00"},
+    )
+    assert isinstance(created, ApprovalRequired)
+    resume(tools, created.continuation, True)
+
+    for arguments in (
+        {"reminder_id": "a1b2c3d4", "body": None, "due_local": None},
+        {"reminder_id": "a1b2c3d4", "body": "", "due_local": None},
+        {"reminder_id": "a1b2c3d4", "body": None, "due_local": "tomorrow"},
+        {
+            "reminder_id": "a1b2c3d4",
+            "body": None,
+            "due_local": "2026-09-05T11:59",
+        },
+    ):
+        with pytest.raises(ReminderError):
+            execute(tools, "edit_reminder", arguments)
+    assert [event for event, _ in trace.events].count(
+        "reminder_edit_validation_failed"
+    ) == 4
+
+
+def test_cancel_requires_approval_and_retains_terminal_history(tmp_path: Path) -> None:
+    store, tools, _, trace = make_tools(tmp_path)
+    created = execute(
+        tools,
+        "create_reminder",
+        {"body": "Cancel this exact body", "due_local": "2026-09-06T12:00"},
+    )
+    assert isinstance(created, ApprovalRequired)
+    resume(tools, created.continuation, True)
+
+    proposed = execute(tools, "cancel_reminder", {"reminder_id": "a1b2c3d4"})
+
+    assert isinstance(proposed, ApprovalRequired)
+    assert proposed.action.allow_save_permission is False
+    assert proposed.action.display == (
+        "Cancel reminder?\n"
+        "ID: a1b2c3d4\n"
+        "Body: Cancel this exact body\n"
+        "Date: 2026-09-06\n"
+        "Time: 12:00:00\n"
+        "Timezone: Asia/Amman"
+    )
+    assert store.list()[0].status == "pending"
+    assert resume(tools, proposed.continuation, True) == {
+        "cancelled": True,
+        "id": "a1b2c3d4",
+    }
+    assert store.list() == ()
+    history = store.list(include_terminal=True)
+    assert len(history) == 1
+    assert history[0].status == "cancelled"
+    assert resume(tools, proposed.continuation, True) == {"error": "already_resolved"}
+    assert [event for event, _ in trace.events][-3:] == [
+        "reminder_cancel_proposed",
+        "reminder_cancel_approval",
+        "reminder_cancelled",
+    ]
+
+
+def test_rejected_cancel_is_unchanged_and_missing_or_terminal_targets_fail(
+    tmp_path: Path,
+) -> None:
+    store, tools, _, trace = make_tools(tmp_path)
+    created = execute(
+        tools,
+        "create_reminder",
+        {"body": "Remain pending", "due_local": "2026-09-06T12:00"},
+    )
+    assert isinstance(created, ApprovalRequired)
+    resume(tools, created.continuation, True)
+    original = store.list()[0]
+    rejected = execute(tools, "cancel_reminder", {"reminder_id": "a1b2c3d4"})
+    assert isinstance(rejected, ApprovalRequired)
+    assert resume(tools, rejected.continuation, False) == {"rejected": True}
+    assert store.list()[0] == original
+
+    with pytest.raises(ReminderError, match="not found"):
+        execute(tools, "cancel_reminder", {"reminder_id": "missing1"})
+
+    approved = execute(tools, "cancel_reminder", {"reminder_id": "a1b2c3d4"})
+    assert isinstance(approved, ApprovalRequired)
+    resume(tools, approved.continuation, True)
+    with pytest.raises(ReminderError, match="not pending"):
+        execute(tools, "cancel_reminder", {"reminder_id": "a1b2c3d4"})
+    assert [event for event, _ in trace.events].count(
+        "reminder_cancel_validation_failed"
+    ) == 2
+
+
+@pytest.mark.parametrize("status", ["sent", "failed", "unknown", "cancelled"])
+def test_cancel_rejects_every_terminal_status(tmp_path: Path, status: str) -> None:
+    store, tools, clock, trace = make_tools(tmp_path)
+    store.save(
+        Reminder(
+            id="terminal",
+            body="Historical",
+            due_at=clock.now() + timedelta(days=1),
+            timezone="Asia/Amman",
+            status=status,
+            created_at=clock.now(),
+            updated_at=clock.now(),
+            attempt_at=clock.now() if status != "cancelled" else None,
+            completed_at=clock.now(),
+            outbound_message_id="out-1" if status == "sent" else None,
+            failure_classification=(
+                status if status in {"failed", "unknown"} else None
+            ),
+        ),
+        now=clock.now(),
+    )
+
+    with pytest.raises(ReminderError, match="not pending"):
+        execute(tools, "cancel_reminder", {"reminder_id": "terminal"})
+    assert trace.events[-1][0] == "reminder_cancel_validation_failed"
+
+
+def test_mutation_tool_descriptions_forbid_guessing_ambiguous_references() -> None:
+    definitions = {str(item["name"]): item for item in ReminderTools.definitions}
+
+    for name in ("edit_reminder", "cancel_reminder"):
+        description = str(definitions[name]["description"])
+        assert "list_reminders" in description
+        assert "more than one" in description
+        assert "ask the operator" in description
+        assert "Never guess" in description

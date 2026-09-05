@@ -206,6 +206,20 @@ class ReminderStore:
             ).fetchone()
         return row is not None
 
+    def get(self, reminder_id: str) -> Reminder | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id, body, due_at, timezone, status, created_at, updated_at,
+                       attempt_at, completed_at, outbound_message_id,
+                       failure_classification
+                FROM reminders
+                WHERE id = ?
+                """,
+                (reminder_id,),
+            ).fetchone()
+        return self._from_row(row) if row is not None else None
+
     def save(self, record: Reminder, *, now: datetime) -> None:
         validated = _validate_record(record, now)
         values = (
@@ -235,6 +249,61 @@ class ReminderStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ReminderError(f"reminder id {validated.id} already exists") from exc
+
+    def replace_pending(
+        self,
+        record: Reminder,
+        *,
+        expected_updated_at: datetime,
+        now: datetime,
+    ) -> bool:
+        validated = _validate_record(record, now)
+        if validated.status != "pending":
+            raise ReminderError("replacement reminder must be pending")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE reminders
+                SET body = ?, due_at = ?, timezone = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending' AND attempt_at IS NULL
+                    AND updated_at = ?
+                """,
+                (
+                    validated.body,
+                    _timestamp(validated.due_at),
+                    validated.timezone,
+                    _timestamp(validated.updated_at),
+                    validated.id,
+                    _timestamp(_utc(expected_updated_at, "expected_updated_at")),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_pending(
+        self,
+        reminder_id: str,
+        *,
+        expected_updated_at: datetime,
+        now: datetime,
+    ) -> bool:
+        completed_at = _utc(now, "now")
+        timestamp = _timestamp(completed_at)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE reminders
+                SET status = 'cancelled', updated_at = ?, completed_at = ?
+                WHERE id = ? AND status = 'pending' AND attempt_at IS NULL
+                    AND updated_at = ?
+                """,
+                (
+                    timestamp,
+                    timestamp,
+                    reminder_id,
+                    _timestamp(_utc(expected_updated_at, "expected_updated_at")),
+                ),
+            )
+        return cursor.rowcount == 1
 
     def list(
         self, *, include_terminal: bool = False, limit: int = MAX_LIST_ENTRIES
@@ -398,8 +467,24 @@ class _CreateContinuation:
     resolved: bool = False
 
 
+@dataclass(slots=True)
+class _EditContinuation:
+    original_updated_at: datetime
+    reminder_id: str
+    body: str
+    due_at: datetime
+    resolved: bool = False
+
+
+@dataclass(slots=True)
+class _CancelContinuation:
+    original_updated_at: datetime
+    reminder_id: str
+    resolved: bool = False
+
+
 class ReminderTools:
-    """Prepared create and bounded read-only list operations."""
+    """Prepared create, edit, list, and cancel Reminder operations."""
 
     definitions: tuple[dict[str, object], ...] = (
         {
@@ -432,6 +517,40 @@ class ReminderTools:
         },
         {
             "type": "function",
+            "name": "edit_reminder",
+            "description": (
+                "Propose changes to one pending Reminder by stable ID. Use "
+                "list_reminders to resolve conversational references. If more than "
+                "one pending Reminder could match, ask the operator which one they "
+                "mean. Never guess an ID. Pass null for each unchanged field."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_id": {
+                        "type": "string",
+                        "pattern": r"^[a-z0-9]{8}$",
+                    },
+                    "body": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "maxLength": MAX_BODY_CHARACTERS,
+                    },
+                    "due_local": {
+                        "type": ["string", "null"],
+                        "pattern": (
+                            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"
+                            r"(?::\d{2})?$"
+                        ),
+                    },
+                },
+                "required": ["reminder_id", "body", "due_local"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
             "name": "list_reminders",
             "description": (
                 "List Reminders. Set include_terminal to false for the default "
@@ -442,6 +561,28 @@ class ReminderTools:
                 "type": "object",
                 "properties": {"include_terminal": {"type": "boolean"}},
                 "required": ["include_terminal"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "cancel_reminder",
+            "description": (
+                "Propose cancellation of one pending Reminder by stable ID. Use "
+                "list_reminders to resolve conversational references. If more than "
+                "one pending Reminder could match, ask the operator which one they "
+                "mean. Never guess an ID."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_id": {
+                        "type": "string",
+                        "pattern": r"^[a-z0-9]{8}$",
+                    }
+                },
+                "required": ["reminder_id"],
                 "additionalProperties": False,
             },
         },
@@ -484,13 +625,26 @@ class ReminderTools:
     ) -> str | ApprovalRequired:
         if name == "create_reminder":
             return self._create(arguments)
+        if name == "edit_reminder":
+            return self._edit(arguments)
         if name == "list_reminders":
             return self._list(arguments)
+        if name == "cancel_reminder":
+            return self._cancel(arguments)
         raise ReminderError(f"unknown prepared tool: {name}")
 
     async def resume(self, continuation: object, *, approved: bool) -> str:
-        if not isinstance(continuation, _CreateContinuation):
-            raise TypeError("invalid Reminder continuation")
+        if isinstance(continuation, _CreateContinuation):
+            return self._resume_create(continuation, approved=approved)
+        if isinstance(continuation, _EditContinuation):
+            return self._resume_edit(continuation, approved=approved)
+        if isinstance(continuation, _CancelContinuation):
+            return self._resume_cancel(continuation, approved=approved)
+        raise TypeError("invalid Reminder continuation")
+
+    def _resume_create(
+        self, continuation: _CreateContinuation, *, approved: bool
+    ) -> str:
         if continuation.resolved:
             return _canonical({"error": "already_resolved"})
         continuation.resolved = True
@@ -533,6 +687,97 @@ class ReminderTools:
         self._on_change()
         return _canonical({"created": True, "id": record.id})
 
+    def _resume_edit(self, continuation: _EditContinuation, *, approved: bool) -> str:
+        if continuation.resolved:
+            return _canonical({"error": "already_resolved"})
+        continuation.resolved = True
+        if not approved:
+            self._trace.record(
+                "reminder_edit_approval",
+                {"id": continuation.reminder_id, "outcome": "rejected"},
+            )
+            return _canonical({"rejected": True})
+        now = _utc(self._clock.now(), "now")
+        if continuation.due_at <= now:
+            self._trace.record(
+                "reminder_edit_approval",
+                {"id": continuation.reminder_id, "outcome": "expired"},
+            )
+            return _canonical({"error": "due_time_not_future"})
+        original = self._store.get(continuation.reminder_id)
+        if original is None or original.status != "pending" or original.attempt_at:
+            self._trace.record(
+                "reminder_edit_approval",
+                {"id": continuation.reminder_id, "outcome": "stale"},
+            )
+            return _canonical({"error": "reminder_no_longer_pending"})
+        replacement = Reminder(
+            id=continuation.reminder_id,
+            body=continuation.body,
+            due_at=continuation.due_at,
+            timezone=self._timezone_name,
+            status="pending",
+            created_at=original.created_at,
+            updated_at=now,
+        )
+        changed = self._store.replace_pending(
+            replacement,
+            expected_updated_at=continuation.original_updated_at,
+            now=now,
+        )
+        if not changed:
+            self._trace.record(
+                "reminder_edit_approval",
+                {"id": continuation.reminder_id, "outcome": "stale"},
+            )
+            return _canonical({"error": "reminder_changed_before_approval"})
+        self._trace.record(
+            "reminder_edit_approval",
+            {"id": continuation.reminder_id, "outcome": "approved"},
+        )
+        self._trace.record(
+            "reminder_edited",
+            {
+                "id": replacement.id,
+                "body": replacement.body,
+                "due_at": _timestamp(replacement.due_at),
+                "timezone": replacement.timezone,
+            },
+        )
+        self._on_change()
+        return _canonical({"edited": True, "id": replacement.id})
+
+    def _resume_cancel(
+        self, continuation: _CancelContinuation, *, approved: bool
+    ) -> str:
+        if continuation.resolved:
+            return _canonical({"error": "already_resolved"})
+        continuation.resolved = True
+        if not approved:
+            self._trace.record(
+                "reminder_cancel_approval",
+                {"id": continuation.reminder_id, "outcome": "rejected"},
+            )
+            return _canonical({"rejected": True})
+        changed = self._store.cancel_pending(
+            continuation.reminder_id,
+            expected_updated_at=continuation.original_updated_at,
+            now=self._clock.now(),
+        )
+        if not changed:
+            self._trace.record(
+                "reminder_cancel_approval",
+                {"id": continuation.reminder_id, "outcome": "stale"},
+            )
+            return _canonical({"error": "reminder_changed_before_approval"})
+        self._trace.record(
+            "reminder_cancel_approval",
+            {"id": continuation.reminder_id, "outcome": "approved"},
+        )
+        self._trace.record("reminder_cancelled", {"id": continuation.reminder_id})
+        self._on_change()
+        return _canonical({"cancelled": True, "id": continuation.reminder_id})
+
     def _create(self, arguments: dict[str, object]) -> ApprovalRequired:
         if set(arguments) != {"body", "due_local"}:
             raise ReminderError("create_reminder arguments must be body and due_local")
@@ -566,6 +811,120 @@ class ReminderTools:
                 allow_save_permission=False,
             ),
             _CreateContinuation(reminder_id, body, due_at),
+        )
+
+    def _edit(self, arguments: dict[str, object]) -> ApprovalRequired:
+        reminder_id = arguments.get("reminder_id")
+        try:
+            if set(arguments) != {"reminder_id", "body", "due_local"}:
+                raise ReminderError(
+                    "edit_reminder requires reminder_id, body, and due_local"
+                )
+            record = self._pending(reminder_id)
+            replacement_body = arguments["body"]
+            replacement_due = arguments["due_local"]
+            if replacement_body is None and replacement_due is None:
+                raise ReminderError("edit_reminder requires at least one replacement")
+            body = record.body if replacement_body is None else _body(replacement_body)
+            if replacement_due is None:
+                due_at = record.due_at
+                local = due_at.astimezone(self._timezone).replace(tzinfo=None)
+            else:
+                due_at, local = self._resolve_local(replacement_due)
+            now = _utc(self._clock.now(), "now")
+            candidate = Reminder(
+                id=record.id,
+                body=body,
+                due_at=due_at,
+                timezone=self._timezone_name,
+                status="pending",
+                created_at=record.created_at,
+                updated_at=now,
+            )
+            _validate_record(candidate, now)
+        except (ReminderError, TypeError) as exc:
+            self._trace.record(
+                "reminder_edit_validation_failed",
+                {
+                    "id": reminder_id if isinstance(reminder_id, str) else None,
+                    "error": str(exc),
+                },
+            )
+            raise
+        display = self._display("Edit reminder?", candidate, local)
+        self._trace.record(
+            "reminder_edit_proposed",
+            {
+                "id": candidate.id,
+                "body": candidate.body,
+                "due_at": _timestamp(candidate.due_at),
+                "timezone": candidate.timezone,
+            },
+        )
+        return ApprovalRequired(
+            PendingAction(
+                host="reminder",
+                prefix="edit_reminder",
+                display=display,
+                allow_save_permission=False,
+            ),
+            _EditContinuation(record.updated_at, record.id, body, due_at),
+        )
+
+    def _cancel(self, arguments: dict[str, object]) -> ApprovalRequired:
+        reminder_id = arguments.get("reminder_id")
+        try:
+            if set(arguments) != {"reminder_id"}:
+                raise ReminderError("cancel_reminder requires reminder_id")
+            record = self._pending(reminder_id)
+        except (ReminderError, TypeError) as exc:
+            self._trace.record(
+                "reminder_cancel_validation_failed",
+                {
+                    "id": reminder_id if isinstance(reminder_id, str) else None,
+                    "error": str(exc),
+                },
+            )
+            raise
+        local = record.due_at.astimezone(self._timezone).replace(tzinfo=None)
+        self._trace.record(
+            "reminder_cancel_proposed",
+            {
+                "id": record.id,
+                "body": record.body,
+                "due_at": _timestamp(record.due_at),
+                "timezone": record.timezone,
+            },
+        )
+        return ApprovalRequired(
+            PendingAction(
+                host="reminder",
+                prefix="cancel_reminder",
+                display=self._display("Cancel reminder?", record, local),
+                allow_save_permission=False,
+            ),
+            _CancelContinuation(record.updated_at, record.id),
+        )
+
+    def _pending(self, reminder_id: object) -> Reminder:
+        if not isinstance(reminder_id, str) or not _ID_PATTERN.fullmatch(reminder_id):
+            raise ReminderError("reminder id must be eight lowercase letters or digits")
+        record = self._store.get(reminder_id)
+        if record is None:
+            raise ReminderError("reminder not found")
+        if record.status != "pending" or record.attempt_at is not None:
+            raise ReminderError("reminder is not pending")
+        return record
+
+    @staticmethod
+    def _display(label: str, record: Reminder, local: datetime) -> str:
+        return (
+            f"{label}\n"
+            f"ID: {record.id}\n"
+            f"Body: {record.body}\n"
+            f"Date: {local.date().isoformat()}\n"
+            f"Time: {local.time().isoformat()}\n"
+            f"Timezone: {record.timezone}"
         )
 
     def _list(self, arguments: dict[str, object]) -> str:

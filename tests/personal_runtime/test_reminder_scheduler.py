@@ -416,3 +416,48 @@ def test_concurrent_scheduler_claims_still_make_one_transport_call(
         await second.stop()
 
     asyncio.run(scenario())
+
+
+def test_approved_edit_and_cancel_wake_and_recalculate_next_due(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        sender = RecordingSender()
+        store, tools, scheduler, clock = make_capability(tmp_path, sender)
+        await approve(tools, "first body", "2026-09-05T14:00:00")
+        await approve(tools, "second body", "2026-09-05T15:00:00")
+        scheduler.start()
+        await eventually(
+            lambda: (
+                bool(clock.waited_for)
+                and clock.waited_for[-1] == datetime(2026, 9, 5, 11, tzinfo=UTC)
+            )
+        )
+
+        edited = await tools.execute(
+            "edit_reminder",
+            {
+                "reminder_id": "later001",
+                "body": None,
+                "due_local": "2026-09-05T16:00:00",
+            },
+        )
+        await tools.resume(edited.continuation, approved=True)
+        await eventually(
+            lambda: clock.waited_for[-1] == datetime(2026, 9, 5, 12, tzinfo=UTC)
+        )
+
+        cancelled = await tools.execute("cancel_reminder", {"reminder_id": "early001"})
+        await tools.resume(cancelled.continuation, approved=True)
+        await eventually(
+            lambda: clock.waited_for[-1] == datetime(2026, 9, 5, 13, tzinfo=UTC)
+        )
+
+        clock.advance(datetime(2026, 9, 5, 13, tzinfo=UTC))
+        await eventually(lambda: sender.calls == [(OPERATOR, "first body")])
+        history = {record.id: record for record in store.list(include_terminal=True)}
+        assert history["early001"].status == "cancelled"
+        assert history["later001"].status == "sent"
+        await scheduler.stop()
+
+    asyncio.run(scenario())
