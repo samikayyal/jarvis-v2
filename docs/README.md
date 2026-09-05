@@ -2,6 +2,11 @@
 
 - [Domain language](../CONTEXT.md)
 
+## Personal runtime
+
+- [Reminder lifecycle and supervised acceptance](reminders.md)
+- [ADR-0002: Keep reminder scheduling in Jarvis](adr/0002-keep-reminder-scheduling-in-jarvis.md)
+
 ## OpenWA messaging gateway
 
 - [Overview and current state](openwa/README.md)

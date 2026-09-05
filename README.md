@@ -17,10 +17,11 @@ The active runtime is intentionally small:
 - `.scratch/` retains the project history, research, issues, and acceptance
   evidence. It is not runtime code.
 
-The prepared tools include `read_vault`, `run_terminal`, `create_reminder`, and
-`list_reminders`, plus explicitly configured Google operations. Reminder
-creation requires exact one-time approval and persists independently of the
-working session; this first slice does not yet send due reminders. Ubuntu
+The prepared tools include `read_vault`, `run_terminal`, `create_reminder`,
+`edit_reminder`, `list_reminders`, and `cancel_reminder`, plus explicitly
+configured Google operations. Approved one-time Reminders persist independently
+of the working session and send their exact stored body once to the authorized
+operator when due. Ubuntu
 commands run as local subprocesses. Windows commands use ordinary OpenSSH over
 Tailscale. Simple configured read-only prefixes may run automatically; every
 other command waits for the operator's exact approval or a matching saved
@@ -51,7 +52,8 @@ database, state, and traces. The single active TOML is
 `/etc/jarvis/jarvis.toml`. Keep credentials out of Git and shell output. See
 [`deployment/personal-runtime/README.md`](deployment/personal-runtime/README.md)
 for installation, configuration, private OpenWA handoff, operation, update, and
-recovery procedures.
+recovery procedures. See [`docs/reminders.md`](docs/reminders.md) for the
+Reminder lifecycle, trust boundaries, and supervised phone acceptance procedure.
 
 ## Boundaries
 

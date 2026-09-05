@@ -139,6 +139,15 @@ Connection replacement or disconnection also invalidates pending Google writes.
 Google writes accept only `1`, `9`, or `/cancel`, are attempted once, and are
 never automatically retried after an ambiguous outcome.
 
+The Reminder capability is the one proactive exception to the otherwise
+inbound-driven runtime. Jarvis stores approved one-time Reminders in the
+configured SQLite database and owns their due-time decisions. One scheduler in
+the existing service process submits the exact stored body once to the
+configured operator chat ID. OpenWA remains the immediate transport and owns
+pairing, readiness, and message persistence; it does not own Reminder state or
+timing. See the [Reminder lifecycle and supervised acceptance procedure](../../docs/reminders.md)
+before testing this capability with the authorized account.
+
 The active personal route uses Google's generally available official Gmail,
 Drive, and Calendar REST APIs. It exposes bounded Gmail search/read and
 send/reply, Drive search/metadata/text content/export only, and Calendar
