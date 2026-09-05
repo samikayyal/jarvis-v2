@@ -221,6 +221,35 @@ def test_each_transport_outcome_is_terminal_and_never_retried(
     asyncio.run(scenario())
 
 
+def test_unusable_accepted_message_id_is_terminal_unknown(tmp_path: Path) -> None:
+    class OversizedIdSender(RecordingSender):
+        def send_text(self, chat_id: str, text: str) -> str:
+            super().send_text(chat_id, text)
+            return "x" * 257
+
+    async def scenario() -> None:
+        sender = OversizedIdSender()
+        store, tools, scheduler, clock = make_capability(tmp_path, sender)
+        await approve(tools, "ambiguous acceptance", "2026-09-05T13:00:00")
+        scheduler.start()
+        clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
+        await eventually(
+            lambda: (
+                bool(store.list(include_terminal=True))
+                and store.list(include_terminal=True)[0].status == "unknown"
+            )
+        )
+
+        record = store.list(include_terminal=True)[0]
+        assert record.status == "unknown"
+        assert record.outbound_message_id is None
+        assert record.failure_classification == "invalid_response"
+        assert sender.calls == [(OPERATOR, "ambiguous acceptance")]
+        await scheduler.stop()
+
+    asyncio.run(scenario())
+
+
 def test_due_reminder_sends_while_an_ordinary_request_is_active(tmp_path: Path) -> None:
     async def scenario() -> None:
         sender = RecordingSender()

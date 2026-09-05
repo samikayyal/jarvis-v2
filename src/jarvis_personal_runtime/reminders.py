@@ -1107,6 +1107,7 @@ class ReminderScheduler:
                 or not outbound_id
                 or len(outbound_id) > 256
             ):
+                outbound_id = None
                 raise OpenWASendError("invalid_response", may_have_sent=True)
         except OpenWASendError as exc:
             status = "unknown" if exc.may_have_sent else "failed"
