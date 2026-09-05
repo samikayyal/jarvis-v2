@@ -177,6 +177,9 @@ _Avoid_: Sanitized application log, hidden model reasoning
 
 ## Operational definition of active
 
+Deploy committed and pushed runtime changes with the PowerShell `deploy-jarvis`
+function.
+
 Jarvis is active only when the native service is enabled and running on its exact
 private bridge listener, OpenWA is healthy with the configured named session
 `ready`, the single webhook targets that listener, and a real authorized message
