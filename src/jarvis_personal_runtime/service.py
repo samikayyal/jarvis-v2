@@ -21,11 +21,12 @@ from .mcp import (
     validate_configured_mcp_manifests,
 )
 from .openwa import (
+    OpenWAHttpSender,
     OpenWASettings,
     WebhookAcknowledgement,
     build_openwa_message_flow,
 )
-from .reminders import ReminderStore, ReminderTools
+from .reminders import ReminderScheduler, ReminderStore, ReminderTools
 from .responses import build_direct_responses_runner
 from .runtime import build_runtime_from_loaded
 from .trace import build_runtime_trace
@@ -50,8 +51,22 @@ class HttpResponse:
 class WebhookHttpApplication:
     """Expose only the private OpenWA webhook handoff."""
 
-    def __init__(self, flow: WebhookFlow) -> None:
+    def __init__(
+        self,
+        flow: WebhookFlow,
+        *,
+        reminder_scheduler: ReminderScheduler | None = None,
+    ) -> None:
         self._flow = flow
+        self.reminder_scheduler = reminder_scheduler
+
+    async def start(self) -> None:
+        if self.reminder_scheduler is not None:
+            self.reminder_scheduler.start()
+
+    async def stop(self) -> None:
+        if self.reminder_scheduler is not None:
+            await self.reminder_scheduler.stop()
 
     def handle(
         self,
@@ -105,10 +120,20 @@ async def build_service_async(
     config = loaded.config
     trace = build_runtime_trace(config)
     configured_services = ()
+    openwa_settings = OpenWASettings.from_loaded_config(loaded)
+    openwa_sender = OpenWAHttpSender(openwa_settings)
+    reminder_store = ReminderStore(config.reminder_database_path)
+    reminder_scheduler = ReminderScheduler(
+        reminder_store,
+        sender=openwa_sender,
+        operator_chat_id=openwa_settings.operator_chat_id,
+        trace=trace,
+    )
     reminder_tools = ReminderTools(
-        ReminderStore(config.reminder_database_path),
+        reminder_store,
         operator_timezone=config.operator_timezone,
         trace=trace,
+        on_change=reminder_scheduler.wake,
         max_result_chars=config.max_output_chars,
     )
     additional_tools = (reminder_tools,)
@@ -156,8 +181,8 @@ async def build_service_async(
         trace=trace,
         connections=connections,
     )
-    flow = build_openwa_message_flow(loaded, runtime)
-    return WebhookHttpApplication(flow), config
+    flow = build_openwa_message_flow(loaded, runtime, sender=openwa_sender)
+    return WebhookHttpApplication(flow, reminder_scheduler=reminder_scheduler), config
 
 
 def build_service(
@@ -195,8 +220,12 @@ async def run_service(
         config.listener_host,
         config.listener_port,
     )
-    async with server:
-        await server.serve_forever()
+    await application.start()
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        await application.stop()
 
 
 async def _handle_connection(

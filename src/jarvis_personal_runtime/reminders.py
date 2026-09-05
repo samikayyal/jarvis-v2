@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .openwa import OpenWASender, OpenWASendError
 from .runtime import ApprovalRequired, PendingAction
 
 MAX_BODY_CHARACTERS = 4096
@@ -31,6 +33,10 @@ class Clock(Protocol):
     def now(self) -> datetime: ...
 
 
+class SchedulerClock(Clock, Protocol):
+    async def wait_until(self, due_at: datetime, wake: asyncio.Event) -> None: ...
+
+
 class Trace(Protocol):
     def record(self, event: str, payload: dict[str, object]) -> None: ...
 
@@ -38,6 +44,15 @@ class Trace(Protocol):
 class _SystemClock:
     def now(self) -> datetime:
         return datetime.now(UTC)
+
+
+class _SystemSchedulerClock(_SystemClock):
+    async def wait_until(self, due_at: datetime, wake: asyncio.Event) -> None:
+        delay = max(0.0, (due_at - self.now()).total_seconds())
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=delay)
+        except TimeoutError:
+            return
 
 
 class _NoTrace:
@@ -247,6 +262,98 @@ class ReminderStore:
             ).fetchall()
         return tuple(self._from_row(row) for row in rows)
 
+    def next_pending(self, *, after: datetime | None = None) -> Reminder | None:
+        cutoff = _timestamp(_utc(after, "after")) if after is not None else None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id, body, due_at, timezone, status, created_at, updated_at,
+                       attempt_at, completed_at, outbound_message_id,
+                       failure_classification
+                FROM reminders
+                WHERE status = 'pending' AND (? IS NULL OR due_at > ?)
+                ORDER BY due_at ASC, id ASC
+                LIMIT 1
+                """,
+                (cutoff, cutoff),
+            ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def begin_due_attempt(self, reminder_id: str, *, now: datetime) -> Reminder | None:
+        """Atomically terminalize and return one due Reminder for its only send."""
+
+        attempted_at = _utc(now, "now")
+        attempted_timestamp = _timestamp(attempted_at)
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT id, body, due_at, timezone, status, created_at, updated_at,
+                       attempt_at, completed_at, outbound_message_id,
+                       failure_classification
+                FROM reminders
+                WHERE id = ? AND status = 'pending' AND due_at <= ?
+                """,
+                (reminder_id, attempted_timestamp),
+            ).fetchone()
+            if row is None:
+                return None
+            self._connection.execute(
+                """
+                UPDATE reminders
+                SET status = 'unknown', updated_at = ?, attempt_at = ?,
+                    completed_at = ?, failure_classification = 'attempt_in_progress'
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    attempted_timestamp,
+                    attempted_timestamp,
+                    attempted_timestamp,
+                    reminder_id,
+                ),
+            )
+        return self._from_row(row)
+
+    def finish_attempt(
+        self,
+        reminder_id: str,
+        *,
+        status: str,
+        now: datetime,
+        outbound_message_id: str | None = None,
+        failure_classification: str | None = None,
+    ) -> None:
+        if status not in {"sent", "failed", "unknown"}:
+            raise ReminderError("invalid delivery outcome")
+        completed_timestamp = _timestamp(_utc(now, "now"))
+        for name, value in (
+            ("outbound_message_id", outbound_message_id),
+            ("failure_classification", failure_classification),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value or len(value) > 256
+            ):
+                raise ReminderError(f"{name} must be a bounded non-empty string")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE reminders
+                SET status = ?, updated_at = ?, completed_at = ?,
+                    outbound_message_id = ?, failure_classification = ?
+                WHERE id = ? AND status = 'unknown'
+                    AND failure_classification = 'attempt_in_progress'
+                """,
+                (
+                    status,
+                    completed_timestamp,
+                    completed_timestamp,
+                    outbound_message_id,
+                    failure_classification,
+                    reminder_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ReminderError("reminder attempt is not in progress")
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()
@@ -341,6 +448,7 @@ class ReminderTools:
         clock: Clock | None = None,
         id_generator: Callable[[], str] | None = None,
         trace: Trace | None = None,
+        on_change: Callable[[], object] | None = None,
         max_result_chars: int = 65_536,
     ) -> None:
         if not isinstance(store, ReminderStore):
@@ -357,6 +465,7 @@ class ReminderTools:
         self._clock = clock or _SystemClock()
         self._id_generator = id_generator or (lambda: secrets.token_hex(4))
         self._trace = trace or _NoTrace()
+        self._on_change = on_change or (lambda: None)
         self._max_result_chars = max_result_chars
 
     @property
@@ -414,6 +523,7 @@ class ReminderTools:
                 "timezone": record.timezone,
             },
         )
+        self._on_change()
         return _canonical({"created": True, "id": record.id})
 
     def _create(self, arguments: dict[str, object]) -> ApprovalRequired:
@@ -536,6 +646,119 @@ class ReminderTools:
         }
 
 
+class ReminderScheduler:
+    """Wait for and make the one transport attempt for each due Reminder."""
+
+    def __init__(
+        self,
+        store: ReminderStore,
+        *,
+        sender: OpenWASender,
+        operator_chat_id: str,
+        clock: SchedulerClock | None = None,
+        trace: Trace | None = None,
+    ) -> None:
+        if not isinstance(store, ReminderStore):
+            raise TypeError("store must be a ReminderStore")
+        if not isinstance(operator_chat_id, str) or not operator_chat_id:
+            raise ValueError("operator_chat_id must be non-empty")
+        self.store = store
+        self.sender = sender
+        self.operator_chat_id = operator_chat_id
+        self._clock = clock or _SystemSchedulerClock()
+        self._trace = trace or _NoTrace()
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._started_at: datetime | None = None
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._started_at = _utc(self._clock.now(), "now")
+            self._task = asyncio.create_task(self.run())
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    async def stop(self) -> None:
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def run(self) -> None:
+        started_at = self._started_at or _utc(self._clock.now(), "now")
+        while True:
+            self._wake.clear()
+            reminder = self.store.next_pending(after=started_at)
+            if reminder is None:
+                await self._wake.wait()
+                continue
+            await self._clock.wait_until(reminder.due_at, self._wake)
+            if self._wake.is_set():
+                continue
+            now = _utc(self._clock.now(), "now")
+            claimed = self.store.begin_due_attempt(reminder.id, now=now)
+            if claimed is None:
+                continue
+            self._trace.record(
+                "reminder_delivery_attempt",
+                {"id": claimed.id, "attempt_at": _timestamp(now)},
+            )
+            await self._deliver(claimed, now)
+
+    async def _deliver(self, reminder: Reminder, attempted_at: datetime) -> None:
+        try:
+            outbound_id = await asyncio.to_thread(
+                self.sender.send_text, self.operator_chat_id, reminder.body
+            )
+            if (
+                not isinstance(outbound_id, str)
+                or not outbound_id
+                or len(outbound_id) > 256
+            ):
+                raise OpenWASendError("invalid_response", may_have_sent=True)
+        except OpenWASendError as exc:
+            status = "unknown" if exc.may_have_sent else "failed"
+            self.store.finish_attempt(
+                reminder.id,
+                status=status,
+                now=attempted_at,
+                failure_classification=exc.code,
+            )
+            payload: dict[str, object] = {
+                "id": reminder.id,
+                "status": status,
+                "failure_classification": exc.code,
+            }
+        except Exception:  # noqa: BLE001 - an unclassified send may have succeeded
+            self.store.finish_attempt(
+                reminder.id,
+                status="unknown",
+                now=attempted_at,
+                failure_classification="unexpected_error",
+            )
+            payload = {
+                "id": reminder.id,
+                "status": "unknown",
+                "failure_classification": "unexpected_error",
+            }
+        else:
+            self.store.finish_attempt(
+                reminder.id,
+                status="sent",
+                now=attempted_at,
+                outbound_message_id=outbound_id,
+            )
+            payload = {
+                "id": reminder.id,
+                "status": "sent",
+                "outbound_message_id": outbound_id,
+            }
+        self._trace.record("reminder_delivery_outcome", payload)
+
+
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -544,6 +767,7 @@ __all__ = [
     "MAX_BODY_CHARACTERS",
     "Reminder",
     "ReminderError",
+    "ReminderScheduler",
     "ReminderStore",
     "ReminderTools",
 ]

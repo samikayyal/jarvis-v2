@@ -47,6 +47,31 @@ def test_http_application_exposes_only_the_content_free_webhook() -> None:
     assert len(flow.calls) == 1
 
 
+def test_http_application_owns_reminder_scheduler_lifecycle() -> None:
+    class _Scheduler:
+        def __init__(self) -> None:
+            self.started = 0
+            self.stopped = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+        async def stop(self) -> None:
+            self.stopped += 1
+
+    async def scenario() -> None:
+        scheduler = _Scheduler()
+        app = WebhookHttpApplication(_Flow(), reminder_scheduler=scheduler)
+
+        await app.start()
+        await app.stop()
+
+        assert scheduler.started == 1
+        assert scheduler.stopped == 1
+
+    asyncio.run(scenario())
+
+
 def test_listener_returns_the_admission_acknowledgement_over_http() -> None:
     async def scenario() -> None:
         flow = _Flow()
@@ -183,6 +208,54 @@ def test_async_service_composition_can_prepare_configured_services(
 
     assert isinstance(application, WebhookHttpApplication)
     assert len(config.mcp_services) == 1
+
+
+def test_service_composes_reminders_with_the_operator_only_openwa_sender(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "runtime"
+    _write_service_config(root)
+    captured: dict[str, object] = {}
+
+    class _Sender:
+        def __init__(self, settings: object) -> None:
+            captured["settings"] = settings
+
+    class _Scheduler:
+        def __init__(
+            self,
+            store: object,
+            *,
+            sender: object,
+            operator_chat_id: str,
+            trace: object,
+        ) -> None:
+            self.sender = sender
+            captured.update(
+                store=store,
+                sender=sender,
+                operator_chat_id=operator_chat_id,
+                trace=trace,
+            )
+
+        def wake(self) -> None:
+            return None
+
+        def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(service_module, "OpenWAHttpSender", _Sender)
+    monkeypatch.setattr(service_module, "ReminderScheduler", _Scheduler)
+
+    application, _ = asyncio.run(build_service_async(root))
+
+    assert application.reminder_scheduler is not None
+    assert captured["sender"] is application.reminder_scheduler.sender
+    assert captured["operator_chat_id"] == "962790000000@c.us"
+    assert captured["store"].path == root / "data" / "reminders.sqlite3"
 
 
 def test_async_service_composition_uses_one_direct_google_api_tool(
