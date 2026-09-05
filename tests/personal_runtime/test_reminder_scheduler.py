@@ -377,3 +377,42 @@ def test_shutdown_waits_for_an_active_attempt_and_records_its_outcome(
         )
 
     asyncio.run(scenario())
+
+
+def test_concurrent_scheduler_claims_still_make_one_transport_call(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        sender = BlockingSender()
+        store = ReminderStore(tmp_path / "reminders.sqlite3")
+        clock = ControlledSchedulerClock()
+        first = ReminderScheduler(
+            store, sender=sender, operator_chat_id=OPERATOR, clock=clock
+        )
+        second = ReminderScheduler(
+            store, sender=sender, operator_chat_id=OPERATOR, clock=clock
+        )
+        tools = ReminderTools(
+            store,
+            operator_timezone="Asia/Amman",
+            clock=clock,
+            id_generator=lambda: "claimed1",
+            on_change=lambda: (first.wake(), second.wake()),
+        )
+        await approve(tools, "claim only once", "2026-09-05T13:00:00")
+        first.start()
+        second.start()
+        await eventually(lambda: len(clock.waited_for) == 2)
+        clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
+        await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), timeout=1)
+        await asyncio.sleep(0.05)
+
+        assert sender.calls == []
+        sender.release.set()
+        await eventually(lambda: len(sender.calls) >= 1)
+        await asyncio.sleep(0.05)
+        assert sender.calls == [(OPERATOR, "claim only once")]
+        await first.stop()
+        await second.stop()
+
+    asyncio.run(scenario())

@@ -298,13 +298,14 @@ class ReminderStore:
                        attempt_at, completed_at, outbound_message_id,
                        failure_classification
                 FROM reminders
-                WHERE id = ? AND status = 'pending' AND due_at <= ?
+                WHERE id = ? AND status = 'pending' AND attempt_at IS NULL
+                    AND due_at <= ?
                 """,
                 (reminder_id, attempted_timestamp),
             ).fetchone()
             if row is None:
                 return None
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """
                 UPDATE reminders
                 SET updated_at = ?, attempt_at = ?
@@ -316,6 +317,8 @@ class ReminderStore:
                     reminder_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                return None
         return self._from_row(row)
 
     def finish_attempt(
