@@ -68,9 +68,8 @@ authorized operator at an approved future time. It may be edited or cancelled
 before it is sent and never addresses another recipient.
 _Avoid_: Scheduled message, third-party message, recurring reminder
 
-The Reminder lifecycle is delivered incrementally: the current first slice
-saves and lists approved Reminders; later tickets add sending, editing, and
-cancellation.
+The Reminder lifecycle is delivered incrementally: the current slices save,
+list, and send approved Reminders; later tickets add editing and cancellation.
 
 **Due time**:
 The exact future instant at which a reminder becomes eligible to be sent,

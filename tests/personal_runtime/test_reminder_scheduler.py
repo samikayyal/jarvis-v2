@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -79,6 +80,18 @@ class BlockingRunner:
 
     async def resume(self, *_args: object, **_kwargs: object) -> Completed:
         raise AssertionError("approval was not expected")
+
+
+class BlockingSender(RecordingSender):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def send_text(self, chat_id: str, text: str) -> str:
+        self.entered.set()
+        self.release.wait(timeout=2)
+        return super().send_text(chat_id, text)
 
 
 async def approve(tools: ReminderTools, body: str, due_local: str) -> str:
@@ -291,5 +304,76 @@ def test_scheduler_does_not_recover_a_reminder_that_became_due_while_stopped(
         assert sender.calls == []
         assert store.list()[0].status == "pending"
         await scheduler.stop()
+
+    asyncio.run(scenario())
+
+
+def test_in_flight_attempt_is_not_exposed_as_a_terminal_outcome(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        sender = BlockingSender()
+        store, tools, scheduler, clock = make_capability(tmp_path, sender)
+        await approve(tools, "still sending", "2026-09-05T13:00:00")
+        scheduler.start()
+        clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
+        await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), timeout=1)
+
+        assert store.list() == ()
+        assert store.list(include_terminal=True) == ()
+
+        sender.release.set()
+        await eventually(
+            lambda: (
+                bool(store.list(include_terminal=True))
+                and store.list(include_terminal=True)[0].status == "sent"
+            )
+        )
+        await scheduler.stop()
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_waits_for_an_active_attempt_and_records_its_outcome(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        sender = BlockingSender()
+        store = ReminderStore(tmp_path / "reminders.sqlite3")
+        clock = ControlledSchedulerClock()
+        trace = MemoryTrace()
+        scheduler = ReminderScheduler(
+            store,
+            sender=sender,
+            operator_chat_id=OPERATOR,
+            clock=clock,
+            trace=trace,
+        )
+        tools = ReminderTools(
+            store,
+            operator_timezone="Asia/Amman",
+            clock=clock,
+            id_generator=lambda: "stopped1",
+            on_change=scheduler.wake,
+        )
+        await approve(tools, "finish on shutdown", "2026-09-05T13:00:00")
+        scheduler.start()
+        clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
+        await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), timeout=1)
+
+        stopping = asyncio.create_task(scheduler.stop())
+        await asyncio.sleep(0)
+        assert stopping.done() is False
+        sender.release.set()
+        await stopping
+
+        record = store.list(include_terminal=True)[0]
+        assert record.status == "sent"
+        assert trace.events[-1] == (
+            "reminder_delivery_outcome",
+            {
+                "id": "stopped1",
+                "status": "sent",
+                "outbound_message_id": "outbound-1",
+            },
+        )
 
     asyncio.run(scenario())

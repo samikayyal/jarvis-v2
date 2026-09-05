@@ -247,7 +247,11 @@ class ReminderStore:
             or not 1 <= limit <= 100
         ):
             raise ReminderError("limit must be between 1 and 100")
-        where = "" if include_terminal else "WHERE status = 'pending'"
+        where = (
+            "WHERE status != 'pending' OR attempt_at IS NULL"
+            if include_terminal
+            else "WHERE status = 'pending' AND attempt_at IS NULL"
+        )
         with self._lock:
             rows = self._connection.execute(
                 f"""
@@ -262,8 +266,10 @@ class ReminderStore:
             ).fetchall()
         return tuple(self._from_row(row) for row in rows)
 
-    def next_pending(self, *, after: datetime | None = None) -> Reminder | None:
-        cutoff = _timestamp(_utc(after, "after")) if after is not None else None
+    def next_pending(self, *, due_after: datetime | None = None) -> Reminder | None:
+        cutoff = (
+            _timestamp(_utc(due_after, "due_after")) if due_after is not None else None
+        )
         with self._lock:
             row = self._connection.execute(
                 """
@@ -271,7 +277,8 @@ class ReminderStore:
                        attempt_at, completed_at, outbound_message_id,
                        failure_classification
                 FROM reminders
-                WHERE status = 'pending' AND (? IS NULL OR due_at > ?)
+                WHERE status = 'pending' AND attempt_at IS NULL
+                    AND (? IS NULL OR due_at > ?)
                 ORDER BY due_at ASC, id ASC
                 LIMIT 1
                 """,
@@ -300,12 +307,10 @@ class ReminderStore:
             self._connection.execute(
                 """
                 UPDATE reminders
-                SET status = 'unknown', updated_at = ?, attempt_at = ?,
-                    completed_at = ?, failure_classification = 'attempt_in_progress'
-                WHERE id = ? AND status = 'pending'
+                SET updated_at = ?, attempt_at = ?
+                WHERE id = ? AND status = 'pending' AND attempt_at IS NULL
                 """,
                 (
-                    attempted_timestamp,
                     attempted_timestamp,
                     attempted_timestamp,
                     reminder_id,
@@ -339,8 +344,7 @@ class ReminderStore:
                 UPDATE reminders
                 SET status = ?, updated_at = ?, completed_at = ?,
                     outbound_message_id = ?, failure_classification = ?
-                WHERE id = ? AND status = 'unknown'
-                    AND failure_classification = 'attempt_in_progress'
+                WHERE id = ? AND status = 'pending' AND attempt_at IS NOT NULL
                 """,
                 (
                     status,
@@ -670,9 +674,11 @@ class ReminderScheduler:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._started_at: datetime | None = None
+        self._stopping = False
 
     def start(self) -> None:
         if self._task is None or self._task.done():
+            self._stopping = False
             self._started_at = _utc(self._clock.now(), "now")
             self._task = asyncio.create_task(self.run())
 
@@ -684,19 +690,20 @@ class ReminderScheduler:
         self._task = None
         if task is None:
             return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        self._stopping = True
+        self.wake()
+        await task
 
     async def run(self) -> None:
         started_at = self._started_at or _utc(self._clock.now(), "now")
-        while True:
+        while not self._stopping:
             self._wake.clear()
-            reminder = self.store.next_pending(after=started_at)
+            reminder = self.store.next_pending(due_after=started_at)
             if reminder is None:
                 await self._wake.wait()
                 continue
             await self._clock.wait_until(reminder.due_at, self._wake)
-            if self._wake.is_set():
+            if self._wake.is_set() or self._stopping:
                 continue
             now = _utc(self._clock.now(), "now")
             claimed = self.store.begin_due_attempt(reminder.id, now=now)
@@ -706,9 +713,11 @@ class ReminderScheduler:
                 "reminder_delivery_attempt",
                 {"id": claimed.id, "attempt_at": _timestamp(now)},
             )
-            await self._deliver(claimed, now)
+            await self._deliver(claimed)
 
-    async def _deliver(self, reminder: Reminder, attempted_at: datetime) -> None:
+    async def _deliver(self, reminder: Reminder) -> None:
+        outbound_id: str | None = None
+        failure_classification: str | None = None
         try:
             outbound_id = await asyncio.to_thread(
                 self.sender.send_text, self.operator_chat_id, reminder.body
@@ -721,41 +730,24 @@ class ReminderScheduler:
                 raise OpenWASendError("invalid_response", may_have_sent=True)
         except OpenWASendError as exc:
             status = "unknown" if exc.may_have_sent else "failed"
-            self.store.finish_attempt(
-                reminder.id,
-                status=status,
-                now=attempted_at,
-                failure_classification=exc.code,
-            )
-            payload: dict[str, object] = {
-                "id": reminder.id,
-                "status": status,
-                "failure_classification": exc.code,
-            }
+            failure_classification = exc.code
         except Exception:  # noqa: BLE001 - an unclassified send may have succeeded
-            self.store.finish_attempt(
-                reminder.id,
-                status="unknown",
-                now=attempted_at,
-                failure_classification="unexpected_error",
-            )
-            payload = {
-                "id": reminder.id,
-                "status": "unknown",
-                "failure_classification": "unexpected_error",
-            }
+            status = "unknown"
+            failure_classification = "unexpected_error"
         else:
-            self.store.finish_attempt(
-                reminder.id,
-                status="sent",
-                now=attempted_at,
-                outbound_message_id=outbound_id,
-            )
-            payload = {
-                "id": reminder.id,
-                "status": "sent",
-                "outbound_message_id": outbound_id,
-            }
+            status = "sent"
+        self.store.finish_attempt(
+            reminder.id,
+            status=status,
+            now=self._clock.now(),
+            outbound_message_id=outbound_id,
+            failure_classification=failure_classification,
+        )
+        payload: dict[str, object] = {"id": reminder.id, "status": status}
+        if outbound_id is not None:
+            payload["outbound_message_id"] = outbound_id
+        if failure_classification is not None:
+            payload["failure_classification"] = failure_classification
         self._trace.record("reminder_delivery_outcome", payload)
 
 
