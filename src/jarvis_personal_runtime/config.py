@@ -21,6 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypedDict, cast
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_ALLOWED_MODELS = (
     "gpt-5.6-sol",
@@ -64,6 +65,8 @@ class _RuntimeDefaults(TypedDict):
     windows_read_only_prefixes: tuple[str, ...]
     message_cache_path: str
     message_cache_retention_days: int
+    operator_timezone: str
+    reminder_database_path: str
     trace_path: str
     trace_max_bytes: int
     listener_host: None
@@ -102,6 +105,8 @@ DEFAULTS: _RuntimeDefaults = cast(
             "windows_read_only_prefixes": (),
             "message_cache_path": "data/message-cache.json",
             "message_cache_retention_days": 7,
+            "operator_timezone": "Asia/Amman",
+            "reminder_database_path": "data/reminders.sqlite3",
             "trace_path": "data/runtime-trace.jsonl",
             "trace_max_bytes": 10 * 1024 * 1024,
             "listener_host": None,
@@ -254,6 +259,8 @@ class RuntimeConfig:
     windows_read_only_prefixes: tuple[str, ...] = DEFAULTS["windows_read_only_prefixes"]
     message_cache_path: Path = Path(DEFAULTS["message_cache_path"])
     message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
+    operator_timezone: str = DEFAULTS["operator_timezone"]
+    reminder_database_path: Path = Path(DEFAULTS["reminder_database_path"])
     trace_path: Path = Path(DEFAULTS["trace_path"])
     trace_max_bytes: int = DEFAULTS["trace_max_bytes"]
     listener_host: str | None = DEFAULTS["listener_host"]
@@ -354,6 +361,8 @@ _RUNTIME_KEYS = {
     "windows_read_only_prefixes",
     "message_cache_path",
     "message_cache_retention_days",
+    "operator_timezone",
+    "reminder_database_path",
     "trace_path",
     "trace_max_bytes",
     "listener_host",
@@ -503,6 +512,12 @@ def _setting(values: Mapping[str, Any], *names: str, default: Any) -> Any:
         names_text = ", ".join(name for name, _ in present)
         raise ValueError(f"conflicting aliases: {names_text}")
     return first
+
+
+def _required_setting(values: Mapping[str, Any], path: Path, name: str) -> Any:
+    if name not in values:
+        raise ConfigError(path, f"missing required runtime setting: {name}")
+    return values[name]
 
 
 def _string(value: Any, path: Path, name: str, *, nonempty: bool = True) -> str:
@@ -744,6 +759,10 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             "message_cache_retention_days",
             default=DEFAULTS["message_cache_retention_days"],
         )
+        operator_timezone_value = _required_setting(values, path, "operator_timezone")
+        reminder_database_path_value = _required_setting(
+            values, path, "reminder_database_path"
+        )
         trace_path_value = _setting(
             values, "trace_path", default=DEFAULTS["trace_path"]
         )
@@ -820,6 +839,13 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_tool_rounds = _positive_int(max_tool_rounds, path, "max_tool_rounds")
         output_limit = _positive_int(output_limit, path, "max_output_chars")
         retention = _positive_int(retention, path, "message_cache_retention_days")
+        operator_timezone = _string(operator_timezone_value, path, "operator_timezone")
+        try:
+            ZoneInfo(operator_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConfigError(
+                path, "operator_timezone must be a valid IANA timezone"
+            ) from exc
         trace_max_bytes = _positive_int(trace_max_bytes, path, "trace_max_bytes")
         listener_host = _optional_string(listener_host_value, path, "listener_host")
         listener_port = listener_port_value
@@ -847,6 +873,12 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         if retention != DEFAULTS["message_cache_retention_days"]:
             raise ConfigError(path, "message_cache_retention_days is fixed at 7")
         cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
+        reminder_database_path = _rooted_path(
+            reminder_database_path_value,
+            root,
+            path,
+            "reminder_database_path",
+        )
         trace_path = _rooted_path(trace_path_value, root, path, "trace_path")
         prompt_path = _rooted_path(prompt_path_value, root, path, "system_prompt_path")
         ubuntu_working_directory = _optional_configured_path(
@@ -936,6 +968,8 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         windows_read_only_prefixes=windows_read_only_prefixes,
         message_cache_path=cache_path,
         message_cache_retention_days=retention,
+        operator_timezone=operator_timezone,
+        reminder_database_path=reminder_database_path,
         trace_path=trace_path,
         trace_max_bytes=trace_max_bytes,
         listener_host=listener_host,

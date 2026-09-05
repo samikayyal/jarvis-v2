@@ -390,7 +390,11 @@ async def test_restart_discards_session_work_and_persists_message_ids(
         "OPENWA_WEBHOOK_SIGNING_SECRET=signing-test\n",
         encoding="utf-8",
     )
-    (tmp_path / "jarvis.toml").write_text("", encoding="utf-8")
+    (tmp_path / "jarvis.toml").write_text(
+        '[runtime]\noperator_timezone = "Asia/Amman"\n'
+        'reminder_database_path = "data/reminders.sqlite3"\n',
+        encoding="utf-8",
+    )
     (tmp_path / "SYSTEM.md").write_text("System instructions.\n", encoding="utf-8")
     clock = FakeClock()
     action = PendingAction(host="ubuntu", prefix="pwd", display="Run pwd?")

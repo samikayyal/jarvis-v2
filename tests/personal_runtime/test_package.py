@@ -68,6 +68,8 @@ def test_example_configuration_carries_the_private_handoff_and_rotating_trace() 
     assert config["trace_path"] == "data/runtime-trace.jsonl"
     assert config["trace_max_bytes"] > 0
     assert config["message_cache_retention_days"] == 7
+    assert config["operator_timezone"] == "Asia/Amman"
+    assert config["reminder_database_path"] == "data/reminders.sqlite3"
     assert config["openwa_api_base_url"] == "REPLACE_WITH_PRIVATE_OPENWA_API_BASE_URL"
 
 

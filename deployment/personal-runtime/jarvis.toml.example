@@ -18,6 +18,8 @@ listener_port = 9011
 
 message_cache_path = "data/message-cache.json"
 message_cache_retention_days = 7
+operator_timezone = "Asia/Amman"
+reminder_database_path = "data/reminders.sqlite3"
 trace_path = "data/runtime-trace.jsonl"
 trace_max_bytes = 10485760
 system_prompt_path = "SYSTEM.md"

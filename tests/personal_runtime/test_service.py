@@ -11,6 +11,7 @@ from jarvis_personal_runtime.openwa import (
     WebhookAcknowledgement,
     WebhookDisposition,
 )
+from jarvis_personal_runtime.reminders import ReminderTools
 from jarvis_personal_runtime.service import (
     WebhookHttpApplication,
     build_service_async,
@@ -93,6 +94,8 @@ def _write_service_config(root: Path, *, include_listener: bool = True) -> None:
     (root / "jarvis.toml").write_text(
         "[runtime]\n"
         + listener
+        + 'operator_timezone = "Asia/Amman"\n'
+        + 'reminder_database_path = "data/reminders.sqlite3"\n'
         + 'openwa_api_base_url = "http://172.17.0.2:2785/api"\n'
         + 'openwa_internal_session_id = "internal-session"\n'
         + 'openwa_named_session = "jarvis"\n'
@@ -259,9 +262,11 @@ def test_async_service_composition_uses_one_direct_google_api_tool(
     assert config.google is not None
     assert captured["config_path"] == root / "jarvis.toml"
     tools = captured["additional_tools"]
-    assert isinstance(tools, tuple) and len(tools) == 1
-    assert tools[0] is captured["connections"]
-    google_tools = tools[0]
+    assert isinstance(tools, tuple) and len(tools) == 2
+    assert isinstance(tools[0], ReminderTools)
+    assert tools[0].database_path == root / "data" / "reminders.sqlite3"
+    assert tools[1] is captured["connections"]
+    google_tools = tools[1]
     assert isinstance(google_tools, _FakeGoogleApiTools)
     assert google_tools.expected_email == "kayyal.sami@gmail.com"
     assert google_tools.max_output_chars == 20000

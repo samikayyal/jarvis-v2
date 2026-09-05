@@ -62,6 +62,21 @@ Admitted text that is not a deterministic command and enters the sequential
 model-and-tool loop.
 _Avoid_: Background task, queued request
 
+**Reminder**:
+A one-time instruction for Jarvis to send exact stored reminder text to the
+authorized operator at an approved future time. It may be edited or cancelled
+before it is sent and never addresses another recipient.
+_Avoid_: Scheduled message, third-party message, recurring reminder
+
+The Reminder lifecycle is delivered incrementally: the current first slice
+saves and lists approved Reminders; later tickets add sending, editing, and
+cancellation.
+
+**Due time**:
+The exact future instant at which a reminder becomes eligible to be sent,
+presented to the operator in the configured operator timezone.
+_Avoid_: Natural-language time, timer duration
+
 **Working session**:
 The in-memory conversation context for the authorized operator. It ends on
 `/new`, configured inactivity, service restart, or the configured token limit.
@@ -173,7 +188,7 @@ _Avoid_: Sanitized application log, hidden model reasoning
 | `.env` | OpenAI, OpenWA, and Google OAuth credentials | Non-secret settings, saved permissions |
 | `/etc/jarvis/jarvis.toml` | Non-secret limits, paths, identities, read-only prefixes, saved permissions | Credentials, message bodies, command output |
 | `SYSTEM.md` | Editable assistant instruction | Credentials, saved permissions |
-| Runtime data directory | Seven-day deduplication cache and verbatim rotating trace | OpenWA data or pairing state |
+| Runtime data directory | Reminder SQLite database, seven-day deduplication cache, and verbatim rotating trace | OpenWA data or pairing state |
 
 ## Operational definition of active
 

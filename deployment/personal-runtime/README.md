@@ -47,9 +47,11 @@ have distinct trust boundaries:
 | `SYSTEM.md` | Editable system prompt | `jarvis-personal-runtime:jarvis-personal-runtime`, `0600` |
 
 Jarvis never edits `.env` or `SYSTEM.md`; it writes only the
-`[saved_permissions]` section of `/etc/jarvis/jarvis.toml`. Runtime-owned cache
-and trace paths must stay below the runtime root. An optional vault path may be
-an absolute read-only directory outside it.
+`[saved_permissions]` section of `/etc/jarvis/jarvis.toml`. Runtime-owned cache,
+Reminder database, and trace paths must stay below the runtime root. The
+required `operator_timezone` is an IANA name and is initially `Asia/Amman`; it
+does not inherit the host timezone. An optional vault path may be an absolute
+read-only directory outside the runtime root.
 
 Keep `/etc/jarvis` root-owned because it may contain unrelated protected files.
 Install the configuration in a dedicated service-owned subdirectory and expose
@@ -107,8 +109,9 @@ private `manifests/` directory only when a separate generic MCP service is
 configured. The `[google]` section is the active personal route; do not model it
 as a `[[mcp_services]]` entry. Required production TOML values include the
 private listener, OpenWA API base URL, internal session ID, named session,
-authorized operator number and chat ID, Ubuntu working directory, and read-only
-prefixes. Configure all four
+authorized operator number and chat ID, `operator_timezone`,
+`reminder_database_path`, Ubuntu working directory, and read-only prefixes.
+Configure all four
 Windows SSH fields together when Windows execution is enabled. The identity file
 must be private to the service account and the SSH host key must already be
 pinned in that account's known-hosts file.

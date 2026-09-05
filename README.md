@@ -17,10 +17,14 @@ The active runtime is intentionally small:
 - `.scratch/` retains the project history, research, issues, and acceptance
   evidence. It is not runtime code.
 
-The prepared tools are `read_vault` and `run_terminal`. Ubuntu commands run as
-local subprocesses. Windows commands use ordinary OpenSSH over Tailscale. Simple
-configured read-only prefixes may run automatically; every other command waits
-for the operator's exact approval or a matching saved host-plus-prefix rule.
+The prepared tools include `read_vault`, `run_terminal`, `create_reminder`, and
+`list_reminders`, plus explicitly configured Google operations. Reminder
+creation requires exact one-time approval and persists independently of the
+working session; this first slice does not yet send due reminders. Ubuntu
+commands run as local subprocesses. Windows commands use ordinary OpenSSH over
+Tailscale. Simple configured read-only prefixes may run automatically; every
+other command waits for the operator's exact approval or a matching saved
+host-plus-prefix rule.
 
 ## Development
 
@@ -42,9 +46,9 @@ uv run jarvis-personal-runtime --root /path/to/runtime-root \
   --config /etc/jarvis/jarvis.toml
 ```
 
-The runtime root contains `.env`, `SYSTEM.md`, state, and traces. The single
-active TOML is `/etc/jarvis/jarvis.toml`. Keep credentials out of Git and shell
-output. See
+The runtime root contains `.env`, `SYSTEM.md`, the independent Reminder SQLite
+database, state, and traces. The single active TOML is
+`/etc/jarvis/jarvis.toml`. Keep credentials out of Git and shell output. See
 [`deployment/personal-runtime/README.md`](deployment/personal-runtime/README.md)
 for installation, configuration, private OpenWA handoff, operation, update, and
 recovery procedures.
@@ -58,8 +62,8 @@ not sufficient: the configured named session must also be `ready`.
 
 Jarvis accepts only direct text from the configured authorized WhatsApp number.
 Groups, other senders, self-authored traffic, media, and malformed events do not
-enter assistant work. The working session is memory-only; the seven-day
-message-ID cache, saved permissions, and rotating verbatim JSON Lines trace are
-the only runtime-owned durable state.
+enter assistant work. The working session is memory-only; the Reminder SQLite
+database, seven-day message-ID cache, saved permissions, and rotating verbatim
+JSON Lines trace are the runtime-owned durable state.
 
 Canonical domain language and trust boundaries live in [`CONTEXT.md`](CONTEXT.md).

@@ -29,6 +29,14 @@ def _write_runtime_files(
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / ".env").write_text(env, encoding="utf-8")
+    reminder_settings = (
+        'operator_timezone = "Asia/Amman"\n'
+        'reminder_database_path = "data/reminders.sqlite3"\n'
+    )
+    if "[runtime]" in toml:
+        toml = toml.replace("[runtime]\n", "[runtime]\n" + reminder_settings, 1)
+    else:
+        toml = "[runtime]\n" + reminder_settings + toml
     (root / "jarvis.toml").write_text(toml, encoding="utf-8")
     (root / "SYSTEM.md").write_text(system, encoding="utf-8")
 
@@ -62,6 +70,10 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.windows_read_only_prefixes == ()
     assert loaded.config.max_output_chars == 65_536
     assert loaded.config.message_cache_path == tmp_path / "data" / "message-cache.json"
+    assert loaded.config.operator_timezone == "Asia/Amman"
+    assert (
+        loaded.config.reminder_database_path == tmp_path / "data" / "reminders.sqlite3"
+    )
     assert loaded.config.trace_path == tmp_path / "data" / "runtime-trace.jsonl"
     assert loaded.config.trace_max_bytes == 10 * 1024 * 1024
     assert loaded.config.listener_host is None
@@ -89,7 +101,11 @@ def test_toml_may_be_loaded_outside_the_runtime_root(tmp_path: Path) -> None:
     _write_runtime_files(root)
     external_config = tmp_path / "etc" / "jarvis" / "jarvis.toml"
     external_config.parent.mkdir(parents=True)
-    external_config.write_text('[runtime]\nmodel = "sol"\n', encoding="utf-8")
+    external_config.write_text(
+        '[runtime]\noperator_timezone = "Asia/Amman"\n'
+        'reminder_database_path = "data/reminders.sqlite3"\nmodel = "sol"\n',
+        encoding="utf-8",
+    )
 
     loaded = load_runtime_config(root, config_path=external_config)
 
@@ -97,6 +113,44 @@ def test_toml_may_be_loaded_outside_the_runtime_root(tmp_path: Path) -> None:
     assert loaded.config.root == root
     assert loaded.config.model == "gpt-5.6-sol"
     assert loaded.config.message_cache_path == root / "data" / "message-cache.json"
+
+
+@pytest.mark.parametrize("timezone", [None, "", "Mars/Amman"])
+def test_operator_timezone_is_required_and_must_be_iana_without_writes(
+    tmp_path: Path, timezone: str | None
+) -> None:
+    root = tmp_path / "runtime"
+    _write_runtime_files(root)
+    setting = "" if timezone is None else f'operator_timezone = "{timezone}"\n'
+    (root / "jarvis.toml").write_text(
+        "[runtime]\n" + setting + 'reminder_database_path = "data/reminders.sqlite3"\n',
+        encoding="utf-8",
+    )
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+
+    with pytest.raises(ConfigError, match="operator_timezone"):
+        load_runtime_config(root)
+
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+
+
+def test_reminder_database_path_is_required_and_rooted(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    _write_runtime_files(root)
+    (root / "jarvis.toml").write_text(
+        '[runtime]\noperator_timezone = "Asia/Amman"\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match="reminder_database_path"):
+        load_runtime_config(root)
+
+    (root / "jarvis.toml").write_text(
+        '[runtime]\noperator_timezone = "Asia/Amman"\n'
+        'reminder_database_path = "../outside.sqlite3"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="reminder_database_path"):
+        load_runtime_config(root)
 
 
 def test_toml_overrides_are_validated_and_paths_are_rooted(tmp_path: Path) -> None:

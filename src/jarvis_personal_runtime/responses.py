@@ -590,9 +590,20 @@ class DirectResponsesRunner:
             raise TypeError("invalid Responses approval continuation")
         call = continuation.call
         if decision is ApprovalDecision.REJECT:
-            output = json.dumps(
-                {"rejected": True}, sort_keys=True, separators=(",", ":")
-            )
+            try:
+                output = await self._tools.resume(
+                    continuation.tool_continuation, approved=False
+                )
+            except Exception as exc:  # noqa: BLE001 - errors continue via model
+                self._trace.record(
+                    "tool_error",
+                    {
+                        "name": str(call["name"]),
+                        "call_id": str(call["call_id"]),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                output = _tool_error(exc)
         else:
             try:
                 output = await self._tools.resume(

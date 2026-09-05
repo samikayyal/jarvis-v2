@@ -25,6 +25,7 @@ from .openwa import (
     WebhookAcknowledgement,
     build_openwa_message_flow,
 )
+from .reminders import ReminderStore, ReminderTools
 from .responses import build_direct_responses_runner
 from .runtime import build_runtime_from_loaded
 from .trace import build_runtime_trace
@@ -104,7 +105,13 @@ async def build_service_async(
     config = loaded.config
     trace = build_runtime_trace(config)
     configured_services = ()
-    additional_tools = ()
+    reminder_tools = ReminderTools(
+        ReminderStore(config.reminder_database_path),
+        operator_timezone=config.operator_timezone,
+        trace=trace,
+        max_result_chars=config.max_output_chars,
+    )
+    additional_tools = (reminder_tools,)
     connections = None
     if config.google is not None:
         client_id = loaded.secrets.google_oauth_client_id
@@ -118,7 +125,7 @@ async def build_service_async(
             max_output_chars=config.google.max_output_chars,
             trace=trace,
         )
-        additional_tools = (google_tools,)
+        additional_tools += (google_tools,)
         connections = google_tools
     elif config.mcp_services:
         client_id = loaded.secrets.google_oauth_client_id
@@ -134,7 +141,7 @@ async def build_service_async(
         configured_services = await prepare_configured_mcp_services(
             config.mcp_services, transport
         )
-        additional_tools = configured_services
+        additional_tools += configured_services
         connections = GoogleConnectionManager(configured_services, tokens)
     runner = build_direct_responses_runner(
         loaded.secrets.openai_api_key,
