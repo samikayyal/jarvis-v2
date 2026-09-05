@@ -786,13 +786,12 @@ class ReminderTools:
         if due_at <= _utc(self._clock.now(), "now"):
             raise ReminderError("due time must be in the future")
         reminder_id = self._new_id()
-        display = (
-            "Create reminder?\n"
-            f"ID: {reminder_id}\n"
-            f"Body: {body}\n"
-            f"Date: {local.date().isoformat()}\n"
-            f"Time: {local.time().isoformat()}\n"
-            f"Timezone: {self._timezone_name}"
+        display = self._display(
+            "Create reminder?",
+            reminder_id=reminder_id,
+            body=body,
+            local=local,
+            timezone=self._timezone_name,
         )
         self._trace.record(
             "reminder_create_proposed",
@@ -851,7 +850,13 @@ class ReminderTools:
                 },
             )
             raise
-        display = self._display("Edit reminder?", candidate, local)
+        display = self._display(
+            "Edit reminder?",
+            reminder_id=candidate.id,
+            body=candidate.body,
+            local=local,
+            timezone=candidate.timezone,
+        )
         self._trace.record(
             "reminder_edit_proposed",
             {
@@ -900,7 +905,13 @@ class ReminderTools:
             PendingAction(
                 host="reminder",
                 prefix="cancel_reminder",
-                display=self._display("Cancel reminder?", record, local),
+                display=self._display(
+                    "Cancel reminder?",
+                    reminder_id=record.id,
+                    body=record.body,
+                    local=local,
+                    timezone=record.timezone,
+                ),
                 allow_save_permission=False,
             ),
             _CancelContinuation(record.updated_at, record.id),
@@ -917,14 +928,21 @@ class ReminderTools:
         return record
 
     @staticmethod
-    def _display(label: str, record: Reminder, local: datetime) -> str:
+    def _display(
+        label: str,
+        *,
+        reminder_id: str,
+        body: str,
+        local: datetime,
+        timezone: str,
+    ) -> str:
         return (
             f"{label}\n"
-            f"ID: {record.id}\n"
-            f"Body: {record.body}\n"
+            f"ID: {reminder_id}\n"
+            f"Body: {body}\n"
             f"Date: {local.date().isoformat()}\n"
             f"Time: {local.time().isoformat()}\n"
-            f"Timezone: {record.timezone}"
+            f"Timezone: {timezone}"
         )
 
     def _list(self, arguments: dict[str, object]) -> str:

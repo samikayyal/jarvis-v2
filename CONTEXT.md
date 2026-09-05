@@ -97,7 +97,8 @@ _Avoid_: Deterministic command, provider conversation object
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
 current prepared tools are `read_vault`, `run_terminal`, the bounded Google API
-tools, and the manifest-selected bounded operations of configured MCP services.
+tools, `create_reminder`, `edit_reminder`, `list_reminders`, `cancel_reminder`,
+and the manifest-selected bounded operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
 
 **Google API tools**:
@@ -121,11 +122,12 @@ the prior link.
 _Avoid_: Configured Google identity, OAuth token, configured MCP service
 
 **Pending action**:
-The one exact terminal command or Google write waiting indefinitely for the
-authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
-`9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all
-other messages are silently ignored while either kind is pending except the
-exact Google connection controls. Reauthorization or disconnection invalidates
+The one exact terminal command, Google write, or Reminder write waiting
+indefinitely for the authorized operator's deterministic choice. Terminal
+commands accept `1`, `2`, `9`, or `/cancel`; Google and Reminder writes accept
+only `1`, `9`, or `/cancel`, and all other messages are silently ignored while
+one is pending except the exact Google connection controls. Reauthorization or
+disconnection invalidates
 a pending Google write created under the prior connection.
 _Avoid_: Active request, saved permission, queued action
 

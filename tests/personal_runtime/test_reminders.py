@@ -731,3 +731,77 @@ def test_mutation_tool_descriptions_forbid_guessing_ambiguous_references() -> No
         assert "more than one" in description
         assert "ask the operator" in description
         assert "Never guess" in description
+
+
+@pytest.mark.parametrize("operation", ["edit", "cancel"])
+def test_ambiguous_conversational_match_lists_and_asks_without_guessing_id(
+    tmp_path: Path, operation: str
+) -> None:
+    _store, tools, _, trace = make_tools(tmp_path, ids=["first001", "second01"])
+    for body, due_local in (
+        ("Call Sara about the first draft", "2026-09-06T12:00"),
+        ("Call Sara about the final draft", "2026-09-06T13:00"),
+    ):
+        proposal = execute(
+            tools,
+            "create_reminder",
+            {"body": body, "due_local": due_local},
+        )
+        assert isinstance(proposal, ApprovalRequired)
+        resume(tools, proposal.continuation, True)
+
+    class Responses:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.results = [
+                ResponsesResult(
+                    output=(
+                        {
+                            "type": "function_call",
+                            "name": "list_reminders",
+                            "call_id": "call-list",
+                            "arguments": json.dumps({"include_terminal": False}),
+                        },
+                    ),
+                    output_text="",
+                ),
+                ResponsesResult(
+                    output=(),
+                    output_text=(
+                        "I found two matching pending Reminders. Which one do you mean: "
+                        "first001 or second01?"
+                    ),
+                ),
+            ]
+
+        async def create(
+            self, request: dict[str, object], *, timeout: float
+        ) -> ResponsesResult:
+            self.requests.append(request)
+            return self.results.pop(0)
+
+    responses = Responses()
+    runner = DirectResponsesRunner(
+        responses,
+        tools=tools,
+        request_timeout_seconds=30,
+        trace=trace,
+    )
+
+    result = asyncio.run(
+        runner.run(
+            f"{operation} my Sara reminder",
+            model="gpt-test",
+            reasoning="low",
+            system_prompt="Use the prepared Reminder operations exactly as described.",
+        )
+    )
+
+    assert isinstance(result, Completed)
+    assert result.reply is not None
+    assert "Which one do you mean" in result.reply
+    tool_calls = [payload for event, payload in trace.events if event == "tool_call"]
+    assert [call["name"] for call in tool_calls] == ["list_reminders"]
+    assert len(responses.requests) == 2
+    assert '"id":"first001"' in str(responses.requests[1]["input"])
+    assert '"id":"second01"' in str(responses.requests[1]["input"])
