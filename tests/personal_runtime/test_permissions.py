@@ -89,6 +89,25 @@ def test_store_generates_deterministic_ids_and_atomic_replacement(
     assert "answer = 7" in path.read_text(encoding="utf-8")
 
 
+def test_store_replaces_explicit_empty_rules_before_adding_first_rule(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jarvis.toml"
+    path.write_text(
+        "[saved_permissions]\nrules = []\n\n[other]\nrules = []\nvalue = 42\n",
+        encoding="utf-8",
+    )
+    store = TomlPermissionStore(path)
+
+    added = store.add("ubuntu", "date")
+
+    assert store.list_rules() == (added,)
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.count("rules = []") == 1
+    assert rendered.count("[[saved_permissions.rules]]") == 1
+    assert "[other]\nrules = []\nvalue = 42" in rendered
+
+
 def test_store_rejects_malformed_or_ambiguous_permission_toml_without_writing(
     tmp_path: Path,
 ) -> None:

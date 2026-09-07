@@ -18,6 +18,7 @@ _RULE_BLOCK = re.compile(
     r".*?(?=^\[|\Z)"
 )
 _SAVED_HEADER = re.compile(r"(?m)^\[saved_permissions\][ \t]*$")
+_EMPTY_RULES = re.compile(r"(?m)^[ \t]*rules[ \t]*=[ \t]*\[[ \t]*\][ \t]*\r?\n?")
 _NEXT_SECTION = re.compile(r"(?m)^\[(?!saved_permissions(?:\.|\]))[^\r\n]+\][ \t]*$")
 
 
@@ -209,6 +210,9 @@ def _render_updated_document(original: str, rules: tuple[PermissionRule, ...]) -
         insert_at = (
             len(text) if next_section is None else header.end() + next_section.start()
         )
+        section = _EMPTY_RULES.sub("", text[header.end() : insert_at])
+        text = text[: header.end()] + section + text[insert_at:]
+        insert_at = header.end() + len(section)
 
     blocks = "".join(
         "\n[[saved_permissions.rules]]\n"
