@@ -268,7 +268,7 @@ def test_http_sender_preserves_the_verified_openwa_send_text_contract() -> None:
     requests: list[Request] = []
 
     def opener(request: Request, *, timeout: float) -> _Response:
-        assert timeout == 5.0
+        assert timeout == 15.0
         requests.append(request)
         return _Response(b'{"messageId":"wa-outbound-001"}')
 

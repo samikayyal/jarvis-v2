@@ -132,7 +132,7 @@ class _SystemClock:
 
 
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024
-OPENWA_TIMEOUT_SECONDS = 5.0
+OPENWA_TIMEOUT_SECONDS = 15.0
 
 
 class _RejectRedirects(HTTPRedirectHandler):
