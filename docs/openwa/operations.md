@@ -42,6 +42,11 @@ as an ingestion failure until the internal ID has been used.
 
 ## Controlled service recreation
 
+The `openwa-api` service environment must pin `SIMULATE_TYPING=false`. This
+disables OpenWA's length-scaled, jittered pause before every text send. Jarvis
+uses the separate typing-presence endpoint while it is actually processing and
+clears that presence before submitting the completed reply.
+
 Use a recreation when applying Compose changes or proving persistence:
 
 ```bash

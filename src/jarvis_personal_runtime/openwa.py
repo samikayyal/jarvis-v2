@@ -79,6 +79,8 @@ class Clock(Protocol):
 
 
 class OpenWASender(Protocol):
+    def set_typing(self, chat_id: str, *, active: bool) -> None: ...
+
     def send_text(self, chat_id: str, text: str) -> str: ...
 
 
@@ -132,7 +134,7 @@ class _SystemClock:
 
 
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024
-OPENWA_TIMEOUT_SECONDS = 15.0
+OPENWA_TIMEOUT_SECONDS = 5.0
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -161,6 +163,40 @@ class OpenWAHttpSender:
     ) -> None:
         self.settings = settings
         self._opener = opener or build_opener(_RejectRedirects()).open
+
+    def set_typing(self, chat_id: str, *, active: bool) -> None:
+        if chat_id != self.settings.operator_chat_id:
+            raise OpenWASendError("recipient_not_configured", may_have_sent=False)
+        session_id = quote(self.settings.internal_session_id, safe="")
+        body = json.dumps(
+            {"chatId": chat_id, "state": "typing" if active else "paused"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = Request(
+            self.settings.api_base_url.rstrip("/")
+            + f"/sessions/{session_id}/chats/typing",
+            data=body,
+            method="POST",
+            headers={
+                "X-API-Key": self.settings.api_key,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with self._opener(request, timeout=OPENWA_TIMEOUT_SECONDS) as response:
+                status = response.getcode()
+                response_body = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            exc.close()
+            raise OpenWASendError("typing_unavailable", may_have_sent=False) from exc
+        except (HTTPException, TimeoutError, URLError, OSError) as exc:
+            raise OpenWASendError("typing_unavailable", may_have_sent=False) from exc
+        if (
+            status != 200
+            or not isinstance(response_body, bytes)
+            or len(response_body) > MAX_HTTP_RESPONSE_BYTES
+        ):
+            raise OpenWASendError("typing_unavailable", may_have_sent=False)
 
     def send_text(self, chat_id: str, text: str) -> str:
         if chat_id != self.settings.operator_chat_id:
@@ -300,9 +336,13 @@ class OpenWAMessageFlow:
         return _AdmittedMessage(data["id"], data["body"])
 
     async def _process(self, message: _AdmittedMessage) -> MessageOutcome:
-        result = await self._runtime.receive(
-            InboundText(message.message_id, message.body, self._clock.now())
-        )
+        await self._set_typing(message.message_id, active=True)
+        try:
+            result = await self._runtime.receive(
+                InboundText(message.message_id, message.body, self._clock.now())
+            )
+        finally:
+            await self._set_typing(message.message_id, active=False)
         chunks = tuple(
             chunk
             for reply in result.replies
@@ -350,6 +390,25 @@ class OpenWAMessageFlow:
             DeliveryDisposition.SENT if chunks else DeliveryDisposition.NOT_NEEDED
         )
         return MessageOutcome(message.message_id, result, tuple(outbound_ids), delivery)
+
+    async def _set_typing(self, message_id: str, *, active: bool) -> None:
+        state = "typing" if active else "paused"
+        try:
+            await asyncio.to_thread(
+                self._sender.set_typing,
+                self.settings.operator_chat_id,
+                active=active,
+            )
+        except Exception:  # noqa: BLE001 - presence is deliberately best-effort
+            self._trace.record(
+                "openwa_typing_error",
+                {"message_id": message_id, "state": state},
+            )
+        else:
+            self._trace.record(
+                "openwa_typing_result",
+                {"message_id": message_id, "state": state},
+            )
 
 
 def build_openwa_message_flow(

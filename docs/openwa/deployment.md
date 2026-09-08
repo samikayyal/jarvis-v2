@@ -64,6 +64,9 @@ The durable Compose contract is:
 - `BAILEYS_AUTH_DIR=/app/data/baileys`;
 - `SESSION_DATA_PATH=/app/data/sessions` retained for a reversible engine switch;
 - automatic session startup enabled;
+- OpenWA's artificial pre-send typing pause disabled with
+  `SIMULATE_TYPING=false`; Jarvis owns best-effort typing presence only while it
+  is actively processing an admitted message;
 - bundled dashboard and API served by the same container;
 - Swagger disabled;
 - plain-LAN-HTTP CSP behavior retained;

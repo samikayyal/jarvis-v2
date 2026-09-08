@@ -48,7 +48,11 @@ class _BlockingRunner:
 class _RecordingSender:
     def __init__(self, fail_at: int | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.activity: list[tuple[str, str]] = []
         self.fail_at = fail_at
+
+    def set_typing(self, chat_id: str, *, active: bool) -> None:
+        self.activity.append(("typing" if active else "paused", chat_id))
 
     def send_text(self, chat_id: str, text: str) -> str:
         self.sent.append((chat_id, text))
@@ -134,11 +138,16 @@ def test_signed_direct_text_is_acknowledged_before_runtime_work_finishes() -> No
         assert runner.entered.is_set() is False
 
         await asyncio.wait_for(runner.entered.wait(), timeout=1)
+        assert sender.activity == [("typing", OPERATOR)]
         assert sender.sent == []
         runner.release.set()
         outcomes = await flow.drain()
 
         assert outcomes[0].message_id == "wa-inbound-001"
+        assert sender.activity == [
+            ("typing", OPERATOR),
+            ("paused", OPERATOR),
+        ]
         assert sender.sent == [(OPERATOR, "done")]
 
     asyncio.run(scenario())
@@ -268,17 +277,25 @@ def test_http_sender_preserves_the_verified_openwa_send_text_contract() -> None:
     requests: list[Request] = []
 
     def opener(request: Request, *, timeout: float) -> _Response:
-        assert timeout == 15.0
+        assert timeout == 5.0
         requests.append(request)
+        if request.full_url.endswith("/chats/typing"):
+            return _Response(b'{"success":true}', status=200)
         return _Response(b'{"messageId":"wa-outbound-001"}')
 
     sender = OpenWAHttpSender(_settings(), opener=opener)
 
+    sender.set_typing(OPERATOR, active=True)
+    sender.set_typing(OPERATOR, active=False)
     outbound_id = sender.send_text(OPERATOR, "hello from replacement")
 
     assert outbound_id == "wa-outbound-001"
-    assert len(requests) == 1
-    request = requests[0]
+    assert len(requests) == 3
+    typing, paused, request = requests
+    assert typing.full_url.endswith(f"/sessions/{SESSION_ID}/chats/typing")
+    assert json.loads(typing.data) == {"chatId": OPERATOR, "state": "typing"}
+    assert paused.full_url.endswith(f"/sessions/{SESSION_ID}/chats/typing")
+    assert json.loads(paused.data) == {"chatId": OPERATOR, "state": "paused"}
     assert request.get_method() == "POST"
     assert request.full_url.endswith(f"/sessions/{SESSION_ID}/messages/send-text")
     assert dict(request.header_items()) == {
@@ -289,6 +306,33 @@ def test_http_sender_preserves_the_verified_openwa_send_text_contract() -> None:
         "chatId": OPERATOR,
         "text": "hello from replacement",
     }
+
+
+def test_typing_failure_does_not_delay_or_block_the_reply() -> None:
+    class FailingTypingSender(_RecordingSender):
+        def set_typing(self, chat_id: str, *, active: bool) -> None:
+            raise OpenWASendError("typing_unavailable", may_have_sent=False)
+
+    async def scenario() -> None:
+        runner = _BlockingRunner()
+        runner.release.set()
+        sender = FailingTypingSender()
+        flow = OpenWAMessageFlow(
+            settings=_settings(),
+            signing_secret=SECRET,
+            runtime=PersonalRuntime(request_runner=runner, clock=_Clock()),
+            sender=sender,
+            clock=_Clock(),
+        )
+        raw_body = _event()
+
+        flow.receive_webhook(raw_body, _headers(raw_body))
+        outcomes = await flow.drain()
+
+        assert sender.sent == [(OPERATOR, "done")]
+        assert outcomes[0].delivery is DeliveryDisposition.SENT
+
+    asyncio.run(scenario())
 
 
 def test_duplicate_admitted_message_is_suppressed_without_a_second_send() -> None:

@@ -175,6 +175,9 @@ _Avoid_: Sanitized application log, hidden model reasoning
 - Terminal commands and outbound message chunks execute once. Timeouts or
   transport failures after an attempt are uncertain and are never retried
   automatically.
+- OpenWA's artificial pre-send typing delay is disabled. Jarvis uses best-effort
+  typing presence only while it is processing an admitted message and clears it
+  before sending the completed reply.
 - Retrieved vault content and terminal output are untrusted data. They cannot
   grant authority, alter policy, select another host, or approve work.
 - Runtime traces are sensitive verbatim data. Hidden model reasoning is not
