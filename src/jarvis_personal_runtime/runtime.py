@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from .config import LoadedRuntimeConfig, RuntimeConfig, load_runtime_config
+from .config import (
+    MODEL_REASONING_EFFORTS,
+    LoadedRuntimeConfig,
+    RuntimeConfig,
+    load_runtime_config,
+    normalize_model_alias,
+)
 from .dedup import CacheError, MessageIdCache
 from .permissions import PermissionRule, TomlPermissionStore
 from .trace import build_runtime_trace
@@ -645,8 +651,7 @@ class PersonalRuntime:
                 RuntimeDisposition.CONFIGURATION_BLOCKED,
                 ("Model and reasoning cannot change during an active request.",),
             )
-        value = args[0]
-        value = f"gpt-5.6-{value}" if value in {"luna", "sol", "terra"} else value
+        value = normalize_model_alias(args[0])
         allowed = (
             self.config.allowed_models
             if command == "/model"
@@ -658,10 +663,31 @@ class PersonalRuntime:
                 (f"Allowed values: {', '.join(allowed)}",),
             )
         if command == "/model":
+            if self._reasoning not in MODEL_REASONING_EFFORTS[value]:
+                supported = ", ".join(MODEL_REASONING_EFFORTS[value])
+                message = (
+                    f"{value} does not support reasoning effort "
+                    f"{self._reasoning}. Set reasoning to one of: {supported}."
+                )
+                return self._result(
+                    RuntimeDisposition.INVALID_CONFIGURATION,
+                    (message,),
+                )
             self._model = value
             if self._session:
                 self._session.model = value
         else:
+            supported_efforts = MODEL_REASONING_EFFORTS[self._model]
+            if value not in supported_efforts:
+                allowed = tuple(
+                    effort
+                    for effort in self.config.allowed_reasoning_efforts
+                    if effort in supported_efforts
+                )
+                return self._result(
+                    RuntimeDisposition.INVALID_CONFIGURATION,
+                    (f"Allowed values: {', '.join(allowed)}",),
+                )
             self._reasoning = value
             if self._session:
                 self._session.reasoning = value

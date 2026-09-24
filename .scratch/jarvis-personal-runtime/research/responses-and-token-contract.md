@@ -218,12 +218,18 @@ TOML value is not proof that every possible model accepts it. A configuration
 or `/reasoning` change should be validated against the selected model, and an
 unsupported pair should fail visibly rather than falling back.
 
-The current guide describes GPT-5.6 reasoning mode as `standard` by default
+For the selected variants, GPT-6 Astra accepts `low`, `medium`, `high`,
+`xhigh`, and `max`; GPT-6 Sol, GPT-5.6 Terra, and GPT-6 Luna also accept
+`none`. None of these four model pages lists `minimal`, so Jarvis does not
+offer it. Reject an unsupported configured pair at startup and reject an
+unsupported `/model` or `/reasoning` change before it reaches the API.
+
+The current guide describes GPT-6 reasoning mode as `standard` by default
 and `pro` as a separate, higher-work option. The simplified Jarvis contract
 does not need to expose `reasoning.mode`; pass only the configured effort
 unless a later product decision adds a mode.
 
-`reasoning.context` is separate from effort. The guide says GPT-5.6 models
+`reasoning.context` is separate from effort. The guide says GPT-6 models
 support `all_turns` and use it by default, while earlier models default to
 `current_turn`. If implementation exposes this setting, it must be explicit
 and model-aware. It should not be inferred from the local transcript alone.

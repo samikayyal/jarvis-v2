@@ -167,7 +167,7 @@ async def test_exact_context_limit_ends_session_before_initial_provider_call() -
     )
 
     result = await runner.run(
-        "Hi", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+        "Hi", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
 
     assert isinstance(result, ContextLimitReached)
@@ -206,7 +206,7 @@ async def test_continuation_is_gated_with_complete_tool_result_context() -> None
     )
 
     result = await runner.run(
-        "Read", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+        "Read", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
 
     assert isinstance(result, ContextLimitReached)
@@ -238,14 +238,14 @@ async def test_oversized_final_text_is_rejected_without_entering_transcript() ->
     with pytest.raises(RuntimeError, match="configured output character limit"):
         await runner.run(
             "First",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
 
     await runner.run(
         "Second",
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         reasoning="medium",
         system_prompt="Help.",
     )
@@ -270,7 +270,7 @@ async def test_provider_usage_is_traced_next_to_the_local_estimate() -> None:
     )
 
     await runner.run(
-        "Hi", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+        "Hi", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
 
     output = next(
@@ -290,13 +290,13 @@ async def test_final_text_uses_the_direct_stateless_responses_contract() -> None
     runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
 
     result = await runner.run(
-        "Hi", model="gpt-5.6-luna", reasoning="medium", system_prompt="Be useful."
+        "Hi", model="gpt-6-luna", reasoning="medium", system_prompt="Be useful."
     )
 
     assert result.reply == "Hello"
     request, timeout = responses.calls[0]
     assert request == {
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "instructions": "Be useful.",
         "input": [{"role": "user", "content": "Hi"}],
         "tools": [],
@@ -341,7 +341,7 @@ async def test_one_tool_call_replays_complete_output_before_exact_result() -> No
     )
 
     result = await runner.run(
-        "Find it", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+        "Find it", model="gpt-6-astra", reasoning="high", system_prompt="Use tools."
     )
 
     assert result.reply == "I found it."
@@ -402,7 +402,7 @@ async def test_output_replay_omits_response_only_status() -> None:
     )
 
     result = await runner.run(
-        "Find it", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+        "Find it", model="gpt-6-astra", reasoning="high", system_prompt="Use tools."
     )
 
     assert result.reply == "Found it."
@@ -452,13 +452,13 @@ async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -
     )
 
     pending = await runner.run(
-        "Find it", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+        "Find it", model="gpt-6-astra", reasoning="high", system_prompt="Use tools."
     )
     assert isinstance(pending, ApprovalRequired)
 
     runner.cancel_pending(pending.continuation)
     result = await runner.run(
-        "Continue", model="gpt-5.6-sol", reasoning="high", system_prompt="Use tools."
+        "Continue", model="gpt-6-astra", reasoning="high", system_prompt="Use tools."
     )
 
     assert result.reply == "Next request completed."
@@ -499,7 +499,7 @@ async def test_tool_error_is_returned_to_the_model_and_continuation_proceeds() -
     )
 
     result = await runner.run(
-        "Read it", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+        "Read it", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
 
     assert result.reply == "The vault is unavailable."
@@ -529,7 +529,7 @@ async def test_malformed_tool_arguments_continue_as_a_tool_error() -> None:
     )
 
     result = await runner.run(
-        "Read it", model="gpt-5.6-luna", reasoning="medium", system_prompt="Help."
+        "Read it", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
 
     assert result.reply == "I could not use that tool call."
@@ -555,14 +555,14 @@ async def test_failed_continuation_preserves_observed_tool_turn_in_session() -> 
     with pytest.raises(OSError, match="provider unavailable"):
         await runner.run(
             "First",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
     responses.results.append(ResponsesResult(output=(), output_text="Recovered"))
     result = await runner.run(
         "Continue",
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         reasoning="medium",
         system_prompt="Help.",
     )
@@ -589,7 +589,7 @@ async def test_response_without_tool_call_or_final_text_is_rejected() -> None:
     with pytest.raises(RuntimeError, match="final text"):
         await runner.run(
             "Hello",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
@@ -627,7 +627,7 @@ async def test_multiple_function_calls_are_traced_and_rejected_without_execution
     with pytest.raises(RuntimeError, match="multiple function calls"):
         await runner.run(
             "Read twice",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
@@ -667,7 +667,7 @@ async def test_tool_round_limit_rejects_the_next_call_before_execution() -> None
     with pytest.raises(RuntimeError, match="tool-round limit"):
         await runner.run(
             "Keep reading",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
@@ -689,14 +689,14 @@ async def test_current_session_history_and_each_turns_overrides_are_replayed() -
     runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
 
     await runner.run(
-        "One", model="gpt-5.6-luna", reasoning="medium", system_prompt="Always."
+        "One", model="gpt-6-luna", reasoning="medium", system_prompt="Always."
     )
     await runner.run(
-        "Two", model="gpt-5.6-sol", reasoning="max", system_prompt="Always."
+        "Two", model="gpt-6-astra", reasoning="max", system_prompt="Always."
     )
 
     request, _ = responses.calls[1]
-    assert request["model"] == "gpt-5.6-sol"
+    assert request["model"] == "gpt-6-astra"
     assert request["reasoning"] == {"effort": "max"}
     assert request["instructions"] == "Always."
     assert request["input"] == [
@@ -715,7 +715,7 @@ async def test_starting_a_new_session_discards_the_prior_transcript() -> None:
     runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
     await runner.run(
         "Old request",
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         reasoning="medium",
         system_prompt="Always.",
     )
@@ -723,7 +723,7 @@ async def test_starting_a_new_session_discards_the_prior_transcript() -> None:
     runner.start_session()
     await runner.run(
         "New request",
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         reasoning="medium",
         system_prompt="Always.",
     )
@@ -740,7 +740,7 @@ async def test_foreground_cancellation_is_traced_as_local_best_effort() -> None:
     task = asyncio.create_task(
         runner.run(
             "Wait",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
@@ -769,7 +769,7 @@ async def test_overall_deadline_bounds_the_whole_request() -> None:
     with pytest.raises(TimeoutError):
         await runner.run(
             "Wait",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )
@@ -796,7 +796,7 @@ async def test_openai_adapter_traces_every_sdk_retry_attempt_and_raw_exchange() 
                 "object": "response",
                 "created_at": 1,
                 "status": "completed",
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "output": [
                     {
                         "id": "msg_1",
@@ -826,7 +826,7 @@ async def test_openai_adapter_traces_every_sdk_retry_attempt_and_raw_exchange() 
     try:
         result = await adapter.create(
             {
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "instructions": "Help.",
                 "input": [{"role": "user", "content": "Hi"}],
                 "tools": [],
@@ -869,7 +869,7 @@ async def test_sdk_retry_backoff_cannot_escape_the_runner_deadline() -> None:
         with pytest.raises(TimeoutError):
             await runner.run(
                 "Hi",
-                model="gpt-5.6-luna",
+                model="gpt-6-luna",
                 reasoning="medium",
                 system_prompt="Help.",
             )

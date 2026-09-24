@@ -78,7 +78,7 @@ def test_direct_responses_loop_executes_the_prepared_vault_contract(
     result = asyncio.run(
         runner.run(
             "Read the note",
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             reasoning="medium",
             system_prompt="Help.",
         )

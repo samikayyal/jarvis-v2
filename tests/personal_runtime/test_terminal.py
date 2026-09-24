@@ -483,7 +483,7 @@ async def test_terminal_failure_is_returned_once_and_never_retried(
 
     result = await runner.run(
         "check it",
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
         reasoning="medium",
         system_prompt="Help.",
     )

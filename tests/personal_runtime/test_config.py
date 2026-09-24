@@ -49,13 +49,22 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert isinstance(loaded, LoadedRuntimeConfig)
     assert isinstance(loaded.config, RuntimeConfig)
     assert isinstance(loaded.secrets, RuntimeSecrets)
-    assert loaded.config.model == DEFAULTS["model"] == "gpt-5.6-luna"
+    assert loaded.config.model == DEFAULTS["model"] == "gpt-6-luna"
     assert loaded.config.allowed_models == (
-        "gpt-5.6-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
         "gpt-5.6-terra",
-        "gpt-5.6-luna",
+        "gpt-6-luna",
     )
     assert loaded.config.reasoning_effort == "medium"
+    assert loaded.config.allowed_reasoning_efforts == (
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
     assert loaded.config.inactivity_minutes == 60
     assert loaded.config.max_context_tokens == 100_000
     assert loaded.config.request_timeout_seconds == 600
@@ -89,7 +98,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.secrets.openwa_webhook_signing_secret == "signing-test"
 
     with pytest.raises(FrozenInstanceError):
-        loaded.config.model = "gpt-5.6-sol"  # type: ignore[misc]
+        loaded.config.model = "gpt-6-astra"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         loaded.secrets.openai_api_key = "changed"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
@@ -111,8 +120,58 @@ def test_toml_may_be_loaded_outside_the_runtime_root(tmp_path: Path) -> None:
 
     assert loaded.toml_path == external_config
     assert loaded.config.root == root
-    assert loaded.config.model == "gpt-5.6-sol"
+    assert loaded.config.model == "gpt-6-sol"
     assert loaded.config.message_cache_path == root / "data" / "message-cache.json"
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected"),
+    [
+        ("astra", "gpt-6-astra"),
+        ("6-astra", "gpt-6-astra"),
+        ("sol", "gpt-6-sol"),
+        ("6-sol", "gpt-6-sol"),
+        ("terra", "gpt-5.6-terra"),
+        ("5.6-terra", "gpt-5.6-terra"),
+        ("luna", "gpt-6-luna"),
+        ("6-luna", "gpt-6-luna"),
+    ],
+)
+def test_short_model_aliases_resolve_to_supported_models(
+    tmp_path: Path, alias: str, expected: str
+) -> None:
+    _write_runtime_files(tmp_path, toml=f'model = "{alias}"\n')
+
+    loaded = load_runtime_config(tmp_path)
+
+    assert loaded.config.model == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "supported"),
+    [
+        ("gpt-6-astra", "none", False),
+        ("gpt-6-astra", "low", True),
+        ("gpt-6-sol", "none", True),
+        ("gpt-5.6-terra", "none", True),
+        ("gpt-6-luna", "none", True),
+    ],
+)
+def test_config_rejects_reasoning_efforts_unsupported_by_model(
+    tmp_path: Path, model: str, effort: str, supported: bool
+) -> None:
+    _write_runtime_files(
+        tmp_path,
+        toml=f'model = "{model}"\nreasoning_effort = "{effort}"\n',
+    )
+
+    if supported:
+        loaded = load_runtime_config(tmp_path)
+        assert loaded.config.model == model
+        assert loaded.config.reasoning_effort == effort
+    else:
+        with pytest.raises(ConfigError, match="unsupported for model"):
+            load_runtime_config(tmp_path)
 
 
 @pytest.mark.parametrize("timezone", [None, "", "Mars/Amman"])
@@ -158,7 +217,7 @@ def test_toml_overrides_are_validated_and_paths_are_rooted(tmp_path: Path) -> No
         tmp_path,
         toml="""
 [runtime]
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 reasoning_effort = "high"
 inactivity_minutes = 12
 max_context_tokens = 1234
@@ -184,7 +243,7 @@ vault_path = "vault"
 
     loaded = load_runtime_config(tmp_path)
 
-    assert loaded.config.model == "gpt-5.6-sol"
+    assert loaded.config.model == "gpt-6-astra"
     assert loaded.config.reasoning_effort == "high"
     assert loaded.config.inactivity_minutes == 12
     assert loaded.config.max_context_tokens == 1234
@@ -407,6 +466,7 @@ def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:
     [
         ('[runtime]\nmodel = "not-allowed"\n', "model"),
         ('[runtime]\nreasoning_effort = "bogus"\n', "reasoning_effort"),
+        ('[runtime]\nreasoning_effort = "minimal"\n', "reasoning_effort"),
         ("[runtime]\ninactivity_minutes = 0\n", "inactivity_minutes"),
         ("[runtime]\nmax_context_tokens = -1\n", "max_context_tokens"),
         ("[runtime]\nrequest_timeout_seconds = 0\n", "request_timeout_seconds"),

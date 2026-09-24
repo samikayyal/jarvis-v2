@@ -86,7 +86,7 @@ def dispatch(state: ControlState, line: str) -> Transition:
 def demo(state: ControlState) -> ControlState:
     steps = (
         ("operator", "/status"),
-        ("operator", "/model gpt-5.6-sol"),
+        ("operator", "/model 5.6-terra"),
         ("operator", "/reasoning high"),
         ("operator", "Check the file I downloaded in Chrome on my laptop"),
         ("system", "route windows request refers to a file on the personal laptop"),

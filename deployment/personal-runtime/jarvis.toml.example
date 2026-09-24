@@ -1,8 +1,8 @@
 [runtime]
-model = "gpt-5.6-luna"
-allowed_models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+model = "gpt-6-luna"
+allowed_models = ["gpt-6-astra", "gpt-6-sol", "gpt-5.6-terra", "gpt-6-luna"]
 reasoning_effort = "medium"
-allowed_reasoning_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+allowed_reasoning_efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 inactivity_minutes = 60
 max_context_tokens = 100000
 request_timeout_seconds = 600

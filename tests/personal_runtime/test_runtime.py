@@ -116,7 +116,7 @@ def inbound(message_id: str, text: str, at: datetime = NOW) -> InboundText:
 async def test_ordinary_text_starts_one_request_and_returns_completed_reply() -> None:
     runner = FakeRunner()
     runtime = PersonalRuntime(
-        RuntimeConfig(model="gpt-5.6-luna", reasoning_effort="medium"),
+        RuntimeConfig(model="gpt-6-luna", reasoning_effort="medium"),
         request_runner=runner,
     )
 
@@ -124,7 +124,7 @@ async def test_ordinary_text_starts_one_request_and_returns_completed_reply() ->
 
     assert result.disposition == "completed"
     assert result.replies == ("done",)
-    assert runner.calls == [("hello", "gpt-5.6-luna", "medium")]
+    assert runner.calls == [("hello", "gpt-6-luna", "medium")]
     assert runtime.status().active_request is None
 
 
@@ -157,7 +157,7 @@ async def test_second_ordinary_message_is_refused_while_first_request_is_active(
     second = await runtime.receive(inbound("m2", "second"))
 
     assert second.disposition in {"busy", "busy_refused"}
-    assert runner.calls == [("first", "gpt-5.6-luna", "medium")]
+    assert runner.calls == [("first", "gpt-6-luna", "medium")]
 
     runner.release.set()
     assert (await first).replies == ("done",)
@@ -296,7 +296,7 @@ async def test_model_and_reasoning_commands_are_deterministic_and_slash_unknown_
 
     model = await runtime.receive(inbound("m1", "/model sol"))
     reasoning = await runtime.receive(inbound("m2", "/reasoning max"))
-    malformed = await runtime.receive(inbound("m3", "/model gpt-5.6-sol extra"))
+    malformed = await runtime.receive(inbound("m3", "/model gpt-6-astra extra"))
     unknown = await runtime.receive(inbound("m4", "/not-a-command"))
 
     assert model.disposition == "command"
@@ -304,8 +304,39 @@ async def test_model_and_reasoning_commands_are_deterministic_and_slash_unknown_
     assert malformed.disposition == "malformed_command"
     assert unknown.disposition == "unknown_command"
     assert runner.calls == []
-    assert runtime.status().model == "gpt-5.6-sol"
+    assert runtime.status().model == "gpt-6-sol"
     assert runtime.status().reasoning == "max"
+
+
+@async_test
+async def test_model_aliases_and_model_specific_reasoning_are_enforced() -> None:
+    runtime = PersonalRuntime(request_runner=FakeRunner())
+
+    terra = await runtime.receive(inbound("m1", "/model 5.6-terra"))
+    terra_model = runtime.status().model
+    no_reasoning = await runtime.receive(inbound("m2", "/reasoning none"))
+    astra_while_none = await runtime.receive(inbound("m3", "/model 6-astra"))
+    low_reasoning = await runtime.receive(inbound("m4", "/reasoning low"))
+    astra = await runtime.receive(inbound("m5", "/model 6-astra"))
+    none_on_astra = await runtime.receive(inbound("m6", "/reasoning none"))
+
+    assert terra.disposition == "command"
+    assert terra_model == "gpt-5.6-terra"
+    assert no_reasoning.disposition == "command"
+    assert astra_while_none.disposition == "invalid_configuration"
+    assert astra_while_none.replies == (
+        (
+            "gpt-6-astra does not support reasoning effort none. Set reasoning to "
+            "one of: low, medium, high, xhigh, max."
+        ),
+    )
+    assert low_reasoning.disposition == "command"
+    assert astra.disposition == "command"
+    assert astra.replies == ("Set to gpt-6-astra.",)
+    assert none_on_astra.disposition == "invalid_configuration"
+    assert none_on_astra.replies == ("Allowed values: low, medium, high, xhigh, max",)
+    assert runtime.status().model == "gpt-6-astra"
+    assert runtime.status().reasoning == "low"
 
 
 @async_test
@@ -401,14 +432,14 @@ async def test_restart_discards_session_work_and_persists_message_ids(
     first_runner = FakeRunner(ApprovalRequired(action, "continuation"))
     first = build_runtime(tmp_path, request_runner=first_runner, clock=clock)
 
-    await first.receive(inbound("selection", "/model gpt-5.6-sol"))
+    await first.receive(inbound("selection", "/model gpt-6-astra"))
     assert (await first.receive(inbound("durable-id", "hello"))).disposition == (
         "approval_required"
     )
     assert first_runner.system_prompts == ["System instructions.\n"]
     before_restart = first.status()
     assert before_restart.session_id is not None
-    assert before_restart.model == "gpt-5.6-sol"
+    assert before_restart.model == "gpt-6-astra"
     assert before_restart.active_request is not None
     assert before_restart.pending_action == action
 
@@ -416,7 +447,7 @@ async def test_restart_discards_session_work_and_persists_message_ids(
     restarted = build_runtime(tmp_path, request_runner=restarted_runner, clock=clock)
     after_restart = restarted.status()
     assert after_restart.session_id is None
-    assert after_restart.model == "gpt-5.6-luna"
+    assert after_restart.model == "gpt-6-luna"
     assert after_restart.active_request is None
     assert after_restart.pending_action is None
 

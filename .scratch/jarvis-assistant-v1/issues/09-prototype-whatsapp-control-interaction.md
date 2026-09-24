@@ -52,9 +52,9 @@ no state change.
 | `/status` | Show the current safe session ID and inactivity boundary, model/reasoning, active request phase and host, pending-action safe summary and expiry, permission count, and Ubuntu/Windows plus connected-service readiness. Never show credentials, cached content, raw tool payloads, or command output. |
 | `/cancel` | Cancel the active request and invalidate its pending action immediately. It does not end the working session or revoke permissions. If idle, report that nothing changed. |
 | `/model` | Show the current session model and canonical choices. |
-| `/model <model>` | Set the idle working session to exactly `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`; persistent default is unchanged. Refuse while a request or approval is active. |
+| `/model <model>` | Set the idle working session to `gpt-6-astra`, `gpt-6-sol`, `gpt-5.6-terra`, or `gpt-6-luna`; accept aliases `6-astra`, `6-sol`, `5.6-terra`, and `6-luna`, plus the shorter forms `astra`, `sol`, `terra`, and `luna`. Refuse while a request or approval is active or its reasoning effort is unsupported by the selected model. |
 | `/reasoning` | Show the current session reasoning and canonical choices. |
-| `/reasoning <level>` | Set the idle working session to exactly `none`, `low`, `medium`, `high`, `xhigh`, or `max`; persistent default is unchanged. Refuse while active. |
+| `/reasoning <level>` | Set the idle working session to `low`, `medium`, `high`, `xhigh`, or `max`; also accept `none` for Sol, Terra, and Luna, but not Astra. Persistent default is unchanged. Refuse while active or when the level is unsupported by the selected model. |
 | `/config` | Show persistent model/reasoning defaults and the inactivity boundary. |
 | `/config model <model>` | Set the persistent model default for future sessions; current session model is unchanged. |
 | `/config reasoning <level>` | Set the persistent reasoning default for future sessions; current session reasoning is unchanged. |
@@ -123,8 +123,8 @@ be replayed.
 ### Reference transcript
 
 ```text
-Operator: /model gpt-5.6-sol
-Jarvis: Session model set to gpt-5.6-sol. Persistent default unchanged.
+Operator: /model 5.6-terra
+Jarvis: Session model set to gpt-5.6-terra. Persistent default unchanged.
 
 Operator: /reasoning high
 Jarvis: Session reasoning set to high. Persistent default unchanged.

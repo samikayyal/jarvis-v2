@@ -5,8 +5,24 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
-MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+MODELS = ("gpt-6-astra", "gpt-6-sol", "gpt-5.6-terra", "gpt-6-luna")
+MODEL_ALIASES = {
+    "astra": "gpt-6-astra",
+    "6-astra": "gpt-6-astra",
+    "sol": "gpt-6-sol",
+    "6-sol": "gpt-6-sol",
+    "terra": "gpt-5.6-terra",
+    "5.6-terra": "gpt-5.6-terra",
+    "luna": "gpt-6-luna",
+    "6-luna": "gpt-6-luna",
+}
 REASONING_LEVELS = ("none", "low", "medium", "high", "xhigh", "max")
+MODEL_REASONING_LEVELS = {
+    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-6-sol": REASONING_LEVELS,
+    "gpt-5.6-terra": REASONING_LEVELS,
+    "gpt-6-luna": REASONING_LEVELS,
+}
 HOSTS = ("ubuntu", "windows")
 SESSION_MINUTES = (15, 30, 60, 120, 240)
 
@@ -66,9 +82,9 @@ class ControlState:
     session_id: str = "S-001"
     session_number: int = 1
     session_minutes: int = 60
-    model: str = "gpt-5.6-terra"
+    model: str = "gpt-6-sol"
     reasoning: str = "medium"
-    default_model: str = "gpt-5.6-terra"
+    default_model: str = "gpt-6-sol"
     default_reasoning: str = "medium"
     active_request: Request | None = None
     pending_action: PendingAction | None = None
@@ -90,6 +106,10 @@ class Transition:
 
 def normalize(message: str) -> str:
     return " ".join(message.strip().lower().split())
+
+
+def normalize_model(value: str) -> str:
+    return MODEL_ALIASES.get(value, value)
 
 
 def approval_choice(message: str) -> ApprovalChoice | None:
@@ -231,11 +251,26 @@ def _handle_command(state: ControlState, message: str) -> Transition:
     if command == "/model":
         if not args:
             return Transition(
-                state, (f"Session model: {state.model}. Valid: {', '.join(MODELS)}.",)
+                state,
+                (
+                    (
+                        f"Session model: {state.model}. Valid: "
+                        "gpt-6-astra (astra), gpt-6-sol (sol), "
+                        "gpt-5.6-terra (terra), gpt-6-luna (luna)."
+                    ),
+                ),
             )
-        if len(args) != 1 or args[0] not in MODELS:
+        model = normalize_model(args[0]) if len(args) == 1 else ""
+        if model not in MODELS:
             return Transition(
-                state, (f"Invalid model. Use exactly one of: {', '.join(MODELS)}.",)
+                state,
+                (
+                    (
+                        "Invalid model. Use one of: gpt-6-astra (astra), "
+                        "gpt-6-sol (sol), gpt-5.6-terra (terra), "
+                        "gpt-6-luna (luna)."
+                    ),
+                ),
             )
         if state.active_request:
             return Transition(
@@ -244,26 +279,31 @@ def _handle_command(state: ControlState, message: str) -> Transition:
                     "Model cannot change while a request or approval is active. Cancel or finish it first.",
                 ),
             )
+        if state.reasoning not in MODEL_REASONING_LEVELS[model]:
+            message = (
+                f"{model} does not support reasoning effort {state.reasoning}. "
+                f"Set reasoning to one of: {', '.join(MODEL_REASONING_LEVELS[model])}."
+            )
+            return Transition(state, (message,))
         updated = replace(
-            state, model=args[0], last_notice=f"Session model set to {args[0]}."
+            state, model=model, last_notice=f"Session model set to {model}."
         )
         return Transition(
-            updated, (f"Session model set to {args[0]}. Persistent default unchanged.",)
+            updated, (f"Session model set to {model}. Persistent default unchanged.",)
         )
     if command == "/reasoning":
+        supported_efforts = MODEL_REASONING_LEVELS[state.model]
         if not args:
             return Transition(
                 state,
                 (
-                    f"Session reasoning: {state.reasoning}. Valid: {', '.join(REASONING_LEVELS)}.",
+                    f"Session reasoning: {state.reasoning}. Valid: {', '.join(supported_efforts)}.",
                 ),
             )
-        if len(args) != 1 or args[0] not in REASONING_LEVELS:
+        if len(args) != 1 or args[0] not in supported_efforts:
             return Transition(
                 state,
-                (
-                    f"Invalid reasoning. Use exactly one of: {', '.join(REASONING_LEVELS)}.",
-                ),
+                (f"Invalid reasoning. Use one of: {', '.join(supported_efforts)}.",),
             )
         if state.active_request:
             return Transition(
@@ -329,14 +369,21 @@ def _handle_config(state: ControlState, args: list[str]) -> Transition:
             ),
         )
     key, value = args
-    if key == "model" and value in MODELS:
+    model = normalize_model(value)
+    if key == "model" and model in MODELS:
+        if state.default_reasoning not in MODEL_REASONING_LEVELS[model]:
+            message = (
+                f"{model} does not support persistent reasoning effort "
+                f"{state.default_reasoning}."
+            )
+            return Transition(state, (message,))
         return Transition(
-            replace(state, default_model=value),
+            replace(state, default_model=model),
             (
-                f"Persistent model default set to {value}; current session remains {state.model}.",
+                f"Persistent model default set to {model}; current session remains {state.model}.",
             ),
         )
-    if key == "reasoning" and value in REASONING_LEVELS:
+    if key == "reasoning" and value in MODEL_REASONING_LEVELS[state.default_model]:
         return Transition(
             replace(state, default_reasoning=value),
             (

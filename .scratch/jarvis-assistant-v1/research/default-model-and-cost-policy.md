@@ -8,22 +8,23 @@ Jarvis Assistant V1 should explicitly run the OpenAI Responses path through the
 Agents SDK with:
 
 ```text
-default model:     gpt-5.6-terra
+default model:     gpt-6-sol
 default reasoning: medium
 execution mode:    standard (do not enable pro by default)
 verbosity:         medium
 ```
 
-Terra is the best V1 default because OpenAI describes it as the GPT-5.6 model
-that balances intelligence and cost. Jarvis is a reactive, single-operator
-assistant with multi-step tool use and approval boundaries, so the balanced
-model is a better starting policy than either the flagship price of Sol or the
-cost-sensitive/high-volume role of Luna. This model choice and the `medium`
-reasoning level are a Jarvis recommendation derived from the product contract,
-not an OpenAI-mandated default. OpenAI's guidance calls `medium` a balanced
-starting effort, while reserving `max` for the hardest quality-first work.
+Sol is the best V1 default for Jarvis's mixed workload because GPT-6 Sol is
+built for complex coding and agentic workflows. Jarvis is a reactive,
+single-operator assistant with multi-step tool use and approval boundaries, so
+the workhorse model is a better starting policy than either the flagship
+capability role of Astra or the cost-sensitive/high-volume role of Luna.
+This model choice and the `medium` reasoning level are a Jarvis
+recommendation derived from the product contract, not an OpenAI-mandated
+default. OpenAI's guidance calls `medium` a balanced starting effort, while
+reserving `max` for the hardest quality-first work.
 [OpenAI model selection](https://developers.openai.com/api/docs/models) ·
-[OpenAI GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+[OpenAI GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 
 The model ID and reasoning effort must be passed explicitly through the
 Agents SDK `Agent`/`RunConfig`/`ModelSettings` path. Do not inherit the SDK's
@@ -41,12 +42,14 @@ visible and testable.
 The following are facts from current first-party OpenAI sources, observed on
 the research date:
 
-- The current frontier choices are `gpt-5.6-sol`, `gpt-5.6-terra`, and
-  `gpt-5.6-luna`. OpenAI describes Sol as the flagship for complex reasoning
-  and coding, Terra as balancing intelligence and cost, and Luna as optimized
-  for cost-sensitive workloads. The `gpt-5.6` alias routes to Sol.
-- The model catalog lists `none`, `low`, `medium`, `high`, `xhigh`, and `max`
-  as the supported reasoning efforts for all three GPT-5.6 variants.
+- The selected variants are `gpt-6-astra`, `gpt-6-sol`, `gpt-5.6-terra`, and
+  `gpt-6-luna`. OpenAI describes Astra as its most capable model for hard
+  end-to-end work, Sol for complex coding and agentic workflows, Terra as
+  balancing intelligence and cost, and Luna for focused, high-volume tasks.
+  Jarvis uses explicit variant IDs rather than an unqualified model alias.
+- All four variants support `low`, `medium`, `high`, `xhigh`, and `max`
+  reasoning effort. Sol, Terra, and Luna additionally support `none`; Astra
+  does not. `minimal` is not accepted by this model set.
 - OpenAI recommends the Responses API for reasoning, tool-calling, and
   multi-turn workflows. The Agents SDK recommends its OpenAI Responses model
   path for OpenAI-only applications.
@@ -54,12 +57,9 @@ the research date:
   `reasoning.effort="none"` and `verbosity="low"`. A run-level `RunConfig`
   model overrides the model on each agent for that run, and `model_settings`
   provides global model settings for that run.
-- OpenAI's current standard prices are per 1M tokens: Sol is $5.00 input,
-  $0.50 cached input, and $30.00 output; Terra is $2.00 input, $0.20 cached
-  input, and $12.00 output; Luna is $0.20 input, $0.02 cached input, and
-  $1.20 output. These are a price snapshot, not a permanent application
-  constant. The pricing page says the displayed standard rates apply to
-  context lengths under 270K tokens.
+- Pricing is a release-time concern rather than an application constant.
+  Recheck the current OpenAI pricing page when activating a model policy; the
+  deployed configuration must not infer pricing from a model name.
 - OpenAI's pricing guidance says a monthly budget can stop serving requests,
   but enforcement may be delayed and overage remains the customer's
   responsibility; it also supports monthly email notification thresholds.
@@ -70,6 +70,10 @@ the research date:
   model.
 
 Sources: [OpenAI models](https://developers.openai.com/api/docs/models),
+[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
+[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol),
+[GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra),
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna),
 [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model),
 [OpenAI API pricing](https://openai.com/api/pricing/),
 [OpenAI Agents SDK models](https://openai.github.io/openai-agents-python/models/),
@@ -90,12 +94,13 @@ next request in that session. They do not alter the persistent default.
 | Command | Valid values and effect |
 | --- | --- |
 | `/model` | Show the effective session model, whether it is an explicit session override or the persistent default, and the availability status. |
-| `/model gpt-5.6-sol` | Use Sol for subsequent requests in this working session. |
-| `/model gpt-5.6-terra` | Use Terra for subsequent requests in this working session. |
-| `/model gpt-5.6-luna` | Use Luna for subsequent requests in this working session. |
+| `/model gpt-6-astra`, `/model 6-astra`, or `/model astra` | Use Astra for subsequent requests in this working session. |
+| `/model gpt-6-sol`, `/model 6-sol`, or `/model sol` | Use Sol for subsequent requests in this working session. |
+| `/model gpt-5.6-terra`, `/model 5.6-terra`, or `/model terra` | Use Terra for subsequent requests in this working session. |
+| `/model gpt-6-luna`, `/model 6-luna`, or `/model luna` | Use Luna for subsequent requests in this working session. |
 | `/model default` | Clear the session model override; subsequent requests inherit the persistent default. |
 | `/reasoning` | Show the effective session effort and whether it is a session override or the persistent default. |
-| `/reasoning none` | Set session reasoning effort to `none`. |
+| `/reasoning none` | Set session reasoning effort to `none` for Sol, Terra, or Luna; Astra rejects it. |
 | `/reasoning low` | Set session reasoning effort to `low`. |
 | `/reasoning medium` | Set session reasoning effort to `medium`. |
 | `/reasoning high` | Set session reasoning effort to `high`. |
@@ -103,11 +108,13 @@ next request in that session. They do not alter the persistent default.
 | `/reasoning max` | Set session reasoning effort to `max`; this is valid but not the default because it is reserved for explicitly chosen quality-first work. |
 | `/reasoning default` | Clear the session reasoning override; subsequent requests inherit the persistent default. |
 
-Only the three canonical model IDs above are accepted by the V1 `/model`
-grammar. Although OpenAI documents `gpt-5.6` as an API alias for Sol, V1
-rejects that alias in the command grammar to keep the user-visible selection
-canonical and explicit. An unknown ID or effort is a local validation error;
-it must not reach the model API.
+Only the four canonical model IDs above are sent to the model API. The local
+configuration boundary accepts the aliases `6-astra`, `6-sol`, `5.6-terra`,
+and `6-luna` plus the shorter forms `astra`, `sol`, `terra`, and `luna`,
+resolving each to its same-named model variant. An unknown ID,
+unsupported model/effort pair, or effort outside `none`, `low`, `medium`,
+`high`, `xhigh`, and `max` is a local validation error; it must not reach the
+model API.
 
 ### Persistent-default commands
 
@@ -119,11 +126,12 @@ working session or an active request.
 | Command | Effect |
 | --- | --- |
 | `/config` or `/config show` | Show persistent defaults, the canonical allowlists, the effective current session values, and the last availability check. |
-| `/config default-model gpt-5.6-sol` | Set the persistent default model to Sol after availability validation. |
+| `/config default-model gpt-6-astra` | Set the persistent default model to Astra after availability validation. |
+| `/config default-model gpt-6-sol` | Set the persistent default model to Sol after availability validation. |
 | `/config default-model gpt-5.6-terra` | Set the persistent default model to Terra after availability validation. |
-| `/config default-model gpt-5.6-luna` | Set the persistent default model to Luna after availability validation. |
+| `/config default-model gpt-6-luna` | Set the persistent default model to Luna after availability validation. |
 | `/config default-reasoning none\|low\|medium\|high\|xhigh\|max` | Set the persistent default reasoning effort. |
-| `/config reset-defaults` | Restore the V1 defaults: `gpt-5.6-terra` and `medium`. |
+| `/config reset-defaults` | Restore the V1 defaults: `gpt-6-sol` and `medium`. |
 
 The exact parser should treat the vertical bar above as notation for the
 allowed alternatives, not as a character the operator types. In particular,
@@ -140,7 +148,7 @@ next session inherits the current persistent defaults.
 Jarvis should store these fields separately:
 
 ```text
-persistent_model_default:     gpt-5.6-terra
+persistent_model_default:     gpt-6-sol
 persistent_reasoning_default: medium
 session_model_override:       null or one canonical model ID
 session_reasoning_override:   null or one allowed effort
@@ -168,7 +176,7 @@ usage; it is not an appropriate hidden cost change. If implementation enables
 persisted reasoning context, it must be an explicit, tested runtime setting
 whose history behavior matches Jarvis's temporary working-session contract;
 it is not part of this command surface.
-[GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model) ·
+[GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model) ·
 [Agents SDK Responses model path](https://openai.github.io/openai-agents-python/models/)
 
 ## Cost policy
@@ -177,10 +185,10 @@ it is not part of this command surface.
    interactive request through Batch or Flex merely to reduce cost; those modes
    change latency/availability characteristics that the V1 interaction has not
    selected.
-2. Use Terra/`medium` as the baseline. Allow Sol and Luna as explicit operator
-   choices through `/model`. Allow all documented effort values through
-   `/reasoning`, but keep `medium` as the default and require the operator to
-   choose `high`, `xhigh`, or `max` explicitly.
+2. Use Sol/`medium` as the baseline. Allow Astra, Terra, and Luna as explicit
+   operator choices through `/model`. Allow only the selected model's
+   documented effort values through `/reasoning`, keep `medium` as the default,
+   and require the operator to choose `high`, `xhigh`, or `max` explicitly.
 3. Do not promise a fixed dollar amount per message. The actual bill depends on
    input, cached-input, output, reasoning, tool, and possibly context-length
    usage. Record model, reasoning setting, token usage, tool calls, and request
@@ -203,7 +211,7 @@ OpenAI's model catalog and API reference establish IDs and availability
 operations, but they do not define Jarvis's user-facing fallback policy. The
 following is the V1 recommendation:
 
-- Keep a static, reviewed allowlist containing only the three canonical GPT-5.6
+- Keep a static, reviewed allowlist containing only the four canonical model
   IDs above. At deployment/startup, validate the configured persistent default
   against the project's model availability/permission response. Revalidate an
   explicit `/model` choice before committing it to the session.
@@ -216,7 +224,8 @@ following is the V1 recommendation:
 - If the persistent default is unavailable when a new session starts, mark the
   assistant model path unavailable and return a deterministic operator-facing
   error that asks for an explicit available `/model` choice. Do not silently
-  use `gpt-5.4-mini`, `gpt-5.6`, Sol, Terra, Luna, or any other fallback.
+  replace it with `gpt-6-astra`, `gpt-6-sol`, `gpt-5.6-terra`, `gpt-6-luna`,
+  or any other fallback.
 - If a request fails after a valid model was selected, classify the provider
   error. A transient transport/rate-limit failure may receive a bounded retry
   using the same model and settings. An invalid-model, permission, or
@@ -254,7 +263,7 @@ commands, but every change is allowlisted, availability-checked, and visible.
 ## Sources
 
 - [OpenAI API models](https://developers.openai.com/api/docs/models)
-- [OpenAI GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
+- [OpenAI GPT-6 model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 - [OpenAI API pricing](https://openai.com/api/pricing/)
 - [OpenAI Agents SDK models](https://openai.github.io/openai-agents-python/models/)
 - [OpenAI Agents SDK running agents and RunConfig](https://openai.github.io/openai-agents-python/running_agents/)

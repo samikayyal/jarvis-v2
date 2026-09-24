@@ -42,7 +42,7 @@ def test_store_reads_and_writes_only_saved_permissions_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "jarvis.toml"
-    original = """title = "preserve me"\n\n[model]\nname = "gpt-5.6-luna"\n\n[saved_permissions]\ncomment = "keep this key"\n\n[[saved_permissions.rules]]\nhost = "Ubuntu"\nprefix = "git status"\n\n[other]\nvalue = 42\n"""
+    original = """title = "preserve me"\n\n[model]\nname = "gpt-6-luna"\n\n[saved_permissions]\ncomment = "keep this key"\n\n[[saved_permissions.rules]]\nhost = "Ubuntu"\nprefix = "git status"\n\n[other]\nvalue = 42\n"""
     path.write_text(original, encoding="utf-8")
     store = TomlPermissionStore(path)
 
@@ -56,7 +56,7 @@ def test_store_reads_and_writes_only_saved_permissions_and_is_idempotent(
     added = store.add("Windows.EXAMPLE", "Get-ChildItem")
     after_first_add = path.read_text(encoding="utf-8")
     assert 'title = "preserve me"' in after_first_add
-    assert '[model]\nname = "gpt-5.6-luna"' in after_first_add
+    assert '[model]\nname = "gpt-6-luna"' in after_first_add
     assert "[other]\nvalue = 42" in after_first_add
     assert 'comment = "keep this key"' in after_first_add
     assert after_first_add.count("[[saved_permissions.rules]]") == 2

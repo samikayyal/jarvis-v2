@@ -24,18 +24,38 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_ALLOWED_MODELS = (
-    "gpt-5.6-sol",
+    "gpt-6-astra",
+    "gpt-6-sol",
     "gpt-5.6-terra",
-    "gpt-5.6-luna",
+    "gpt-6-luna",
+)
+MODEL_ALIASES = MappingProxyType(
+    {
+        "astra": "gpt-6-astra",
+        "6-astra": "gpt-6-astra",
+        "sol": "gpt-6-sol",
+        "6-sol": "gpt-6-sol",
+        "terra": "gpt-5.6-terra",
+        "5.6-terra": "gpt-5.6-terra",
+        "luna": "gpt-6-luna",
+        "6-luna": "gpt-6-luna",
+    }
 )
 DEFAULT_ALLOWED_REASONING_EFFORTS = (
     "none",
-    "minimal",
     "low",
     "medium",
     "high",
     "xhigh",
     "max",
+)
+MODEL_REASONING_EFFORTS = MappingProxyType(
+    {
+        "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
+        "gpt-6-sol": DEFAULT_ALLOWED_REASONING_EFFORTS,
+        "gpt-5.6-terra": DEFAULT_ALLOWED_REASONING_EFFORTS,
+        "gpt-6-luna": DEFAULT_ALLOWED_REASONING_EFFORTS,
+    }
 )
 GOOGLE_MCP_ENDPOINTS = {
     "google-gmail": "https://gmailmcp.googleapis.com/mcp/v1",
@@ -86,7 +106,7 @@ DEFAULTS: _RuntimeDefaults = cast(
     _RuntimeDefaults,
     MappingProxyType(
         {
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "allowed_models": DEFAULT_ALLOWED_MODELS,
             "reasoning_effort": "medium",
             "allowed_reasoning_efforts": DEFAULT_ALLOWED_REASONING_EFFORTS,
@@ -121,6 +141,13 @@ DEFAULTS: _RuntimeDefaults = cast(
         }
     ),
 )
+
+
+def normalize_model_alias(value: str) -> str:
+    """Resolve the short model names accepted in operator configuration."""
+
+    return MODEL_ALIASES.get(value, value)
+
 
 # Readable aliases are useful to downstream code, while DEFAULTS remains the
 # single source of the actual values.
@@ -276,6 +303,19 @@ class RuntimeConfig:
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
     mcp_services: tuple[McpServiceConfig, ...] = ()
     google: GoogleApiConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.model not in self.allowed_models:
+            raise ValueError("model must be included in allowed_models")
+        if self.reasoning_effort not in self.allowed_reasoning_efforts:
+            raise ValueError(
+                "reasoning_effort must be included in allowed_reasoning_efforts"
+            )
+        if self.reasoning_effort not in MODEL_REASONING_EFFORTS.get(self.model, ()):
+            raise ValueError(
+                f"reasoning_effort {self.reasoning_effort!r} is unsupported "
+                f"for model {self.model}"
+            )
 
     @property
     def reasoning(self) -> str:
@@ -805,8 +845,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             default=DEFAULTS["openwa_operator_chat_id"],
         )
 
-        model = _string(model, path, "model")
-        model = f"gpt-5.6-{model}" if model in {"luna", "sol", "terra"} else model
+        model = normalize_model_alias(_string(model, path, "model"))
         allowed_models = _string_list(allowed_models_value, path, "allowed_models")
         if any(item not in DEFAULT_ALLOWED_MODELS for item in allowed_models):
             raise ConfigError(path, "allowed_models contains an unsupported model")
@@ -826,6 +865,11 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         if reasoning not in allowed_reasoning:
             raise ConfigError(
                 path, "reasoning_effort must be included in allowed_reasoning_efforts"
+            )
+        if reasoning not in MODEL_REASONING_EFFORTS[model]:
+            raise ConfigError(
+                path,
+                f"reasoning_effort {reasoning!r} is unsupported for model {model}",
             )
 
         inactivity = _positive_int(inactivity, path, "inactivity_minutes")

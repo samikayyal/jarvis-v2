@@ -108,7 +108,7 @@ Jarvis runs as an independently operated, resource-bounded deployment. OpenWA re
 
 - The primary runtime is a server-side Python service using `uv` for dependency management and execution.
 - The orchestration runtime uses the OpenAI Agents SDK over Responses. Jarvis, not an OpenAI-hosted conversation object, owns lifecycle, policy, approval, host, cancellation, and durable-state authority.
-- The default model is explicit `gpt-5.6-terra` with `medium` reasoning. Canonical session choices are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; reasoning choices are `none`, `low`, `medium`, `high`, `xhigh`, and `max`. Availability failure never silently changes either selection.
+- The default model is explicit `gpt-6-sol` with `medium` reasoning. Canonical session choices are `gpt-6-astra`, `gpt-6-sol`, `gpt-5.6-terra`, and `gpt-6-luna`; aliases `6-astra`, `6-sol`, `5.6-terra`, and `6-luna` resolve to those exact IDs, and the shorter `astra`, `sol`, `terra`, and `luna` forms remain accepted. All support `low`, `medium`, `high`, `xhigh`, and `max`; Sol, Terra, and Luna additionally support `none`. Availability or model/effort compatibility failure never silently changes either selection.
 - Coordinator tool calls are sequential in V1. Tools use strict, bounded typed schemas. Read tools return bounded data; mutation and terminal tools return proposals and cannot dispatch side effects.
 - The orchestration agent is non-authoritative. Model output, terminal output, quoted text, and connected-service content cannot establish identity, approval, policy, permission, or connector authority.
 
