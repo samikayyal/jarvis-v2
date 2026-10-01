@@ -94,11 +94,10 @@ class BlockingSender(RecordingSender):
         return super().send_text(chat_id, text)
 
 
-async def approve(tools: ReminderTools, body: str, due_local: str) -> str:
-    proposed = await tools.execute(
+async def create(tools: ReminderTools, body: str, due_local: str) -> str:
+    result = await tools.execute(
         "create_reminder", {"body": body, "due_local": due_local}
     )
-    result = await tools.resume(proposed.continuation, approved=True)
     await asyncio.sleep(0)
     return result
 
@@ -133,19 +132,19 @@ def make_capability(
     return store, tools, scheduler, clock
 
 
-def test_approved_creation_wakes_next_due_and_delivers_in_chronological_order(
+def test_immediate_creation_wakes_next_due_and_delivers_in_chronological_order(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         sender = RecordingSender()
         store, tools, scheduler, clock = make_capability(tmp_path, sender)
-        await approve(tools, "later exact body", "2026-09-05T15:00:00")
+        await create(tools, "later exact body", "2026-09-05T15:00:00")
         scheduler.start()
         await eventually(
             lambda: clock.waited_for == [datetime(2026, 9, 5, 12, tzinfo=UTC)]
         )
 
-        await approve(tools, "earlier exact body", "2026-09-05T14:00:00")
+        await create(tools, "earlier exact body", "2026-09-05T14:00:00")
         await eventually(
             lambda: clock.waited_for[-1] == datetime(2026, 9, 5, 11, tzinfo=UTC)
         )
@@ -199,7 +198,7 @@ def test_each_transport_outcome_is_terminal_and_never_retried(
             id_generator=lambda: "single01",
             on_change=scheduler.wake,
         )
-        await approve(tools, "send me once", "2026-09-05T13:00:00")
+        await create(tools, "send me once", "2026-09-05T13:00:00")
         scheduler.start()
         clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
         await eventually(lambda: len(sender.calls) == 1)
@@ -230,7 +229,7 @@ def test_unusable_accepted_message_id_is_terminal_unknown(tmp_path: Path) -> Non
     async def scenario() -> None:
         sender = OversizedIdSender()
         store, tools, scheduler, clock = make_capability(tmp_path, sender)
-        await approve(tools, "ambiguous acceptance", "2026-09-05T13:00:00")
+        await create(tools, "ambiguous acceptance", "2026-09-05T13:00:00")
         scheduler.start()
         clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
         await eventually(
@@ -254,7 +253,7 @@ def test_due_reminder_sends_while_an_ordinary_request_is_active(tmp_path: Path) 
     async def scenario() -> None:
         sender = RecordingSender()
         _store, tools, scheduler, clock = make_capability(tmp_path, sender)
-        await approve(tools, "independent reminder", "2026-09-05T13:00:00")
+        await create(tools, "independent reminder", "2026-09-05T13:00:00")
         runner = BlockingRunner()
         runtime = PersonalRuntime(request_runner=runner, clock=clock)
         foreground = asyncio.create_task(
@@ -294,7 +293,7 @@ def test_scheduler_traces_attempt_and_terminal_outcome(tmp_path: Path) -> None:
             id_generator=lambda: "traced01",
             on_change=scheduler.wake,
         )
-        await approve(tools, "trace me", "2026-09-05T13:00:00")
+        await create(tools, "trace me", "2026-09-05T13:00:00")
         scheduler.start()
         clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
         await eventually(lambda: len(trace.events) == 2)
@@ -324,7 +323,7 @@ def test_scheduler_does_not_recover_a_reminder_that_became_due_while_stopped(
     async def scenario() -> None:
         sender = RecordingSender()
         store, tools, scheduler, clock = make_capability(tmp_path, sender)
-        await approve(tools, "missed while stopped", "2026-09-05T13:00:00")
+        await create(tools, "missed while stopped", "2026-09-05T13:00:00")
         clock.advance(datetime(2026, 9, 5, 11, tzinfo=UTC))
 
         scheduler.start()
@@ -341,7 +340,7 @@ def test_in_flight_attempt_is_not_exposed_as_a_terminal_outcome(tmp_path: Path) 
     async def scenario() -> None:
         sender = BlockingSender()
         store, tools, scheduler, clock = make_capability(tmp_path, sender)
-        await approve(tools, "still sending", "2026-09-05T13:00:00")
+        await create(tools, "still sending", "2026-09-05T13:00:00")
         scheduler.start()
         clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
         await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), timeout=1)
@@ -383,7 +382,7 @@ def test_shutdown_waits_for_an_active_attempt_and_records_its_outcome(
             id_generator=lambda: "stopped1",
             on_change=scheduler.wake,
         )
-        await approve(tools, "finish on shutdown", "2026-09-05T13:00:00")
+        await create(tools, "finish on shutdown", "2026-09-05T13:00:00")
         scheduler.start()
         clock.advance(datetime(2026, 9, 5, 10, tzinfo=UTC))
         await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), timeout=1)
@@ -428,7 +427,7 @@ def test_concurrent_scheduler_claims_still_make_one_transport_call(
             id_generator=lambda: "claimed1",
             on_change=lambda: (first.wake(), second.wake()),
         )
-        await approve(tools, "claim only once", "2026-09-05T13:00:00")
+        await create(tools, "claim only once", "2026-09-05T13:00:00")
         first.start()
         second.start()
         await eventually(lambda: len(clock.waited_for) == 2)
@@ -447,14 +446,14 @@ def test_concurrent_scheduler_claims_still_make_one_transport_call(
     asyncio.run(scenario())
 
 
-def test_approved_edit_and_cancel_wake_and_recalculate_next_due(
+def test_immediate_edit_and_cancel_wake_and_recalculate_next_due(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         sender = RecordingSender()
         store, tools, scheduler, clock = make_capability(tmp_path, sender)
-        await approve(tools, "first body", "2026-09-05T14:00:00")
-        await approve(tools, "second body", "2026-09-05T15:00:00")
+        await create(tools, "first body", "2026-09-05T14:00:00")
+        await create(tools, "second body", "2026-09-05T15:00:00")
         scheduler.start()
         await eventually(
             lambda: (
@@ -463,7 +462,7 @@ def test_approved_edit_and_cancel_wake_and_recalculate_next_due(
             )
         )
 
-        edited = await tools.execute(
+        await tools.execute(
             "edit_reminder",
             {
                 "reminder_id": "later001",
@@ -471,13 +470,11 @@ def test_approved_edit_and_cancel_wake_and_recalculate_next_due(
                 "due_local": "2026-09-05T16:00:00",
             },
         )
-        await tools.resume(edited.continuation, approved=True)
         await eventually(
             lambda: clock.waited_for[-1] == datetime(2026, 9, 5, 12, tzinfo=UTC)
         )
 
-        cancelled = await tools.execute("cancel_reminder", {"reminder_id": "early001"})
-        await tools.resume(cancelled.continuation, approved=True)
+        await tools.execute("cancel_reminder", {"reminder_id": "early001"})
         await eventually(
             lambda: clock.waited_for[-1] == datetime(2026, 9, 5, 13, tzinfo=UTC)
         )

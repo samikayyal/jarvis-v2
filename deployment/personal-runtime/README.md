@@ -140,7 +140,7 @@ Google writes accept only `1`, `9`, or `/cancel`, are attempted once, and are
 never automatically retried after an ambiguous outcome.
 
 The Reminder capability is the one proactive exception to the otherwise
-inbound-driven runtime. Jarvis stores approved one-time Reminders in the
+inbound-driven runtime. Jarvis stores operator-requested one-time Reminders in the
 configured SQLite database and owns their due-time decisions. One scheduler in
 the existing service process submits the exact stored body once to the
 configured operator chat ID. OpenWA remains the immediate transport and owns

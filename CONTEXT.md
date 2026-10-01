@@ -64,11 +64,11 @@ _Avoid_: Background task, queued request
 
 **Reminder**:
 A one-time instruction for Jarvis to send exact stored reminder text to the
-authorized operator at an approved future time. It may be edited or cancelled
+authorized operator at a requested future time. It may be edited or cancelled
 before it is sent and never addresses another recipient.
 _Avoid_: Scheduled message, third-party message, recurring reminder
 
-The current Reminder lifecycle saves, lists, edits, cancels, and sends approved
+The current Reminder lifecycle saves, lists, edits, cancels, and sends requested
 Reminders.
 
 **Due time**:
@@ -122,11 +122,11 @@ the prior link.
 _Avoid_: Configured Google identity, OAuth token, configured MCP service
 
 **Pending action**:
-The one exact terminal command, Google write, or Reminder write waiting
-indefinitely for the authorized operator's deterministic choice. Terminal
-commands accept `1`, `2`, `9`, or `/cancel`; Google and Reminder writes accept
-only `1`, `9`, or `/cancel`, and all other messages are silently ignored while
-one is pending except the exact Google connection controls. Reauthorization or
+The one exact terminal command or Google write waiting indefinitely for the
+authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
+`9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all other
+messages are silently ignored while one is pending except the exact Google
+connection controls. Reauthorization or
 disconnection invalidates
 a pending Google write created under the prior connection.
 _Avoid_: Active request, saved permission, queued action

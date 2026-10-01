@@ -2,7 +2,7 @@
 
 ## Capability and ownership
 
-A Reminder is Jarvis's narrow proactive exception: one approved instruction to
+A Reminder is Jarvis's narrow proactive exception: one authorized instruction to
 send exact stored text once to the authorized operator at one future instant.
 It is not a scheduled message to a third party and is not a general automation
 or background-job facility.
@@ -34,14 +34,13 @@ database.
 
 ## Lifecycle and operating contract
 
-`create_reminder`, `edit_reminder`, and `cancel_reminder` are prepared writes.
-Each freezes its complete proposal and accepts only exact `1` to approve once,
-exact `9` to reject, or `/cancel` to abandon the pending action. Permission
-saving is unavailable. Approval never reparses the request or accepts changed
-values between preview and commit.
+`create_reminder`, `edit_reminder`, and `cancel_reminder` commit during the
+authorized request, without a follow-up `1` or `9` confirmation. The tool
+result for creation and editing reports the stable ID, exact body, and local Due
+time. Jarvis can also list the stored Reminder. Editing and cancellation require
+a stable ID; Jarvis lists pending records and asks which one the operator means when a
+conversational reference is ambiguous.
 
-Creation and edits preview the exact body, stable ID, local date, local time,
-and configured timezone. Cancellation previews the same complete Reminder.
 Bodies must contain 1 through 4,096 characters, and Due times must be strict,
 unambiguous future local date-times. Only pending Reminders can be edited or
 cancelled.
@@ -53,7 +52,7 @@ explicit historical listing also includes retained terminal records:
   outbound message ID is retained.
 - `failed`: the one attempt definitely failed.
 - `unknown`: the attempt may have been accepted, so Jarvis does not retry it.
-- `cancelled`: the operator approved cancellation before an attempt began.
+- `cancelled`: the operator cancelled it before an attempt began.
 
 At the Due time, the scheduler claims the pending record for its sole attempt
 and sends its exact stored body as one OpenWA text message to the configured
@@ -63,10 +62,10 @@ in-flight records are excluded from future delivery selection. The send can run
 while a foreground request is active; there is no ordering promise when an
 ordinary reply and a Reminder are simultaneous.
 
-The sensitive rotating runtime trace provides bounded events for proposals,
-approval outcomes, committed mutations, delivery attempts, accepted outbound
-IDs, definite failures, and ambiguous outcomes. Protect it as verbatim runtime
-data: do not copy bodies, phone or chat identifiers, credentials, or raw payloads
+The sensitive rotating runtime trace provides bounded events for committed
+mutations, delivery attempts, accepted outbound IDs, definite failures, and
+ambiguous outcomes. Protect it as verbatim runtime data: do not copy bodies,
+phone or chat identifiers, credentials, or raw payloads
 into ordinary logs or tickets.
 
 This capability deliberately has no recurrence, snoozing, contact lookup,
@@ -95,24 +94,20 @@ physical receipt.
 2. From that authorized WhatsApp account, ask Jarvis to create the one-time
    Reminder. Do not ask it to message a named third party; any named person may
    appear only as context inside the body sent back to the operator.
-3. On the phone, verify that the approval preview shows the exact body, stable
-   ID, calendar date, local time, and configured timezone. Verify that it offers
-   one-time approval and rejection, not permission saving. Send exact `1` only
-   if every value matches.
-4. Ask Jarvis to list pending Reminders and verify that the approved record
+3. Ask Jarvis to list pending Reminders and verify that the created record
    appears once with the same ID, body, and Due time.
-5. Optionally, while enough future time remains, ask Jarvis to edit that ID's
-   body, Due time, or both. Verify the preview shows the complete resulting
-   Reminder, including unchanged fields, then send exact `1`. List pending
-   Reminders again and use the resulting approved body as the receipt fixture.
-6. Keep the authorized phone available through the Due time. The human confirms
+4. Optionally, while enough future time remains, ask Jarvis to edit that ID's
+   body, Due time, or both. List pending Reminders again and verify the complete
+   resulting record, including unchanged fields. Use the resulting body as the
+   receipt fixture.
+5. Keep the authorized phone available through the Due time. The human confirms
    that one WhatsApp message arrives, that its body exactly matches the final
-   approved body, and that no second copy arrives during a reasonable observation
+   stored body, and that no second copy arrives during a reasonable observation
    window. Do not manufacture a second attempt if delivery is delayed or unclear.
-7. Ask for Reminder history and verify the record is terminal. A definite
+6. Ask for Reminder history and verify the record is terminal. A definite
    acceptance should appear as `sent`; preserve `failed` or `unknown` exactly if
    that is the observed outcome and do not retry it automatically.
-8. On the host, inspect only bounded trace metadata needed to correlate the
-   proposal, committed mutation, single delivery attempt, and terminal outcome.
+7. On the host, inspect only bounded trace metadata needed to correlate the
+   committed mutation, single delivery attempt, and terminal outcome.
    Record the human's phone confirmation separately from transport acceptance,
    and state explicitly whether this procedure was actually executed.
