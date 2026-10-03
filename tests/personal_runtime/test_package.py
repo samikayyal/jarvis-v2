@@ -35,9 +35,13 @@ def test_native_service_runs_only_the_replacement_with_private_state() -> None:
     )
     assert "StandardOutput=journal" in unit
     assert "StandardError=journal" in unit
-    assert "ProtectSystem=full" in unit
+    assert "NoNewPrivileges=" not in unit
+    assert "CapabilityBoundingSet=" not in unit
+    assert "ProtectSystem=" not in unit
+    assert "RestrictAddressFamilies=" not in unit
     assert "ProtectHome=" not in unit
-    assert "ReadWritePaths=@RUNTIME_ROOT@ /etc/jarvis/personal-runtime" in unit
+    sudoers = (PACKAGE / "jarvis-personal-runtime.sudoers").read_text(encoding="utf-8")
+    assert sudoers == "jarvis-personal-runtime ALL=(ALL:ALL) NOPASSWD: ALL\n"
     assert "jarvis_control_plane" not in unit
     assert "EnvironmentFile=" not in unit
     assert "/opt/jarvis-personal-runtime" not in unit

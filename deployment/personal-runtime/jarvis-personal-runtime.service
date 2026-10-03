@@ -19,24 +19,5 @@ StandardError=journal
 SyslogIdentifier=jarvis-personal-runtime
 Environment=PYTHONUNBUFFERED=1
 
-NoNewPrivileges=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
-PrivateDevices=yes
-PrivateTmp=yes
-ProtectClock=yes
-ProtectControlGroups=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectSystem=full
-ReadWritePaths=@RUNTIME_ROOT@ /etc/jarvis/personal-runtime
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictNamespaces=yes
-LockPersonality=yes
-SystemCallArchitectures=native
-TasksMax=64
-
 [Install]
 WantedBy=multi-user.target

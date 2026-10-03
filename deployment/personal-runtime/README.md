@@ -167,6 +167,19 @@ operator makes the final go/no-go decision.
 
 ## Install or update the service
 
+To allow Jarvis to run approved Ubuntu terminal commands with unrestricted
+passwordless sudo, install the dedicated sudoers rule. This gives the service
+account full root access when it invokes `sudo`; Jarvis's WhatsApp command
+approval still applies before execution.
+
+```console
+sudo visudo -cf deployment/personal-runtime/jarvis-personal-runtime.sudoers
+sudo install -o root -g root -m 0440 \
+  deployment/personal-runtime/jarvis-personal-runtime.sudoers \
+  /etc/sudoers.d/jarvis-personal-runtime
+sudo visudo -c
+```
+
 Render the four `@...@` placeholders in
 `jarvis-personal-runtime.service` with the reviewed service user, group, release
 root, and runtime root. Reject whitespace, `%`, `|`, and shell metacharacters in
