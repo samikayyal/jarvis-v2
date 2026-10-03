@@ -7,6 +7,13 @@ authorized operator. Deterministic slash commands are handled locally; other
 admitted text becomes an ordinary request in a sequential OpenAI Responses
 model-and-tool loop.
 
+Send `/status` to see the working session, model, active work, saved permission
+count, and estimated context tokens used against the configured limit. The local
+context estimate includes system instructions, tool definitions, and the retained
+conversation (including replies and tool results). During processing it reflects
+the transcript retained so far. With no working session it shows zero; `/new`
+starts with only the system instructions and tool definitions.
+
 The active runtime is intentionally small:
 
 - `src/jarvis_personal_runtime/` contains the complete assistant runtime.

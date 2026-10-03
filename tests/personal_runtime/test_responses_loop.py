@@ -251,6 +251,9 @@ async def test_oversized_final_text_is_rejected_without_entering_transcript() ->
     )
     request, _ = responses.calls[-1]
     assert request["input"] == [{"role": "user", "content": "Second"}]
+    assert runner.context_tokens(system_prompt="Help.") == local_input_tokens(
+        {"instructions": "Help.", "tools": [], "input": request["input"]}
+    )
 
 
 @async_test
@@ -455,6 +458,14 @@ async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -
         "Find it", model="gpt-6-astra", reasoning="high", system_prompt="Use tools."
     )
     assert isinstance(pending, ApprovalRequired)
+    assert runner.context_tokens(system_prompt="Use tools.") == local_input_tokens(
+        {
+            "instructions": "Use tools.",
+            "tools": list(ApprovalTools.definitions),
+            "input": responses.calls[0][0]["input"]
+            + [responses_module._replay_output_item(function_call)],
+        }
+    )
 
     runner.cancel_pending(pending.continuation)
     result = await runner.run(
@@ -479,6 +490,13 @@ async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -
         },
         {"role": "user", "content": "Continue"},
     ]
+    assert runner.context_tokens(system_prompt="Use tools.") == local_input_tokens(
+        {
+            "instructions": "Use tools.",
+            "tools": list(ApprovalTools.definitions),
+            "input": continuation["input"],
+        }
+    )
 
 
 @async_test

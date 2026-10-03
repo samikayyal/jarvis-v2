@@ -7,6 +7,11 @@ from functools import wraps
 from pathlib import Path
 
 from jarvis_personal_runtime.config import RuntimeConfig
+from jarvis_personal_runtime.responses import (
+    DirectResponsesRunner,
+    ResponsesResult,
+    local_input_tokens,
+)
 from jarvis_personal_runtime.runtime import (
     ApprovalDecision,
     ApprovalRequired,
@@ -110,6 +115,92 @@ class MemoryCache:
 
 def inbound(message_id: str, text: str, at: datetime = NOW) -> InboundText:
     return InboundText(message_id=message_id, text=text, received_at=at)
+
+
+@async_test
+async def test_status_reports_retained_context_and_resets_after_new_and_expiry() -> (
+    None
+):
+    class Responses:
+        calls = 0
+
+        async def create(self, request, *, timeout):
+            self.calls += 1
+            return ResponsesResult(
+                output=({"type": "message", "role": "assistant", "content": "Done."},),
+                output_text="Done.",
+            )
+
+    responses = Responses()
+    runner = DirectResponsesRunner(responses, request_timeout_seconds=30)
+    clock = FakeClock()
+    runtime = PersonalRuntime(
+        request_runner=runner, system_prompt="Help the operator.", clock=clock
+    )
+
+    empty = await runtime.receive(inbound("status-empty", "/status"))
+    assert (
+        "Context: ~0 / 100,000 tokens (0.0% used; local estimate)" in empty.replies[0]
+    )
+    assert empty.status.context_used_tokens == 0
+    baseline = runner.context_tokens(system_prompt=runtime.system_prompt)
+
+    await runtime.receive(inbound("request", "Remember this conversation."))
+    used = runner.context_tokens(system_prompt=runtime.system_prompt)
+    assert used > baseline
+    assert used == local_input_tokens(
+        {
+            "instructions": "Help the operator.",
+            "tools": [],
+            "input": [
+                {"role": "user", "content": "Remember this conversation."},
+                {"type": "message", "role": "assistant", "content": "Done."},
+            ],
+        }
+    )
+    status = await runtime.receive(inbound("status-used", "/status"))
+    assert status.status.context_used_tokens == used
+    assert f"Context: ~{used:,} / 100,000 tokens" in status.replies[0]
+    assert responses.calls == 1
+    assert runner.context_tokens(system_prompt=runtime.system_prompt) == used
+
+    await runtime.receive(inbound("reset", "/new"))
+    assert runtime.status().context_used_tokens == baseline
+    clock.current += timedelta(minutes=60)
+    expired = await runtime.receive(inbound("status-expired", "/status"))
+    assert expired.status.context_used_tokens == 0
+    assert expired.status.session_id is None
+
+
+@async_test
+async def test_status_uses_configured_context_limit_and_tolerates_counter_failure() -> (
+    None
+):
+    class CountingRunner(FakeRunner):
+        fail_count = False
+
+        def context_tokens(self, *, system_prompt: str) -> int:
+            if self.fail_count:
+                raise RuntimeError("token counter unavailable")
+            return 250
+
+    runner = CountingRunner()
+    runtime = PersonalRuntime(
+        RuntimeConfig(max_context_tokens=1_000), request_runner=runner
+    )
+    await runtime.receive(inbound("new", "/new"))
+    status = await runtime.receive(inbound("status", "/status"))
+    assert (
+        "Context: ~250 / 1,000 tokens (25.0% used; local estimate)" in status.replies[0]
+    )
+    assert status.status.max_context_tokens == 1_000
+
+    runner.fail_count = True
+    completed = await runtime.receive(inbound("request", "Hello"))
+    assert completed.replies == ("done",)
+    unavailable = await runtime.receive(inbound("status-unavailable", "/status"))
+    assert unavailable.status.context_used_tokens is None
+    assert "Context: unavailable." in unavailable.replies[0]
 
 
 @async_test

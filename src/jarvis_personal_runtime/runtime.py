@@ -137,6 +137,8 @@ RequestStep = Completed | ApprovalRequired | ContextLimitReached
 
 
 class RequestRunner(Protocol):
+    def context_tokens(self, *, system_prompt: str) -> int: ...
+
     def cancel_pending(self, continuation: object) -> None: ...
 
     async def run(
@@ -218,6 +220,8 @@ class RuntimeStatus:
     active_request: ActiveRequestStatus | None
     pending_action: PendingAction | None
     permission_count: int
+    context_used_tokens: int | None
+    max_context_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +334,17 @@ class PersonalRuntime:
             expires = session.last_activity_at + timedelta(
                 minutes=self.config.inactivity_minutes
             )
+        context_used: int | None = 0
+        if session is not None:
+            context_tokens = getattr(self.request_runner, "context_tokens", None)
+            try:
+                context_used = (
+                    context_tokens(system_prompt=self.system_prompt)
+                    if callable(context_tokens)
+                    else None
+                )
+            except Exception:  # noqa: BLE001 - diagnostics must not break replies
+                context_used = None
         return RuntimeStatus(
             session_id=session.session_id if session else None,
             model=session.model if session else self._model,
@@ -344,6 +359,8 @@ class PersonalRuntime:
             ),
             pending_action=pending.action if pending else None,
             permission_count=len(self.permission_store.list_rules()),
+            context_used_tokens=context_used,
+            max_context_tokens=self.config.max_context_tokens,
         )
 
     async def receive(self, message: InboundText) -> RuntimeResult:
@@ -813,10 +830,19 @@ def _status_text(status: RuntimeStatus) -> str:
     session = status.session_id or "none"
     active = status.active_request.phase if status.active_request else "none"
     pending = "yes" if status.pending_action else "no"
+    context = (
+        "unavailable"
+        if status.context_used_tokens is None
+        else (
+            f"~{status.context_used_tokens:,} / {status.max_context_tokens:,} tokens "
+            f"({status.context_used_tokens / status.max_context_tokens:.1%} used; "
+            "local estimate)"
+        )
+    )
     return (
         f"Session: {session}; model: {status.model}; reasoning: {status.reasoning}; "
         f"active request: {active}; pending action: {pending}; "
-        f"saved permissions: {status.permission_count}."
+        f"saved permissions: {status.permission_count}.\nContext: {context}."
     )
 
 

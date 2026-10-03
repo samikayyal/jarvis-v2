@@ -331,6 +331,17 @@ class DirectResponsesRunner:
 
         self._transcript = []
 
+    def context_tokens(self, *, system_prompt: str) -> int:
+        """Estimate retained context, including instructions and tool definitions."""
+
+        return self._context_counter(
+            {
+                "instructions": system_prompt,
+                "tools": list(self._tools.definitions),
+                "input": self._transcript,
+            }
+        )
+
     async def run(
         self,
         text: str,
