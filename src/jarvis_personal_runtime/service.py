@@ -106,6 +106,29 @@ def _load_service_config(
         validate_configured_mcp_manifests(loaded.config.mcp_services)
     except McpManifestError as exc:
         raise ConfigError(loaded.toml_path, str(exc)) from exc
+    if loaded.config.vault_git is not None:
+        vault = loaded.config.vault_path
+        assert vault is not None
+        if vault.is_symlink() or not vault.is_dir():
+            raise ConfigError(loaded.toml_path, "vault_path must be a real directory")
+        metadata = vault / ".git"
+        if metadata.is_symlink() or not metadata.is_dir():
+            raise ConfigError(
+                loaded.toml_path, "vault_path must be a dedicated Git clone"
+            )
+        for credential in (
+            loaded.config.vault_git.ssh_identity_file,
+            loaded.config.vault_git.ssh_known_hosts_file,
+        ):
+            if credential is not None:
+                try:
+                    with credential.open("rb") as stream:
+                        if not stream.read(1):
+                            raise OSError("empty credential file")
+                except OSError as exc:
+                    raise ConfigError(
+                        loaded.toml_path, "vault SSH files must exist and be readable"
+                    ) from exc
     return loaded
 
 

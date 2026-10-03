@@ -88,6 +88,7 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.listener_host is None
     assert loaded.config.listener_port is None
     assert loaded.config.vault_path is None
+    assert loaded.config.vault_git is None
     assert loaded.config.mcp_services == ()
     assert loaded.config.google is None
     assert loaded.config.message_cache_retention_days == 7
@@ -459,6 +460,108 @@ def test_external_absolute_vault_path_is_preserved(tmp_path: Path) -> None:
     loaded = load_runtime_config(tmp_path)
 
     assert loaded.config.vault_path == external_vault.resolve()
+
+
+def test_vault_git_configuration_is_top_level_and_loads_optional_ssh_files(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    identity = tmp_path / "ssh" / "vault_ed25519"
+    known_hosts = tmp_path / "ssh" / "known_hosts"
+    _write_runtime_files(
+        tmp_path,
+        toml=(
+            f'[runtime]\nvault_path = "{vault.as_posix()}"\n\n'
+            "[vault_git]\n"
+            'remote = "git@github.com:owner/private-vault.git"\n'
+            'branch = "main"\n'
+            'note_directories = [".", "Projects/Jarvis"]\n'
+            'author_name = "Jarvis"\n'
+            'author_email = "jarvis@example.com"\n'
+            f'ssh_identity_file = "{identity.as_posix()}"\n'
+            f'ssh_known_hosts_file = "{known_hosts.as_posix()}"\n'
+        ),
+    )
+
+    loaded = load_runtime_config(tmp_path)
+
+    assert loaded.config.vault_path == vault.resolve()
+    assert loaded.config.vault_git is not None
+    assert loaded.config.vault_git.remote == "git@github.com:owner/private-vault.git"
+    assert loaded.config.vault_git.branch == "main"
+    assert loaded.config.vault_git.note_directories == (".", "Projects/Jarvis")
+    assert loaded.config.vault_git.author_name == "Jarvis"
+    assert loaded.config.vault_git.author_email == "jarvis@example.com"
+    assert loaded.config.vault_git.ssh_identity_file == identity.resolve()
+    assert loaded.config.vault_git.ssh_known_hosts_file == known_hosts.resolve()
+
+
+@pytest.mark.parametrize(
+    ("toml", "needle"),
+    [
+        (
+            (
+                '[vault_git]\nremote = "origin"\nbranch = "main"\n'
+                'note_directories = ["."]\n'
+            ),
+            "requires vault_path",
+        ),
+        (
+            (
+                '[runtime]\nvault_path = "vault"\n\n[vault_git]\n'
+                'remote = "origin"\nbranch = "main"\n'
+            ),
+            "unknown or missing",
+        ),
+        (
+            (
+                '[runtime]\nvault_path = "vault"\n\n[vault_git]\n'
+                'remote = "origin"\nbranch = "main"\nnote_directories = []\n'
+            ),
+            "note_directories",
+        ),
+        (
+            (
+                '[runtime]\nvault_path = "vault"\n\n[vault_git]\n'
+                'remote = "origin"\nbranch = "feature/../main"\n'
+                'note_directories = ["."]\n'
+            ),
+            "branch",
+        ),
+        (
+            (
+                '[runtime]\nvault_path = "vault"\n\n[vault_git]\n'
+                'remote = "origin"\nbranch = "main"\n'
+                'note_directories = ["../outside"]\n'
+            ),
+            "note_directories",
+        ),
+        (
+            (
+                '[runtime]\nvault_path = "vault"\n\n[vault_git]\n'
+                'remote = "origin"\nbranch = "main"\n'
+                'note_directories = ["."]\nssh_identity_file = ".ssh/id"\n'
+            ),
+            "absolute file path",
+        ),
+        (
+            (
+                '[runtime]\nvault_path = "vault"\n\n[vault_git]\n'
+                'remote = "origin"\nbranch = "main"\n'
+                'note_directories = ["."]\n'
+                f'ssh_known_hosts_file = "{Path("known_hosts").resolve().as_posix()}"\n'
+            ),
+            "configured together",
+        ),
+    ],
+)
+def test_vault_git_configuration_rejects_unsafe_or_incomplete_fields(
+    tmp_path: Path, toml: str, needle: str
+) -> None:
+    _write_runtime_files(tmp_path, toml=toml)
+
+    with pytest.raises(ConfigError, match=needle):
+        load_runtime_config(tmp_path)
 
 
 @pytest.mark.parametrize(

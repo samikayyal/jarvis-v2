@@ -17,11 +17,14 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from .vault_git import VaultGitSettings
 
 DEFAULT_ALLOWED_MODELS = (
     "gpt-6-astra",
@@ -93,6 +96,7 @@ class _RuntimeDefaults(TypedDict):
     listener_port: None
     system_prompt_path: str
     vault_path: None
+    vault_git: None
     openwa_api_base_url: None
     openwa_internal_session_id: None
     openwa_named_session: None
@@ -133,6 +137,7 @@ DEFAULTS: _RuntimeDefaults = cast(
             "listener_port": None,
             "system_prompt_path": "SYSTEM.md",
             "vault_path": None,
+            "vault_git": None,
             "openwa_api_base_url": None,
             "openwa_internal_session_id": None,
             "openwa_named_session": None,
@@ -303,6 +308,7 @@ class RuntimeConfig:
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
     mcp_services: tuple[McpServiceConfig, ...] = ()
     google: GoogleApiConfig | None = None
+    vault_git: VaultGitSettings | None = DEFAULTS["vault_git"]
 
     def __post_init__(self) -> None:
         if self.model not in self.allowed_models:
@@ -316,6 +322,8 @@ class RuntimeConfig:
                 f"reasoning_effort {self.reasoning_effort!r} is unsupported "
                 f"for model {self.model}"
             )
+        if self.vault_git is not None and self.vault_path is None:
+            raise ValueError("vault_git requires vault_path")
 
     @property
     def reasoning(self) -> str:
@@ -532,7 +540,13 @@ def _collect_runtime_values(raw: Mapping[str, Any], path: Path) -> dict[str, Any
 
     values: dict[str, Any] = {}
     for key, value in raw.items():
-        if key not in {"runtime", "saved_permissions", "mcp_services", "google"}:
+        if key not in {
+            "runtime",
+            "saved_permissions",
+            "mcp_services",
+            "google",
+            "vault_git",
+        }:
             if key not in _RUNTIME_KEYS:
                 raise ConfigError(path, f"unknown top-level setting: {key}")
             values[key] = value
@@ -640,6 +654,152 @@ def _optional_configured_path(
         return candidate.resolve()
     except OSError as exc:
         raise ConfigError(path, f"cannot resolve {name}: {exc}") from exc
+
+
+def _bounded_text(value: Any, path: Path, name: str, *, maximum: int) -> str:
+    result = _string(value, path, name)
+    if len(result) > maximum:
+        raise ConfigError(path, f"{name} must not exceed {maximum} characters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in result):
+        raise ConfigError(path, f"{name} must not contain control characters")
+    return result
+
+
+def _vault_note_directories(value: Any, path: Path, name: str) -> tuple[str, ...]:
+    directories = _string_list(value, path, name)
+    if len(directories) > 128:
+        raise ConfigError(path, f"{name} must not contain more than 128 directories")
+
+    validated: list[str] = []
+    for directory in directories:
+        if len(directory) > 512:
+            raise ConfigError(path, f"{name} entries must not exceed 512 characters")
+        if any(ord(character) < 32 or ord(character) == 127 for character in directory):
+            raise ConfigError(
+                path, f"{name} entries must not contain control characters"
+            )
+        if directory == ".":
+            validated.append(directory)
+            continue
+        if "\\" in directory:
+            raise ConfigError(path, f"{name} entries must use POSIX relative paths")
+        if PureWindowsPath(directory).drive or PurePosixPath(directory).is_absolute():
+            raise ConfigError(
+                path, f"{name} entries must be vault-relative directories"
+            )
+        parts = PurePosixPath(directory).parts
+        if not parts or any(part in {".", ".."} for part in parts):
+            raise ConfigError(path, f"{name} entries must not contain dot segments")
+        if any(part.startswith(".") for part in parts):
+            raise ConfigError(path, f"{name} entries must be ordinary directories")
+        if str(PurePosixPath(directory)) != directory:
+            raise ConfigError(path, f"{name} entries must be normalized POSIX paths")
+        validated.append(directory)
+    return tuple(validated)
+
+
+def _absolute_configured_file(value: Any, path: Path, name: str) -> Path | None:
+    if value is None:
+        return None
+    value_text = _bounded_text(value, path, name, maximum=4096)
+    candidate = Path(value_text).expanduser()
+    if not candidate.is_absolute():
+        raise ConfigError(path, f"{name} must be an absolute file path")
+    try:
+        return candidate.resolve()
+    except OSError as exc:
+        raise ConfigError(path, f"cannot resolve {name}: {exc}") from exc
+
+
+def _git_branch(value: Any, path: Path, name: str) -> str:
+    branch = _bounded_text(value, path, name, maximum=255)
+    forbidden = set(" ~^:?*[\\")
+    components = branch.split("/")
+    if (
+        branch.startswith(("-", "/", "."))
+        or branch.endswith(("/", ".", ".lock"))
+        or ".." in branch
+        or "//" in branch
+        or "@{" in branch
+        or branch == "@"
+        or any(character in forbidden for character in branch)
+        or any(
+            not component
+            or component.startswith(".")
+            or component.endswith((".", ".lock"))
+            for component in components
+        )
+    ):
+        raise ConfigError(path, f"{name} must be a valid Git branch name")
+    return branch
+
+
+def _build_vault_git_settings(
+    raw: Mapping[str, Any], vault_path: Path | None, path: Path
+) -> VaultGitSettings | None:
+    if "vault_git" not in raw:
+        return None
+    if vault_path is None:
+        raise ConfigError(path, "[vault_git] requires vault_path")
+    from .vault_git import VaultGitSettings
+
+    table = _ensure_table(raw["vault_git"], path, "[vault_git]")
+    required = {"remote", "branch", "note_directories"}
+    optional = {
+        "author_name",
+        "author_email",
+        "ssh_identity_file",
+        "ssh_known_hosts_file",
+    }
+    if not required.issubset(table) or set(table) - required - optional:
+        raise ConfigError(path, "[vault_git] has unknown or missing fields")
+
+    remote = _bounded_text(table["remote"], path, "vault_git.remote", maximum=2048)
+    if remote.startswith("-"):
+        raise ConfigError(path, "vault_git.remote must not begin with '-'")
+    branch = _git_branch(table["branch"], path, "vault_git.branch")
+    note_directories = _vault_note_directories(
+        table["note_directories"], path, "vault_git.note_directories"
+    )
+    author_name = _bounded_text(
+        table.get("author_name", "Jarvis"),
+        path,
+        "vault_git.author_name",
+        maximum=128,
+    )
+    author_email = _bounded_text(
+        table.get("author_email", "jarvis@samikayyal.com"),
+        path,
+        "vault_git.author_email",
+        maximum=320,
+    )
+    if author_email.count("@") != 1 or any(
+        character.isspace() for character in author_email
+    ):
+        raise ConfigError(path, "vault_git.author_email must be an email address")
+    ssh_identity_file = _absolute_configured_file(
+        table.get("ssh_identity_file"), path, "vault_git.ssh_identity_file"
+    )
+    ssh_known_hosts_file = _absolute_configured_file(
+        table.get("ssh_known_hosts_file"), path, "vault_git.ssh_known_hosts_file"
+    )
+    if (ssh_identity_file is None) != (ssh_known_hosts_file is None):
+        raise ConfigError(
+            path,
+            "vault_git.ssh_identity_file and vault_git.ssh_known_hosts_file must be configured together",
+        )
+    try:
+        return VaultGitSettings(
+            remote=remote,
+            branch=branch,
+            note_directories=note_directories,
+            author_name=author_name,
+            author_email=author_email,
+            ssh_identity_file=ssh_identity_file,
+            ssh_known_hosts_file=ssh_known_hosts_file,
+        )
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
 
 
 def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConfig:
@@ -969,6 +1129,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         vault_path = _optional_configured_path(
             vault_path_value, root, path, "vault_path"
         )
+        vault_git = _build_vault_git_settings(raw, vault_path, path)
         openwa_api_base_url = _optional_string(
             openwa_api_base_url, path, "openwa_api_base_url"
         )
@@ -1027,6 +1188,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         openwa_operator_chat_id=openwa_operator_chat_id,
         mcp_services=tuple(configured_services),
         google=google,
+        vault_git=vault_git,
     )
 
 

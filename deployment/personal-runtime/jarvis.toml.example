@@ -33,7 +33,7 @@ openwa_operator_chat_id = "replace-with-chat-id@c.us"
 ubuntu_working_directory = "/srv/jarvis-workspace"
 ubuntu_read_only_prefixes = ["pwd", "git status"]
 
-# Add vault_path only after reviewing its exact read-only filesystem path, for
+# Add vault_path only after reviewing its exact vault filesystem path, for
 # example: vault_path = "/srv/knowledge-vault"
 #
 # Configure all four Windows SSH values together if Windows execution is enabled:
@@ -43,6 +43,19 @@ ubuntu_read_only_prefixes = ["pwd", "git status"]
 # windows_working_directory = "D:\\Projects\\Jarvis-v2"
 # The service account's known_hosts file must already pin the exact SSH host key.
 windows_read_only_prefixes = []
+
+# Leave [vault_git] absent for read-only vault access. To enable the bounded
+# Git-backed read/edit/commit/push tool, configure both vault_path and every
+# required field below. The SSH files must already exist and be pinned for the
+# service account on the Ubuntu host.
+# [vault_git]
+# remote = "git@github.com:owner/private-vault.git"
+# branch = "main"
+# note_directories = ["."]
+# author_name = "Jarvis"
+# author_email = "jarvis@samikayyal.com"
+# ssh_identity_file = "/var/lib/jarvis-personal-runtime/ssh/vault_ed25519"
+# ssh_known_hosts_file = "/var/lib/jarvis-personal-runtime/ssh/known_hosts"
 
 [google]
 account = "kayyal.sami@gmail.com"

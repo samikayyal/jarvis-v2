@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -168,6 +169,43 @@ def test_service_check_requires_an_explicit_private_listener(tmp_path: Path) -> 
 
     with pytest.raises(ConfigError, match="listener_host and listener_port"):
         validate_service_config(root)
+
+
+def test_vault_service_check_is_offline_and_checks_local_paths(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    _write_service_config(root)
+    vault = root / "vault"
+    config_file = root / "jarvis.toml"
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8")
+        + 'vault_path = "vault"\n\n[vault_git]\n'
+        + 'remote = "ssh://git@unreachable.invalid/vault.git"\n'
+        + 'branch = "main"\nnote_directories = ["."]\n'
+        + f"ssh_identity_file = {json.dumps((root / 'key').as_posix())}\n"
+        + f"ssh_known_hosts_file = {json.dumps((root / 'known_hosts').as_posix())}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="real directory"):
+        validate_service_config(root)
+    vault.mkdir()
+    with pytest.raises(ConfigError, match="dedicated Git clone"):
+        validate_service_config(root)
+    (vault / ".git").mkdir()
+    with pytest.raises(ConfigError, match="SSH files"):
+        validate_service_config(root)
+    (root / "key").write_bytes(b"fixture key")
+    (root / "known_hosts").write_bytes(b"fixture known host")
+    before = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    assert validate_service_config(root).vault_git is not None
+    assert {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before
 
 
 def test_async_service_composition_can_prepare_configured_services(

@@ -682,7 +682,18 @@ def build_direct_responses_runner(
         from .vault import ReadVaultTool
 
         configured_tools: list[PreparedTools] = []
-        if config.vault_path is not None:
+        if config.vault_git is not None:
+            from .vault_git import VaultTools
+
+            assert config.vault_path is not None
+            configured_tools.append(
+                VaultTools(
+                    config.vault_path,
+                    config.vault_git,
+                    max_result_chars=config.max_output_chars,
+                )
+            )
+        elif config.vault_path is not None:
             configured_tools.append(
                 ReadVaultTool(
                     config.vault_path, max_result_chars=config.max_output_chars

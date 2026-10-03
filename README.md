@@ -24,15 +24,24 @@ The active runtime is intentionally small:
 - `.scratch/` retains the project history, research, issues, and acceptance
   evidence. It is not runtime code.
 
-The prepared tools include `read_vault`, `run_terminal`, `create_reminder`,
-`edit_reminder`, `list_reminders`, and `cancel_reminder`, plus explicitly
-configured Google operations. Approved one-time Reminders persist independently
-of the working session and send their exact stored body once to the authorized
-operator when due. Ubuntu
-commands run as local subprocesses. Windows commands use ordinary OpenSSH over
-Tailscale. Simple configured read-only prefixes may run automatically; every
-other command waits for the operator's exact approval or a matching saved
+The prepared tools include `read_vault`, the optional Git-backed `edit_vault`,
+`run_terminal`, `create_reminder`, `edit_reminder`, `list_reminders`, and
+`cancel_reminder`, plus explicitly configured Google operations. Approved
+one-time Reminders persist independently of the working session and send their
+exact stored body once to the authorized operator when due. Ubuntu commands run
+as local subprocesses. Windows commands use ordinary OpenSSH over Tailscale.
+Simple configured read-only prefixes may run automatically; every other
+terminal command waits for the operator's exact approval or a matching saved
 host-plus-prefix rule.
+
+Vault editing is enabled only when the optional `[vault_git]` configuration is
+present with a dedicated clone, pinned SSH host identity, and configured note
+directories. Jarvis prepares an exact Markdown diff from a synchronized base,
+shows the complete proposal, and uses one approval to write, commit, and push
+that frozen batch. It reports local commit and remote synchronization outcomes
+separately and never uses general terminal commands for vault Git operations.
+The design and implementation tickets live in
+[`.scratch/jarvis-vault-editing/spec.md`](.scratch/jarvis-vault-editing/spec.md).
 
 ## Development
 

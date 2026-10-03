@@ -50,8 +50,10 @@ Jarvis never edits `.env` or `SYSTEM.md`; it writes only the
 `[saved_permissions]` section of `/etc/jarvis/jarvis.toml`. Runtime-owned cache,
 Reminder database, and trace paths must stay below the runtime root. The
 required `operator_timezone` is an IANA name and is initially `Asia/Amman`; it
-does not inherit the host timezone. An optional vault path may be an absolute
-read-only directory outside the runtime root.
+does not inherit the host timezone. `vault_path` may be an absolute directory
+outside the runtime root. Without `[vault_git]`, it remains read-only. With
+`[vault_git]`, it must be the service-owned dedicated clone used for the
+bounded Markdown-only `edit_vault` workflow.
 
 Keep `/etc/jarvis` root-owned because it may contain unrelated protected files.
 Install the configuration in a dedicated service-owned subdirectory and expose
@@ -116,6 +118,52 @@ Windows SSH fields together when Windows execution is enabled. The identity file
 must be private to the service account and the SSH host key must already be
 pinned in that account's known-hosts file.
 
+### Optional Git-backed Obsidian vault
+
+Add this section only when Jarvis is authorized to edit and synchronize the
+dedicated vault clone. The section requires `remote`, `branch`, and
+`note_directories`, plus `vault_path` as the clone root. The author identity has
+defaults; SSH identity and known-hosts paths must be configured together:
+
+```toml
+# Add this to the [runtime] section.
+vault_path = "/srv/knowledge-vault"
+
+[vault_git]
+remote = "git@github.com:ACCOUNT/OBSIDIAN-VAULT.git"
+branch = "main"
+note_directories = ["Projects", "Ideas"]
+author_name = "Jarvis"
+author_email = "jarvis@samikayyal.com"
+ssh_identity_file = "/var/lib/jarvis-personal-runtime/credentials/obsidian-vault"
+ssh_known_hosts_file = "/var/lib/jarvis-personal-runtime/credentials/known_hosts"
+```
+
+The clone at `vault_path` must already exist, be owned by the service account,
+and have the configured remote and branch. The SSH private key and known-hosts
+file are provisioned separately with service-account-only permissions; do not
+put their contents in TOML, `.env`, `SYSTEM.md`, model context, or traces. The
+remote host identity must be pinned before activation. Jarvis invokes a bounded
+Git argument list with this identity and known-hosts file; it does not run Git
+through `run_terminal` or a shell.
+
+`read_vault` synchronizes a clean clone before fresh reads and includes the
+base revision. A temporarily unavailable remote may produce a clearly marked
+stale read, but cannot prepare a write. `edit_vault` accepts only exact
+Markdown create/update changes below `note_directories`, previews the complete
+diff, freezes the proposal, and waits for one exact `1`, `9`, or `/cancel`
+choice. After approval Jarvis revalidates the base, writes the notes, stages only the
+approved paths, creates one normal commit, and pushes it. It never merges,
+rebases, force-pushes, resolves conflicts, or blindly retries an uncertain
+push. A local commit that the remote did not accept is preserved and reported
+as `committed_not_synced`; an unverifiable push is reported as `sync_unknown`.
+
+Keep the vault clone and credential files outside the application release
+directory. Before live activation, validate the section with `--check`, prove
+the temporary-clone contract, make one small supervised test edit, verify the
+commit on the configured remote, and confirm the Obsidian client can pull it.
+Do not treat this documentation or a successful `--check` as live acceptance.
+
 Validate without binding a socket or contacting providers:
 
 ```console
@@ -138,6 +186,8 @@ configured OAuth grant and binds one in-memory Google connection;
 Connection replacement or disconnection also invalidates pending Google writes.
 Google writes accept only `1`, `9`, or `/cancel`, are attempted once, and are
 never automatically retried after an ambiguous outcome.
+When `[vault_git]` is present, `--check` also validates its required fields and
+paths without contacting the Git remote or modifying the clone.
 
 The Reminder capability is the one proactive exception to the otherwise
 inbound-driven runtime. Jarvis stores operator-requested one-time Reminders in the
@@ -163,7 +213,11 @@ OAuth consent, validate the private configuration, prove restart persistence,
 run bounded reads, perform the approved real Gmail and Calendar acceptance
 fixtures, verify rejection and excluded mutations, test disconnect/reconnect,
 and confirm the unchanged WhatsApp, vault, and terminal paths before the human
-operator makes the final go/no-go decision.
+operator makes the final go/no-go decision. Vault activation has the additional
+gates in [the vault editing spec](../../.scratch/jarvis-vault-editing/spec.md):
+temporary-clone tests, a clean candidate release, one supervised note edit,
+remote verification, and an explicit recovery procedure for a local commit or
+an uncertain push.
 
 ## Install or update the service
 

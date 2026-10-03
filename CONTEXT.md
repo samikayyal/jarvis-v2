@@ -96,10 +96,29 @@ _Avoid_: Deterministic command, provider conversation object
 
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
-current prepared tools are `read_vault`, `run_terminal`, the bounded Google API
-tools, `create_reminder`, `edit_reminder`, `list_reminders`, `cancel_reminder`,
-and the manifest-selected bounded operations of configured MCP services.
+current prepared tools are `read_vault`, the optional Git-backed `edit_vault`,
+`run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
+`list_reminders`, `cancel_reminder`, and the manifest-selected bounded
+operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
+
+**Knowledge vault**:
+The configured tree of ordinary Markdown notes that Jarvis may read and, when
+the optional `[vault_git]` configuration is present, edit through its dedicated
+Git clone.
+_Avoid_: Application checkout, runtime data directory, arbitrary filesystem
+
+**Vault edit proposal**:
+One frozen batch of exact Markdown changes, its synchronized base revision,
+complete diff, and configured commit metadata waiting for the operator's
+one-time approval. It is never approved by a saved terminal permission.
+_Avoid_: Git command, saved permission, unreviewed file write
+
+**Vault sync outcome**:
+The result of executing a vault edit proposal, distinguishing a synchronized
+commit from a local commit that was not accepted by the remote or a push whose
+effect remains unknown.
+_Avoid_: Successful local write, generic terminal result
 
 **Google API tools**:
 The bounded Gmail, Drive, and Calendar operations exposed through the one
@@ -122,13 +141,13 @@ the prior link.
 _Avoid_: Configured Google identity, OAuth token, configured MCP service
 
 **Pending action**:
-The one exact terminal command or Google write waiting indefinitely for the
+The one exact terminal command, Google write, or vault edit proposal waiting for the
 authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
 `9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all other
 messages are silently ignored while one is pending except the exact Google
-connection controls. Reauthorization or
-disconnection invalidates
-a pending Google write created under the prior connection.
+connection controls. A vault edit proposal accepts only `1`, `9`, or `/cancel`
+and never saves permission. Reauthorization or disconnection invalidates a
+pending Google write created under the prior connection.
 _Avoid_: Active request, saved permission, queued action
 
 **Saved permission**:
@@ -163,9 +182,21 @@ _Avoid_: Sanitized application log, hidden model reasoning
   permissions from `/etc/jarvis/jarvis.toml`, and its editable prompt from
   `SYSTEM.md`.
   Jarvis never edits `.env` or `SYSTEM.md`.
+- Without `[vault_git]`, `vault_path` provides the existing bounded read-only
+  vault behavior. With `[vault_git]`, `vault_path` is a dedicated clone and
+  the configured remote, branch, note directories, commit identity, SSH
+  identity, and pinned known-hosts file govern vault Git operations.
 - Google API tools use only the exact configured Google account. Gmail and
   Calendar writes require exact operator approval and one attempt; Drive tools
   cannot mutate data.
+- Git-backed vault reads synchronize a clean clone before a fresh result and
+  disclose stale reads when synchronization is unavailable. Vault writes require
+  a synchronized base and are limited to exact Markdown changes under the
+  configured note directories.
+- Every vault write is one frozen `edit_vault` proposal with one exact approval.
+  The tool stages only approved paths, creates one normal commit, and reports
+  commit and remote outcomes separately. It never merges, rebases, force-pushes,
+  resolves conflicts, or blindly retries an uncertain push.
 - Configured simple read-only command prefixes may run automatically. Compound
   shell structure, scripts, unmatched commands, and mutating commands require
   exact approval or a matching saved permission.
@@ -190,8 +221,9 @@ _Avoid_: Sanitized application log, hidden model reasoning
 | OpenWA | WhatsApp transport, message persistence, pairing, named-session readiness | Assistant decisions, command permissions, model transcript |
 | Personal assistant runtime | Admission filtering, sessions, commands, model-and-tool loop, approvals, replies | OpenWA pairing or container lifecycle, durable conversation history |
 | `.env` | OpenAI, OpenWA, and Google OAuth credentials | Non-secret settings, saved permissions |
-| `/etc/jarvis/jarvis.toml` | Non-secret limits, paths, identities, read-only prefixes, saved permissions | Credentials, message bodies, command output |
+| `/etc/jarvis/jarvis.toml` | Non-secret limits, paths, identities, read-only prefixes, saved permissions, optional vault Git settings | Credentials, message bodies, command output |
 | `SYSTEM.md` | Editable assistant instruction | Credentials, saved permissions |
+| Dedicated vault clone | Configured Markdown notes and the exact Git history used for vault reads and writes | Application checkout, OpenWA data, arbitrary terminal writes |
 | Runtime data directory | Reminder SQLite database, seven-day deduplication cache, and verbatim rotating trace | OpenWA data or pairing state |
 
 ## Operational definition of active
