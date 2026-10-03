@@ -827,7 +827,6 @@ async def _cancel_task(task: asyncio.Task[object] | None) -> None:
 
 
 def _status_text(status: RuntimeStatus) -> str:
-    session = status.session_id or "none"
     active = status.active_request.phase if status.active_request else "none"
     pending = "yes" if status.pending_action else "no"
     context = (
@@ -840,9 +839,13 @@ def _status_text(status: RuntimeStatus) -> str:
         )
     )
     return (
-        f"Session: {session}; model: {status.model}; reasoning: {status.reasoning}; "
-        f"active request: {active}; pending action: {pending}; "
-        f"saved permissions: {status.permission_count}.\nContext: {context}."
+        f"Model: {status.model} ({status.reasoning})\n"
+        "---\n"
+        f"Active request: {active}; pending action: {pending}\n"
+        "---\n"
+        f"Saved permissions: {status.permission_count}\n"
+        "---\n"
+        f"Context: {context}"
     )
 
 

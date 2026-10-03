@@ -200,7 +200,7 @@ async def test_status_uses_configured_context_limit_and_tolerates_counter_failur
     assert completed.replies == ("done",)
     unavailable = await runtime.receive(inbound("status-unavailable", "/status"))
     assert unavailable.status.context_used_tokens is None
-    assert "Context: unavailable." in unavailable.replies[0]
+    assert "Context: unavailable" in unavailable.replies[0]
 
 
 @async_test
