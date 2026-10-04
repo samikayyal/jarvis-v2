@@ -54,3 +54,33 @@ partial or uncertain synchronization result?
   service replacement, and live acceptance require the deployment operator and
   are not implied by documentation changes in this ticket.
 
+
+## Deployment evidence — 2026-10-04
+
+- Implemented release: `e9fb255d6d821c2e1e12ec51366576045766b134`.
+- Full surviving suite: 295 passed, 1 skipped. Ruff, formatting, compilation,
+  and diff checks passed. The Windows CRLF fixture was corrected before the
+  clean final suite run.
+- Built the candidate on the host's installed Python 3.14.4 with hash-locked
+  production dependencies; service-account `--check` passed before activation.
+- The provider accepted the strict vault tool schemas. A live vault read
+  synchronized successfully with GitHub.
+- Activated the commit-named release. The service is active and enabled with
+  zero restarts, its only listener is `172.20.0.1:9011`, OpenWA is healthy,
+  and the configured named session is `ready`.
+- The service-owned clone is `/var/lib/jarvis-personal-runtime/vault` and
+  targets `ssh://git@github.com/samikayyal/obsidian-vault.git`, branch `main`.
+  It is clean at `f7208d78bc7fabdce95ce9041238e4d5871d87c1`.
+- The former clone `/var/lib/jarvis/vault` is preserved. Its unpublished
+  commit `b89628fde69b52914274501767944d9fb30d88ef`, affecting
+  `Projects/Jarvis/ideas.md`, was not replayed into the GitHub-backed clone.
+- Post-deployment verification passed a disposable Ubuntu note update/create,
+  exact approval, single commit, and push. A production-vault proposal was
+  prepared and rejected, proving no live note or commit changed. The existing
+  repository credential also passed a production push dry run.
+- Previous runtime release `e4032ca18edf7c3cd31f61aed097ee7f39353ea7` and
+  root-only configuration/prompt backups were retained for rollback.
+- Acceptance limits: no actual note was pushed to the personal remote during
+  testing, and no real authorized WhatsApp round trip or Obsidian client pull
+  was performed. Those remaining human acceptance checks keep this ticket open;
+  they do not mean the deployment itself is pending.

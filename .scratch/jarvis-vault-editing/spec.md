@@ -2,8 +2,7 @@
 
 ## Status
 
-Implementation and focused tests complete. Final verification and live
-deployment and real-remote acceptance have not been claimed.
+Implemented and deployed on 2026-10-04 from release `e9fb255d6d821c2e1e12ec51366576045766b134`. Automated checks and host verification passed. A real authorized WhatsApp note edit and an Obsidian client pull remain unverified.
 
 ## Goal
 
@@ -160,4 +159,5 @@ updated or that a real Obsidian remote has passed acceptance.
 - Editing `.obsidian`, hidden paths, Git metadata, or non-Markdown files.
 - Automatic merge, conflict resolution, force-push, retry after an uncertain push, or host failover.
 - A blanket permission for future vault writes.
+
 
