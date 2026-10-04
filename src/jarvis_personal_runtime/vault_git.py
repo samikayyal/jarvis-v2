@@ -295,7 +295,9 @@ class VaultTools:
             "description": (
                 "Prepare an exact Markdown note batch against a synchronized "
                 "Git revision. The operator must approve the complete diff "
-                "before Jarvis writes, commits, and pushes it."
+                "before Jarvis writes, commits, and pushes it. The runtime shows "
+                "the preview and waits outside the model loop; the final result's "
+                "approval field reports the operator's actual decision."
             ),
             "strict": True,
             "parameters": {
@@ -434,6 +436,11 @@ class VaultTools:
                 return _json(
                     {
                         "status": "rejected",
+                        "approval": {
+                            "decision": "rejected",
+                            "preview_shown": True,
+                            "source": "operator_reply",
+                        },
                         "base_revision": continuation.base_revision,
                         "paths": [change.path for change in continuation.changes],
                     },
@@ -1110,6 +1117,11 @@ class VaultTools:
     ) -> str:
         payload: dict[str, object] = {
             "status": status,
+            "approval": {
+                "decision": "approved_once",
+                "preview_shown": True,
+                "source": "operator_reply",
+            },
             "base_revision": continuation.base_revision,
             "paths": [change.path for change in continuation.changes],
         }

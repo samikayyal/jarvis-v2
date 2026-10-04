@@ -119,3 +119,8 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
     assert isinstance(transcript, list)
     output = json.loads(transcript[-1]["output"])
     assert output["status"] == "synced"
+    assert output["approval"] == {
+        "decision": "approved_once",
+        "preview_shown": True,
+        "source": "operator_reply",
+    }
