@@ -2,7 +2,13 @@
 
 ## Status
 
-Implemented and deployed on 2026-10-04 from release `e9fb255d6d821c2e1e12ec51366576045766b134`. Automated checks and host verification passed. A real authorized WhatsApp note edit and an Obsidian client pull remain unverified.
+Implemented, deployed, and tested through the authorized WhatsApp chat on
+2026-10-04. Current application release:
+`05bfec5c9b5077a7776475ad8fe40e0d814580cc`. Automated checks, live approval,
+rejection, cancellation, exact note create/update, and independent GitHub
+synchronization verification passed. The test note is synchronized at vault
+commit `eb2647e7802bad86a9ed18aa5fbafbc83f45269c`. An Obsidian client pull
+remains unverified. See [acceptance evidence](issues/04-verify-and-activate-vault-editing.md).
 
 ## Goal
 
@@ -107,6 +113,10 @@ creates or consults a saved terminal permission. The approved patch, paths,
 base revision, and commit metadata are frozen inside the continuation. A later
 model message cannot replace the patch after approval.
 
+The runtime shows the preview and waits outside the model loop. When the loop
+resumes, the result explicitly reports the operator's approval or rejection
+and that the preview was shown, so Jarvis can describe the decision accurately.
+
 After `1`, the tool takes the vault lock, fetches again, and verifies that the
 branch, local state, remote base, and approved base revision still match. It
 then:
@@ -147,9 +157,9 @@ The implementation is split into four tickets:
 3. [Approve, commit, and synchronize one vault edit](issues/03-approve-commit-and-synchronize-vault-edits.md)
 4. [Verify and activate vault editing](issues/04-verify-and-activate-vault-editing.md)
 
-The final ticket covers automated temporary-clone tests and supervised
-deployment preparation. It does not claim that the live Ubuntu host has been
-updated or that a real Obsidian remote has passed acceptance.
+The final ticket records automated temporary-clone tests, deployment validation,
+and authorized live WhatsApp acceptance against the configured vault remote.
+Client-side Obsidian synchronization remains a separate, unverified check.
 
 ## Out of scope
 

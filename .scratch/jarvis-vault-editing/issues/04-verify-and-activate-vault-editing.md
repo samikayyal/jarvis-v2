@@ -1,5 +1,5 @@
 Type: task
-Status: claimed
+Status: complete
 Blocked by: 01, 02, 03
 
 # Verify and activate vault editing
@@ -33,19 +33,19 @@ partial or uncertain synchronization result?
 
 ## Acceptance criteria
 
-- [ ] Temporary-clone tests pass for every listed success, rejection, race, and
+- [x] Temporary-clone tests pass for every listed success, rejection, race, and
   uncertain-outcome path.
-- [ ] The full surviving suite and required static checks pass after the vault
+- [x] The full surviving suite and required static checks pass after the vault
   capability is composed into the runtime.
-- [ ] Deployment documentation and the system prompt direct the model to use
+- [x] Deployment documentation and the system prompt direct the model to use
   `edit_vault` for vault changes and never use general terminal Git commands.
-- [ ] `--check` validates the optional vault configuration without contacting a
+- [x] `--check` validates the optional vault configuration without contacting a
   provider or modifying the clone.
-- [ ] Candidate release validation is complete and the live replacement steps
+- [x] Candidate release validation is complete and the live replacement steps
   have a recorded rollback target before service activation.
-- [ ] A human-supervised real-remote acceptance proves one exact note edit,
+- [x] A human-supervised real-remote acceptance proves one exact note edit,
   one commit, remote synchronization, and truthful reporting of the result.
-- [ ] No claim of live activation is made until the service, remote, and
+- [x] No claim of live activation is made until the service, remote, and
   authorized phone interaction have all passed their respective gates.
 
 ## Comments
@@ -80,7 +80,43 @@ partial or uncertain synchronization result?
   repository credential also passed a production push dry run.
 - Previous runtime release `e4032ca18edf7c3cd31f61aed097ee7f39353ea7` and
   root-only configuration/prompt backups were retained for rollback.
-- Acceptance limits: no actual note was pushed to the personal remote during
-  testing, and no real authorized WhatsApp round trip or Obsidian client pull
-  was performed. Those remaining human acceptance checks keep this ticket open;
-  they do not mean the deployment itself is pending.
+- Initial acceptance limits: the initial deployment tests did not push an
+  actual note to the personal remote or exercise a real authorized WhatsApp
+  round trip. The live acceptance below closes those gaps. An Obsidian client
+  pull remains unverified and is not claimed by this implementation completion.
+
+## Live WhatsApp acceptance — 2026-10-04
+
+- The operator explicitly authorized messaging Jarvis and testing the tools
+  through the open in-app WhatsApp chat.
+- `read_vault` searched successfully and returned a synchronized base. A new
+  test-note proposal was rejected with `9`; the note remained absent and the
+  clean vault HEAD did not change. Repeating the proposal and replying `1`
+  created only `Projects/Jarvis/vault-tool-acceptance-2026-10-04.md` in commit
+  `2fe522808e5a389d5f8ae57828ac1437a3050914`.
+- An update proposal was cancelled with `/cancel`. A new exact proposal changing
+  only `Status: created` to `Status: verified` was approved with `1`, committed,
+  and synchronized in `eb2647e7802bad86a9ed18aa5fbafbc83f45269c`.
+- Testing exposed misleading model narration about whether approval happened.
+  Release `05bfec5c9b5077a7776475ad8fe40e0d814580cc` fixes this by returning
+  explicit operator approval metadata to the model and explaining the runtime
+  approval pause in the tool description. Its regression test reproduced the
+  failure before the fix. Final suite: 295 passed, 1 skipped; changed-file Ruff
+  and formatting checks passed. Candidate `--check` passed before deployment;
+  release `e9fb255d6d821c2e1e12ec51366576045766b134` remains a rollback target.
+- After deployment, Jarvis correctly acknowledged the approved update. A
+  subsequent proposal changing `verified` to `rejected-test` was rejected with
+  `9`; Jarvis correctly reported that the preview was shown, the proposal was
+  rejected, and no changes were made. Its synchronized read showed `verified`.
+- Independent service-account Git verification proved local HEAD and remote
+  `main` both equal `eb2647e7802bad86a9ed18aa5fbafbc83f45269c`, a clean clone,
+  exactly the two accepted test commits, and only the named test note changed.
+  Final note SHA-256:
+  `4aa3ba012e2823042c7b24367592d8cb11050df8a0d407878bbb834e6568466a`.
+- The live release is `05bfec5c9b5077a7776475ad8fe40e0d814580cc`; service active
+  and enabled, zero restarts, exact listener `172.20.0.1:9011`, OpenWA healthy,
+  and configured named session `ready`. WhatsApp `/status` reports no active
+  request and no pending action.
+- The test note is retained as acceptance evidence. Receiving it in an
+  Obsidian client still depends on that client's Git pull; no client pull was
+  performed or verified in this test.
