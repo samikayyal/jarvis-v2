@@ -132,8 +132,8 @@ def test_edit_requires_approval_and_pushes_exact_crlf_change(
     result = json.loads(asyncio.run(tool.resume(proposed.continuation, approved=True)))
 
     assert result["status"] == "synced"
-    assert result["commit"] == _head(clone)
-    assert _git(remote, "rev-parse", "refs/heads/main") == result["commit"]
+    assert "commit" not in result and "base_revision" not in result
+    assert _git(remote, "rev-parse", "refs/heads/main") == _head(clone)
     assert (clone / "Projects" / "Jarvis.md").read_bytes() == (
         b"# Jarvis\r\n\r\nStatus: started\r\n"
     )

@@ -150,9 +150,17 @@ through `run_terminal` or a shell.
 `read_vault` synchronizes a clean clone before fresh reads and includes the
 base revision. A temporarily unavailable remote may produce a clearly marked
 stale read, but cannot prepare a write. `edit_vault` accepts only exact
-Markdown create/update changes below `note_directories`, previews the complete
-diff, freezes the proposal, and waits for one exact `1`, `9`, or `/cancel`
-choice. After approval Jarvis revalidates the base, writes the notes, stages only the
+Markdown create/update changes below `note_directories`, previews additions,
+removals, replacements, or new content in plain language, and freezes the proposal.
+Reply `1` to approve once, `2` to always approve future edits to that exact file,
+or `9` to reject; `/cancel` also discards the proposal. Choice `2` is offered
+only for single-file proposals. Grants survive restart, are scoped to the clone,
+remote, branch, and exact note path, and never grant terminal permission.
+Use `/permissions` and `/forget-permission ID` to inspect or revoke a grant.
+Future requests skip the prompt only when every changed file has a saved grant.
+Git hashes and commit messages are retained in diagnostic traces; replies simply
+describe what changed and whether it synced.
+After approval Jarvis revalidates the base, writes the notes, stages only the
 approved paths, creates one normal commit, and pushes it. It never merges,
 rebases, force-pushes, resolves conflicts, or blindly retries an uncertain
 push. A local commit that the remote did not accept is preserved and reported

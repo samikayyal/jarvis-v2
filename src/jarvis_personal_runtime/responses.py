@@ -691,6 +691,12 @@ def build_direct_responses_runner(
                     config.vault_path,
                     config.vault_git,
                     max_result_chars=config.max_output_chars,
+                    permission_store=TomlPermissionStore(
+                        Path(config_path)
+                        if config_path is not None
+                        else config.root / "jarvis.toml"
+                    ),
+                    trace=sink,
                 )
             )
         elif config.vault_path is not None:

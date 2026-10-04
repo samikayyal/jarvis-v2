@@ -47,7 +47,9 @@ class PermissionRule:
         normalized_host = normalize_host(host)
         if not isinstance(prefix, str):
             raise TypeError("permission prefix must be a string")
-        normalized_prefix = prefix.strip()
+        normalized_prefix = (
+            prefix if normalized_host.startswith("vault:") else prefix.strip()
+        )
         if not normalized_prefix or _CONTROL.search(normalized_prefix):
             raise ValueError("permission prefix must be non-empty and control-free")
         digest = hashlib.sha256(
@@ -64,6 +66,9 @@ class PermissionRule:
             return False
         if normalize_host(host) != self.host:
             return False
+        # Repository-scoped vault rules match exact note paths, never prefixes.
+        if self.host.startswith("vault:"):
+            return command == self.prefix
         candidate = command.casefold() if self.host == "windows" else command
         prefix = self.prefix.casefold() if self.host == "windows" else self.prefix
         return candidate == prefix or candidate.startswith(f"{prefix} ")

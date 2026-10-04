@@ -124,8 +124,8 @@ def test_final_newline_change_is_visible_in_preview(
         )
     )
     assert isinstance(step, ApprovalRequired)
-    assert "-aaa" in step.action.display
-    assert "+aaa" in step.action.display
+    assert "Replace:\naaa" in step.action.display
+    assert "With:\naaa" in step.action.display
     assert "newline" in step.action.display.lower()
 
 
@@ -272,7 +272,7 @@ def test_push_outcomes_preserve_one_commit_and_never_retry(
     )
     assert attempts == 1
     assert git(clone, "rev-list", "--count", f"{base}..HEAD") == "1"
-    assert result["commit"] == git(clone, "rev-parse", "HEAD")
-    assert (git(remote, "rev-parse", "main") == result["commit"]) == (
+    assert "commit" not in result
+    assert (git(remote, "rev-parse", "main") == git(clone, "rev-parse", "HEAD")) == (
         failure == "timeout_after_success"
     )

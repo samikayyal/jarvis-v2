@@ -18,7 +18,7 @@ from .config import (
     normalize_model_alias,
 )
 from .dedup import CacheError, MessageIdCache
-from .permissions import PermissionRule, TomlPermissionStore
+from .permissions import PermissionRule, PermissionStoreError, TomlPermissionStore
 from .trace import build_runtime_trace
 
 BUSY_NOTICE = "Jarvis is busy with another request. Use /cancel to stop it."
@@ -94,6 +94,7 @@ class PendingAction:
     prefix: str
     display: str
     allow_save_permission: bool = True
+    approval_suffix: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.host, "host")
@@ -101,6 +102,8 @@ class PendingAction:
         _required_text(self.display, "display")
         if not isinstance(self.allow_save_permission, bool):
             raise TypeError("allow_save_permission must be a boolean")
+        if self.approval_suffix is not None:
+            _required_text(self.approval_suffix, "approval_suffix")
 
 
 class ApprovalDecision(str, Enum):
@@ -469,7 +472,7 @@ class PersonalRuntime:
             action = pending.action
         try:
             self.permission_store.add(action.host, action.prefix)
-        except (OSError, ValueError):
+        except (OSError, ValueError, PermissionStoreError):
             async with self._lock:
                 if self._session and self._session.pending is pending:
                     pending.claimed = False
@@ -539,7 +542,7 @@ class PersonalRuntime:
                 self._session.active.phase = "awaiting_approval"
                 self._session.active.task = None
                 self._session.pending = _Pending(step.action, step.continuation)
-            suffix = (
+            suffix = step.action.approval_suffix or (
                 APPROVAL_SUFFIX
                 if step.action.allow_save_permission
                 else "Reply 1 to approve once or 9 to reject."
@@ -641,10 +644,18 @@ class PersonalRuntime:
         if command == "/permissions" and not args:
             rules = self.permission_store.list_rules()
             reply = (
-                "No saved command permissions."
+                "No saved permissions."
                 if not rules
-                else "Saved command permissions:\n"
-                + "\n".join(f"{rule.id}: {rule.host} {rule.prefix}" for rule in rules)
+                else "Saved permissions:\n"
+                + "\n".join(
+                    f"{rule.id}: "
+                    + (
+                        f"vault file {rule.prefix}"
+                        if rule.host.startswith("vault:")
+                        else f"{rule.host} {rule.prefix}"
+                    )
+                    for rule in rules
+                )
             )
             return self._result(RuntimeDisposition.COMMAND, (reply,))
         if command == "/forget-permission" and len(args) == 1:

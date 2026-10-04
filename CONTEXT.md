@@ -110,8 +110,9 @@ _Avoid_: Application checkout, runtime data directory, arbitrary filesystem
 
 **Vault edit proposal**:
 One frozen batch of exact Markdown changes, its synchronized base revision,
-complete diff, and configured commit metadata waiting for the operator's
-one-time approval. It is never approved by a saved terminal permission.
+complete internal diff, and configured commit metadata. The operator reviews
+plain-language changes and can approve once or remember approval for exactly
+one file. It is never approved by a saved terminal permission.
 _Avoid_: Git command, saved permission, unreviewed file write
 
 **Vault sync outcome**:
@@ -145,15 +146,17 @@ The one exact terminal command, Google write, or vault edit proposal waiting for
 authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
 `9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all other
 messages are silently ignored while one is pending except the exact Google
-connection controls. A vault edit proposal accepts only `1`, `9`, or `/cancel`
-and never saves permission. Reauthorization or disconnection invalidates a
+connection controls. A vault edit proposal accepts `1`, `9`, or `/cancel`
+and also `2` for a single-file proposal, saving approval for that exact note
+in its clone, remote, and branch. Reauthorization or disconnection invalidates a
 pending Google write created under the prior connection.
 _Avoid_: Active request, saved permission, queued action
 
 **Saved permission**:
-A non-secret host-plus-literal-command-prefix rule stored only in the
-`[saved_permissions]` section of `jarvis.toml`. It never grants authority across
-hosts or to a changed command prefix.
+A non-secret rule stored only in the `[saved_permissions]` section of
+`jarvis.toml`. Terminal rules match a host plus a literal command prefix.
+Vault rules use a separate repository scope and match one exact canonical note
+path. Both can be listed and revoked through deterministic commands.
 _Avoid_: Wildcard permission, credential, approval for one action
 
 **Runtime trace**:
@@ -193,7 +196,8 @@ _Avoid_: Sanitized application log, hidden model reasoning
   disclose stale reads when synchronization is unavailable. Vault writes require
   a synchronized base and are limited to exact Markdown changes under the
   configured note directories.
-- Every vault write is one frozen `edit_vault` proposal with one exact approval.
+- Every vault write is one frozen `edit_vault` proposal authorized by one exact
+  approval or a previously saved permission for every affected file.
   The tool stages only approved paths, creates one normal commit, and reports
   commit and remote outcomes separately. It never merges, rebases, force-pushes,
   resolves conflicts, or blindly retries an uncertain push.

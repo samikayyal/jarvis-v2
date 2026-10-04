@@ -10,6 +10,10 @@ synchronization verification passed. The test note is synchronized at vault
 commit `eb2647e7802bad86a9ed18aa5fbafbc83f45269c`. An Obsidian client pull
 remains unverified. See [acceptance evidence](issues/04-verify-and-activate-vault-editing.md).
 
+The subsequent plain-language preview and saved-file-approval refinement in
+[ticket 05](issues/05-simple-previews-and-file-permissions.md) is implemented
+locally; deployment and its live WhatsApp acceptance remain pending.
+
 ## Goal
 
 Give Jarvis one bounded capability for updating ordinary Obsidian Markdown notes
@@ -98,26 +102,32 @@ the entire batch. The tool preserves the rest of the note, including
 frontmatter, formatting, and line endings. It never guesses an edit location.
 
 The tool synchronizes and validates the base, computes the complete resulting
-files and unified diff, validates the commit message, and stores that exact
-proposal without changing the working tree. The approval preview includes the
-base revision, canonical paths, complete diff, commit metadata, and a clear
-statement that approval will write, commit, and push this exact batch. A
-truncated preview is not an approval preview; oversized proposals are rejected
-or split before approval.
+files and internal unified diff, validates the commit message, and freezes the
+exact proposal. The operator sees the file and plain-language Add, Remove,
+Replace/With, or Create sections containing the actual changed text. Git diffs,
+revisions, hashes, and commit messages stay out of the preview and final reply.
+Oversized previews are rejected or split before approval, never truncated.
 
 ## Approval and execution
 
 The proposal is one pending action. It uses the existing runtime continuation
-and accepts only the exact one-time choices `1`, `9`, and `/cancel`; it never
-creates or consults a saved terminal permission. The approved patch, paths,
+and accepts `1` to approve once, `9` to reject, and `/cancel`. A single-file
+proposal also offers `2` to approve and remember future edits to that exact file.
+The saved permission is scoped to the canonical note path, clone, remote, and
+branch, persists across restarts, and is independent of terminal permissions.
+Use `/permissions` to list grants and `/forget-permission ID` to revoke one.
+Multi-file proposals offer only one-time approval unless every changed file
+already has a saved grant. Jarvis uses one file per call to offer choice `2`.
+The approved patch, paths,
 base revision, and commit metadata are frozen inside the continuation. A later
 model message cannot replace the patch after approval.
 
 The runtime shows the preview and waits outside the model loop. When the loop
 resumes, the result explicitly reports the operator's approval or rejection
-and that the preview was shown, so Jarvis can describe the decision accurately.
+or the use of a saved file permission, so Jarvis can describe the decision accurately.
 
-After `1`, the tool takes the vault lock, fetches again, and verifies that the
+After `1`, `2`, or a matching saved file permission, the tool takes the vault
+lock, fetches again, and verifies that the
 branch, local state, remote base, and approved base revision still match. It
 then:
 
@@ -150,14 +160,15 @@ A local commit is preserved when it exists so an operator can recover it.
 
 ## Work packages
 
-The implementation is split into four tickets:
+The implementation and subsequent approval refinement are tracked in these tickets:
 
 1. [Configure the Git-backed vault and synchronized reads](issues/01-configure-vault-git-and-synchronized-reads.md)
 2. [Prepare exact Markdown vault edits](issues/02-prepare-exact-markdown-vault-edits.md)
 3. [Approve, commit, and synchronize one vault edit](issues/03-approve-commit-and-synchronize-vault-edits.md)
 4. [Verify and activate vault editing](issues/04-verify-and-activate-vault-editing.md)
+5. [Simple edit previews and remembered file approval](issues/05-simple-previews-and-file-permissions.md)
 
-The final ticket records automated temporary-clone tests, deployment validation,
+Ticket 04 records automated temporary-clone tests, deployment validation,
 and authorized live WhatsApp acceptance against the configured vault remote.
 Client-side Obsidian synchronization remains a separate, unverified check.
 

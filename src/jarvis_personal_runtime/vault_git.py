@@ -22,8 +22,10 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
+from .permissions import TomlPermissionStore
+
 if TYPE_CHECKING:
-    from .runtime import ApprovalRequired
+    from .runtime import ApprovalRequired, RuntimeTrace
 
 
 _MAX_PATH_CHARS = 512
@@ -168,6 +170,8 @@ class _PreparedChange:
 @dataclass(slots=True)
 class _ContinuationState:
     resolved: bool = False
+    approval_decision: str = "approved_once"
+    preview_shown: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,10 +298,14 @@ class VaultTools:
             "name": "edit_vault",
             "description": (
                 "Prepare an exact Markdown note batch against a synchronized "
-                "Git revision. The operator must approve the complete diff "
-                "before Jarvis writes, commits, and pushes it. The runtime shows "
-                "the preview and waits outside the model loop; the final result's "
-                "approval field reports the operator's actual decision."
+                "Git revision. The runtime shows a simple before/after preview "
+                "and handles approval outside the model loop. Choice 2 remembers "
+                "approval for that exact file; later requests for it can proceed "
+                "without another prompt. Use one file per call when offering this "
+                "choice. The result reports the actual approval and sync outcome. "
+                "Tell the operator briefly what changed and whether it synced. "
+                "Keep commit hashes, base revisions, commit messages, and Git "
+                "details out of the preview and final reply."
             ),
             "strict": True,
             "parameters": {
@@ -392,6 +400,8 @@ class VaultTools:
         settings: VaultGitSettings,
         *,
         max_result_chars: int = 65_536,
+        permission_store: TomlPermissionStore | None = None,
+        trace: RuntimeTrace | None = None,
     ) -> None:
         if not isinstance(root, Path):
             raise TypeError("vault root must be a Path")
@@ -412,6 +422,18 @@ class VaultTools:
         self._root = resolved
         self._settings = settings
         self._max_result_chars = max_result_chars
+        self._permission_store = permission_store
+        self._trace = trace
+        # A remembered file never grants access to another clone, remote, or branch.
+        self._permission_host = "vault:" + _hash(
+            json.dumps(
+                [
+                    os.path.normcase(str(resolved)),
+                    _remote_key(settings.remote),
+                    settings.branch,
+                ]
+            ).encode()
+        )
         self._lock = asyncio.Lock()
         self._last_successful_revision: str | None = None
         self._last_successful_sync: datetime | None = None
@@ -441,11 +463,12 @@ class VaultTools:
                             "preview_shown": True,
                             "source": "operator_reply",
                         },
-                        "base_revision": continuation.base_revision,
                         "paths": [change.path for change in continuation.changes],
                     },
                     limit=self._max_result_chars,
                 )
+            if self._has_saved_permissions(continuation.changes):
+                continuation.state.approval_decision = "approved_and_saved"
             return await self._execute_approved(continuation)
 
     async def _execute_read(self, arguments: dict[str, object]) -> str:
@@ -492,15 +515,12 @@ class VaultTools:
                 return _json(
                     {
                         "status": "no_change",
-                        "base_revision": base_revision,
                         "paths": [change.path for change in changes],
                     },
                     limit=self._max_result_chars,
                 )
             patch = "\n\n".join(change.patch for change in actual_changes)
-            display = self._approval_display(
-                base_revision, commit_message, actual_changes, patch
-            )
+            display = self._approval_display(actual_changes)
             if len(display) > self._max_result_chars:
                 raise VaultToolError(
                     "edit_vault proposal is larger than the configured result limit"
@@ -514,15 +534,36 @@ class VaultTools:
                 patch=patch,
                 state=_ContinuationState(),
             )
+            if self._has_saved_permissions(actual_changes):
+                continuation.state.resolved = True
+                continuation.state.approval_decision = "saved_file_permission"
+                continuation.state.preview_shown = False
+                return await self._execute_approved(continuation)
+            can_save = self._permission_store is not None and len(actual_changes) == 1
             return ApprovalRequired(
                 PendingAction(
-                    host="ubuntu",
-                    prefix="edit_vault",
+                    host=self._permission_host,
+                    prefix=actual_changes[0].path,
                     display=display,
-                    allow_save_permission=False,
+                    allow_save_permission=can_save,
+                    approval_suffix=(
+                        "Reply 1 to approve once, 2 to always approve future edits "
+                        "to this file, or 9 to reject."
+                        if can_save
+                        else None
+                    ),
                 ),
                 continuation,
             )
+
+    def _has_saved_permissions(self, changes: tuple[_PreparedChange, ...]) -> bool:
+        if self._permission_store is None:
+            return False
+        rules = self._permission_store.list_rules()
+        return all(
+            any(rule.matches(self._permission_host, change.path) for rule in rules)
+            for change in changes
+        )
 
     def _validate_read_arguments(self, arguments: dict[str, object]) -> tuple[str, str]:
         if not isinstance(arguments, dict) or set(arguments) != {"mode", "value"}:
@@ -670,32 +711,45 @@ class VaultTools:
             result = result[:start] + new_text + result[end:]
         return result
 
-    def _approval_display(
-        self,
-        base_revision: str,
-        commit_message: str,
-        changes: Iterable[_PreparedChange],
-        patch: str,
-    ) -> str:
-        change_list = [
-            {
-                "operation": change.operation,
-                "path": change.path,
-                "old_sha256": _hash(change.old_bytes)
-                if change.operation == "update"
-                else None,
-                "new_sha256": _hash(change.new_bytes),
-            }
-            for change in changes
-        ]
-        return (
-            "Edit the configured Obsidian vault, commit, and push this exact patch?\n"
-            f"Base revision: {base_revision}\n"
-            f"Commit message: {commit_message}\n"
-            f"Changes: {json.dumps(change_list, ensure_ascii=False, sort_keys=True)}\n"
-            "Unified diff:\n"
-            f"{patch}"
-        )
+    def _approval_display(self, changes: Iterable[_PreparedChange]) -> str:
+        sections = ["Proposed note changes:"]
+        for change in changes:
+            sections.append(f"File: {change.path}")
+            old = _decode_note(change.old_bytes)
+            new = _decode_note(change.new_bytes)
+            if change.operation == "create":
+                sections.append("Create this note:\n" + (new or "(empty note)"))
+                continue
+            before, after = old.splitlines(keepends=True), new.splitlines(keepends=True)
+            matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+            for tag, i, j, k, l in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                previous = "\n".join(
+                    line.rstrip("\r\n") or "(blank line)" for line in before[i:j]
+                )
+                replacement = "\n".join(
+                    line.rstrip("\r\n") or "(blank line)" for line in after[k:l]
+                )
+                if tag == "insert":
+                    sections.append("Add:\n" + (replacement or "(blank line)"))
+                elif tag == "delete":
+                    sections.append("Remove:\n" + (previous or "(blank line)"))
+                else:
+                    sections.append(
+                        "Replace:\n"
+                        + (previous or "(blank line)")
+                        + "\nWith:\n"
+                        + (replacement or "(blank line)")
+                    )
+            if old.endswith("\n") != new.endswith("\n"):
+                sections.append(
+                    "Add the final newline."
+                    if new.endswith("\n")
+                    else "Remove the final newline."
+                )
+        sections.append("Approval saves and syncs these changes.")
+        return "\n\n".join(sections)
 
     def _validate_note_path(self, value: str) -> str:
         if (
@@ -1118,15 +1172,25 @@ class VaultTools:
         payload: dict[str, object] = {
             "status": status,
             "approval": {
-                "decision": "approved_once",
-                "preview_shown": True,
-                "source": "operator_reply",
+                "decision": continuation.state.approval_decision,
+                "preview_shown": continuation.state.preview_shown,
+                "source": "operator_reply"
+                if continuation.state.preview_shown
+                else "saved_permission",
             },
-            "base_revision": continuation.base_revision,
             "paths": [change.path for change in continuation.changes],
         }
-        if commit is not None:
-            payload["commit"] = commit
+        if self._trace is not None:
+            self._trace.record(
+                "vault_edit_outcome",
+                {
+                    **payload,
+                    "base_revision": continuation.base_revision,
+                    "commit": commit,
+                    "commit_message": continuation.commit_message,
+                    "local_changes_left": local_changes,
+                },
+            )
         if local_changes:
             payload["local_changes_left"] = True
         return _json(payload, limit=self._max_result_chars)
