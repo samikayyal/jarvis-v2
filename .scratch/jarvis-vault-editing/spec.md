@@ -4,23 +4,25 @@
 
 Implemented, deployed, and tested through the authorized WhatsApp chat on
 2026-10-04. Current application release:
-`05bfec5c9b5077a7776475ad8fe40e0d814580cc`. Automated checks, live approval,
-rejection, cancellation, exact note create/update, and independent GitHub
-synchronization verification passed. The test note is synchronized at vault
-commit `eb2647e7802bad86a9ed18aa5fbafbc83f45269c`. An Obsidian client pull
-remains unverified. See [acceptance evidence](issues/04-verify-and-activate-vault-editing.md).
+`40184830fd90bfc3a22967a94949232014e6e5c7`. Plain Add/Remove/Replace/Create
+previews, exact-file saved approvals, concise sync replies, and automated
+validation passed. Live WhatsApp proved addition approval with `2`, automatic
+subsequent editing, permission revocation, and a fresh removal preview.
+Independent verification confirmed a clean vault synchronized with GitHub and
+the test note restored byte-for-byte. See [initial acceptance](issues/04-verify-and-activate-vault-editing.md)
+and [refinement acceptance](issues/05-simple-previews-and-file-permissions.md).
 
-The subsequent plain-language preview and saved-file-approval refinement in
-[ticket 05](issues/05-simple-previews-and-file-permissions.md) is implemented
-locally; deployment and its live WhatsApp acceptance remain pending.
+Connectivity dropped during final cleanup: the last `9` rejection is queued in
+WhatsApp, and final idle status has not been verified. No approval was sent for
+that pending removal proposal. An Obsidian client pull remains unverified.
 
 ## Goal
 
 Give Jarvis one bounded capability for updating ordinary Obsidian Markdown notes
 and synchronizing those updates through the vault's Git remote. The operator
-should be able to ask Jarvis to change a note, inspect the exact diff, approve
-once, and receive a precise result describing whether the change was committed
-and whether the commit reached the remote.
+should be able to ask Jarvis to change a note, inspect simple content changes, approve
+once or remember approval for that exact file, and receive a short result
+describing the edit and whether it synced.
 
 The capability belongs in the personal assistant runtime beside `read_vault`.
 It does not require an Obsidian plugin, an MCP service, or a second worker. The
