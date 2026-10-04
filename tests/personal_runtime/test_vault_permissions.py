@@ -258,3 +258,15 @@ def test_plain_preview_handles_additions_removals_and_blank_lines(
     assert "Unified diff" not in step.action.display
     assert "Commit message" not in step.action.display
     assert (clone / "note.md").read_bytes() == b"aaa\n"
+
+
+def test_append_to_note_without_final_newline_is_an_addition():
+    from jarvis_personal_runtime.vault_git import _PreparedChange
+
+    tool = object.__new__(VaultTools)
+    change = _PreparedChange(
+        "update", "note.md", b"Original.", b"Original.\nAdded.", ""
+    )
+    preview = tool._approval_display([change])
+    assert "Add:\nAdded." in preview
+    assert "Replace:" not in preview

@@ -124,8 +124,7 @@ def test_final_newline_change_is_visible_in_preview(
         )
     )
     assert isinstance(step, ApprovalRequired)
-    assert "Replace:\naaa" in step.action.display
-    assert "With:\naaa" in step.action.display
+    assert "Replace:" not in step.action.display
     assert "newline" in step.action.display.lower()
 
 

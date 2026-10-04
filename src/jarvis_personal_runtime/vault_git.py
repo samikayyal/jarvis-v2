@@ -720,7 +720,10 @@ class VaultTools:
             if change.operation == "create":
                 sections.append("Create this note:\n" + (new or "(empty note)"))
                 continue
-            before, after = old.splitlines(keepends=True), new.splitlines(keepends=True)
+            # Classify content edits independently of the final newline, which
+            # is described below. Appending a line is still an addition when
+            # the original note has no trailing newline.
+            before, after = old.splitlines(), new.splitlines()
             matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
             for tag, i, j, k, l in matcher.get_opcodes():
                 if tag == "equal":
