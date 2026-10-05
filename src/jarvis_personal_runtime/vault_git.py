@@ -639,7 +639,7 @@ class VaultTools:
                         "Reply 1 to approve once, 2 to always approve future edits "
                         "to this file, or 9 to reject."
                         if can_save
-                        else None
+                        else "Reply 1 to approve once or 9 to reject."
                     ),
                 ),
                 continuation,
