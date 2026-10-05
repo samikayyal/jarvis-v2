@@ -2,6 +2,14 @@
 
 ## Status
 
+Whole-note deletion is now implemented and deployed as `delete_vault` in release
+`e8bd4e2076d3c4ef16aff8a8f378fd8167b3914e`. On 2026-10-05, live WhatsApp
+acceptance proved rejection, approved deletion, remote synchronization, and
+cleanup of a disposable note. Service and session health passed; final status
+was idle. See [deletion deployment and acceptance](issues/06-delete-notes-and-verify-live.md).
+
+Earlier create/update deployment evidence:
+
 Implemented, deployed, and tested through the authorized WhatsApp chat on
 2026-10-04. Current application release:
 `40184830fd90bfc3a22967a94949232014e6e5c7`. Plain Add/Remove/Replace/Create
@@ -182,5 +190,4 @@ Client-side Obsidian synchronization remains a separate, unverified check.
 - Editing `.obsidian`, hidden paths, Git metadata, or non-Markdown files.
 - Automatic merge, conflict resolution, force-push, retry after an uncertain push, or host failover.
 - A blanket permission for future vault writes.
-
 
