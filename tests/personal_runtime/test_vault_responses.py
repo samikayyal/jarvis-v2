@@ -7,6 +7,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from jarvis_personal_runtime.responses import (
     DirectResponsesRunner,
     PreparedToolCollection,
@@ -16,8 +18,10 @@ from jarvis_personal_runtime.runtime import ApprovalDecision, ApprovalRequired
 from jarvis_personal_runtime.vault_git import VaultGitSettings, VaultTools
 
 
+@pytest.mark.parametrize("deleting", [False, True])
 def test_responses_approval_commits_exactly_once_and_returns_sync_result(
     tmp_path: Path,
+    deleting: bool,
 ) -> None:
     def git(*args: str) -> str:
         result = subprocess.run(
@@ -55,6 +59,12 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
             }
         ],
     }
+    if deleting:
+        arguments = {
+            "base_revision": base,
+            "commit_message": "jarvis: delete note",
+            "path": "note.md",
+        }
 
     class Provider:
         def __init__(self) -> None:
@@ -70,7 +80,7 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
                         {
                             "type": "function_call",
                             "call_id": "vault-edit",
-                            "name": "edit_vault",
+                            "name": "delete_vault" if deleting else "edit_vault",
                             "arguments": json.dumps(arguments),
                         },
                     ),
@@ -102,7 +112,10 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
         )
         assert isinstance(step, ApprovalRequired)
         assert not step.action.allow_save_permission
-        assert "Before." in step.action.display and "After." in step.action.display
+        assert "Before." in step.action.display
+        assert (
+            "Delete this entire note:" if deleting else "After."
+        ) in step.action.display
         assert (clone / "note.md").read_bytes() == b"# Note\n\nBefore.\n"
         assert len(provider.calls) == 1
         completed = await runner.resume(
@@ -111,7 +124,10 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
         assert completed.reply == "Note committed and synced."
 
     asyncio.run(scenario())
-    assert (clone / "note.md").read_bytes() == b"# Note\n\nAfter.\n"
+    if deleting:
+        assert not (clone / "note.md").exists()
+    else:
+        assert (clone / "note.md").read_bytes() == b"# Note\n\nAfter.\n"
     head = git("-C", str(clone), "rev-parse", "HEAD")
     assert git("--git-dir", str(remote), "rev-parse", "main") == head
     assert git("-C", str(clone), "rev-list", "--count", f"{base}..HEAD") == "1"

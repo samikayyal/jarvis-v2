@@ -24,7 +24,8 @@ The active runtime is intentionally small:
 - `.scratch/` retains the project history, research, issues, and acceptance
   evidence. It is not runtime code.
 
-The prepared tools include `read_vault`, the optional Git-backed `edit_vault`,
+The prepared tools include `read_vault`, the optional Git-backed `edit_vault` and
+`delete_vault`,
 `run_terminal`, `create_reminder`, `edit_reminder`, `list_reminders`, and
 `cancel_reminder`, plus explicitly configured Google operations. Approved
 one-time Reminders persist independently of the working session and send their
@@ -40,6 +41,9 @@ directories. Jarvis prepares an exact Markdown diff from a synchronized base,
 shows the complete proposal, and uses one approval to write, commit, and push
 that frozen batch. It reports local commit and remote synchronization outcomes
 separately and never uses general terminal commands for vault Git operations.
+`delete_vault` removes one exact Markdown note after a full-note preview and
+one-time approval. Saved edit permissions do not authorize deletion; the deleted
+content remains in Git history.
 The design and implementation tickets live in
 [`.scratch/jarvis-vault-editing/spec.md`](.scratch/jarvis-vault-editing/spec.md).
 

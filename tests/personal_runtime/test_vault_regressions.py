@@ -210,10 +210,12 @@ def test_offline_reads_disclose_staleness_and_writes_stop(
 
 
 @pytest.mark.parametrize("failure", ["rejected", "timeout_after_success", "unknown"])
+@pytest.mark.parametrize("deleting", [False, True])
 def test_push_outcomes_preserve_one_commit_and_never_retry(
     vault: tuple[Path, Path, VaultTools],
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
+    deleting: bool,
 ) -> None:
     from jarvis_personal_runtime.vault_git import _GitResult
 
@@ -241,16 +243,25 @@ def test_push_outcomes_preserve_one_commit_and_never_retry(
     monkeypatch.setattr(tool, "_run_git", transport)
 
     async def scenario() -> dict[str, object]:
-        step = await tool.execute(
-            "edit_vault",
-            edit(
+        arguments = (
+            {
+                "base_revision": base,
+                "commit_message": "jarvis: delete note",
+                "path": "note.md",
+            }
+            if deleting
+            else edit(
                 clone,
                 {
                     "operation": "update",
                     "path": "note.md",
                     "replacements": [{"old_text": "aaa", "new_text": "bbb"}],
                 },
-            ),
+            )
+        )
+        step = await tool.execute(
+            "delete_vault" if deleting else "edit_vault",
+            arguments,
         )
         assert isinstance(step, ApprovalRequired)
         result = json.loads(await tool.resume(step.continuation, approved=True))

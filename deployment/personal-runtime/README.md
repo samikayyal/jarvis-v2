@@ -158,6 +158,11 @@ only for single-file proposals. Grants survive restart, are scoped to the clone,
 remote, branch, and exact note path, and never grant terminal permission.
 Use `/permissions` and `/forget-permission ID` to inspect or revoke a grant.
 Future requests skip the prompt only when every changed file has a saved grant.
+`delete_vault` accepts `base_revision`, `commit_message`, and one exact `path`.
+It previews the entire Markdown note and always requires `1` to approve once;
+`9` or `/cancel` rejects it. Saved edit grants do not authorize deletion, and
+choice `2` is unavailable. Approval removes the file, commits, and syncs through
+the same validated Git workflow. Deleted content remains in Git history.
 Git hashes and commit messages are retained in diagnostic traces; replies simply
 describe what changed and whether it synced.
 After approval Jarvis revalidates the base, writes the notes, stages only the

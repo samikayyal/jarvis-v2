@@ -218,7 +218,7 @@ def _display_diff(path: str, old: bytes, new: bytes, *, operation: str) -> str:
     # no final newline.  Markdown input is already validated as UTF-8, so the
     # resulting display remains safe text while the actual edit stays bytes.
     from_name = b"/dev/null" if operation == "create" else f"a/{path}".encode()
-    to_name = f"b/{path}".encode()
+    to_name = b"/dev/null" if operation == "delete" else f"b/{path}".encode()
     rendered = difflib.diff_bytes(
         difflib.unified_diff,
         old.splitlines(keepends=True),
@@ -268,7 +268,7 @@ def _remote_key(value: str) -> str:
 
 
 class VaultTools:
-    """Expose synchronized ``read_vault`` and approval-gated ``edit_vault``."""
+    """Expose synchronized reads and approval-gated note edits and deletion."""
 
     definitions: tuple[dict[str, object], ...] = (
         {
@@ -392,6 +392,42 @@ class VaultTools:
                 "additionalProperties": False,
             },
         },
+        {
+            "type": "function",
+            "name": "delete_vault",
+            "description": (
+                "Delete one exact Obsidian Markdown note from the configured "
+                "Git-backed vault. First use read_vault to obtain its path and "
+                "synchronized base_revision. The runtime previews the entire "
+                "note and requires approval once for every deletion, even with "
+                "a saved edit permission. Approval deletes, commits, and syncs "
+                "the note; its previous content remains in Git history. Report "
+                "whether deletion synced, without Git hashes or commit details."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "base_revision": {
+                        "type": "string",
+                        "minLength": 40,
+                        "maxLength": 40,
+                    },
+                    "commit_message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": _MAX_COMMIT_MESSAGE_CHARS,
+                    },
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": _MAX_PATH_CHARS,
+                    },
+                },
+                "required": ["base_revision", "commit_message", "path"],
+                "additionalProperties": False,
+            },
+        },
     )
 
     def __init__(
@@ -445,6 +481,23 @@ class VaultTools:
             return await self._execute_read(arguments)
         if name == "edit_vault":
             return await self._execute_edit(arguments)
+        if name == "delete_vault":
+            if not isinstance(arguments, dict) or set(arguments) != {
+                "base_revision",
+                "commit_message",
+                "path",
+            }:
+                raise VaultToolError(
+                    "delete_vault arguments must be exactly base_revision, commit_message, and path"
+                )
+            return await self._execute_edit(
+                {
+                    "base_revision": arguments["base_revision"],
+                    "commit_message": arguments["commit_message"],
+                    "changes": [{"operation": "delete", "path": arguments["path"]}],
+                },
+                deleting=True,
+            )
         raise VaultToolError(f"unknown prepared tool: {name}")
 
     async def resume(self, continuation: object, *, approved: bool) -> str:
@@ -494,7 +547,7 @@ class VaultTools:
         return _json(result, limit=self._max_result_chars)
 
     async def _execute_edit(
-        self, arguments: dict[str, object]
+        self, arguments: dict[str, object], *, deleting: bool = False
     ) -> str | ApprovalRequired:
         base_revision, commit_message, raw_changes = self._validate_edit_arguments(
             arguments
@@ -505,11 +558,12 @@ class VaultTools:
                 raise VaultToolError(
                     "edit_vault base_revision does not match the synchronized vault"
                 )
-            changes = self._prepare_changes(raw_changes)
+            changes = self._prepare_changes(raw_changes, deleting=deleting)
             actual_changes = tuple(
                 change
                 for change in changes
-                if change.operation == "create" or change.old_bytes != change.new_bytes
+                if change.operation in {"create", "delete"}
+                or change.old_bytes != change.new_bytes
             )
             if not actual_changes:
                 return _json(
@@ -539,7 +593,11 @@ class VaultTools:
                 continuation.state.approval_decision = "saved_file_permission"
                 continuation.state.preview_shown = False
                 return await self._execute_approved(continuation)
-            can_save = self._permission_store is not None and len(actual_changes) == 1
+            can_save = (
+                not deleting
+                and self._permission_store is not None
+                and len(actual_changes) == 1
+            )
             return ApprovalRequired(
                 PendingAction(
                     host=self._permission_host,
@@ -557,7 +615,9 @@ class VaultTools:
             )
 
     def _has_saved_permissions(self, changes: tuple[_PreparedChange, ...]) -> bool:
-        if self._permission_store is None:
+        if self._permission_store is None or any(
+            change.operation == "delete" for change in changes
+        ):
             return False
         rules = self._permission_store.list_rules()
         return all(
@@ -617,14 +677,15 @@ class VaultTools:
         return base_revision, commit_message, tuple(raw_changes)  # type: ignore[arg-type]
 
     def _prepare_changes(
-        self, raw_changes: tuple[Mapping[str, object], ...]
+        self, raw_changes: tuple[Mapping[str, object], ...], *, deleting: bool = False
     ) -> tuple[_PreparedChange, ...]:
         prepared: list[_PreparedChange] = []
         seen: set[str] = set()
         for raw in raw_changes:
             operation = raw.get("operation")
             path_value = raw.get("path")
-            if operation not in {"update", "create"} or not isinstance(path_value, str):
+            allowed_operations = {"delete"} if deleting else {"update", "create"}
+            if operation not in allowed_operations or not isinstance(path_value, str):
                 raise VaultToolError("each change needs operation and path")
             path = self._validate_note_path(path_value)
             if path in seen:
@@ -640,6 +701,15 @@ class VaultTools:
                     raise VaultToolError(f"Markdown note already exists: {path}")
                 old_bytes = b""
                 new_bytes = _encode_note(raw["content"])  # type: ignore[arg-type]
+            elif operation == "delete":
+                if set(raw) != {"operation", "path"}:
+                    raise VaultToolError(
+                        "delete changes require exactly operation and path"
+                    )
+                if not self._is_ordinary_note(candidate, path):
+                    raise VaultToolError(f"Markdown note was not found: {path}")
+                old_bytes = self._read_note_bytes(candidate)
+                new_bytes = b""
             else:
                 if set(raw) != {"operation", "path", "replacements"}:
                     raise VaultToolError(
@@ -719,6 +789,12 @@ class VaultTools:
             new = _decode_note(change.new_bytes)
             if change.operation == "create":
                 sections.append("Create this note:\n" + (new or "(empty note)"))
+                continue
+            if change.operation == "delete":
+                sections.append("Delete this entire note:\n" + (old or "(empty note)"))
+                sections.append(
+                    "The note will be removed. Its content remains in Git history."
+                )
                 continue
             # Classify content edits independently of the final newline, which
             # is described below. Appending a line is still an addition when
@@ -981,7 +1057,7 @@ class VaultTools:
             for change in continuation.changes:
                 self._validate_note_path(change.path)
                 candidate = self._root.joinpath(*PurePosixPath(change.path).parts)
-                if change.operation == "update":
+                if change.operation in {"update", "delete"}:
                     if not self._is_ordinary_note(candidate, change.path):
                         return self._outcome("stale_base", continuation)
                     current = self._read_note_bytes(candidate)
@@ -993,12 +1069,19 @@ class VaultTools:
                     self._ensure_parent_directory(candidate)
             for change in continuation.changes:
                 candidate = self._root.joinpath(*PurePosixPath(change.path).parts)
-                self._write_note_bytes(
-                    candidate, change.new_bytes, create=change.operation == "create"
-                )
+                if change.operation == "delete":
+                    candidate.unlink()
+                else:
+                    self._write_note_bytes(
+                        candidate, change.new_bytes, create=change.operation == "create"
+                    )
             for change in continuation.changes:
                 candidate = self._root.joinpath(*PurePosixPath(change.path).parts)
-                if self._read_note_bytes(candidate) != change.new_bytes:
+                if change.operation == "delete":
+                    matches = not candidate.exists() and not candidate.is_symlink()
+                else:
+                    matches = self._read_note_bytes(candidate) == change.new_bytes
+                if not matches:
                     return self._outcome(
                         "execution_failed", continuation, local_changes=True
                     )
@@ -1006,7 +1089,9 @@ class VaultTools:
                 _display_diff(
                     change.path,
                     change.old_bytes,
-                    self._read_note_bytes(
+                    b""
+                    if change.operation == "delete"
+                    else self._read_note_bytes(
                         self._root.joinpath(*PurePosixPath(change.path).parts)
                     ),
                     operation=change.operation,
@@ -1036,6 +1121,19 @@ class VaultTools:
                     "execution_failed", continuation, local_changes=True
                 )
             for change in continuation.changes:
+                if change.operation == "delete":
+                    staged_entry = await self._run_git(
+                        ["ls-files", "--stage", "-z", "--", change.path]
+                    )
+                    if (
+                        staged_entry.timed_out
+                        or staged_entry.exit_code != 0
+                        or staged_entry.stdout
+                    ):
+                        return self._outcome(
+                            "execution_failed", continuation, local_changes=True
+                        )
+                    continue
                 staged_blob = await self._run_git(
                     ["cat-file", "blob", f":{change.path}"]
                 )

@@ -96,7 +96,8 @@ _Avoid_: Deterministic command, provider conversation object
 
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
-current prepared tools are `read_vault`, the optional Git-backed `edit_vault`,
+current prepared tools are `read_vault`, the optional Git-backed `edit_vault` and
+`delete_vault`,
 `run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
 `list_reminders`, `cancel_reminder`, and the manifest-selected bounded
 operations of configured MCP services.
@@ -109,10 +110,12 @@ Git clone.
 _Avoid_: Application checkout, runtime data directory, arbitrary filesystem
 
 **Vault edit proposal**:
-One frozen batch of exact Markdown changes, its synchronized base revision,
-complete internal diff, and configured commit metadata. The operator reviews
-plain-language changes and can approve once or remember approval for exactly
-one file. It is never approved by a saved terminal permission.
+One frozen batch of exact Markdown changes or a single-note deletion, its
+synchronized base revision, complete internal diff, and configured commit
+metadata. The operator reviews
+plain-language changes and can approve once or remember edit approval for exactly
+one file. Deletion always requires one-time approval. A proposal is never approved
+by a saved terminal permission.
 _Avoid_: Git command, saved permission, unreviewed file write
 
 **Vault sync outcome**:
@@ -147,8 +150,8 @@ authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
 `9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all other
 messages are silently ignored while one is pending except the exact Google
 connection controls. A vault edit proposal accepts `1`, `9`, or `/cancel`
-and also `2` for a single-file proposal, saving approval for that exact note
-in its clone, remote, and branch. Reauthorization or disconnection invalidates a
+and also `2` for a single-file create/update proposal, saving edit approval for
+that exact note in its clone, remote, and branch. Reauthorization or disconnection invalidates a
 pending Google write created under the prior connection.
 _Avoid_: Active request, saved permission, queued action
 
@@ -196,8 +199,10 @@ _Avoid_: Sanitized application log, hidden model reasoning
   disclose stale reads when synchronization is unavailable. Vault writes require
   a synchronized base and are limited to exact Markdown changes under the
   configured note directories.
-- Every vault write is one frozen `edit_vault` proposal authorized by one exact
-  approval or a previously saved permission for every affected file.
+- Every vault write is one frozen `edit_vault` or `delete_vault` proposal.
+  Edits require one exact approval or a saved permission for every affected file.
+  Deletion removes one exact note and always requires one-time approval after
+  showing its full content; saved edit permissions never authorize deletion.
   The tool stages only approved paths, creates one normal commit, and reports
   commit and remote outcomes separately. It never merges, rebases, force-pushes,
   resolves conflicts, or blindly retries an uncertain push.

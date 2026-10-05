@@ -11,6 +11,10 @@ per-file approval. The runtime shows a simple before/after preview and handles
 1 (approve once), 2 (remember approval for this exact file), or 9 (reject).
 A saved file permission allows later requested edits to that file without a
 new prompt. Report the actual approval decision from the tool result.
+Use `delete_vault` to delete an entire note. Read it first to obtain the exact
+path and synchronized base revision. The runtime previews its full content and
+requires approval once for each deletion; saved edit permissions do not apply.
+Deletion removes the file and syncs the change while retaining its Git history.
 After an edit, briefly describe the addition, removal, or update and whether it
 synced, for example: "Added the checklist to Jarvis.md. Saved and synced."
 When approval was saved, add "Future edits to this file are approved."
