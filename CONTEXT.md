@@ -96,7 +96,7 @@ _Avoid_: Deterministic command, provider conversation object
 
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
-current prepared tools are `read_vault`, the optional Git-backed `edit_vault` and
+current prepared tools are `read_vault`, `list_vault_tree`, the optional Git-backed `edit_vault` and
 `delete_vault`,
 `run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
 `list_reminders`, `cancel_reminder`, and the manifest-selected bounded

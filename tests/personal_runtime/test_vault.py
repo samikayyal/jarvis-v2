@@ -15,10 +15,10 @@ def _execute(tool: ReadVaultTool, **arguments: object) -> dict[str, object]:
     return json.loads(asyncio.run(tool.execute("read_vault", arguments)))
 
 
-def test_tool_exposes_one_small_strict_responses_schema(tmp_path: Path) -> None:
+def test_read_tool_keeps_its_strict_responses_schema(tmp_path: Path) -> None:
     tool = ReadVaultTool(tmp_path)
 
-    assert tool.definitions == (
+    assert tool.definitions[:1] == (
         {
             "type": "function",
             "name": "read_vault",

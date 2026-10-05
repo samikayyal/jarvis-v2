@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from .permissions import TomlPermissionStore
+from .vault_tree import TREE_DEFINITION, list_tree, validate_tree_arguments
 
 if TYPE_CHECKING:
     from .runtime import ApprovalRequired, RuntimeTrace
@@ -271,6 +272,7 @@ class VaultTools:
     """Expose synchronized reads and approval-gated note edits and deletion."""
 
     definitions: tuple[dict[str, object], ...] = (
+        TREE_DEFINITION,
         {
             "type": "function",
             "name": "read_vault",
@@ -479,6 +481,8 @@ class VaultTools:
     ) -> str | ApprovalRequired:
         if name == "read_vault":
             return await self._execute_read(arguments)
+        if name == "list_vault_tree":
+            return await self._execute_tree(arguments)
         if name == "edit_vault":
             return await self._execute_edit(arguments)
         if name == "delete_vault":
@@ -523,6 +527,33 @@ class VaultTools:
             if self._has_saved_permissions(continuation.changes):
                 continuation.state.approval_decision = "approved_and_saved"
             return await self._execute_approved(continuation)
+
+    async def _execute_tree(self, arguments: dict[str, object]) -> str:
+        try:
+            offset = validate_tree_arguments(arguments)
+            async with self._lock:
+                sync = await self._synchronize(allow_stale=True)
+                metadata: dict[str, object] = {
+                    "base_revision": sync.base_revision,
+                    "freshness": sync.freshness,
+                }
+                if sync.freshness == "stale":
+                    metadata["warning"] = (
+                        "The remote could not be reached; this result may be stale."
+                    )
+                    if sync.last_successful_sync is not None:
+                        metadata["last_successful_sync"] = (
+                            sync.last_successful_sync.isoformat()
+                        )
+                return list_tree(
+                    self._root,
+                    self._settings.note_directories,
+                    offset,
+                    max_result_chars=self._max_result_chars,
+                    metadata=metadata,
+                )
+        except ValueError as exc:
+            raise VaultToolError(str(exc)) from exc
 
     async def _execute_read(self, arguments: dict[str, object]) -> str:
         mode, value = self._validate_read_arguments(arguments)

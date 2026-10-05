@@ -7,6 +7,8 @@ import os
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from .vault_tree import TREE_DEFINITION, list_tree, validate_tree_arguments
+
 _MAX_QUERY_CHARS = 200
 _MAX_PATH_CHARS = 512
 _MAX_MATCHES = 8
@@ -46,6 +48,7 @@ class ReadVaultTool:
                 "additionalProperties": False,
             },
         },
+        TREE_DEFINITION,
     )
 
     def __init__(self, root: Path, *, max_result_chars: int = 65_536) -> None:
@@ -65,6 +68,14 @@ class ReadVaultTool:
         self._max_result_chars = max_result_chars
 
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
+        if name == "list_vault_tree":
+            try:
+                offset = validate_tree_arguments(arguments)
+                return list_tree(
+                    self._root, (".",), offset, max_result_chars=self._max_result_chars
+                )
+            except ValueError as exc:
+                raise VaultToolError(str(exc)) from exc
         if name != "read_vault":
             raise VaultToolError(f"unknown prepared tool: {name}")
         if set(arguments) != {"mode", "value"}:

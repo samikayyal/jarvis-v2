@@ -147,6 +147,17 @@ remote host identity must be pinned before activation. Jarvis invokes a bounded
 Git argument list with this identity and known-hosts file; it does not run Git
 through `run_terminal` or a shell.
 
+`list_vault_tree` returns the recursive folder and file paths (including
+attachments and empty folders) without reading file contents. It is available
+with or without Git configuration. Git-backed listings synchronize first and
+respect `note_directories`; standalone listings cover the configured vault root.
+Hidden entries, symlinks/junctions, and nested repositories are excluded.
+Start with `offset: 0`, then follow `next_offset` until null. Each page has at
+most 200 entries and fits the configured tool-result limit. The scan rejects
+more than 20,000 filesystem entries or unreadable directories explicitly; it
+never labels a partial scan complete. Git-backed pages report freshness and
+base revision; restart pagination if that revision changes between pages.
+
 `read_vault` synchronizes a clean clone before fresh reads and includes the
 base revision. A temporarily unavailable remote may produce a clearly marked
 stale read, but cannot prepare a write. `edit_vault` accepts only exact

@@ -25,3 +25,11 @@ unless the tool verifies it. Explain a sync failure or uncertainty in plain
 language. Never approve truncated previews or retry an uncertain push blindly.
 If the Git-backed vault is not
 configured, the existing `read_vault` capability remains read-only.
+
+Use `list_vault_tree` to discover the Obsidian repository's full folder and file
+tree without reading note contents. Start with offset 0 and follow next_offset
+until null before calling a listing complete. If the base revision changes
+between pages, restart at 0. The tree includes visible files and attachments
+within the configured note directories; hidden metadata, symlinks, and nested
+repositories are excluded. Report stale results honestly. Use `read_vault` when
+you need a note's contents, and do not use terminal commands for vault listings.
