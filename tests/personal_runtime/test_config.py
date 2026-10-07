@@ -12,6 +12,8 @@ from jarvis_personal_runtime.config import (
     LoadedRuntimeConfig,
     RuntimeConfig,
     RuntimeSecrets,
+    WebDepthLimits,
+    WebSearchConfig,
     load_runtime_config,
 )
 
@@ -91,6 +93,12 @@ def test_defaults_are_centralized_and_loading_is_immutable(tmp_path: Path) -> No
     assert loaded.config.vault_git is None
     assert loaded.config.mcp_services == ()
     assert loaded.config.google is None
+    assert loaded.config.web_search == WebSearchConfig()
+    assert loaded.config.web_search.enabled is False
+    assert loaded.config.web_search.quick == WebDepthLimits(max_queries=1, max_pages=2)
+    assert loaded.config.web_search.moderate == WebDepthLimits(
+        max_queries=3, max_pages=5
+    )
     assert loaded.config.message_cache_retention_days == 7
     assert loaded.system_prompt == "You are Jarvis.\n"
     assert loaded.toml_path == tmp_path / "jarvis.toml"
@@ -681,3 +689,93 @@ def test_malformed_files_report_the_file_path(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as caught:
         load_runtime_config(tmp_path)
     assert caught.value.path == tmp_path / ".env"
+
+
+def test_web_search_settings_load_with_configured_depth_limits(tmp_path: Path) -> None:
+    _write_runtime_files(
+        tmp_path,
+        toml="""
+[web_search]
+enabled = true
+operation_timeout_seconds = 12.5
+results_per_query = 4
+max_chars_per_page = 900
+max_total_evidence_chars = 3000
+
+[web_search.quick]
+max_queries = 1
+max_pages = 2
+
+[web_search.moderate]
+max_queries = 2
+max_pages = 4
+""",
+    )
+
+    config = load_runtime_config(tmp_path).config.web_search
+
+    assert config == WebSearchConfig(
+        enabled=True,
+        operation_timeout_seconds=12.5,
+        results_per_query=4,
+        max_chars_per_page=900,
+        max_total_evidence_chars=3000,
+        quick=WebDepthLimits(max_queries=1, max_pages=2),
+        moderate=WebDepthLimits(max_queries=2, max_pages=4),
+    )
+
+
+@pytest.mark.parametrize(
+    ("toml", "needle"),
+    [
+        ('[web_search]\nenabled = "yes"\n', "web_search.enabled"),
+        (
+            "[web_search]\noperation_timeout_seconds = 0\n",
+            "operation_timeout_seconds",
+        ),
+        (
+            "[web_search]\noperation_timeout_seconds = inf\n",
+            "operation_timeout_seconds",
+        ),
+        ("[web_search]\nresults_per_query = 0\n", "results_per_query"),
+        ("[web_search]\nmax_chars_per_page = 0\n", "max_chars_per_page"),
+        (
+            "[web_search]\nmax_total_evidence_chars = 100\n",
+            "max_total_evidence_chars",
+        ),
+        (
+            "[web_search.quick]\nmax_queries = 4\n",
+            "quick.max_queries",
+        ),
+        (
+            "[web_search.quick]\nmax_pages = 6\n",
+            "quick.max_pages",
+        ),
+        (
+            (
+                "[web_search]\n[web_search.quick]\nmax_queries = 4\n"
+                "[web_search.moderate]\nmax_queries = 3\n"
+            ),
+            "quick.max_queries",
+        ),
+        (
+            (
+                "[web_search]\nmax_chars_per_page = 4000\n"
+                "max_total_evidence_chars = 3999\n"
+            ),
+            "max_total_evidence_chars",
+        ),
+        ("[web_search]\nunknown = true\n", "unknown"),
+        ("[web_search.quick]\nunknown = true\n", "unknown"),
+    ],
+)
+def test_invalid_web_search_settings_are_path_specific_config_errors(
+    tmp_path: Path, toml: str, needle: str
+) -> None:
+    _write_runtime_files(tmp_path, toml=toml)
+
+    with pytest.raises(ConfigError) as caught:
+        load_runtime_config(tmp_path)
+
+    assert caught.value.path == tmp_path / "jarvis.toml"
+    assert needle in str(caught.value)

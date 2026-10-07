@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import json
 from collections.abc import Callable
@@ -104,7 +105,8 @@ def _replay_output_item(item: dict[str, object]) -> dict[str, object]:
 
 
 class PreparedTools(Protocol):
-    definitions: tuple[dict[str, object], ...]
+    @property
+    def definitions(self) -> tuple[dict[str, object], ...]: ...
 
     async def execute(
         self, name: str, arguments: dict[str, object]
@@ -130,6 +132,15 @@ class _NoTools:
 
     async def resume(self, continuation: object, *, approved: bool) -> str:
         raise RuntimeError("unknown prepared tool continuation")
+
+    def request_started(self) -> None:
+        return None
+
+    async def close_request(self) -> None:
+        return None
+
+    def finish_answer(self, text: str) -> str:
+        return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +182,48 @@ class PreparedToolCollection:
         return await continuation.tool.resume(
             continuation.continuation, approved=approved
         )
+
+    def request_started(self) -> None:
+        """Reset request-owned state on every ordinary request.
+
+        Most prepared tools do not own request state.  Optional lifecycle hooks
+        keep that fact out of the individual tool protocols while allowing the
+        web adapter to own a browser and cumulative allowance for one request.
+        """
+
+        for tool in self._tools:
+            callback = getattr(tool, "request_started", None)
+            if callable(callback):
+                callback()
+
+    async def close_request(self) -> None:
+        """Close request-owned resources for every contained tool."""
+
+        first_error: BaseException | None = None
+        for tool in self._tools:
+            callback = getattr(tool, "close_request", None)
+            if not callable(callback):
+                continue
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - close all resources first
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+    def finish_answer(self, text: str) -> str:
+        """Apply result-path answer annotations supplied by prepared tools."""
+
+        answer = text
+        for tool in self._tools:
+            callback = getattr(tool, "finish_answer", None)
+            if callable(callback):
+                answer = callback(answer)
+        return answer
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +374,7 @@ class DirectResponsesRunner:
         self._max_output_chars = max_output_chars
         self._context_counter = context_counter
         self._transcript: list[dict[str, object]] = []
+        self._request_lock = asyncio.Lock()
 
     @property
     def trace(self) -> TraceSink:
@@ -330,13 +384,20 @@ class DirectResponsesRunner:
         """Start ownership of a fresh in-memory working-session transcript."""
 
         self._transcript = []
+        reset_tools = getattr(self._tools, "start_session", None)
+        if callable(reset_tools):
+            reset_tools()
+
+    def _instructions(self, system_prompt: str) -> str:
+        extra = getattr(self._tools, "instructions", "")
+        return f"{system_prompt.rstrip()}\n\n{extra}" if extra else system_prompt
 
     def context_tokens(self, *, system_prompt: str) -> int:
         """Estimate retained context, including instructions and tool definitions."""
 
         return self._context_counter(
             {
-                "instructions": system_prompt,
+                "instructions": self._instructions(system_prompt),
                 "tools": list(self._tools.definitions),
                 "input": self._transcript,
             }
@@ -350,7 +411,23 @@ class DirectResponsesRunner:
         reasoning: str,
         system_prompt: str,
     ) -> Completed | ApprovalRequired | ContextLimitReached:
+        # A cancelled receive can finish cleanup after /cancel has replied.
+        # Do not let the next request acquire its browser or counters meanwhile.
+        async with self._request_lock:
+            return await self._run_request(
+                text, model=model, reasoning=reasoning, system_prompt=system_prompt
+            )
+
+    async def _run_request(
+        self,
+        text: str,
+        *,
+        model: str,
+        reasoning: str,
+        system_prompt: str,
+    ) -> Completed | ApprovalRequired | ContextLimitReached:
         try:
+            self._request_started()
             return await self._run_loop(
                 text,
                 model=model,
@@ -372,6 +449,8 @@ class DirectResponsesRunner:
                 {"error": f"{type(exc).__name__}: {exc}"},
             )
             raise
+        finally:
+            await self._close_request()
 
     async def _run_loop(
         self,
@@ -402,8 +481,9 @@ class DirectResponsesRunner:
         async with asyncio.timeout(self._request_timeout_seconds) as deadline:
             while True:
                 tools = list(self._tools.definitions)
+                instructions = self._instructions(system_prompt)
                 candidate = {
-                    "instructions": system_prompt,
+                    "instructions": instructions,
                     "tools": tools,
                     "input": transcript,
                 }
@@ -427,7 +507,7 @@ class DirectResponsesRunner:
                     return ContextLimitReached()
                 request: dict[str, object] = {
                     "model": model,
-                    "instructions": system_prompt,
+                    "instructions": instructions,
                     "input": transcript,
                     "tools": tools,
                     "reasoning": {"effort": reasoning},
@@ -463,11 +543,12 @@ class DirectResponsesRunner:
                             {"reason": "missing_final_text"},
                         )
                         raise RuntimeError("provider response has no final text")
-                    if len(response.output_text) > self._max_output_chars:
+                    answer = self._finish_answer(response.output_text)
+                    if len(answer) > self._max_output_chars:
                         self._trace.record(
                             "output_limit_exceeded",
                             {
-                                "output_characters": len(response.output_text),
+                                "output_characters": len(answer),
                                 "max_output_chars": self._max_output_chars,
                             },
                         )
@@ -475,7 +556,7 @@ class DirectResponsesRunner:
                             "provider response exceeded configured output character limit"
                         )
                     self._transcript = transcript
-                    return Completed(response.output_text)
+                    return Completed(answer)
                 if len(calls) != 1:
                     self._trace.record(
                         "provider_protocol_error",
@@ -597,67 +678,106 @@ class DirectResponsesRunner:
     async def resume(
         self, decision: ApprovalDecision, continuation: object
     ) -> Completed | ApprovalRequired | ContextLimitReached:
-        if not isinstance(continuation, _ResponsesContinuation):
-            raise TypeError("invalid Responses approval continuation")
-        call = continuation.call
-        if decision is ApprovalDecision.REJECT:
-            try:
-                output = await self._tools.resume(
-                    continuation.tool_continuation, approved=False
+        async with self._request_lock:
+            return await self._resume_request(decision, continuation)
+
+    async def _resume_request(
+        self, decision: ApprovalDecision, continuation: object
+    ) -> Completed | ApprovalRequired | ContextLimitReached:
+        try:
+            if not isinstance(continuation, _ResponsesContinuation):
+                raise TypeError("invalid Responses approval continuation")
+            call = continuation.call
+            if decision is ApprovalDecision.REJECT:
+                try:
+                    output = await self._tools.resume(
+                        continuation.tool_continuation, approved=False
+                    )
+                except Exception as exc:  # noqa: BLE001 - errors continue via model
+                    self._trace.record(
+                        "tool_error",
+                        {
+                            "name": str(call["name"]),
+                            "call_id": str(call["call_id"]),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    output = _tool_error(exc)
+            else:
+                try:
+                    output = await self._tools.resume(
+                        continuation.tool_continuation, approved=True
+                    )
+                except Exception as exc:  # noqa: BLE001 - errors continue via model
+                    self._trace.record(
+                        "tool_error",
+                        {
+                            "name": str(call["name"]),
+                            "call_id": str(call["call_id"]),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    output = _tool_error(exc)
+            if len(output) > self._max_output_chars:
+                raise RuntimeError(
+                    "prepared tool result exceeded configured output character limit"
                 )
-            except Exception as exc:  # noqa: BLE001 - errors continue via model
-                self._trace.record(
-                    "tool_error",
-                    {
-                        "name": str(call["name"]),
-                        "call_id": str(call["call_id"]),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-                output = _tool_error(exc)
-        else:
-            try:
-                output = await self._tools.resume(
-                    continuation.tool_continuation, approved=True
-                )
-            except Exception as exc:  # noqa: BLE001 - errors continue via model
-                self._trace.record(
-                    "tool_error",
-                    {
-                        "name": str(call["name"]),
-                        "call_id": str(call["call_id"]),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-                output = _tool_error(exc)
-        if len(output) > self._max_output_chars:
-            raise RuntimeError(
-                "prepared tool result exceeded configured output character limit"
+            self._trace.record(
+                "tool_result",
+                {
+                    "name": str(call["name"]),
+                    "call_id": str(call["call_id"]),
+                    "output": output,
+                },
             )
-        self._trace.record(
-            "tool_result",
-            {
-                "name": str(call["name"]),
-                "call_id": str(call["call_id"]),
-                "output": output,
-            },
-        )
-        transcript = [
-            *continuation.transcript,
-            {
-                "type": "function_call_output",
-                "call_id": str(call["call_id"]),
-                "output": output,
-            },
-        ]
-        self._transcript = transcript
-        return await self._continue_loop(
-            transcript,
-            model=continuation.model,
-            reasoning=continuation.reasoning,
-            system_prompt=continuation.system_prompt,
-            tool_rounds=continuation.tool_rounds + 1,
-        )
+            transcript = [
+                *continuation.transcript,
+                {
+                    "type": "function_call_output",
+                    "call_id": str(call["call_id"]),
+                    "output": output,
+                },
+            ]
+            self._transcript = transcript
+            return await self._continue_loop(
+                transcript,
+                model=continuation.model,
+                reasoning=continuation.reasoning,
+                system_prompt=continuation.system_prompt,
+                tool_rounds=continuation.tool_rounds + 1,
+            )
+        finally:
+            await self._close_request()
+
+    def _request_started(self) -> None:
+        callback = getattr(self._tools, "request_started", None)
+        if callable(callback):
+            callback()
+
+    async def _close_request(self) -> None:
+        callback = getattr(self._tools, "close_request", None)
+        if not callable(callback):
+            return
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask request state
+            self._trace.record(
+                "request_cleanup_error",
+                {"error": f"{type(exc).__name__}: {exc}"},
+            )
+
+    def _finish_answer(self, text: str) -> str:
+        callback = getattr(self._tools, "finish_answer", None)
+        if not callable(callback):
+            return text
+        result = callback(text)
+        if not isinstance(result, str):
+            raise TypeError("prepared answer finisher must return a string")
+        return result
 
 
 def build_direct_responses_runner(
@@ -732,7 +852,20 @@ def build_direct_responses_runner(
                 trace=sink,
             )
         )
-        tools = PreparedToolCollection(*configured_tools, *additional_tools)
+        web_search = getattr(config, "web_search", None)
+        if web_search is not None and web_search.enabled:
+            from .web_tools import WebTools
+
+            configured_tools.append(
+                WebTools(
+                    web_search,
+                    runtime_dir=config.root / "data" / "web",
+                    max_output_chars=config.max_output_chars,
+                )
+            )
+        from .skill_tools import SkillTools
+
+        tools = SkillTools(PreparedToolCollection(*configured_tools, *additional_tools))
     elif additional_tools:
         raise ValueError("additional_tools cannot be combined with tools")
     adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)

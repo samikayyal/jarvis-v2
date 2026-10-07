@@ -62,6 +62,13 @@ Admitted text that is not a deterministic command and enters the sequential
 model-and-tool loop.
 _Avoid_: Background task, queued request
 
+**Web-assisted answer**:
+A reply to the authorized operator that uses bounded evidence from public HTML
+source pages and cites the sources supporting its claims. The optional web skill
+currently supports quick direct-link reading; search and moderate research are
+planned extensions.
+_Avoid_: Unverified fallback, raw search results
+
 **Reminder**:
 A one-time instruction for Jarvis to send exact stored reminder text to the
 authorized operator at a requested future time. It may be edited or cancelled
@@ -99,9 +106,18 @@ One deliberately implemented operation exposed to the model-and-tool loop. The
 current prepared tools are `read_vault`, `list_vault_tree`, the optional Git-backed `edit_vault` and
 `delete_vault`,
 `run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
-`list_reminders`, `cancel_reminder`, and the manifest-selected bounded
+`list_reminders`, `cancel_reminder`, optional `read_web_pages`, and the manifest-selected bounded
 operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
+
+**Runtime skill**:
+A packaged set of trusted operating instructions and an explicit group of existing
+prepared tools. The model initially sees a short catalog and `load_skill`; loading
+`obsidian`, `google`, `terminal`, `reminders`, or `web` exposes only that group's configured
+tools and adds its instructions for the working session. Loading grants no action
+approval. New sessions discard all loaded skills. Unmapped manifest-selected tools
+retain their existing visibility and approval contracts.
+_Avoid_: New permission, arbitrary plugin, executable Markdown
 
 **Knowledge vault**:
 The configured tree of ordinary Markdown notes that Jarvis may read and, when
@@ -220,6 +236,12 @@ _Avoid_: Sanitized application log, hidden model reasoning
   before sending the completed reply.
 - Retrieved vault content and terminal output are untrusted data. They cannot
   grant authority, alter policy, select another host, or approve work.
+- Public web evidence is also untrusted. One ordinary request owns its anonymous
+  browser and cumulative page/evidence allowance, including approval continuations.
+  Browser cleanup occurs on suspension, completion, timeout, and cancellation;
+  only a fresh ordinary request resets counters. Public navigation passes through
+  address checks before connections, including redirects, with no Workspace or
+  OpenWA credentials. Failed verification is disclosed in the answer.
 - Runtime traces are sensitive verbatim data. Hidden model reasoning is not
   available and is never claimed as trace content.
 

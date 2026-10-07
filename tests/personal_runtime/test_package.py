@@ -12,6 +12,7 @@ def test_replacement_package_has_valid_dependency_pins() -> None:
     for requirement in (
         "httpx==0.28.1",
         "openai==2.53.0",
+        "selenium==4.50.0",
         "setuptools==80.10.2",
         "tiktoken==0.14.0",
     ):
@@ -62,9 +63,10 @@ def test_transactional_config_editor_validates_before_replacing_and_restarting()
 
 
 def test_example_configuration_carries_the_private_handoff_and_rotating_trace() -> None:
-    config = tomllib.loads(
+    document = tomllib.loads(
         (PACKAGE / "jarvis.toml.example").read_text(encoding="utf-8")
-    )["runtime"]
+    )
+    config = document["runtime"]
 
     assert config["listener_host"] == "REPLACE_WITH_DOCKER_BRIDGE_GATEWAY"
     assert config["listener_port"] == 9011
@@ -75,6 +77,16 @@ def test_example_configuration_carries_the_private_handoff_and_rotating_trace() 
     assert config["operator_timezone"] == "Asia/Amman"
     assert config["reminder_database_path"] == "data/reminders.sqlite3"
     assert config["openwa_api_base_url"] == "REPLACE_WITH_PRIVATE_OPENWA_API_BASE_URL"
+    web = document["web_search"]
+    assert web == {
+        "enabled": False,
+        "operation_timeout_seconds": 20,
+        "results_per_query": 5,
+        "max_chars_per_page": 8000,
+        "max_total_evidence_chars": 32000,
+        "quick": {"max_queries": 1, "max_pages": 2},
+        "moderate": {"max_queries": 3, "max_pages": 5},
+    }
 
 
 def test_runbook_documents_active_native_operations_without_legacy_fallback() -> None:
@@ -114,5 +126,6 @@ def test_only_personal_runtime_source_and_dependencies_remain() -> None:
     assert project["project"]["dependencies"] == [
         "httpx>=0.28.1",
         "openai==2.53.0",
+        "selenium>=4.50.0",
         "tiktoken>=0.14.0",
     ]

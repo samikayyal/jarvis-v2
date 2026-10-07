@@ -44,6 +44,23 @@ ubuntu_read_only_prefixes = ["pwd", "git status"]
 # The service account's known_hosts file must already pin the exact SSH host key.
 windows_read_only_prefixes = []
 
+[web_search]
+# Public-page web access is disabled until the browser prerequisites have been
+# installed and the operator has explicitly enabled this section.
+enabled = false
+operation_timeout_seconds = 20
+results_per_query = 5
+max_chars_per_page = 8000
+max_total_evidence_chars = 32000
+
+[web_search.quick]
+max_queries = 1
+max_pages = 2
+
+[web_search.moderate]
+max_queries = 3
+max_pages = 5
+
 # Leave [vault_git] absent for read-only vault access. To enable the bounded
 # Git-backed read/edit/commit/push tool, configure both vault_path and every
 # required field below. The SSH files must already exist and be pinned for the

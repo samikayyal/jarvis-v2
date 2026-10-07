@@ -67,6 +67,75 @@ GOOGLE_MCP_ENDPOINTS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class WebDepthLimits:
+    """Per-request query and page ceilings for one web research depth."""
+
+    max_queries: int
+    max_pages: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_queries", self.max_queries),
+            ("max_pages", self.max_pages),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"web depth {name} must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class WebSearchConfig:
+    """Validated non-secret settings for Selenium-backed public web access."""
+
+    enabled: bool = False
+    operation_timeout_seconds: float = 20.0
+    results_per_query: int = 5
+    max_chars_per_page: int = 8_000
+    max_total_evidence_chars: int = 32_000
+    quick: WebDepthLimits = field(
+        default_factory=lambda: WebDepthLimits(max_queries=1, max_pages=2)
+    )
+    moderate: WebDepthLimits = field(
+        default_factory=lambda: WebDepthLimits(max_queries=3, max_pages=5)
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("web_search.enabled must be a boolean")
+        if not isinstance(self.quick, WebDepthLimits):
+            raise TypeError("web_search.quick must be a WebDepthLimits value")
+        if not isinstance(self.moderate, WebDepthLimits):
+            raise TypeError("web_search.moderate must be a WebDepthLimits value")
+        if (
+            isinstance(self.operation_timeout_seconds, bool)
+            or not isinstance(self.operation_timeout_seconds, (int, float))
+            or not math.isfinite(float(self.operation_timeout_seconds))
+            or self.operation_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "web_search.operation_timeout_seconds must be a positive finite number"
+            )
+        for name, value in (
+            ("results_per_query", self.results_per_query),
+            ("max_chars_per_page", self.max_chars_per_page),
+            ("max_total_evidence_chars", self.max_total_evidence_chars),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"web_search.{name} must be a positive integer")
+        if self.quick.max_queries > self.moderate.max_queries:
+            raise ValueError(
+                "web_search.quick.max_queries must not exceed web_search.moderate.max_queries"
+            )
+        if self.quick.max_pages > self.moderate.max_pages:
+            raise ValueError(
+                "web_search.quick.max_pages must not exceed web_search.moderate.max_pages"
+            )
+        if self.max_total_evidence_chars < self.max_chars_per_page:
+            raise ValueError(
+                "web_search.max_total_evidence_chars must be at least web_search.max_chars_per_page"
+            )
+
+
 # This is for typing
 class _RuntimeDefaults(TypedDict):
     model: str
@@ -102,6 +171,7 @@ class _RuntimeDefaults(TypedDict):
     openwa_named_session: None
     openwa_authorized_operator_number: None
     openwa_operator_chat_id: None
+    web_search: WebSearchConfig
 
 
 # Keep defaults in one immutable mapping so a loader and callers constructing
@@ -143,6 +213,7 @@ DEFAULTS: _RuntimeDefaults = cast(
             "openwa_named_session": None,
             "openwa_authorized_operator_number": None,
             "openwa_operator_chat_id": None,
+            "web_search": WebSearchConfig(),
         }
     ),
 )
@@ -306,6 +377,7 @@ class RuntimeConfig:
         "openwa_authorized_operator_number"
     ]
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
+    web_search: WebSearchConfig = DEFAULTS["web_search"]
     mcp_services: tuple[McpServiceConfig, ...] = ()
     google: GoogleApiConfig | None = None
     vault_git: VaultGitSettings | None = DEFAULTS["vault_git"]
@@ -546,6 +618,7 @@ def _collect_runtime_values(raw: Mapping[str, Any], path: Path) -> dict[str, Any
             "mcp_services",
             "google",
             "vault_git",
+            "web_search",
         }:
             if key not in _RUNTIME_KEYS:
                 raise ConfigError(path, f"unknown top-level setting: {key}")
@@ -624,6 +697,92 @@ def _positive_number(value: Any, path: Path, name: str) -> float:
     if not math.isfinite(result) or result <= 0:
         raise ConfigError(path, f"{name} must be a positive number")
     return result
+
+
+def _build_web_depth_limits(
+    value: Any, default: WebDepthLimits, path: Path, name: str
+) -> WebDepthLimits:
+    if value is None:
+        return default
+    table = _ensure_table(value, path, f"[{name}]")
+    allowed = {"max_queries", "max_pages"}
+    if set(table) - allowed:
+        raise ConfigError(path, f"[{name}] has unknown fields")
+    try:
+        return WebDepthLimits(
+            max_queries=_positive_int(
+                table.get("max_queries", default.max_queries),
+                path,
+                f"{name}.max_queries",
+            ),
+            max_pages=_positive_int(
+                table.get("max_pages", default.max_pages),
+                path,
+                f"{name}.max_pages",
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
+
+
+def _build_web_search_config(raw: Mapping[str, Any], path: Path) -> WebSearchConfig:
+    defaults = cast(WebSearchConfig, DEFAULTS["web_search"])
+    if "web_search" not in raw:
+        return defaults
+    table = _ensure_table(raw["web_search"], path, "[web_search]")
+    allowed = {
+        "enabled",
+        "operation_timeout_seconds",
+        "results_per_query",
+        "max_chars_per_page",
+        "max_total_evidence_chars",
+        "quick",
+        "moderate",
+    }
+    if set(table) - allowed:
+        raise ConfigError(path, "[web_search] has unknown fields")
+
+    enabled = table.get("enabled", defaults.enabled)
+    if not isinstance(enabled, bool):
+        raise ConfigError(path, "web_search.enabled must be a boolean")
+    quick = _build_web_depth_limits(
+        table.get("quick"), defaults.quick, path, "web_search.quick"
+    )
+    moderate = _build_web_depth_limits(
+        table.get("moderate"), defaults.moderate, path, "web_search.moderate"
+    )
+    try:
+        return WebSearchConfig(
+            enabled=enabled,
+            operation_timeout_seconds=_positive_number(
+                table.get(
+                    "operation_timeout_seconds", defaults.operation_timeout_seconds
+                ),
+                path,
+                "web_search.operation_timeout_seconds",
+            ),
+            results_per_query=_positive_int(
+                table.get("results_per_query", defaults.results_per_query),
+                path,
+                "web_search.results_per_query",
+            ),
+            max_chars_per_page=_positive_int(
+                table.get("max_chars_per_page", defaults.max_chars_per_page),
+                path,
+                "web_search.max_chars_per_page",
+            ),
+            max_total_evidence_chars=_positive_int(
+                table.get(
+                    "max_total_evidence_chars", defaults.max_total_evidence_chars
+                ),
+                path,
+                "web_search.max_total_evidence_chars",
+            ),
+            quick=quick,
+            moderate=moderate,
+        )
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
 
 
 def _rooted_path(value: Any, root: Path, path: Path, name: str) -> Path:
@@ -868,6 +1027,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             path,
             "[google] cannot be combined with configured Google MCP services",
         )
+    web_search = _build_web_search_config(raw, path)
 
     try:
         model = _setting(values, "model", default=DEFAULTS["model"])
@@ -1186,6 +1346,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         openwa_named_session=openwa_named_session,
         openwa_authorized_operator_number=openwa_authorized_operator_number,
         openwa_operator_chat_id=openwa_operator_chat_id,
+        web_search=web_search,
         mcp_services=tuple(configured_services),
         google=google,
         vault_git=vault_git,
@@ -1270,6 +1431,8 @@ __all__ = [
     "McpServiceConfig",
     "RuntimeConfig",
     "RuntimeSecrets",
+    "WebDepthLimits",
+    "WebSearchConfig",
     "load_config",
     "load_runtime_config",
 ]

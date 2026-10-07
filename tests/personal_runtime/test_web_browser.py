@@ -1,0 +1,501 @@
+from __future__ import annotations
+
+import asyncio
+import http.server
+import json
+import os
+import socket
+import threading
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from jarvis_personal_runtime.web_browser import (
+    BrowserWorker,
+    PublicUrlError,
+    is_public_address,
+    validate_public_url,
+)
+from jarvis_personal_runtime.web_worker import (
+    PublicNetworkError,
+    PublicNetworkProxy,
+    resolve_public_addresses,
+)
+
+
+def test_public_url_validation_rejects_non_http_credentials_and_private_literals() -> (
+    None
+):
+    assert validate_public_url("HTTPS://Example.COM/articles?q=1#part") == (
+        "https://example.com/articles?q=1#part"
+    )
+    for url in (
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "https://user:secret@example.com/",
+        "https://127.0.0.1/",
+        "https://[::1]/",
+        "https://169.254.169.254/latest/",
+        "https://localhost/",
+        "https://service.internal/",
+    ):
+        with pytest.raises(PublicUrlError):
+            validate_public_url(url)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "127.0.0.1",
+        "10.0.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "::1",
+        "fc00::1",
+        "fe80::1",
+        "224.0.0.1",
+    ],
+)
+def test_address_policy_rejects_special_use_addresses(value: str) -> None:
+    assert not is_public_address(value)
+
+
+def test_dns_policy_rejects_loopback_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))
+        ],
+    )
+    with pytest.raises(PublicNetworkError, match="non-public"):
+        resolve_public_addresses("public.example", 80)
+
+
+class _Pipe:
+    def __init__(self, lines: list[bytes] | None = None) -> None:
+        self.lines = list(lines or [])
+        self.writes: list[bytes] = []
+        self.closed = False
+        self.wait_for_line = asyncio.Event()
+
+    def write(self, value: bytes) -> None:
+        self.writes.append(value)
+
+    async def drain(self) -> None:
+        return None
+
+    async def readline(self) -> bytes:
+        if self.lines:
+            return self.lines.pop(0)
+        await self.wait_for_line.wait()
+        return b""
+
+    async def read(self, _size: int = -1) -> bytes:
+        await asyncio.Event().wait()
+        return b""
+
+
+class _Process:
+    def __init__(self, response: dict[str, object] | None = None) -> None:
+        self.stdin = _Pipe()
+        self.stdout = _Pipe(
+            [(json.dumps(response, separators=(",", ":")) + "\n").encode()]
+            if response is not None
+            else None
+        )
+        self.stderr = _Pipe()
+        self.returncode: int | None = None
+        self.pid = os.getpid() + 100_000
+        self.terminated = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+        self.stdout.wait_for_line.set()
+
+    def kill(self) -> None:
+        self.terminated = True
+        self.returncode = -9
+        self.stdout.wait_for_line.set()
+
+    async def wait(self) -> int:
+        return self.returncode or 0
+
+
+def test_browser_worker_is_lazy_and_cleans_profile(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        process: _Process | None = None
+        calls: list[dict[str, Any]] = []
+
+        async def factory(*argv: str, **kwargs: object) -> _Process:
+            nonlocal process
+            calls.append({"argv": argv, **kwargs})
+            process = _Process(
+                {
+                    "outcome": "ok",
+                    "title": "A",
+                    "url": "https://example.com/",
+                    "text": "Evidence",
+                }
+            )
+            return process
+
+        worker = BrowserWorker(tmp_path, 1, 100, process_factory=factory)
+        assert not calls
+        page = await worker.read("https://example.com")
+        assert page == {
+            "outcome": "ok",
+            "title": "A",
+            "url": "https://example.com/",
+            "text": "Evidence",
+        }
+        assert len(calls) == 1
+        assert "--profile-dir" in calls[0]["argv"]
+        profile = Path(calls[0]["argv"][calls[0]["argv"].index("--profile-dir") + 1])
+        assert profile.is_dir()
+        await worker.close()
+        assert process is not None and process.terminated
+        assert not profile.exists()
+
+    asyncio.run(scenario())
+
+
+def test_browser_worker_timeout_is_terminal_and_cleans_profile(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        process: _Process | None = None
+
+        async def factory(*_args: str, **_kwargs: object) -> _Process:
+            nonlocal process
+            process = _Process()
+            return process
+
+        worker = BrowserWorker(tmp_path, 0.01, 100, process_factory=factory)
+        result = await worker.read("https://example.com")
+        assert result["outcome"] == "timeout"
+        assert not worker.usable
+        assert process is not None and process.terminated
+        assert list(tmp_path.iterdir()) == []
+        unavailable = await worker.read("https://example.com")
+        assert unavailable["outcome"] == "unavailable"
+
+    asyncio.run(scenario())
+
+
+def test_proxy_blocks_private_connect_targets() -> None:
+    proxy = PublicNetworkProxy()
+    proxy.start()
+    try:
+        with socket.create_connection(("127.0.0.1", proxy.port), timeout=2) as client:
+            client.sendall(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            response = client.recv(4096)
+        assert response.startswith(b"HTTP/1.1 403 Forbidden")
+        assert proxy.blocked
+    finally:
+        proxy.close()
+
+
+def test_repeated_cancellation_finishes_kill_and_removes_profile(tmp_path):
+    async def scenario():
+        started = asyncio.Event()
+        terminating = asyncio.Event()
+        exited = asyncio.Event()
+
+        class StubbornProcess(_Process):
+            pid = None
+
+            def terminate(self):
+                terminating.set()
+
+            def kill(self):
+                self.returncode = -9
+                exited.set()
+
+            async def wait(self):
+                await exited.wait()
+                return self.returncode
+
+        process = StubbornProcess()
+        process.pid = None
+
+        async def factory(*args, **kwargs):
+            started.set()
+            return process
+
+        worker = BrowserWorker(tmp_path, 10, 100, process_factory=factory)
+        reading = asyncio.create_task(worker.read("https://example.com"))
+        await started.wait()
+        reading.cancel()
+        await terminating.wait()
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        assert process.returncode == -9
+        assert list(tmp_path.iterdir()) == []
+        await worker.close()
+
+    asyncio.run(scenario())
+
+
+def test_posix_cleanup_signals_children_after_the_leader_exits(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from jarvis_personal_runtime import web_browser
+
+    async def scenario():
+        signals = []
+        process = _Process({"outcome": "ok", "url": "https://example.com", "text": "A"})
+
+        async def factory(*args, **kwargs):
+            return process
+
+        worker = BrowserWorker(tmp_path, 1, 100, process_factory=factory)
+        await worker.read("https://example.com")
+        process.returncode = 0
+        monkeypatch.setattr(
+            web_browser, "signal", SimpleNamespace(SIGTERM=15, SIGKILL=9)
+        )
+        monkeypatch.setattr(
+            web_browser,
+            "os",
+            SimpleNamespace(
+                name="posix", killpg=lambda pid, sig: signals.append((pid, sig))
+            ),
+        )
+        await worker.close()
+        assert signals == [
+            (process.pid, web_browser.signal.SIGTERM),
+            (process.pid, web_browser.signal.SIGKILL),
+        ]
+        assert list(tmp_path.iterdir()) == []
+
+    asyncio.run(scenario())
+
+
+class _Driver:
+    def __init__(self, final_url: str = "https://example.com/") -> None:
+        self.final_url = final_url
+        self.commands: list[tuple[str, dict[str, object]]] = []
+        self.options: list[object] = []
+        self.quit_called = False
+
+    def set_page_load_timeout(self, _timeout: float) -> None:
+        return None
+
+    def set_script_timeout(self, _timeout: float) -> None:
+        return None
+
+    def execute_cdp_cmd(self, name: str, value: dict[str, object]) -> None:
+        self.commands.append((name, value))
+
+    def get(self, _url: str) -> None:
+        return None
+
+    @property
+    def current_url(self) -> str:
+        return self.final_url
+
+    @property
+    def title(self) -> str:
+        return "Fixture"
+
+    def execute_script(self, script: str) -> object:
+        if "contentType" in script:
+            return "text/html"
+        return "Visible fixture text"
+
+    def quit(self) -> None:
+        self.quit_called = True
+
+
+def test_selenium_reader_configures_sandbox_proxy_and_scheme_blocks(
+    tmp_path: Path,
+) -> None:
+    from jarvis_personal_runtime.web_worker import SeleniumPageReader
+
+    driver = _Driver()
+    captured: dict[str, object] = {}
+
+    def factory(*, service: object, options: object) -> _Driver:
+        captured["service"] = service
+        captured["options"] = options
+        return driver
+
+    reader = SeleniumPageReader(
+        tmp_path / "profile",
+        2,
+        100,
+        browser_binary="/opt/chromium",
+        driver_binary="/opt/chromedriver",
+        driver_factory=factory,
+    )
+    try:
+        result = reader.read("https://example.com")
+        assert result["outcome"] == "ok"
+        arguments = set(getattr(captured["options"], "arguments", ()))
+        assert "--headless=new" in arguments
+        assert "--enable-sandbox" in arguments
+        assert "--no-sandbox" not in arguments
+        assert any(
+            argument.startswith("--proxy-server=http://127.0.0.1:")
+            for argument in arguments
+        )
+        assert any(argument.startswith("--user-data-dir=") for argument in arguments)
+        blocked = next(
+            value for name, value in driver.commands if name == "Network.setBlockedURLs"
+        )
+        blocked_urls = cast(list[str], blocked["urls"])
+        assert "file://*" in blocked_urls
+        assert "data:*" in blocked_urls
+        assert "wss://*" in blocked_urls
+    finally:
+        reader.close()
+    assert driver.quit_called
+
+
+def test_selenium_reader_does_not_return_a_private_redirect(tmp_path: Path) -> None:
+    from jarvis_personal_runtime.web_worker import SeleniumPageReader
+
+    driver = _Driver("https://127.0.0.1/")
+    reader = SeleniumPageReader(
+        tmp_path / "profile",
+        2,
+        100,
+        browser_binary="/opt/chromium",
+        driver_binary="/opt/chromedriver",
+        driver_factory=lambda **_kwargs: driver,
+    )
+    try:
+        result = reader.read("https://example.com")
+    finally:
+        reader.close()
+    assert result["outcome"] == "blocked"
+    assert result["url"] == "https://example.com/"
+
+
+class _SignalDriver(_Driver):
+    def __init__(self, *, password: bool = False, challenge: bool = False) -> None:
+        super().__init__()
+        self.password = password
+        self.challenge = challenge
+
+    def execute_script(self, script: str) -> object:
+        if "contentType" in script:
+            return "text/html"
+        if "password:" in script:
+            return {
+                "password": self.password,
+                "challenge": self.challenge,
+                "body": "Public text",
+            }
+        return "Public text"
+
+
+@pytest.mark.parametrize(
+    ("password", "challenge", "outcome"),
+    [(True, False, "unsupported"), (False, True, "blocked")],
+)
+def test_reader_discloses_auth_and_challenge_boundaries(
+    tmp_path: Path, password: bool, challenge: bool, outcome: str
+) -> None:
+    from jarvis_personal_runtime.web_worker import SeleniumPageReader
+
+    reader = SeleniumPageReader(
+        tmp_path / "profile",
+        2,
+        100,
+        browser_binary="/opt/chromium",
+        driver_binary="/opt/chromedriver",
+        driver_factory=lambda **_kwargs: _SignalDriver(
+            password=password, challenge=challenge
+        ),
+    )
+    try:
+        result = reader.read("https://example.com")
+    finally:
+        reader.close()
+    assert result["outcome"] == outcome
+
+
+@pytest.mark.skipif(
+    not os.environ.get("JARVIS_TEST_CHROMIUM_BINARY")
+    or not os.environ.get("JARVIS_TEST_CHROMEDRIVER_BINARY"),
+    reason="compatible Chromium and ChromeDriver paths were not provided",
+)
+def test_real_browser_fixture_extracts_and_blocks_private_redirects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise Selenium and the proxy when a compatible browser is available."""
+
+    from jarvis_personal_runtime import web_worker
+
+    hits = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{self.server.server_port}/private"
+                )
+                self.end_headers()
+                return
+            if self.path == "/download":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header(
+                    "Content-Disposition", 'attachment; filename="file.bin"'
+                )
+                self.end_headers()
+                self.wfile.write(b"download contents")
+                return
+            body = (
+                b"<html><head><title>Fixture page</title></head>"
+                b"<body><h1>Fixture evidence</h1><p>Public text.</p>"
+                b"<p style='display:none'>Hidden secret</p>"
+                b"<script>document.body.innerText='Script replaced text';</script>"
+                b"</body></html>"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    monkeypatch.setattr(
+        web_worker,
+        "resolve_public_addresses",
+        lambda _host, _port: ("127.0.0.1",),
+    )
+    reader = web_worker.SeleniumPageReader(
+        tmp_path / "profile",
+        10,
+        1000,
+        browser_binary=os.environ["JARVIS_TEST_CHROMIUM_BINARY"],
+        driver_binary=os.environ["JARVIS_TEST_CHROMEDRIVER_BINARY"],
+    )
+    port = server.server_address[1]
+    try:
+        page = reader.read(f"http://example.com:{port}/")
+        blocked = reader.read(f"http://example.com:{port}/redirect")
+        download = reader.read(f"http://example.com:{port}/download")
+    finally:
+        reader.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+    assert page["outcome"] == "ok"
+    assert page["title"] == "Fixture page"
+    assert "Public text." in str(page["text"])
+    assert "Hidden secret" not in str(page["text"])
+    assert "Script replaced" not in str(page["text"])
+    assert blocked["outcome"] == "blocked"
+    assert blocked["url"] == f"http://example.com:{port}/redirect"
+    assert "/private" not in hits
+    assert download["outcome"] in {"unsupported", "unavailable"}
+    assert not download["text"]

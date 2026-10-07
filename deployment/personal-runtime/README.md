@@ -35,6 +35,81 @@ inactive validation.
 
 ## Runtime root and configuration
 
+### Runtime skills
+
+The installed package includes five trusted `skills/<name>/SKILL.md` resources:
+`obsidian`, `google`, `terminal`, `reminders`, and optional `web`. Their short descriptions and the
+`load_skill` schema are exposed initially. Loading adds that skill's instructions
+and only its configured prepared tool schemas on the next model call. Instructions
+live in the request's instruction field; loader results are small acknowledgements,
+so repeated loads do not duplicate the skill text in conversation history.
+
+Loaded skills persist for follow-ups in the same working session and reset with
+`/new`, inactivity expiry, the context limit, or restart. Skill loading counts as
+one tool round and is included in timeout and context budgets. Existing argument
+validation, approvals, and continuation handling still run in the original tools.
+Only the fixed packaged registry is loadable; vault notes and tool results cannot
+register skills. Manifest-selected operations outside these explicit groups
+keep their existing visibility.
+
+For an existing deployment, review the shorter `SYSTEM.md.example` against its
+current prompt, retaining any operator-specific instructions. Install the new
+package and shortened prompt together during the normal release procedure. Merely
+replacing the prompt does not enable skill loading. The catalog is generated from
+configured tools and packaged frontmatter; do not duplicate it in `SYSTEM.md`.
+
+### Optional public-page reading
+
+The `web` skill currently exposes `read_web_pages` at `quick` depth only. Give
+Jarvis a public HTML link to receive an answer with numbered citations and a
+short source list. Search and moderate research belong to later tickets.
+
+Web access is off when `[web_search]` is absent or `enabled = false`. The example
+TOML records the shared request allowances: quick one query/two pages, moderate
+three queries/five pages, five results per query, 8,000 characters per page,
+32,000 evidence characters, and a 20-second browser-operation timeout. Reserved
+query/moderate settings are validated now but do not enable those operations.
+Page attempts (including failures) count across calls and approval continuations;
+a new ordinary request resets the allowance. Runtime output, tool-round, and
+overall request limits also apply. There is no separate research timer.
+
+Provision compatible Chromium and ChromeDriver on the Ubuntu host before
+enabling this feature. Both binaries must be installed explicitly by the
+operator; the runtime never runs a package manager or Selenium Manager and never
+downloads drivers. Check browser and driver versions under the service account.
+Discovery accepts `/usr/bin/chromium`, `/usr/bin/chromium-browser`,
+`/usr/bin/google-chrome-stable`, or `/usr/bin/google-chrome`, with
+`/usr/bin/chromedriver` or `/usr/local/bin/chromedriver`. Pin a mutually compatible
+browser/driver pair through the host's provisioning process and verify both with
+`--version`; an arbitrary driver on the inherited shell `PATH` is not used.
+The Chromium sandbox must work for that account; do not use `--no-sandbox`.
+Missing or incompatible binaries produce an unavailable-web outcome. No browser
+provisioning or production activation is implied by installing this package.
+
+The request owns a separate Python worker and one anonymous browser profile in
+the private runtime directory. Browser work does not use terminal permissions,
+Google Workspace tokens, personal browser profiles, or `openwa-data`. It returns
+bounded visible HTML text, titles, and URLs; PDFs, downloads, authenticated pages,
+and general browser actions are unsupported. Failed reads are not retried.
+Page JavaScript is disabled in this quick reader; content that requires page
+scripts may be incomplete or unavailable. Selenium's own bounded extraction
+still reads visible rendered text. Every HTTP(S) connection, including redirects
+and subresources, passes through a local proxy that rejects non-public DNS
+answers and connects to the validated address. Non-HTTP schemes and downloads
+are blocked by Chromium controls. No private-destination bypass is configurable.
+Completion, approval suspension, cancellation, and shutdown close the worker's
+process group and remove its profile. A failed browser stays unavailable for
+the rest of that request. Partial evidence remains usable with a coverage notice.
+
+Use the existing config editor/restart procedure to set `enabled = true` only
+after the host prerequisites are checked. Validate with the packaged CLI's
+`--check`, restart normally, and exercise a direct public link. Disable by setting
+`enabled = false` and restarting; roll back the release through the existing
+stopped-service rollback procedure. Runtime checks do not prove live web egress
+or end-to-end WhatsApp readiness.
+
+### Configuration files
+
 The service uses `/var/lib/jarvis-personal-runtime` as its private runtime root
 and `/etc/jarvis/jarvis.toml` as its one active TOML configuration. There is no
 pending configuration file. Create the files from the supplied examples. They
