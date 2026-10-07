@@ -58,20 +58,28 @@ package and shortened prompt together during the normal release procedure. Merel
 replacing the prompt does not enable skill loading. The catalog is generated from
 configured tools and packaged frontmatter; do not duplicate it in `SYSTEM.md`.
 
-### Optional public-page reading
+### Optional quick web search and public-page reading
 
-The `web` skill currently exposes `read_web_pages` at `quick` depth only. Give
-Jarvis a public HTML link to receive an answer with numbered citations and a
-short source list. Search and moderate research belong to later tickets.
+The `web` skill exposes `search_web` and `read_web_pages` at `quick` depth.
+Jarvis loads it for explicit searches and freshness or verification needs, or
+to read a supplied public HTML link. Answers cite source titles and URLs and
+distinguish search snippets from actually read pages. Moderate research remains
+reserved for a later ticket.
 
 Web access is off when `[web_search]` is absent or `enabled = false`. The example
 TOML records the shared request allowances: quick one query/two pages, moderate
 three queries/five pages, five results per query, 8,000 characters per page,
 32,000 evidence characters, and a 20-second browser-operation timeout. Reserved
-query/moderate settings are validated now but do not enable those operations.
-Page attempts (including failures) count across calls and approval continuations;
+moderate settings are validated now but do not enable that depth.
+Query and page attempts (including failures) count across calls and approval continuations;
 a new ordinary request resets the allowance. Runtime output, tool-round, and
 overall request limits also apply. There is no separate research timer.
+
+Google blocking or CAPTCHA stops further searches in the request. A recognized
+consent screen can reject optional cookies; challenges are never solved or
+retried. Empty results, changed layouts, access failures, and exhausted allowances
+have distinct outcomes. Browser HTML fixtures require no live Google access;
+they do not establish that Google will accept searches from the production host.
 
 Provision compatible Chromium and ChromeDriver on the Ubuntu host before
 enabling this feature. Both binaries must be installed explicitly by the

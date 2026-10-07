@@ -216,8 +216,9 @@ def test_real_web_tool_supplies_evidence_and_enforces_failure_notice(tmp_path, o
 
 
 @pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("operation", ["read_web_pages", "search_web"])
 def test_web_request_timeout_and_cancel_close_worker_without_late_answer(
-    tmp_path, cancel
+    tmp_path, cancel, operation
 ):
     class BlockingBrowser:
         def __init__(self):
@@ -227,6 +228,9 @@ def test_web_request_timeout_and_cancel_close_worker_without_late_answer(
         async def read(self, url):
             self.started.set()
             await asyncio.Future()
+
+        async def search(self, query, limit):
+            return await self.read(query)
 
         async def close(self):
             self.closed = True
@@ -239,7 +243,12 @@ def test_web_request_timeout_and_cancel_close_worker_without_late_answer(
             max_output_chars=4096,
             browser_factory=lambda *args: browser,
         )
-        responses = Responses(ResponsesResult(output=(call(),), output_text=""))
+        invocation = call()
+        if operation == "search_web":
+            invocation = dict(
+                call(), name=operation, arguments='{"query":"news","depth":"quick"}'
+            )
+        responses = Responses(ResponsesResult(output=(invocation,), output_text=""))
         runner = DirectResponsesRunner(
             responses, tools=web, request_timeout_seconds=30 if cancel else 0.1
         )
@@ -436,5 +445,117 @@ def test_failure_notice_keeps_a_fallback_answer_within_the_output_limit(tmp_path
         assert "Background knowledge." in result.reply
         assert "shortened" in result.reply
         assert len(result.reply) <= 500
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome", ["ok", "no_results", "blocked", "extraction_failed", "unavailable"]
+)
+@pytest.mark.parametrize("read_source", [False, True])
+def test_search_model_loop_exposes_citations_privacy_and_fallback(
+    tmp_path, outcome, read_source
+):
+    class Browser:
+        closed = False
+
+        def __init__(self):
+            self.queries = []
+
+        async def search(self, query, limit):
+            self.queries.append(query)
+            return {
+                "outcome": outcome,
+                "results": [
+                    {
+                        "title": "Primary source",
+                        "url": "https://example.com",
+                        "snippet": "The value is 42.",
+                    }
+                ]
+                if outcome == "ok"
+                else [],
+            }
+
+        async def read(self, url):
+            return {
+                "outcome": "ok",
+                "title": "Primary source",
+                "url": url,
+                "text": "The page reports 42.",
+            }
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        browser = Browser()
+        browser.queries = []
+        web = WebTools(
+            WebSearchConfig(enabled=True),
+            runtime_dir=tmp_path,
+            max_output_chars=4096,
+            browser_factory=lambda *args: browser,
+        )
+        tools = SkillTools(PreparedToolCollection(web))
+        assert [t["name"] for t in tools.definitions] == ["load_skill"]
+        assert "freshness" in tools.instructions
+        loader = dict(call(), name="load_skill", arguments='{"name":"web"}')
+        search = dict(
+            call(),
+            name="search_web",
+            arguments='{"query":"current published value","depth":"quick"}',
+        )
+        sequence = [
+            ResponsesResult(output=(loader,), output_text=""),
+            ResponsesResult(output=(search,), output_text=""),
+        ]
+        if read_source and outcome == "ok":
+            sequence.append(ResponsesResult(output=(call(),), output_text=""))
+        cited = "The value is 42 [1].\n[1] Primary source: https://example.com"
+        sequence.append(
+            ResponsesResult(
+                output=(),
+                output_text=cited
+                if outcome == "ok"
+                else "Current value remains unverified.",
+            )
+        )
+        responses = Responses(*sequence)
+        runner = DirectResponsesRunner(
+            responses, tools=tools, request_timeout_seconds=30
+        )
+        result = await runner.run(
+            "Search for the current published value.",
+            model="gpt-6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+        assert browser.closed
+        assert browser.queries == ["current published value"]
+        instructions = responses.requests[-1]["instructions"]
+        for required in (
+            "explicit operator intent",
+            "complete conversation",
+            "Google Workspace",
+            "search_result",
+            "actually read",
+            "primary sources",
+            "appropriate to the question",
+        ):
+            assert required in instructions
+        evidence = json.loads(responses.requests[2]["input"][-1]["output"])
+        assert evidence["outcome"] == outcome
+        if outcome == "ok":
+            assert result.reply == cited
+            assert evidence["results"][0]["evidence_type"] == "search_result"
+            if read_source:
+                page = json.loads(responses.requests[-1]["input"][-1]["output"])
+                assert page["pages"][0]["evidence_type"] == "page"
+                assert page["remaining"]["queries"] == 0
+        elif outcome == "no_results":
+            assert result.reply.startswith("No useful search results")
+        else:
+            assert result.reply.startswith("Web access is unavailable")
 
     run(scenario())

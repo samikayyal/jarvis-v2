@@ -277,6 +277,27 @@ class BrowserWorker:
             canonical = validate_public_url(url)
         except PublicUrlError as exc:
             return self._result(exc.outcome, url, reason=str(exc))
+        return await self._operate({"op": "read", "url": canonical}, canonical)
+
+    async def search(self, query: str, limit: int) -> dict[str, object]:
+        from .web_search import MAX_QUERY_LENGTH
+
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or len(query) > MAX_QUERY_LENGTH
+        ):
+            raise ValueError("invalid search query")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("invalid result limit")
+        return await self._operate(
+            {"op": "search", "query": query, "limit": limit},
+            "https://www.google.com/search",
+        )
+
+    async def _operate(
+        self, payload: dict[str, object], canonical: str
+    ) -> dict[str, object]:
         if self._closed:
             return self._result("unavailable", canonical, reason="worker is closed")
         if self._dead:
@@ -287,7 +308,7 @@ class BrowserWorker:
         try:
             await self._ensure_started()
             async with asyncio.timeout(self.timeout):
-                response = await self._request(canonical)
+                response = await self._request(payload)
         except asyncio.CancelledError:
             self._dead = True
             await self._terminate()
@@ -305,7 +326,13 @@ class BrowserWorker:
                 "unavailable", canonical, reason="browser worker unavailable"
             )
 
-        result = self._normalize(response, canonical)
+        result = (
+            response
+            if payload["op"] == "search"
+            else self._normalize(response, canonical)
+        )
+        if "outcome" not in result:
+            result = {"outcome": "extraction_failed", "results": []}
         # Startup failures and child-reported browser crashes must not turn into
         # a hidden second browser on the next call.
         if result["outcome"] == "unavailable":
@@ -372,7 +399,7 @@ class BrowserWorker:
             self._process = None
             raise
 
-    async def _request(self, url: str) -> dict[str, object]:
+    async def _request(self, payload: dict[str, object]) -> dict[str, object]:
         process = self._process
         if process is None or process.stdin is None or process.stdout is None:
             raise RuntimeError("browser worker pipes are unavailable")
@@ -383,10 +410,7 @@ class BrowserWorker:
             # to the pipe; ordinary reads still fail closed on EOF.
             if process.returncode is None:
                 process.stdin.write(
-                    (
-                        json.dumps({"op": "read", "url": url}, separators=(",", ":"))
-                        + "\n"
-                    ).encode()
+                    (json.dumps(payload, separators=(",", ":")) + "\n").encode()
                 )
                 await process.stdin.drain()
             raw = await asyncio.wait_for(

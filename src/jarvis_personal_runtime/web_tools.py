@@ -9,16 +9,20 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import WebSearchConfig
+from .web_search import MAX_QUERY_LENGTH
 
 MAX_BATCH_URLS = 20
 UNAVAILABLE_NOTICE = (
-    "Web access is unavailable for this request; I could not verify these pages. "
+    "Web access is unavailable for this request; I could not verify current web evidence. "
     "Any answer below is based on existing knowledge, not current web verification."
 )
-PARTIAL_NOTICE = "Some requested pages could not be read; web coverage is incomplete."
+PARTIAL_NOTICE = "Some web access failed; web coverage is incomplete."
+EMPTY_NOTICE = "No useful search results were found."
 
 
 class PageBrowser(Protocol):
+    async def search(self, query: str, limit: int) -> dict[str, object]: ...
+
     async def read(self, url: str) -> dict[str, object]: ...
 
     async def close(self) -> None: ...
@@ -35,7 +39,7 @@ def _json(value: object) -> str:
 
 
 class WebTools:
-    """Quick reads only; loading a skill never resets this request's allowance."""
+    """Quick search and reads with request-owned cumulative allowances."""
 
     def __init__(
         self,
@@ -55,6 +59,25 @@ class WebTools:
         self.request_started()
         self.definitions: tuple[dict[str, object], ...] = (
             (
+                {
+                    "type": "function",
+                    "name": "search_web",
+                    "description": "Search Google for bounded organic evidence. Only quick depth is available; query allowance is shared across this request.",
+                    "strict": True,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_QUERY_LENGTH,
+                            },
+                            "depth": {"type": "string", "enum": ["quick"]},
+                        },
+                        "required": ["query", "depth"],
+                        "additionalProperties": False,
+                    },
+                },
                 {
                     "type": "function",
                     "name": "read_web_pages",
@@ -87,6 +110,9 @@ class WebTools:
         if self._browser is not None:
             raise RuntimeError("close the previous web request before resetting")
         self._pages_used = 0
+        self._queries_used = 0
+        self._search_blocked = False
+        self._empty_search = False
         self._evidence_chars = 0
         self._access_failed = False
         self._has_evidence = False
@@ -107,9 +133,15 @@ class WebTools:
                 raise asyncio.CancelledError
 
     def finish_answer(self, text: str) -> str:
-        if not self._access_failed:
+        if not self._access_failed and not (
+            self._empty_search and not self._has_evidence
+        ):
             return text
-        notice = PARTIAL_NOTICE if self._has_evidence else UNAVAILABLE_NOTICE
+        notice = (
+            (PARTIAL_NOTICE if self._has_evidence else UNAVAILABLE_NOTICE)
+            if self._access_failed
+            else EMPTY_NOTICE
+        )
         answer = f"{notice}\n\n{text}"
         if len(answer) <= self.max_output_chars or len(text) > self.max_output_chars:
             return answer
@@ -126,7 +158,7 @@ class WebTools:
 
     def _remaining(self) -> dict[str, int]:
         return {
-            "queries": self.config.quick.max_queries,
+            "queries": max(0, self.config.quick.max_queries - self._queries_used),
             "pages": max(0, self.config.quick.max_pages - self._pages_used),
             "evidence_chars": max(
                 0, self.config.max_total_evidence_chars - self._evidence_chars
@@ -153,24 +185,43 @@ class WebTools:
             text = str(page["text"])
             if not text:
                 return False
-            low, high = 0, len(text) - 1
-            page["text"] = ""
-            if len(_json(result)) <= self.max_output_chars:
-                while low < high:
-                    middle = (low + high + 1) // 2
-                    page["text"] = text[:middle]
-                    if len(_json(result)) <= self.max_output_chars:
-                        low = middle
-                    else:
-                        high = middle - 1
-                page["text"] = text[:low]
+            self._fit_excerpt(result, page, "text", text)
             if not page["text"] and page["outcome"] == "ok":
                 page["outcome"] = "limit_reached"
         return True
 
+    def _fit_excerpt(
+        self, result: dict[str, object], source: dict, key: str, text: str
+    ) -> bool:
+        """Keep the longest excerpt whose escaped JSON fits, or reject metadata."""
+        source[key] = ""
+        if len(_json(result)) > self.max_output_chars:
+            return False
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            source[key] = text[:middle]
+            if len(_json(result)) <= self.max_output_chars:
+                low = middle
+            else:
+                high = middle - 1
+        source[key] = text[:low]
+        return True
+
+    def _get_browser(self) -> PageBrowser:
+        if self._browser is None:
+            self._browser = self._factory(
+                self.runtime_dir,
+                self.config.operation_timeout_seconds,
+                self.config.max_chars_per_page,
+            )
+        return self._browser
+
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
         from .web_browser import validate_public_url
 
+        if name == "search_web" and self.config.enabled:
+            return await self._search(arguments)
         if name != "read_web_pages" or not self.config.enabled:
             raise ValueError("unavailable web tool")
         urls = arguments.get("urls")
@@ -199,6 +250,7 @@ class WebTools:
                 "title": "",
                 "text": "",
                 "outcome": "unattempted",
+                "evidence_type": "page",
                 "reason": "allowance",
             }
             for url in urls
@@ -224,13 +276,7 @@ class WebTools:
                 continue
             self._pages_used += 1
             try:
-                if self._browser is None:
-                    self._browser = self._factory(
-                        self.runtime_dir,
-                        self.config.operation_timeout_seconds,
-                        self.config.max_chars_per_page,
-                    )
-                page = await self._browser.read(url)
+                page = await self._get_browser().read(url)
             except (OSError, RuntimeError, ValueError):
                 page = {"outcome": "unavailable", "reason": "Browser worker failed."}
             outcome = str(page.get("outcome", "extraction_failed"))
@@ -245,6 +291,7 @@ class WebTools:
                 "title": str(page.get("title", "")),
                 "text": text,
                 "outcome": outcome,
+                "evidence_type": "page",
             }
             if page.get("reason"):
                 candidate["reason"] = str(page["reason"])
@@ -291,6 +338,112 @@ class WebTools:
         if len(encoded) > self.max_output_chars:
             return self._error("limit_reached", "Runtime output allowance exhausted.")
         return encoded
+
+    async def _search(self, arguments: dict[str, object]) -> str:
+        from .web_browser import PublicUrlError, validate_public_url
+
+        query = arguments.get("query")
+        if (
+            set(arguments) != {"query", "depth"}
+            or arguments.get("depth") != "quick"
+            or not isinstance(query, str)
+            or not query.strip()
+            or len(query) > MAX_QUERY_LENGTH
+        ):
+            return self._error(
+                "invalid_input", "Use one nonempty query and quick depth."
+            )
+        if self._search_blocked:
+            return self._error("blocked", "Google search is blocked for this request.")
+        if self._worker_failed:
+            return self._error("unavailable", "Browser worker is unavailable.")
+        if not self._remaining()["queries"] or not self._remaining()["evidence_chars"]:
+            return self._error("limit_reached", "Search allowance exhausted.")
+        result: dict[str, object] = {
+            "outcome": "extraction_failed",
+            "query": query,
+            "results": [],
+            "remaining": self._remaining(),
+        }
+        if len(_json(result)) > self.max_output_chars:
+            return self._error("limit_reached", "Query exceeds output allowance.")
+        self._queries_used += 1
+        try:
+            response = await self._get_browser().search(
+                query, self.config.results_per_query
+            )
+        except (OSError, RuntimeError, ValueError):
+            response = {"outcome": "unavailable"}
+        outcome = response.get("outcome")
+        if outcome not in {
+            "ok",
+            "no_results",
+            "blocked",
+            "extraction_failed",
+            "unavailable",
+        }:
+            outcome = "unavailable" if outcome == "timeout" else "extraction_failed"
+        self._search_blocked |= outcome == "blocked"
+        self._worker_failed |= (
+            outcome == "unavailable" or response.get("usable") is False
+        )
+        sources: list[dict[str, str]] = []
+        raw = response.get("results", [])
+        if outcome == "ok" and isinstance(raw, list):
+            for item in raw[: self.config.results_per_query]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    url = validate_public_url(item.get("url"))
+                except (PublicUrlError, TypeError):
+                    continue
+                title = str(item.get("title", ""))[:512]
+                if not title.strip():
+                    continue
+                sources.append(
+                    {
+                        "title": title,
+                        "url": url,
+                        "snippet": str(item.get("snippet", ""))[
+                            : self.config.max_chars_per_page
+                        ],
+                        "evidence_type": "search_result",
+                    }
+                )
+        if outcome == "ok" and not sources:
+            outcome = "extraction_failed"
+        self._access_failed |= outcome in {
+            "blocked",
+            "extraction_failed",
+            "unavailable",
+        }
+        self._empty_search |= outcome == "no_results"
+        # Reserve the longest possible outcome while fitting sources.
+        result.update(outcome="extraction_failed", results=[])
+        accepted: list[dict[str, str]] = []
+        result["results"] = accepted
+        for source in sources:
+            # Titles are evidence too. Source identity is either returned intact
+            # or omitted; never truncate a URL to make the JSON fit.
+            available = self._remaining()["evidence_chars"] - len(source["title"])
+            if available < 0:
+                break
+            snippet = source["snippet"][:available]
+            source["snippet"] = ""
+            accepted.append(source)
+            result["remaining"] = self._remaining()
+            if not self._fit_excerpt(result, source, "snippet", snippet):
+                accepted.pop()
+                break
+            self._evidence_chars += len(source["title"]) + len(source["snippet"])
+        self._has_evidence |= bool(accepted)
+        result["outcome"] = outcome
+        if sources and not accepted:
+            result["outcome"] = "limit_reached"
+        elif len(accepted) < len(sources):
+            result["outcome"] = "partial"
+        result["remaining"] = self._remaining()
+        return _json(result)
 
     async def resume(self, continuation: object, *, approved: bool) -> str:
         raise ValueError("web reads have no approval continuation")

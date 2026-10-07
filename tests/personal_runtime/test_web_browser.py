@@ -392,6 +392,124 @@ class _SignalDriver(_Driver):
         return "Public text"
 
 
+class _SearchDriver(_Driver):
+    page_source = '<div id="search"><div class="g"><a href="https://example.com/source"><h3>Primary source</h3></a><div class="VwiC3b">Fresh evidence.</div></div></div>'
+
+    def __init__(self, state="results"):
+        super().__init__("https://www.google.com/search?q=news")
+        self.state = state
+        self.visits = []
+        self.clicks = 0
+        if state == "traffic":
+            self.page_source = "<html>Our systems have detected unusual traffic</html>"
+
+    def get(self, url):
+        self.visits.append(url)
+        if self.state in {"consent", "unknown_consent"}:
+            self.final_url = "https://consent.google.com/m?continue=search"
+        elif self.state == "interstitial":
+            self.final_url = "https://www.google.com/sorry/index"
+
+    def find_elements(self, by, selector):
+        assert by == "css selector"
+        assert "Reject all" in selector
+        return [self] if self.state == "consent" else []
+
+    def click(self):
+        self.clicks += 1
+        self.final_url = "https://www.google.com/search?q=news"
+
+    def execute_script(self, script):
+        if "contentType" in script:
+            return "text/html"
+        if "password:" in script:
+            return {
+                "password": False,
+                "challenge": self.state == "captcha",
+                "body": "Our systems have detected unusual traffic"
+                if self.state in {"traffic", "traffic_article"}
+                else "Primary source Fresh evidence.",
+            }
+        return "Search results"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("results", "ok"),
+        ("consent", "ok"),
+        ("unknown_consent", "blocked"),
+        ("captcha", "blocked"),
+        ("traffic", "blocked"),
+        ("traffic_article", "ok"),
+        ("interstitial", "blocked"),
+    ],
+)
+def test_selenium_search_results_consent_and_blocking(tmp_path, state, expected):
+    from jarvis_personal_runtime.web_worker import SeleniumPageReader
+
+    driver = _SearchDriver(state)
+    reader = SeleniumPageReader(
+        tmp_path / "profile",
+        2,
+        100,
+        browser_binary="/opt/chromium",
+        driver_binary="/opt/chromedriver",
+        driver_factory=lambda **kwargs: driver,
+    )
+    try:
+        result = reader.search("latest أخبار", 5)
+    finally:
+        reader.close()
+    assert result["outcome"] == expected
+    assert driver.clicks == (1 if state == "consent" else 0)
+    assert len(driver.visits) == 2  # reset and exactly one query navigation
+    assert "q=latest+%D8%A3%D8%AE%D8%A8%D8%A7%D8%B1" in driver.visits[1]
+    if expected == "ok":
+        assert result["results"][0]["snippet"] == "Fresh evidence."
+    assert driver.quit_called
+
+
+def test_browser_worker_search_uses_owned_process_and_cleans_up(tmp_path):
+    async def scenario():
+        process = _Process({"outcome": "no_results", "results": []})
+
+        async def factory(*args, **kwargs):
+            return process
+
+        worker = BrowserWorker(tmp_path, 1, 100, process_factory=factory)
+        assert await worker.search("news", 5) == {
+            "outcome": "no_results",
+            "results": [],
+        }
+        assert json.loads(process.stdin.writes[0]) == {
+            "op": "search",
+            "query": "news",
+            "limit": 5,
+        }
+        await worker.close()
+        assert process.terminated
+        assert not list(tmp_path.iterdir())
+
+    asyncio.run(scenario())
+
+
+def test_browser_worker_search_timeout_is_terminal(tmp_path):
+    async def scenario():
+        process = _Process()
+
+        async def factory(*args, **kwargs):
+            return process
+
+        worker = BrowserWorker(tmp_path, 0.01, 100, process_factory=factory)
+        assert (await worker.search("news", 5))["outcome"] == "timeout"
+        assert process.terminated
+        assert not worker.usable
+        assert not list(tmp_path.iterdir())
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("password", "challenge", "outcome"),
     [(True, False, "unsupported"), (False, True, "blocked")],

@@ -36,7 +36,7 @@ _TOOL_GROUPS = {
     "reminders": frozenset(
         {"create_reminder", "list_reminders", "edit_reminder", "cancel_reminder"}
     ),
-    "web": frozenset({"read_web_pages"}),
+    "web": frozenset({"search_web", "read_web_pages"}),
 }
 
 

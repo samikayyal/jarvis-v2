@@ -464,7 +464,33 @@ class SeleniumPageReader:
             except Exception as exc:
                 raise RuntimeError("browser download blocking is unavailable") from exc
 
-    def read(self, url: str) -> dict[str, object]:
+    def search(self, query: str, limit: int) -> dict[str, object]:
+        from urllib.parse import urlencode
+
+        from .web_search import MAX_QUERY_LENGTH, extract_google_results
+
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or len(query) > MAX_QUERY_LENGTH
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+        ):
+            return {"outcome": "extraction_failed", "results": []}
+        url = "https://www.google.com/search?" + urlencode({"q": query, "num": limit})
+        page = self.read(url, search=True)
+        if page["outcome"] != "ok":
+            return {"outcome": page["outcome"], "results": []}
+        try:
+            assert self.driver is not None
+            return extract_google_results(
+                self.driver.page_source, limit, self.max_chars
+            )
+        except Exception:  # noqa: BLE001 - extraction must not masquerade as an empty search.
+            return {"outcome": "extraction_failed", "results": []}
+
+    def read(self, url: str, *, search: bool = False) -> dict[str, object]:
         requested = validate_public_url(url)
         try:
             self._start()
@@ -497,6 +523,32 @@ class SeleniumPageReader:
                 )
             if self.proxy.blocked:
                 return self._blocked(requested)
+            if search:
+                # Only the known optional-cookie rejection control is allowed.
+                # A challenge or an unknown interstitial never triggers clicks.
+                current = urlsplit(str(self.driver.current_url))
+                if current.hostname == "consent.google.com":
+                    from selenium.webdriver.common.by import By
+
+                    buttons = self.driver.find_elements(
+                        By.CSS_SELECTOR,
+                        'button[aria-label="Reject all"], input[type="submit"][value="Reject all"]',
+                    )
+                    if len(buttons) != 1:
+                        return self._result(
+                            "blocked", requested, reason="unrecognized consent screen"
+                        )
+                    buttons[0].click()
+                    if self.proxy.blocked:
+                        return self._blocked(requested)
+                    current = urlsplit(str(self.driver.current_url))
+                if (
+                    current.hostname not in {"www.google.com", "google.com"}
+                    or current.path != "/search"
+                ):
+                    return self._result(
+                        "blocked", requested, reason="Google search interstitial"
+                    )
             final_url = str(getattr(self.driver, "current_url", requested) or requested)
             try:
                 final_url = validate_public_url(final_url)
@@ -559,6 +611,10 @@ class SeleniumPageReader:
                 "access denied",
                 "cf-chl-",
             )
+            if search:
+                # Search snippets can quote challenge messages. The structured
+                # extractor distinguishes sources from Google's interstitials.
+                challenge_markers = ()
             lowered_title = title.casefold()
             if any(
                 marker in lowered or marker in lowered_title
@@ -653,7 +709,10 @@ def main(argv: list[str] | None = None) -> int:
         for line in sys.stdin:
             try:
                 request = json.loads(line)
-                if not isinstance(request, dict) or request.get("op") != "read":
+                if not isinstance(request, dict) or request.get("op") not in {
+                    "read",
+                    "search",
+                }:
                     _send(
                         {
                             "outcome": "extraction_failed",
@@ -661,11 +720,16 @@ def main(argv: list[str] | None = None) -> int:
                         }
                     )
                     continue
-                url = request.get("url")
-                if not isinstance(url, str):
-                    _send({"outcome": "blocked", "reason": "invalid URL"})
-                    continue
-                response = service.read(url)
+                if request["op"] == "search":
+                    response = service.search(
+                        request.get("query"), request.get("limit")
+                    )
+                else:
+                    url = request.get("url")
+                    if not isinstance(url, str):
+                        _send({"outcome": "blocked", "reason": "invalid URL"})
+                        continue
+                    response = service.read(url)
                 _send(response)
                 if service.unusable:
                     return 2

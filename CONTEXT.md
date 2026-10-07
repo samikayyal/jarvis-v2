@@ -64,9 +64,10 @@ _Avoid_: Background task, queued request
 
 **Web-assisted answer**:
 A reply to the authorized operator that uses bounded evidence from public HTML
-source pages and cites the sources supporting its claims. The optional web skill
-currently supports quick direct-link reading; search and moderate research are
-planned extensions.
+source pages or Google organic results and cites the sources supporting its claims.
+The optional web skill supports quick search and direct-link reading; moderate
+research is a planned extension. Search snippets and actually read pages retain
+distinct evidence provenance.
 _Avoid_: Unverified fallback, raw search results
 
 **Reminder**:
@@ -106,7 +107,7 @@ One deliberately implemented operation exposed to the model-and-tool loop. The
 current prepared tools are `read_vault`, `list_vault_tree`, the optional Git-backed `edit_vault` and
 `delete_vault`,
 `run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
-`list_reminders`, `cancel_reminder`, optional `read_web_pages`, and the manifest-selected bounded
+`list_reminders`, `cancel_reminder`, optional `search_web` and `read_web_pages`, and the manifest-selected bounded
 operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
 
@@ -237,7 +238,7 @@ _Avoid_: Sanitized application log, hidden model reasoning
 - Retrieved vault content and terminal output are untrusted data. They cannot
   grant authority, alter policy, select another host, or approve work.
 - Public web evidence is also untrusted. One ordinary request owns its anonymous
-  browser and cumulative page/evidence allowance, including approval continuations.
+  browser and cumulative query/page/evidence allowance, including approval continuations.
   Browser cleanup occurs on suspension, completion, timeout, and cancellation;
   only a fresh ordinary request resets counters. Public navigation passes through
   address checks before connections, including redirects, with no Workspace or
