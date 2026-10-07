@@ -58,22 +58,29 @@ package and shortened prompt together during the normal release procedure. Merel
 replacing the prompt does not enable skill loading. The catalog is generated from
 configured tools and packaged frontmatter; do not duplicate it in `SYSTEM.md`.
 
-### Optional quick web search and public-page reading
+### Optional web research and public-page reading
 
-The `web` skill exposes `search_web` and `read_web_pages` at `quick` depth.
+The `web` skill exposes `search_web` and `read_web_pages` at `quick` and `moderate` depth.
 Jarvis loads it for explicit searches and freshness or verification needs, or
 to read a supplied public HTML link. Answers cite source titles and URLs and
-distinguish search snippets from actually read pages. Moderate research remains
-reserved for a later ticket.
+distinguish search snippets from actually read pages. Moderate research compares
+relevant sources and identifies material disagreements and coverage gaps.
 
 Web access is off when `[web_search]` is absent or `enabled = false`. The example
 TOML records the shared request allowances: quick one query/two pages, moderate
 three queries/five pages, five results per query, 8,000 characters per page,
-32,000 evidence characters, and a 20-second browser-operation timeout. Reserved
-moderate settings are validated now but do not enable that depth.
+32,000 evidence characters, and a 20-second browser-operation timeout. The first
+web call selects depth; a later moderate call upgrades quick without resetting
+usage, and later quick calls cannot downgrade it. Valid configuration changes
+take effect on the normal service restart.
 Query and page attempts (including failures) count across calls and approval continuations;
 a new ordinary request resets the allowance. Runtime output, tool-round, and
 overall request limits also apply. There is no separate research timer.
+Follow-ups can reuse evidence from the working-session transcript without network
+work. Explicit rechecks and time-sensitive claims require fresh tools. Every
+ordinary request owns and closes its browser; no browser or separate evidence
+cache survives across requests. Session expiry, `/new`, context reset, and restart
+discard the old working-session evidence and loaded skills.
 
 Google blocking or CAPTCHA stops further searches in the request. A recognized
 consent screen can reject optional cookies; challenges are never solved or
@@ -99,7 +106,7 @@ the private runtime directory. Browser work does not use terminal permissions,
 Google Workspace tokens, personal browser profiles, or `openwa-data`. It returns
 bounded visible HTML text, titles, and URLs; PDFs, downloads, authenticated pages,
 and general browser actions are unsupported. Failed reads are not retried.
-Page JavaScript is disabled in this quick reader; content that requires page
+Page JavaScript is disabled in this reader; content that requires page
 scripts may be incomplete or unavailable. Selenium's own bounded extraction
 still reads visible rendered text. Every HTTP(S) connection, including redirects
 and subresources, passes through a local proxy that rejects non-public DNS

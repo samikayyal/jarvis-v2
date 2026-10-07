@@ -39,7 +39,7 @@ def _json(value: object) -> str:
 
 
 class WebTools:
-    """Quick search and reads with request-owned cumulative allowances."""
+    """Quick or moderate research with request-owned cumulative allowances."""
 
     def __init__(
         self,
@@ -62,7 +62,11 @@ class WebTools:
                 {
                     "type": "function",
                     "name": "search_web",
-                    "description": "Search Google for bounded organic evidence. Only quick depth is available; query allowance is shared across this request.",
+                    "description": (
+                        "Search Google for bounded organic evidence. Choose quick or "
+                        "moderate depth; upgrading preserves all usage and later quick "
+                        "calls cannot downgrade. Allowances are shared across this request."
+                    ),
                     "strict": True,
                     "parameters": {
                         "type": "object",
@@ -72,7 +76,7 @@ class WebTools:
                                 "minLength": 1,
                                 "maxLength": MAX_QUERY_LENGTH,
                             },
-                            "depth": {"type": "string", "enum": ["quick"]},
+                            "depth": {"type": "string", "enum": ["quick", "moderate"]},
                         },
                         "required": ["query", "depth"],
                         "additionalProperties": False,
@@ -82,8 +86,9 @@ class WebTools:
                     "type": "function",
                     "name": "read_web_pages",
                     "description": (
-                        "Read public HTML URLs sequentially for cited answers. Only quick "
-                        "depth is available. The page allowance is shared across this request."
+                        "Read public HTML URLs sequentially for cited answers. Choose quick "
+                        "or moderate depth; upgrading preserves all usage and later quick "
+                        "calls cannot downgrade. Allowances are shared across this request."
                     ),
                     "strict": True,
                     "parameters": {
@@ -95,7 +100,7 @@ class WebTools:
                                 "minItems": 1,
                                 "maxItems": MAX_BATCH_URLS,
                             },
-                            "depth": {"type": "string", "enum": ["quick"]},
+                            "depth": {"type": "string", "enum": ["quick", "moderate"]},
                         },
                         "required": ["urls", "depth"],
                         "additionalProperties": False,
@@ -109,6 +114,7 @@ class WebTools:
     def request_started(self) -> None:
         if self._browser is not None:
             raise RuntimeError("close the previous web request before resetting")
+        self._limits = self.config.quick
         self._pages_used = 0
         self._queries_used = 0
         self._search_blocked = False
@@ -158,8 +164,8 @@ class WebTools:
 
     def _remaining(self) -> dict[str, int]:
         return {
-            "queries": max(0, self.config.quick.max_queries - self._queries_used),
-            "pages": max(0, self.config.quick.max_pages - self._pages_used),
+            "queries": max(0, self._limits.max_queries - self._queries_used),
+            "pages": max(0, self._limits.max_pages - self._pages_used),
             "evidence_chars": max(
                 0, self.config.max_total_evidence_chars - self._evidence_chars
             ),
@@ -227,11 +233,13 @@ class WebTools:
         urls = arguments.get("urls")
         if (
             set(arguments) != {"urls", "depth"}
-            or arguments.get("depth") != "quick"
+            or arguments.get("depth") not in ("quick", "moderate")
             or not isinstance(urls, list)
             or not 1 <= len(urls) <= MAX_BATCH_URLS
         ):
-            return self._error("invalid_input", "Use quick depth and 1–20 public URLs.")
+            return self._error(
+                "invalid_input", "Use quick or moderate depth and 1–20 public URLs."
+            )
         try:
             for url in urls:
                 if not isinstance(url, str):
@@ -241,6 +249,9 @@ class WebTools:
             return self._error(
                 "blocked", "Only public HTTP(S) URLs without credentials are allowed."
             )
+
+        if arguments["depth"] == "moderate":
+            self._limits = self.config.moderate
 
         # Reserve source identities for the whole batch before doing any network work.
         pages: list[dict[str, object]] = [
@@ -345,14 +356,16 @@ class WebTools:
         query = arguments.get("query")
         if (
             set(arguments) != {"query", "depth"}
-            or arguments.get("depth") != "quick"
+            or arguments.get("depth") not in ("quick", "moderate")
             or not isinstance(query, str)
             or not query.strip()
             or len(query) > MAX_QUERY_LENGTH
         ):
             return self._error(
-                "invalid_input", "Use one nonempty query and quick depth."
+                "invalid_input", "Use one nonempty query and quick or moderate depth."
             )
+        if arguments["depth"] == "moderate":
+            self._limits = self.config.moderate
         if self._search_blocked:
             return self._error("blocked", "Google search is blocked for this request.")
         if self._worker_failed:

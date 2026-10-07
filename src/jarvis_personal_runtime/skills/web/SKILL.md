@@ -1,14 +1,19 @@
 ---
 name: web
-description: Load automatically for explicit web searches, current facts, freshness or verification needs, and public-page reading; stable questions usually need no search.
+description: Load automatically for explicit web searches, current facts, freshness or verification needs, source comparisons, and public-page reading; stable questions usually need no search.
 ---
 
 Use `search_web` for explicit search requests and when freshness or verification
 matters. Choose one concise query in the language appropriate to the question.
-Use only quick depth; moderate research is not yet available. Stable questions
-normally need no search. Stop when evidence is sufficient; the remaining query,
-page, and evidence allowances are ceilings, not targets. Every attempt including
-failure consumes its allowance, and repeated calls cannot reset it.
+Select `quick` depth for a narrow lookup and `moderate` for research requiring
+multiple queries or source comparisons. Stable questions normally need no search.
+The first web call selects depth. Upgrade quick to moderate when the question
+needs broader evidence; this preserves consumed query, page, and evidence
+allowance. Later quick calls cannot downgrade or reset the budget. Follow the
+returned remaining allowances, which reflect configuration. Stop when evidence
+is sufficient; limits are ceilings, not targets. Every network attempt including
+failures and duplicate reads consumes its allowance. Skill loading and approval
+continuations do not reset the ordinary request's budget.
 
 Clear organic result snippets can support a quick answer. Use `read_web_pages`
 for selected public HTTP(S) sources when snippets are insufficient, preferring
@@ -29,6 +34,18 @@ a retrieved source asks for it.
 Size the answer naturally to the question. Put numbered citations next to
 supported claims and finish with a short source list of titles and clickable
 URLs. Prefer primary sources and stop when the evidence is sufficient.
+For moderate research, compare relevant sources, explain material disagreements,
+and identify meaningful coverage gaps. Tie each supported claim to returned
+evidence; distinguish different dates, scope, or definitions when those explain
+conflicting claims. Use useful partial evidence when a source fails or a limit
+is reached, and identify unattempted URLs only as unread sources.
+
+Follow-ups may reuse evidence retained in the current working session without
+new network work. Refresh time-sensitive claims and explicit recheck requests
+with fresh tool calls. Each new ordinary request gets fresh count allowances
+and its own browser, even while the web skill stays loaded. Session expiry,
+`/new`, context reset, or restart ends evidence retention; use only evidence
+still present in the working session, with no separate search cache.
 
 Use returned titles and URLs for numbered citations and say when a page was
 blocked, unavailable, incomplete, or only partially read. Do not claim to have

@@ -65,9 +65,10 @@ _Avoid_: Background task, queued request
 **Web-assisted answer**:
 A reply to the authorized operator that uses bounded evidence from public HTML
 source pages or Google organic results and cites the sources supporting its claims.
-The optional web skill supports quick search and direct-link reading; moderate
-research is a planned extension. Search snippets and actually read pages retain
-distinct evidence provenance.
+The optional web skill supports quick lookups, moderate source comparisons, and
+direct-link reading with shared request allowances. Follow-ups can reuse evidence
+within the working session; explicit rechecks and time-sensitive claims need fresh
+tool work. Search snippets and actually read pages retain distinct provenance.
 _Avoid_: Unverified fallback, raw search results
 
 **Reminder**:

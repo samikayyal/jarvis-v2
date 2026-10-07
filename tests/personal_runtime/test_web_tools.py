@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from jarvis_personal_runtime.config import WebSearchConfig
+from jarvis_personal_runtime.config import WebDepthLimits, WebSearchConfig
 from jarvis_personal_runtime.web_tools import WebTools
 
 
@@ -174,7 +174,7 @@ def test_search_serialization_always_fits_and_preserves_source_identity(
     "arguments",
     [
         {"query": " ", "depth": "quick"},
-        {"query": "news", "depth": "moderate"},
+        {"query": "news", "depth": "deep"},
         {"query": ["a", "b"], "depth": "quick"},
         {"query": "a" * 2049, "depth": "quick"},
     ],
@@ -189,6 +189,111 @@ def test_invalid_search_does_not_consume_allowance(tmp_path, arguments):
     result = json.loads(asyncio.run(tool.execute("search_web", arguments)))
     assert result["outcome"] == "invalid_input"
     assert result["remaining"]["queries"] == 1
+
+
+@pytest.mark.parametrize("first_outcome", ["ok", "extraction_failed"])
+def test_upgrade_carries_attempts_and_evidence_without_downgrade(
+    tmp_path, first_outcome
+):
+    class ResearchBrowser(Browser):
+        queries = 0
+
+        async def search(self, query, limit):
+            self.queries += 1
+            if self.queries == 1 and first_outcome != "ok":
+                return {"outcome": first_outcome}
+            return await super().search(query, limit)
+
+    async def scenario():
+        browser = ResearchBrowser()
+        tool = WebTools(
+            WebSearchConfig(enabled=True),
+            runtime_dir=tmp_path,
+            max_output_chars=4096,
+            browser_factory=lambda *args: browser,
+        )
+        first = json.loads(
+            await tool.execute("search_web", {"query": "first", "depth": "quick"})
+        )
+        assert first["outcome"] == first_outcome
+        assert first["remaining"]["queries"] == 0
+        direct = json.loads(
+            await tool.execute(
+                "read_web_pages", {"urls": ["https://example.com/a"], "depth": "quick"}
+            )
+        )
+        assert direct["remaining"]["pages"] == 1
+        upgraded = json.loads(
+            await tool.execute("search_web", {"query": "compare", "depth": "moderate"})
+        )
+        assert upgraded["outcome"] == "ok"
+        assert upgraded["remaining"]["queries"] == 1
+        assert upgraded["remaining"]["pages"] == 4
+        assert (
+            upgraded["remaining"]["evidence_chars"]
+            < direct["remaining"]["evidence_chars"]
+        )
+        last = json.loads(
+            await tool.execute("search_web", {"query": "last", "depth": "quick"})
+        )
+        assert last["outcome"] == "ok"
+        assert last["remaining"]["queries"] == 0
+        capped = json.loads(
+            await tool.execute("search_web", {"query": "over", "depth": "moderate"})
+        )
+        assert capped["outcome"] == "limit_reached"
+        assert browser.queries == 3
+        assert capped["remaining"] == last["remaining"]
+        await tool.close_request()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("first_depth", ["quick", "moderate"])
+def test_page_led_research_uses_configured_limits_and_resets_next_request(
+    tmp_path, first_depth
+):
+    async def scenario():
+        browser = Browser()
+        tool = WebTools(
+            WebSearchConfig(
+                enabled=True, quick=WebDepthLimits(1, 1), moderate=WebDepthLimits(2, 3)
+            ),
+            runtime_dir=tmp_path,
+            max_output_chars=4096,
+            browser_factory=lambda *args: browser,
+        )
+        await tool.execute(
+            "read_web_pages",
+            {"urls": ["https://example.com/repeated"], "depth": first_depth},
+        )
+        upgraded = json.loads(
+            await tool.execute(
+                "read_web_pages",
+                {"urls": ["https://example.com/repeated"] * 3, "depth": "moderate"},
+            )
+        )
+        assert upgraded["outcome"] == "partial"
+        assert upgraded["remaining"] == {
+            "queries": 2,
+            "pages": 0,
+            "evidence_chars": 31973,
+        }
+        assert len(browser.urls) == 3
+        assert upgraded["pages"][-1]["outcome"] == "unattempted"
+        await tool.close_request()
+        tool.request_started()
+        fresh = json.loads(
+            await tool.execute(
+                "read_web_pages",
+                {"urls": ["https://example.com/new"] * 2, "depth": "quick"},
+            )
+        )
+        assert fresh["remaining"] == {"queries": 1, "pages": 0, "evidence_chars": 31991}
+        assert fresh["pages"][-1]["outcome"] == "unattempted"
+        await tool.close_request()
+
+    asyncio.run(scenario())
 
 
 def test_failed_search_json_fits_exact_small_output_boundary(tmp_path):
