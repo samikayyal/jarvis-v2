@@ -139,15 +139,26 @@ class _ProxyServer(socketserver.ThreadingTCPServer):
     def __init__(self) -> None:
         self.blocked = threading.Event()
         self.blocked_reason = ""
+        self.blocked_destinations: set[tuple[str | None, int]] = set()
         super().__init__(("127.0.0.1", 0), _ProxyHandler)
 
     @property
     def port(self) -> int:
         return int(self.server_address[1])
 
-    def record_block(self, reason: str) -> None:
+    def record_block(self, reason: str, target: str = "") -> None:
         self.blocked_reason = reason[:256]
         self.blocked.set()
+        try:
+            parsed = urlsplit(target if "://" in target else f"https://{target}")
+            self.blocked_destinations.add(
+                (
+                    parsed.hostname,
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                )
+            )
+        except ValueError:
+            pass
 
 
 class _ProxyHandler(socketserver.StreamRequestHandler):
@@ -164,6 +175,7 @@ class _ProxyHandler(socketserver.StreamRequestHandler):
                 self._deny("malformed proxy request")
                 return
             method, target, version = decoded
+            self.target = target
             if method.upper() == "CONNECT":
                 self._connect_tunnel(target)
                 return
@@ -249,7 +261,7 @@ class _ProxyHandler(socketserver.StreamRequestHandler):
         _relay(self.connection, upstream)
 
     def _deny(self, reason: str) -> None:
-        self.server.record_block(reason)
+        self.server.record_block(reason, getattr(self, "target", ""))
         with contextlib.suppress(OSError):
             self.wfile.write(
                 b"HTTP/1.1 403 Forbidden\r\n"
@@ -280,6 +292,16 @@ class PublicNetworkProxy:
     def blocked_reason(self) -> str:
         return self._server.blocked_reason if self._server else ""
 
+    def blocked_url(self, url: str) -> bool:
+        if self._server is None:
+            return False
+        parsed = urlsplit(url)
+        destination = (
+            parsed.hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+        )
+        return destination in self._server.blocked_destinations
+
     def start(self) -> None:
         if self._server is not None:
             return
@@ -295,6 +317,7 @@ class PublicNetworkProxy:
         if self._server is not None:
             self._server.blocked.clear()
             self._server.blocked_reason = ""
+            self._server.blocked_destinations.clear()
 
     def close(self) -> None:
         server, self._server = self._server, None
@@ -521,8 +544,10 @@ class SeleniumPageReader:
                 return self._result(
                     "unavailable", requested, reason="browser navigation failed"
                 )
-            if self.proxy.blocked:
-                return self._blocked(requested)
+            # The proxy also sees denied background connections and subresources.
+            # Those must stay denied without discarding a successfully loaded
+            # public document. Failed top-level navigation is handled above;
+            # private redirects and empty deny responses are checked below.
             if search:
                 # Only the known optional-cookie rejection control is allowed.
                 # A challenge or an unknown interstitial never triggers clicks.
@@ -539,8 +564,6 @@ class SeleniumPageReader:
                             "blocked", requested, reason="unrecognized consent screen"
                         )
                     buttons[0].click()
-                    if self.proxy.blocked:
-                        return self._blocked(requested)
                     current = urlsplit(str(self.driver.current_url))
                 if (
                     current.hostname not in {"www.google.com", "google.com"}
@@ -559,6 +582,8 @@ class SeleniumPageReader:
                         requested,
                         reason="navigation did not produce an HTML page",
                     )
+                return self._blocked(requested)
+            if self.proxy.blocked_url(final_url):
                 return self._blocked(requested)
             content_type = str(
                 self.driver.execute_script("return document.contentType || '';") or ""
@@ -624,6 +649,8 @@ class SeleniumPageReader:
                     "blocked", final_url, reason="page contains an access challenge"
                 )
             if not text.strip():
+                if self.proxy.blocked:
+                    return self._blocked(requested)
                 return self._result(
                     "extraction_failed", final_url, reason="page has no visible text"
                 )

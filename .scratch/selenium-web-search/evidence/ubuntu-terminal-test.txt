@@ -1,0 +1,5 @@
+Using Python 3.13.3 environment at: /opt/venv
+Checked 42 packages in 256ms
+All installed packages are compatible
+.                                                                        [100%]
+1 passed, 22 deselected in 25.32s

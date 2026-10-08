@@ -1,0 +1,77 @@
+{
+  "package": "/opt/venv/lib/python3.13/site-packages/jarvis_personal_runtime",
+  "dependencies": [
+    "beautifulsoup4==4.15.0",
+    "httpx==0.28.1",
+    "openai==2.53.0",
+    "selenium==4.50.0",
+    "tiktoken==0.14.0"
+  ],
+  "uid": 10001,
+  "provider": "scripted; no live-model or WhatsApp acceptance",
+  "binaries": {
+    "browser": {
+      "path": "/usr/bin/google-chrome-stable",
+      "version": "Google Chrome 155.0.8059.39"
+    },
+    "driver": {
+      "path": "/usr/local/bin/chromedriver",
+      "version": "ChromeDriver 155.0.8059.39 (3ff7ac5a9224be9156d7f8703a06e22890aafd34-refs/branch-heads/8059@{#935})"
+    }
+  },
+  "evidence": [
+    {
+      "outcome": "blocked",
+      "query": "site:iana.org example domains",
+      "results": [],
+      "remaining": {
+        "queries": 0,
+        "pages": 2,
+        "evidence_chars": 32000
+      }
+    },
+    {
+      "outcome": "timeout",
+      "pages": [
+        {
+          "requested_url": "https://www.iana.org/help/example-domains",
+          "url": "https://www.iana.org/help/example-domains",
+          "title": "",
+          "text": "",
+          "outcome": "timeout",
+          "evidence_type": "page",
+          "reason": "browser operation timed out"
+        }
+      ],
+      "remaining": {
+        "queries": 1,
+        "pages": 1,
+        "evidence_chars": 32000
+      }
+    },
+    {
+      "outcome": "ok",
+      "pages": [
+        {
+          "requested_url": "https://www.iana.org/help/example-domains",
+          "url": "https://www.iana.org/help/example-domains",
+          "title": "Example Domains",
+          "text": "Domains\nProtocols\nNumbers\nAbout\nInstructions and Guides\nExample Domains\n\nA number of domains such as example.com and example.org are maintained for documentation purposes. These domains may be used as illustrative examples in documents without prior coordination with us. They are not available for registration or transfer.\n\nWe provide a web service on the example domain hosts to provide basic information on the purpose of the domain. These web services are provided as best effort, but are not designed to support production applications. We strongly recommend you do not design applications that require the example domains to have operating HTTP service.\n\nFurther Reading\nIANA-managed Reserved Domains\nSpecial-Use Domain Names (RFC 6761)\nReserved Top Level DNS Names (RFC 2606)\nLast revised 2026-09-27.\nDomain\u00a0Names\t\nRoot Zone Registry\n.INT Registry\n.ARPA Registry\nIDN Repository\n\nNumber\u00a0Resources\t\nNumber Registries\nRIR Allocation Data\nAbuse Information\n\nProtocols\t\nProtocol Registries\nTime Zone Database\n\nAbout\u00a0Us\t\nNews\nPerformance\nThe Organization\nArchive\nContact Us\n\nThe IANA functions coordinate the Internet\u2019s globally unique identifiers, and are provided by Public Technical Identifiers, an affiliate of ICANN.\n\nPrivacy Policy\nTerms of Service",
+          "outcome": "ok",
+          "evidence_type": "page"
+        }
+      ],
+      "remaining": {
+        "queries": 1,
+        "pages": 1,
+        "evidence_chars": 30744
+      }
+    }
+  ],
+  "search_reply": "Web access is unavailable for this request; I could not verify current web evidence. Any answer below is based on existing knowledge, not current web verification.\n\nNo verified source text is available.",
+  "profile_cleanup": true,
+  "page_reply": "Web access is unavailable for this request; I could not verify current web evidence. Any answer below is based on existing knowledge, not current web verification.\n\nNo verified source text is available.",
+  "follow_up_reply": "No verified source text is available.",
+  "follow_up_source_in_transcript": false,
+  "recheck_reply": "The source says: Domains\nProtocols\nNumbers\nAbout\nInstructions and Guides\nExample Domains\n\nA number of domains such as example.com and example.org are maintained for documentation purposes. These domains may be used as illustrative examples in documents with [1]\n\n[1] Example Domains: https://www.iana.org/help/example-domains"
+}

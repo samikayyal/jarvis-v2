@@ -8,6 +8,11 @@ Docker host-bridge listener. Do not add the assistant to OpenWA's Compose graph.
 
 From a clean checkout, verify the surviving runtime before packaging:
 
+The tracked `uv.lock` fixes the development/test environment. Runtime and build
+pins in `pyproject.toml` agree with `requirements.in`; deployment installs use
+the separate hash-locked `requirements.lock`. Update and compare these together
+when intentionally changing dependency versions.
+
 ```console
 uv sync --locked
 uv run pytest tests/personal_runtime
@@ -122,6 +127,111 @@ after the host prerequisites are checked. Validate with the packaged CLI's
 `enabled = false` and restarting; roll back the release through the existing
 stopped-service rollback procedure. Runtime checks do not prove live web egress
 or end-to-end WhatsApp readiness.
+
+#### Provision and verify a browser candidate
+
+Provision the browser independently of runtime requests. On native Ubuntu, use
+a reviewed Google Chrome `.deb` plus its compatible ChromeDriver, or a matching
+Chrome for Testing browser/driver release. For Chrome 115 and later, use Google's
+[version selection guide](https://developer.chrome.com/docs/chromedriver/downloads/version-selection)
+and the [Chrome for Testing availability dashboard](https://googlechromelabs.github.io/chrome-for-testing/).
+Select the driver for the installed browser's `MAJOR.MINOR.BUILD`, recording the
+full versions and downloaded artifact checksums. Matching only the major version
+does not establish compatibility. Keep the matching pair for rollback; browser
+auto-updates require a new compatibility check.
+
+For an explicitly selected Chrome for Testing pair, unpack each archive under a
+versioned `/opt/jarvis-browser/VERSION/` directory and install its required native
+libraries through the Ubuntu package manager. Point `/usr/bin/google-chrome` at
+that release's `chrome-linux64/chrome` and `/usr/local/bin/chromedriver` at
+`chromedriver-linux64/chromedriver`. Ensure earlier discovery candidates such as
+`/usr/bin/chromium` do not select a different pair. The browser and driver must be
+executable by `jarvis-personal-runtime`; the versioned directory must be readable
+and traversable. Do not point at a personal Chrome profile.
+
+Ubuntu's `chromium-browser` package can be a Snap launcher. Verify that the
+actual browser, its driver, confinement, and private profile path work together
+under the service identity before choosing this route. An unpacked browser on
+Ubuntu 24.04 can also require an administrator-reviewed AppArmor policy to allow
+its sandbox/user namespaces. Do not disable the Chromium sandbox or globally
+weaken the host to make a smoke check pass. A `--version` result alone does not
+test sandbox startup.
+
+The supplied unit uses the service UID/GID, `UMask=0077`, the private runtime
+working directory, and no interactive desktop. Test under these same constraints.
+The worker deliberately drops inherited credentials, `HOME`, proxy settings, and
+user-selected `PATH` entries; only explicit discovery paths above are used. It
+needs permission to create a private profile, loopback sockets for ChromeDriver
+and the restrictive proxy, and public DNS/HTTP(S) egress. Extra service hardening
+must allow Chromium's sandbox and worker process groups. Containers have separate
+seccomp/user-namespace constraints and do not establish native systemd acceptance.
+
+From the candidate release, run the optional installed-package probe as the
+service account, outside the source checkout:
+
+```console
+sudo -u jarvis-personal-runtime sh -c 'umask 077; cd /var/lib/jarvis-personal-runtime; \
+  uv run --no-project --python /opt/jarvis-personal-runtime/releases/COMMIT/.venv/bin/python \
+  python /opt/jarvis-personal-runtime/releases/COMMIT/deployment/personal-runtime/verify-web.py \
+  --live --output web-verification.json'
+```
+
+The probe records installed package paths, pins, executable versions, a real
+Google query, a selected IANA page read, a session follow-up, a fresh recheck, and
+profile removal. Its Responses provider is scripted: it spends nothing on model
+or search services and demonstrates tool/evidence flow, not live-model judgment.
+Inspect the JSON outcomes and supporting excerpts. Exit zero means the probe
+finished; it does **not** mean Google succeeded. `blocked`, CAPTCHA,
+`extraction_failed`, `timeout`, or `unavailable` remain failed lookup evidence.
+The normal runtime fallback notice must accompany a reply with no usable web
+evidence; a genuinely empty search has a different notice. Never fabricate a
+successful lookup or solve/retry a CAPTCHA to pass acceptance.
+
+The opt-in browser tests are independent of Google:
+
+```console
+JARVIS_TEST_CHROMIUM_BINARY=/usr/bin/google-chrome \
+JARVIS_TEST_CHROMEDRIVER_BINARY=/usr/local/bin/chromedriver \
+uv run pytest tests/personal_runtime/test_web_browser.py \
+  tests/personal_runtime/test_web_installed_browser.py -q
+```
+
+Their fixture routing is confined to test code and temporary child entrypoints;
+there is no production setting permitting private destinations. Run the copied
+tests from a directory outside the checkout with a wheel-only environment to
+verify the installed artifact. Test tools such as pytest belong in the isolated
+verification environment, not the service's runtime dependencies.
+
+#### Enable, disable, and roll back web access
+
+1. Stage the package and compatible browser pair. Validate the candidate TOML
+   with the packaged CLI `--check` as described below. It validates configuration;
+   it does not launch Chromium or query Google. Positive finite limits and timeout
+   values are required, quick counts cannot exceed moderate counts, and total
+   evidence capacity cannot be smaller than the per-page bound.
+2. Complete the browser probe and controlled fixture checks in the test
+   environment. Record any missing live success evidence. The ordinary default
+   request timeout is 600 seconds and the tool-round ceiling is eight, including
+   skill loading; these remain separate from the 20-second browser operation
+   bound. There are no quick/moderate timers or promised answer times.
+3. For a separately authorized production activation, use `modify-jarvis-config`
+   to set `[web_search].enabled = true`. Its stop/edit/validate/promote/start
+   sequence makes the immutable configuration snapshot effective. Check service
+   status and then obtain one real authorized WhatsApp search with a supported
+   citation in the phone reply. Configuration and binaries alone are insufficient.
+4. To disable, set `enabled = false` through the same validated restart flow.
+   The web skill/tools disappear; the existing assistant tools and messaging
+   gateway retain their configuration. Restart discards the working session and
+   any active or pending request; it does not replay them.
+5. For rollback, stop the native service, restore the prior reviewed release
+   symlink and matching configuration/prompt/browser pair if those changed,
+   validate with that release's CLI, then start and verify it. Preserve existing
+   saved permissions and runtime data. Do not change OpenWA's image, pairing,
+   volume, credentials, or deployment. Use the general rollback procedure below.
+
+All search/page traffic is anonymous public browsing. There are no paid search
+APIs, paid proxies, extra model services, Workspace credentials, or OpenWA browser
+state in this path. Existing assistant model usage is a separate expense.
 
 ### Configuration files
 

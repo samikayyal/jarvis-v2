@@ -1,6 +1,12 @@
 # Selenium web search
 
-Status: Design aligned; implementation not started
+Status: Tickets 01–04 complete; production activation not performed.
+
+Delivery update (2026-10-08): see the [verification record](evidence/verification.md)
+for installed-package, fixture, Ubuntu sandbox/process, and live-page evidence.
+Live Google success remains unverified because this test environment returns a
+non-public Google DNS answer. The interview-era descriptions below record the
+original design baseline; they are not a current deployment status report.
 
 ## Purpose
 

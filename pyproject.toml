@@ -5,18 +5,18 @@ description = "Single-operator native Ubuntu personal assistant runtime for Open
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "beautifulsoup4>=4.15.0",
-    "httpx>=0.28.1",
+    "beautifulsoup4==4.15.0",
+    "httpx==0.28.1",
     "openai==2.53.0",
-    "selenium>=4.50.0",
-    "tiktoken>=0.14.0",
+    "selenium==4.50.0",
+    "tiktoken==0.14.0",
 ]
 
 [project.scripts]
 jarvis-personal-runtime = "jarvis_personal_runtime.service:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==80.10.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

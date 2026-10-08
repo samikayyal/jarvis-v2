@@ -125,9 +125,14 @@ def test_only_personal_runtime_source_and_dependencies_remain() -> None:
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["dependencies"] == [
-        "beautifulsoup4>=4.15.0",
-        "httpx>=0.28.1",
+        "beautifulsoup4==4.15.0",
+        "httpx==0.28.1",
         "openai==2.53.0",
-        "selenium>=4.50.0",
-        "tiktoken>=0.14.0",
+        "selenium==4.50.0",
+        "tiktoken==0.14.0",
     ]
+    declared = set(
+        project["project"]["dependencies"] + project["build-system"]["requires"]
+    )
+    deployment = set((PACKAGE / "requirements.in").read_text().splitlines())
+    assert declared == deployment

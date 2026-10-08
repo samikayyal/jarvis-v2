@@ -560,6 +560,18 @@ def test_real_browser_fixture_extracts_and_blocks_private_redirects(
                 )
                 self.end_headers()
                 return
+            if self.path in {"/public-redirect", "/private-dns-redirect"}:
+                host = (
+                    "example.com"
+                    if self.path == "/public-redirect"
+                    else "private.example"
+                )
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://{host}:{self.server.server_port}/target"
+                )
+                self.end_headers()
+                return
             if self.path == "/download":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
@@ -572,7 +584,8 @@ def test_real_browser_fixture_extracts_and_blocks_private_redirects(
             body = (
                 b"<html><head><title>Fixture page</title></head>"
                 b"<body><h1>Fixture evidence</h1><p>Public text.</p>"
-                b"<p style='display:none'>Hidden secret</p>"
+                + f'<img src="http://127.0.0.1:{self.server.server_port}/private">'.encode()
+                + b"<p style='display:none'>Hidden secret</p>"
                 b"<script>document.body.innerText='Script replaced text';</script>"
                 b"</body></html>"
             )
@@ -585,10 +598,21 @@ def test_real_browser_fixture_extracts_and_blocks_private_redirects(
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+    original_resolve = web_worker.resolve_public_addresses
+    original_getaddrinfo = socket.getaddrinfo
+
+    def fixture_dns(host, port, *args, **kwargs):
+        if host == "private.example":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fixture_dns)
     monkeypatch.setattr(
         web_worker,
         "resolve_public_addresses",
-        lambda _host, _port: ("127.0.0.1",),
+        lambda host, port: (
+            ("127.0.0.1",) if host == "example.com" else original_resolve(host, port)
+        ),
     )
     reader = web_worker.SeleniumPageReader(
         tmp_path / "profile",
@@ -600,6 +624,8 @@ def test_real_browser_fixture_extracts_and_blocks_private_redirects(
     port = server.server_address[1]
     try:
         page = reader.read(f"http://example.com:{port}/")
+        public_redirect = reader.read(f"http://example.com:{port}/public-redirect")
+        private_dns = reader.read(f"http://example.com:{port}/private-dns-redirect")
         blocked = reader.read(f"http://example.com:{port}/redirect")
         download = reader.read(f"http://example.com:{port}/download")
     finally:
@@ -613,6 +639,10 @@ def test_real_browser_fixture_extracts_and_blocks_private_redirects(
     assert "Hidden secret" not in str(page["text"])
     assert "Script replaced" not in str(page["text"])
     assert blocked["outcome"] == "blocked"
+    assert public_redirect["outcome"] == "ok"
+    assert public_redirect["url"] == f"http://example.com:{port}/target"
+    assert private_dns["outcome"] == "blocked"
+    assert hits.count("/target") == 1
     assert blocked["url"] == f"http://example.com:{port}/redirect"
     assert "/private" not in hits
     assert download["outcome"] in {"unsupported", "unavailable"}
