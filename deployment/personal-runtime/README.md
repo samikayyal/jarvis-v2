@@ -115,8 +115,13 @@ both are removed together. Browser work does not use terminal permissions,
 Google Workspace tokens, personal browser profiles, or `openwa-data`. It returns
 bounded visible HTML text, titles, and URLs; PDFs, downloads, authenticated pages,
 and general browser actions are unsupported. Failed reads are not retried.
-Page JavaScript is disabled in this reader; content that requires page
-scripts may be incomplete or unavailable. Selenium's own bounded extraction
+Page JavaScript is disabled for ordinary reads; content that requires page
+scripts may be incomplete or unavailable. Search permits scripts only on the
+HTTPS `www.google.com` and `consent.google.com` origins, then disables execution
+before ordinary page reads. Search stops at Google's anti-bot challenges and
+reports the specific navigation failure when available. Enabling JavaScript
+does not guarantee that Google will accept automated traffic from the host.
+Selenium's own bounded extraction
 still reads visible rendered text. Every HTTP(S) connection, including redirects
 and subresources, passes through a local proxy that rejects non-public DNS
 answers and connects to the validated address. Non-HTTP schemes and downloads
