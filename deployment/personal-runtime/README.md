@@ -109,7 +109,9 @@ Missing or incompatible binaries produce an unavailable-web outcome. No browser
 provisioning or production activation is implied by installing this package.
 
 The request owns a separate Python worker and one anonymous browser profile in
-the private runtime directory. Browser work does not use terminal permissions,
+the private runtime directory. Its fresh `HOME` is inside that profile so native
+Chrome can create auxiliary state without inheriting the service account's home;
+both are removed together. Browser work does not use terminal permissions,
 Google Workspace tokens, personal browser profiles, or `openwa-data`. It returns
 bounded visible HTML text, titles, and URLs; PDFs, downloads, authenticated pages,
 and general browser actions are unsupported. Failed reads are not retried.

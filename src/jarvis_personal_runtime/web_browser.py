@@ -189,7 +189,7 @@ def _minimal_environment() -> dict[str, str]:
 
     # Do not copy os.environ.  In particular this intentionally omits HOME,
     # cloud credentials, OpenAI/OpenWA variables, proxy credentials, and any
-    # browser profile variables.  Chrome receives an explicit fresh profile.
+    # browser profile variables. The caller supplies a fresh request-owned HOME.
     environment = {
         "PATH": os.defpath,
         "LANG": "C.UTF-8",
@@ -363,11 +363,17 @@ class BrowserWorker:
         with contextlib.suppress(OSError):
             self._profile_dir.chmod(0o700)
         try:
+            # Native Chrome needs HOME for its auxiliary state even with an
+            # explicit user-data-dir. Never inherit the service account's home.
+            anonymous_home = self._profile_dir / "home"
+            anonymous_home.mkdir(mode=0o700)
+            environment = _minimal_environment()
+            environment["HOME"] = str(anonymous_home)
             spawn_kwargs: dict[str, Any] = {
                 "stdin": asyncio.subprocess.PIPE,
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
-                "env": _minimal_environment(),
+                "env": environment,
                 "limit": max(65_536, min(_PROTOCOL_LIMIT, self.max_chars * 8 + 8192)),
             }
             if os.name == "posix":

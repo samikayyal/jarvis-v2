@@ -124,7 +124,12 @@ class _Process:
         return self.returncode or 0
 
 
-def test_browser_worker_is_lazy_and_cleans_profile(tmp_path: Path) -> None:
+def test_browser_worker_is_lazy_and_cleans_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "personal-home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-browser")
+
     async def scenario() -> None:
         process: _Process | None = None
         calls: list[dict[str, Any]] = []
@@ -155,9 +160,16 @@ def test_browser_worker_is_lazy_and_cleans_profile(tmp_path: Path) -> None:
         assert "--profile-dir" in calls[0]["argv"]
         profile = Path(calls[0]["argv"][calls[0]["argv"].index("--profile-dir") + 1])
         assert profile.is_dir()
+        environment = calls[0]["env"]
+        anonymous_home = Path(environment["HOME"])
+        assert anonymous_home.is_dir()
+        assert anonymous_home.is_relative_to(profile)
+        assert "OPENAI_API_KEY" not in environment
+        (anonymous_home / ".browser-cache").write_text("request-only")
         await worker.close()
         assert process is not None and process.terminated
         assert not profile.exists()
+        assert not anonymous_home.exists()
 
     asyncio.run(scenario())
 
