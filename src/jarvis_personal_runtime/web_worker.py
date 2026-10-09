@@ -341,10 +341,10 @@ def find_chromium() -> str | None:
     """Find an explicitly installed Chromium-compatible executable."""
 
     candidates = (
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
     )
@@ -354,8 +354,8 @@ def find_chromium() -> str | None:
 def find_chromedriver() -> str | None:
     return _find_executable(
         (
-            "/usr/bin/chromedriver",
             "/usr/local/bin/chromedriver",
+            "/usr/bin/chromedriver",
             "C:\\Program Files\\ChromeDriver\\chromedriver.exe",
             "C:\\Program Files (x86)\\ChromeDriver\\chromedriver.exe",
         )

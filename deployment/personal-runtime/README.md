@@ -97,9 +97,11 @@ Provision compatible Chromium and ChromeDriver on the Ubuntu host before
 enabling this feature. Both binaries must be installed explicitly by the
 operator; the runtime never runs a package manager or Selenium Manager and never
 downloads drivers. Check browser and driver versions under the service account.
-Discovery accepts `/usr/bin/chromium`, `/usr/bin/chromium-browser`,
-`/usr/bin/google-chrome-stable`, or `/usr/bin/google-chrome`, with
-`/usr/bin/chromedriver` or `/usr/local/bin/chromedriver`. Pin a mutually compatible
+Discovery prefers `/usr/bin/google-chrome-stable`, then `/usr/bin/google-chrome`,
+`/usr/bin/chromium`, and `/usr/bin/chromium-browser`, with
+`/usr/local/bin/chromedriver` preferred over `/usr/bin/chromedriver`. This lets an
+explicit native pair take precedence over Ubuntu's Snap compatibility launchers.
+Pin a mutually compatible
 browser/driver pair through the host's provisioning process and verify both with
 `--version`; an arbitrary driver on the inherited shell `PATH` is not used.
 The Chromium sandbox must work for that account; do not use `--no-sandbox`.
