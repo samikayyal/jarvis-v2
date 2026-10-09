@@ -1,11 +1,15 @@
 # Selenium web search
 
-Status: Tickets 01–04 complete; production activation not performed.
+Status: Tickets 01–04 complete; deployed with web access enabled. Google success
+remains unverified; see the operational records below.
 
 Delivery update (2026-10-08): see the [verification record](evidence/verification.md)
 for installed-package, fixture, Ubuntu sandbox/process, and live-page evidence.
 Live Google success remains unverified because this test environment returns a
-non-public Google DNS answer. The interview-era descriptions below record the
+non-public Google DNS answer. Subsequent native deployment and WhatsApp results
+are recorded in [production acceptance](evidence/production-acceptance.md) and
+the [Google JavaScript fix](evidence/google-javascript-fix.md). The
+interview-era descriptions below record the
 original design baseline; they are not a current deployment status report.
 
 ## Purpose
@@ -13,7 +17,7 @@ original design baseline; they are not a current deployment status report.
 Give Jarvis quick web lookups and moderate research through Selenium-controlled
 Google searches, with no additional paid search service. This document captures
 the agreed grill-with-docs design and a concrete implementation contract. It
-does not record implementation or production activation as completed.
+keeps the original design below separate from the delivery updates above.
 
 Supersedes the [Gemini design](../gemini-web-search/spec.md). Its research is
 retained as history.

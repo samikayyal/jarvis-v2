@@ -1,0 +1,38 @@
+[
+  {
+    "timestamp": "2026-10-09T22:07:33.602620Z",
+    "event": "tool_call",
+    "name": "load_skill",
+    "arguments": {
+      "name": "web"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T22:07:33.602907Z",
+    "event": "tool_result",
+    "name": "load_skill",
+    "loaded": "web"
+  },
+  {
+    "timestamp": "2026-10-09T22:07:35.231382Z",
+    "event": "tool_call",
+    "name": "search_web",
+    "arguments": {
+      "query": "IANA example domains",
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T22:07:55.385067Z",
+    "event": "tool_result",
+    "name": "search_web",
+    "outcome": "unavailable",
+    "remaining": {
+      "queries": 0,
+      "pages": 2,
+      "evidence_chars": 32000
+    },
+    "reason": "browser operation timed out",
+    "results": []
+  }
+]

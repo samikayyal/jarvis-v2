@@ -114,3 +114,15 @@ and final idle status passed. Google returned `blocked`, and Jarvis disclosed
 that limitation without inventing evidence. Successful Google search remains
 unverified. See [production acceptance](../evidence/production-acceptance.md)
 for exact release, rollback, binary versions, checks, and sanitized trace.
+
+## Google JavaScript repair — 2026-10-10
+
+The separately authorized repair is deployed as release `630811c`. Search now
+permits scripts on the two Google HTTPS origins while ordinary reads remain
+script-disabled, and specific search failure reasons reach the model. All 499
+native tests passed; Standards and Spec reviews found no issues. The candidate
+passed the JavaScript gate but encountered an unusual-traffic CAPTCHA. The real
+new-release WhatsApp request timed out and its accurate timeout reply was recorded
+as sent. Direct installed page reading and cleanup passed. Google success and
+new-release final UI status remain unverified; see the
+[repair acceptance record](../evidence/google-javascript-fix.md).
