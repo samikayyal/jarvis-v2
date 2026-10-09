@@ -421,6 +421,8 @@ class _SearchDriver(_Driver):
             self.final_url = "https://consent.google.com/m?continue=search"
         elif self.state == "interstitial":
             self.final_url = "https://www.google.com/sorry/index"
+        elif self.state == "javascript_required":
+            self.final_url = "https://www.google.com/httpservice/retry/enablejs"
 
     def find_elements(self, by, selector):
         assert by == "css selector"
@@ -455,6 +457,7 @@ class _SearchDriver(_Driver):
         ("traffic", "blocked"),
         ("traffic_article", "ok"),
         ("interstitial", "blocked"),
+        ("javascript_required", "blocked"),
     ],
 )
 def test_selenium_search_results_consent_and_blocking(tmp_path, state, expected):
@@ -479,7 +482,56 @@ def test_selenium_search_results_consent_and_blocking(tmp_path, state, expected)
     assert "q=latest+%D8%A3%D8%AE%D8%A8%D8%A7%D8%B1" in driver.visits[1]
     if expected == "ok":
         assert result["results"][0]["snippet"] == "Fresh evidence."
+    if state == "javascript_required":
+        assert result["reason"] == "Google requires JavaScript to search"
+    if state == "interstitial":
+        assert result["reason"] == "Google blocked automated search traffic"
     assert driver.quit_called
+
+
+def test_search_enables_only_google_scripts_and_page_read_disables_them(tmp_path):
+    from jarvis_personal_runtime.web_worker import SeleniumPageReader
+
+    driver = _SearchDriver()
+    captured = {}
+
+    def factory(*, service, options):
+        captured["options"] = options
+        return driver
+
+    reader = SeleniumPageReader(
+        tmp_path / "profile",
+        2,
+        100,
+        browser_binary="/opt/chromium",
+        driver_binary="/opt/chromedriver",
+        driver_factory=factory,
+    )
+    try:
+        assert reader.search("news", 5)["outcome"] == "ok"
+        options = captured["options"]
+        assert "--disable-javascript" not in options.arguments
+        prefs = options.experimental_options["prefs"]
+        assert prefs["profile.default_content_setting_values.javascript"] == 2
+        assert prefs["profile.content_settings.exceptions.javascript"] == {
+            "https://www.google.com:443,*": {"setting": 1},
+            "https://consent.google.com:443,*": {"setting": 1},
+        }
+        commands = [
+            value
+            for name, value in driver.commands
+            if name == "Emulation.setScriptExecutionDisabled"
+        ]
+        assert commands[-1] == {"value": False}
+        reader.read("https://example.com/")
+        commands = [
+            value
+            for name, value in driver.commands
+            if name == "Emulation.setScriptExecutionDisabled"
+        ]
+        assert commands[-1] == {"value": True}
+    finally:
+        reader.close()
 
 
 def test_browser_worker_search_uses_owned_process_and_cleans_up(tmp_path):

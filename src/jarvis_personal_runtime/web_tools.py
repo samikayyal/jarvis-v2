@@ -456,6 +456,11 @@ class WebTools:
         elif len(accepted) < len(sources):
             result["outcome"] = "partial"
         result["remaining"] = self._remaining()
+        reason = response.get("reason")
+        if outcome != "ok" and isinstance(reason, str) and reason:
+            result["reason"] = reason[:512]
+            if len(_json(result)) > self.max_output_chars:
+                del result["reason"]
         return _json(result)
 
     async def resume(self, continuation: object, *, approved: bool) -> str:

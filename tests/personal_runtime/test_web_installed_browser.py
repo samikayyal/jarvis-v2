@@ -69,7 +69,11 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel):
             if self.path == "/slow":
                 slow_started.set()
                 release.wait(30)
-            body = b"<html><title>Owned fixture</title><body>Owned public evidence</body></html>"
+            body = (
+                b"<html><title>Owned fixture</title><body>Owned public evidence"
+                b"<script>document.body.textContent='Page script executed';</script>"
+                b"</body></html>"
+            )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))

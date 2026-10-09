@@ -418,7 +418,6 @@ class SeleniumPageReader:
             "--disable-sync",
             "--disable-quic",
             "--dns-prefetch-disable",
-            "--disable-javascript",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--enable-sandbox",
             "--proxy-bypass-list=<-loopback>",
@@ -434,6 +433,10 @@ class SeleniumPageReader:
                 "autofill.profile_enabled": False,
                 "autofill.credit_card_enabled": False,
                 "profile.default_content_setting_values.javascript": 2,
+                "profile.content_settings.exceptions.javascript": {
+                    "https://www.google.com:443,*": {"setting": 1},
+                    "https://consent.google.com:443,*": {"setting": 1},
+                },
                 "download.default_directory": str(self.profile_dir / "downloads"),
                 "download.prompt_for_download": True,
                 "download.directory_upgrade": False,
@@ -459,6 +462,7 @@ class SeleniumPageReader:
         # These controls stop non-HTTP schemes before a page's script can use
         # them.  HTTP(S) address restrictions are enforced by the proxy.
         driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Emulation.setScriptExecutionDisabled", {"value": True})
         driver.execute_cdp_cmd(
             "Network.setBlockedURLs",
             {
@@ -504,7 +508,11 @@ class SeleniumPageReader:
         url = "https://www.google.com/search?" + urlencode({"q": query, "num": limit})
         page = self.read(url, search=True)
         if page["outcome"] != "ok":
-            return {"outcome": page["outcome"], "results": []}
+            return {
+                "outcome": page["outcome"],
+                "results": [],
+                "reason": page.get("reason", "Google search unavailable"),
+            }
         try:
             assert self.driver is not None
             return extract_google_results(
@@ -522,7 +530,16 @@ class SeleniumPageReader:
             # download can leave the previous document/current_url visible in
             # some Chromium versions, which would falsely reuse old evidence.
             try:
+                self.driver.execute_cdp_cmd(
+                    "Emulation.setScriptExecutionDisabled", {"value": True}
+                )
                 self.driver.get("about:blank")
+                if search:
+                    # Chrome's origin exceptions still deny scripts on other
+                    # sites, including redirects. Ordinary reads stay disabled.
+                    self.driver.execute_cdp_cmd(
+                        "Emulation.setScriptExecutionDisabled", {"value": False}
+                    )
             except Exception:  # noqa: BLE001 - a failed reset makes the worker unsafe.
                 self.unusable = True
                 return self._result(
@@ -570,7 +587,17 @@ class SeleniumPageReader:
                     or current.path != "/search"
                 ):
                     return self._result(
-                        "blocked", requested, reason="Google search interstitial"
+                        "blocked",
+                        requested,
+                        reason=(
+                            "Google requires JavaScript to search"
+                            if current.hostname == "www.google.com"
+                            and current.path == "/httpservice/retry/enablejs"
+                            else "Google blocked automated search traffic"
+                            if current.hostname in {"www.google.com", "google.com"}
+                            and current.path.startswith("/sorry/")
+                            else "Google search interstitial"
+                        ),
                     )
             final_url = str(getattr(self.driver, "current_url", requested) or requested)
             try:

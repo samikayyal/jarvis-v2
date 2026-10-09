@@ -312,6 +312,30 @@ def test_failed_search_json_fits_exact_small_output_boundary(tmp_path):
     assert json.loads(output)["outcome"] in {"limit_reached", "extraction_failed"}
 
 
+@pytest.mark.parametrize("output_limit", [180, 4096])
+def test_search_preserves_bounded_failure_reason(tmp_path, output_limit):
+    class BlockedBrowser(Browser):
+        async def search(self, query, limit):
+            return {
+                "outcome": "blocked",
+                "results": [],
+                "reason": "Google requires JavaScript to search",
+            }
+
+    tool = WebTools(
+        WebSearchConfig(enabled=True),
+        runtime_dir=tmp_path,
+        max_output_chars=output_limit,
+        browser_factory=BlockedBrowser,
+    )
+    output = asyncio.run(tool.execute("search_web", {"query": "q", "depth": "quick"}))
+    result = json.loads(output)
+    assert len(output) <= output_limit
+    assert result["outcome"] == "blocked"
+    if output_limit == 4096:
+        assert result["reason"] == "Google requires JavaScript to search"
+
+
 def test_search_preserves_prior_evidence_when_later_blocked(tmp_path):
     class LaterBlocked(Browser):
         async def search(self, query, limit):
