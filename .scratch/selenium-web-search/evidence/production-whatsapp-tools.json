@@ -1,0 +1,97 @@
+[
+  {
+    "timestamp": "2026-10-09T01:03:17.609863Z",
+    "event": "tool_call",
+    "name": "load_skill",
+    "arguments": {
+      "name": "web"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T01:03:17.610148Z",
+    "event": "tool_result",
+    "name": "load_skill",
+    "loaded": "web"
+  },
+  {
+    "timestamp": "2026-10-09T01:03:19.150592Z",
+    "event": "tool_call",
+    "name": "search_web",
+    "arguments": {
+      "query": "site:iana.org example.com example.org domain names official",
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T01:03:32.705666Z",
+    "event": "tool_result",
+    "name": "search_web",
+    "outcome": "blocked",
+    "remaining": {
+      "queries": 0,
+      "pages": 2,
+      "evidence_chars": 32000
+    },
+    "results": []
+  },
+  {
+    "timestamp": "2026-10-09T01:05:46.355375Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://www.iana.org/help/example-domains"
+      ],
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T01:05:59.934493Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 1,
+      "pages": 1,
+      "evidence_chars": 30744
+    },
+    "pages": [
+      {
+        "url": "https://www.iana.org/help/example-domains",
+        "title": "Example Domains",
+        "outcome": "ok",
+        "evidence_type": "page"
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-09T01:06:55.033441Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://www.iana.org/help/example-domains"
+      ],
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-09T01:07:08.606462Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 1,
+      "pages": 1,
+      "evidence_chars": 30744
+    },
+    "pages": [
+      {
+        "url": "https://www.iana.org/help/example-domains",
+        "title": "Example Domains",
+        "outcome": "ok",
+        "evidence_type": "page"
+      }
+    ]
+  }
+]

@@ -99,3 +99,18 @@ systemd/AppArmor/egress acceptance, production enablement, and an authorized
 real WhatsApp search with a cited phone reply remain separate operational work.
 No production host, OpenWA state, Workspace credentials, or messaging behavior
 was changed. The test provider made no paid model/search-service calls.
+
+## Subsequent production acceptance — 2026-10-09
+
+The user separately authorized continuation through the open WhatsApp chat.
+Release `25ed2fb6286b8c9aaaa15c513f0e9d3ee42b0b93` is now active with web enabled.
+Native full-suite validation passed (495 tests). The production service-account
+probe exposed a native Chrome startup requirement, fixed with a fresh
+request-owned HOME inside the private profile. Both review axes passed after a
+provisioning documentation correction.
+
+Real WhatsApp direct-page reading, citations, follow-up reuse, explicit reread,
+and final idle status passed. Google returned `blocked`, and Jarvis disclosed
+that limitation without inventing evidence. Successful Google search remains
+unverified. See [production acceptance](../evidence/production-acceptance.md)
+for exact release, rollback, binary versions, checks, and sanitized trace.

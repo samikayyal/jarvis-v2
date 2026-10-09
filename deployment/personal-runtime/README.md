@@ -148,8 +148,9 @@ For an explicitly selected Chrome for Testing pair, unpack each archive under a
 versioned `/opt/jarvis-browser/VERSION/` directory and install its required native
 libraries through the Ubuntu package manager. Point `/usr/bin/google-chrome` at
 that release's `chrome-linux64/chrome` and `/usr/local/bin/chromedriver` at
-`chromedriver-linux64/chromedriver`. Ensure earlier discovery candidates such as
-`/usr/bin/chromium` do not select a different pair. The browser and driver must be
+`chromedriver-linux64/chromedriver`. The earlier browser candidate
+`/usr/bin/google-chrome-stable` takes precedence if present; verify the probe's
+resolved browser and driver paths select the intended pair. Both must be
 executable by `jarvis-personal-runtime`; the versioned directory must be readable
 and traversable. Do not point at a personal Chrome profile.
 
