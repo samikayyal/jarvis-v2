@@ -697,6 +697,7 @@ def test_web_search_settings_load_with_configured_depth_limits(tmp_path: Path) -
         toml="""
 [web_search]
 enabled = true
+browser_mode = "headed"
 operation_timeout_seconds = 12.5
 results_per_query = 4
 max_chars_per_page = 900
@@ -716,6 +717,7 @@ max_pages = 4
 
     assert config == WebSearchConfig(
         enabled=True,
+        browser_mode="headed",
         operation_timeout_seconds=12.5,
         results_per_query=4,
         max_chars_per_page=900,
@@ -729,6 +731,8 @@ max_pages = 4
     ("toml", "needle"),
     [
         ('[web_search]\nenabled = "yes"\n', "web_search.enabled"),
+        ('[web_search]\nbrowser_mode = "automatic"\n', "browser_mode"),
+        ("[web_search]\nbrowser_mode = true\n", "browser_mode"),
         (
             "[web_search]\noperation_timeout_seconds = 0\n",
             "operation_timeout_seconds",

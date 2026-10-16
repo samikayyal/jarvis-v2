@@ -49,6 +49,7 @@ def browser_processes() -> set[int]:
                 "google-chrome",
                 "chromedriver",
                 "chrome_crashpad_handler",
+                "Xvfb",
             }:
                 processes.add(int(entry.name))
         except (FileNotFoundError, ProcessLookupError, PermissionError):
@@ -57,7 +58,8 @@ def browser_processes() -> set[int]:
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel):
+@pytest.mark.parametrize("headed", [False, True])
+def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed):
     slow_started = threading.Event()
     release = threading.Event()
     cookies = []
@@ -112,7 +114,11 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel):
             profiles.append(Path(argv[argv.index("--profile-dir") + 1]))
             # Preserve the production new-session and minimal-environment setup.
             process = await asyncio.create_subprocess_exec(
-                sys.executable, str(entrypoint), *argv[3:], **kwargs
+                *argv[: argv.index(sys.executable)],
+                sys.executable,
+                str(entrypoint),
+                *argv[argv.index("--profile-dir") :],
+                **kwargs,
             )
             groups.append(process.pid)
             return process
@@ -120,7 +126,9 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel):
         runtime = tmp_path / "runtime"
         for index in range(2):
             existing_browsers = browser_processes()
-            worker = BrowserWorker(runtime, 20, 1000, process_factory=factory)
+            worker = BrowserWorker(
+                runtime, 20, 1000, process_factory=factory, headed=headed
+            )
             try:
                 result = await worker.read(
                     f"http://fixture.example:{server.server_port}/"

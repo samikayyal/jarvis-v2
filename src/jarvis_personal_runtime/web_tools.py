@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -28,10 +29,12 @@ class PageBrowser(Protocol):
     async def close(self) -> None: ...
 
 
-def _browser(runtime_dir: Path, timeout: float, max_chars: int) -> PageBrowser:
+def _browser(
+    runtime_dir: Path, timeout: float, max_chars: int, *, headed: bool = False
+) -> PageBrowser:
     from .web_browser import BrowserWorker
 
-    return BrowserWorker(runtime_dir, timeout, max_chars)
+    return BrowserWorker(runtime_dir, timeout, max_chars, headed=headed)
 
 
 def _json(value: object) -> str:
@@ -47,14 +50,16 @@ class WebTools:
         *,
         runtime_dir: Path,
         max_output_chars: int,
-        browser_factory: Callable[..., PageBrowser] = _browser,
+        browser_factory: Callable[..., PageBrowser] | None = None,
     ) -> None:
         if max_output_chars < 2:
             raise ValueError("web output capacity must hold a JSON object")
         self.config = config
         self.runtime_dir = runtime_dir
         self.max_output_chars = max_output_chars
-        self._factory = browser_factory
+        self._factory = browser_factory or partial(
+            _browser, headed=config.browser_mode == "headed"
+        )
         self._browser: PageBrowser | None = None
         self.request_started()
         self.definitions: tuple[dict[str, object], ...] = (

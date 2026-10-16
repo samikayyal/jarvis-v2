@@ -88,6 +88,7 @@ class WebSearchConfig:
     """Validated non-secret settings for Selenium-backed public web access."""
 
     enabled: bool = False
+    browser_mode: str = "headless"
     operation_timeout_seconds: float = 20.0
     results_per_query: int = 5
     max_chars_per_page: int = 8_000
@@ -102,6 +103,8 @@ class WebSearchConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("web_search.enabled must be a boolean")
+        if self.browser_mode not in ("headless", "headed"):
+            raise ValueError("web_search.browser_mode must be headless or headed")
         if not isinstance(self.quick, WebDepthLimits):
             raise TypeError("web_search.quick must be a WebDepthLimits value")
         if not isinstance(self.moderate, WebDepthLimits):
@@ -732,6 +735,7 @@ def _build_web_search_config(raw: Mapping[str, Any], path: Path) -> WebSearchCon
     table = _ensure_table(raw["web_search"], path, "[web_search]")
     allowed = {
         "enabled",
+        "browser_mode",
         "operation_timeout_seconds",
         "results_per_query",
         "max_chars_per_page",
@@ -754,6 +758,7 @@ def _build_web_search_config(raw: Mapping[str, Any], path: Path) -> WebSearchCon
     try:
         return WebSearchConfig(
             enabled=enabled,
+            browser_mode=table.get("browser_mode", defaults.browser_mode),
             operation_timeout_seconds=_positive_number(
                 table.get(
                     "operation_timeout_seconds", defaults.operation_timeout_seconds

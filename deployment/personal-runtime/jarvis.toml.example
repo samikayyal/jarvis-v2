@@ -45,6 +45,7 @@ ubuntu_read_only_prefixes = ["pwd", "git status"]
 windows_read_only_prefixes = []
 
 [web_search]
+browser_mode = "headless" # "headed" uses a private Xvfb display; requires xvfb and xauth
 # Public-page web access is disabled until the browser prerequisites have been
 # installed and the operator has explicitly enabled this section.
 enabled = false

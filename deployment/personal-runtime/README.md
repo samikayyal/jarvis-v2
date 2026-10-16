@@ -78,6 +78,25 @@ three queries/five pages, five results per query, 8,000 characters per page,
 web call selects depth; a later moderate call upgrades quick without resetting
 usage, and later quick calls cannot downgrade it. Valid configuration changes
 take effect on the normal service restart.
+
+`browser_mode = "headless"` is the default. The opt-in `"headed"` mode requires
+Ubuntu packages `xvfb` and `xauth` (provision with `sudo apt-get install xvfb xauth`).
+It starts a private 1280x900 Xvfb display in each worker's supervised process
+group, uses headed Chrome, and disables the Blink `AutomationControlled` feature.
+The sandbox, fresh HOME/profile, public-network proxy, script restrictions and
+challenge-stop behavior remain enabled. No personal desktop/session is reused.
+Missing Xvfb fails the request as unavailable; it does not silently retry in
+another browser mode. Neither mode guarantees Google acceptance. Roll back by
+restoring `browser_mode = "headless"` and restarting; before rolling back to a
+release that predates this setting, remove the setting from TOML as well.
+
+Some Google results use opaque `/goto?url=...` redirects. Search evidence preserves
+the actual returned link; it does not invent a destination from a shortened
+display URL. Reading that link consumes the normal page allowance and validates
+its redirects through the public-network proxy. A successful read supplies the
+final source URL for citations. An optional filter/feedback dialog alone is not
+classified as a CAPTCHA.
+
 Query and page attempts (including failures) count across calls and approval continuations;
 a new ordinary request resets the allowance. Runtime output, tool-round, and
 overall request limits also apply. There is no separate research timer.

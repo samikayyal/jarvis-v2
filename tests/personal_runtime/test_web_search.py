@@ -79,3 +79,44 @@ def test_changed_layout_mentioning_empty_results_is_not_an_empty_search():
 def test_hidden_dialog_does_not_block_organic_results(attributes):
     html = f'<div role="dialog" {attributes}>Feedback</div><div id="search"><div class="g"><a href="https://example.com"><h3>Source</h3></a></div></div>'
     assert extract_google_results(html, 5, 100)["outcome"] == "ok"
+
+
+def test_opaque_google_redirect_is_preserved_as_returned_evidence():
+    html = """<div role="dialog">Date range</div><div id="search">
+      <div class="tF2Cxc"><a href="/goto?url=CAESopaque-token"><h3>Example Domains</h3></a>
+      <div class="VwiC3b">Domains reserved for documentation.</div></div></div>"""
+    assert extract_google_results(html, 5, 1000) == {
+        "outcome": "ok",
+        "results": [
+            {
+                "title": "Example Domains",
+                "url": "https://www.google.com/goto?url=CAESopaque-token",
+                "snippet": "Domains reserved for documentation.",
+                "evidence_type": "search_result",
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        '<div class="g-recaptcha"></div>',
+        '<form action="https://consent.google.com/save"></form>',
+        '<div role="dialog" aria-modal="true">Consent</div>',
+    ],
+)
+def test_challenge_still_blocks_pages_with_opaque_result_links(marker):
+    html = (
+        marker
+        + '<div id="search"><div class="tF2Cxc"><a href="/goto?url=token"><h3>Source</h3></a></div></div>'
+    )
+    assert extract_google_results(html, 5, 1000) == {
+        "outcome": "blocked",
+        "results": [],
+    }
+
+
+def test_unrecognized_links_with_optional_dialog_are_not_a_challenge():
+    html = '<div role="dialog">Date range</div><div id="search"><div class="tF2Cxc"><a href="/unknown?url=token"><h3>Source</h3></a></div></div>'
+    assert extract_google_results(html, 5, 1000)["outcome"] == "extraction_failed"
