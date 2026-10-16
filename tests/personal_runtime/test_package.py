@@ -81,6 +81,7 @@ def test_example_configuration_carries_the_private_handoff_and_rotating_trace() 
     web = document["web_search"]
     assert web == {
         "enabled": False,
+        "browser_mode": "headless",
         "operation_timeout_seconds": 20,
         "results_per_query": 5,
         "max_chars_per_page": 8000,
