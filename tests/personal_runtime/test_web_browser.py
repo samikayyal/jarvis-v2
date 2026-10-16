@@ -321,8 +321,10 @@ class _Driver:
         self.quit_called = True
 
 
+@pytest.mark.parametrize("headed", [False, True])
 def test_selenium_reader_configures_sandbox_proxy_and_scheme_blocks(
     tmp_path: Path,
+    headed: bool,
 ) -> None:
     from jarvis_personal_runtime.web_worker import SeleniumPageReader
 
@@ -341,12 +343,14 @@ def test_selenium_reader_configures_sandbox_proxy_and_scheme_blocks(
         browser_binary="/opt/chromium",
         driver_binary="/opt/chromedriver",
         driver_factory=factory,
+        headed=headed,
     )
     try:
         result = reader.read("https://example.com")
         assert result["outcome"] == "ok"
         arguments = set(getattr(captured["options"], "arguments", ()))
-        assert "--headless=new" in arguments
+        assert ("--headless=new" in arguments) is not headed
+        assert ("--disable-blink-features=AutomationControlled" in arguments) is headed
         assert "--enable-sandbox" in arguments
         assert "--no-sandbox" not in arguments
         assert any(

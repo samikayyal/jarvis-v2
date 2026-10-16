@@ -374,6 +374,7 @@ class SeleniumPageReader:
         browser_binary: str | None = None,
         driver_binary: str | None = None,
         driver_factory: Any | None = None,
+        headed: bool = False,
     ) -> None:
         self.profile_dir = Path(profile_dir)
         self.timeout = timeout
@@ -381,6 +382,7 @@ class SeleniumPageReader:
         self.browser_binary = browser_binary or find_chromium()
         self.driver_binary = driver_binary or find_chromedriver()
         self.driver_factory = driver_factory
+        self.headed = headed
         self.proxy = PublicNetworkProxy()
         self.driver: Any | None = None
         self.unusable = False
@@ -408,7 +410,6 @@ class SeleniumPageReader:
         options = Options()
         options.binary_location = self.browser_binary
         for argument in (
-            "--headless=new",
             "--disable-gpu",
             "--no-first-run",
             "--no-default-browser-check",
@@ -425,6 +426,11 @@ class SeleniumPageReader:
             f"--user-data-dir={self.profile_dir}",
         ):
             options.add_argument(argument)
+        if self.headed:
+            options.add_argument("--window-size=1280,900")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+        else:
+            options.add_argument("--headless=new")
         options.add_experimental_option(
             "prefs",
             {
@@ -754,11 +760,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--timeout", required=True, type=float)
     parser.add_argument("--max-chars", required=True, type=int)
+    parser.add_argument("--headed", action="store_true")
     args = parser.parse_args(argv)
     service: SeleniumPageReader | None = None
     try:
         service = SeleniumPageReader(
-            Path(args.profile_dir), args.timeout, args.max_chars
+            Path(args.profile_dir), args.timeout, args.max_chars, headed=args.headed
         )
         for line in sys.stdin:
             try:

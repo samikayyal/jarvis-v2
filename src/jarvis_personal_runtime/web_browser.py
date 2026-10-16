@@ -239,6 +239,7 @@ class BrowserWorker:
         *,
         process_factory: Callable[..., Awaitable[Any]] | None = None,
         python_executable: str | None = None,
+        headed: bool = False,
     ) -> None:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
             raise TypeError("browser timeout must be a finite positive number")
@@ -258,6 +259,7 @@ class BrowserWorker:
         self.max_chars = max_chars
         self._process_factory = process_factory or asyncio.create_subprocess_exec
         self._python_executable = python_executable or sys.executable
+        self._headed = headed
         self._process: Any | None = None
         self._profile_dir: Path | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -384,17 +386,25 @@ class BrowserWorker:
                 # Ubuntu; retaining it here keeps injected test processes
                 # deterministic on the development host.
                 spawn_kwargs["creationflags"] = 0x00000200
+            argv = [
+                self._python_executable,
+                "-m",
+                "jarvis_personal_runtime.web_worker",
+                "--profile-dir",
+                str(self._profile_dir),
+                "--timeout",
+                str(self.timeout),
+                "--max-chars",
+                str(self.max_chars),
+            ]
+            if self._headed:
+                xvfb = shutil.which("xvfb-run", path=environment.get("PATH"))
+                if os.name != "posix" or xvfb is None:
+                    raise RuntimeError("headed browser requires xvfb-run on POSIX")
+                argv = [xvfb, "-a", "-s", "-screen 0 1280x900x24", *argv, "--headed"]
             async with asyncio.timeout(self.timeout):
                 self._process = await self._process_factory(
-                    self._python_executable,
-                    "-m",
-                    "jarvis_personal_runtime.web_worker",
-                    "--profile-dir",
-                    str(self._profile_dir),
-                    "--timeout",
-                    str(self.timeout),
-                    "--max-chars",
-                    str(self.max_chars),
+                    *argv,
                     **spawn_kwargs,
                 )
             stderr = getattr(self._process, "stderr", None)

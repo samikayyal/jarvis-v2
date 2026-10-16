@@ -15,6 +15,12 @@ def destination_url(value: str) -> str:
     url = urljoin("https://www.google.com", value)
     parts = urlsplit(url)
     if parts.hostname in {"google.com", "www.google.com"}:
+        # Current organic cards can carry opaque redirect tokens. Preserve the
+        # actual returned link rather than guessing a URL from display text.
+        # Reading it consumes the normal page allowance and validates redirects
+        # through the same public-network proxy as any other page navigation.
+        if parts.path == "/goto" and parse_qs(parts.query).get("url"):
+            return validate_public_url(url)
         if parts.path != "/url":
             raise PublicUrlError("not a source destination")
         query = parse_qs(parts.query)
@@ -75,8 +81,8 @@ def extract_google_results(html: str, limit: int, max_chars: int) -> dict[str, o
             break
     if results:
         return {"outcome": "ok", "results": results}
-    if soup.select_one('[role="dialog"]'):
-        return {"outcome": "blocked", "results": []}
+    # Non-modal date/filter/feedback dialogs also exist on ordinary result
+    # pages. Their presence is not evidence of an access challenge.
     # Google's dedicated empty-results message, not arbitrary source prose.
     empty = soup.select_one("#topstuff")
     text = empty.get_text(" ", strip=True).casefold() if empty else ""
