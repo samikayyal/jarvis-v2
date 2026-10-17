@@ -6,6 +6,7 @@ import asyncio
 import http.server
 import os
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -126,6 +127,7 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed)
         runtime = tmp_path / "runtime"
         for index in range(2):
             existing_browsers = browser_processes()
+            display_auth_dirs = set(Path(tempfile.gettempdir()).glob("xvfb-run.*"))
             worker = BrowserWorker(
                 runtime, 20, 1000, process_factory=factory, headed=headed
             )
@@ -153,6 +155,9 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed)
                     break
                 await asyncio.sleep(0.1)
             assert not (browser_processes() - existing_browsers)
+            assert not (
+                set(Path(tempfile.gettempdir()).glob("xvfb-run.*")) - display_auth_dirs
+            )
             assert not list(runtime.iterdir())
         assert profiles[0] != profiles[1]
         assert cookies == [None, None]
