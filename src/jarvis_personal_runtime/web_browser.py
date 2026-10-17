@@ -401,7 +401,23 @@ class BrowserWorker:
                 xvfb = shutil.which("xvfb-run", path=environment.get("PATH"))
                 if os.name != "posix" or xvfb is None:
                     raise RuntimeError("headed browser requires xvfb-run on POSIX")
-                argv = [xvfb, "-a", "-s", "-screen 0 1280x900x24", *argv, "--headed"]
+                # xvfb-run's default /tmp authorization directory can survive
+                # process-group cancellation. Keep all display state inside the
+                # request profile so the parent's unconditional cleanup owns it.
+                authority = self._profile_dir / "Xauthority"
+                authority.touch(mode=0o600)
+                argv = [
+                    xvfb,
+                    "-a",
+                    "-f",
+                    str(authority),
+                    "-e",
+                    str(self._profile_dir / "xvfb.log"),
+                    "-s",
+                    "-screen 0 1280x900x24",
+                    *argv,
+                    "--headed",
+                ]
             async with asyncio.timeout(self.timeout):
                 self._process = await self._process_factory(
                     *argv,
