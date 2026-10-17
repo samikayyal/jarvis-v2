@@ -1,11 +1,14 @@
 # Selenium web search
 
-Status: Tickets 01–04 complete; deployed with web access enabled. Google success
-remains unverified; see the operational records below.
+Status: Tickets 01–04 complete; deployed with web access enabled. Google search,
+source reading and a cited WhatsApp answer were verified on 2026-10-17 with
+isolated headed Chromium. Some queries still encounter challenges; this is not
+a guarantee of Google availability. See the
+[headed-browser acceptance record](evidence/stealth-browser-experiment.md).
 
 Delivery update (2026-10-08): see the [verification record](evidence/verification.md)
 for installed-package, fixture, Ubuntu sandbox/process, and live-page evidence.
-Live Google success remains unverified because this test environment returns a
+At that time, live Google success remained unverified because the test environment returned a
 non-public Google DNS answer. Subsequent native deployment and WhatsApp results
 are recorded in [production acceptance](evidence/production-acceptance.md) and
 the [Google JavaScript fix](evidence/google-javascript-fix.md). The

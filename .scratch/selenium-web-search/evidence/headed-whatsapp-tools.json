@@ -1,0 +1,88 @@
+[
+  {
+    "timestamp": "2026-10-17T11:56:37.796199Z",
+    "event": "tool_call",
+    "name": "load_skill",
+    "arguments": {
+      "name": "web"
+    }
+  },
+  {
+    "timestamp": "2026-10-17T11:56:37.796536Z",
+    "event": "tool_result",
+    "name": "load_skill",
+    "loaded": "web"
+  },
+  {
+    "timestamp": "2026-10-17T11:56:38.951087Z",
+    "event": "tool_call",
+    "name": "search_web",
+    "arguments": {
+      "query": "site:iana.org example domains",
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-17T11:56:57.632028Z",
+    "event": "tool_result",
+    "name": "search_web",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 0,
+      "pages": 2,
+      "evidence_chars": 31244
+    },
+    "results": [
+      {
+        "title": "Example Domains",
+        "url": "https://www.google.com/goto?url=CAESZAHrOzAVgiSerWwY0sfv0BNlVxiEQsFPuNTiVmT-dL6ZP_aa-oPZWzgoNDNlbaEQH17zu-9-Y6VjYBENLSOvJoBK0u7hrNsAExHfBbqrLjkY3ntVoLSOSQ7Lgs0LhZzYqvZrqas",
+        "evidence_type": "search_result"
+      },
+      {
+        "title": "IANA-managed Reserved Domains",
+        "url": "https://www.google.com/goto?url=CAESYAHrOzAV1ois56RDmqEFKLNgDzPuitAF-HnKtR5UoFA83aNe4Z6vsecjKSE-xsQEr_BgL3RZPGr3Vstw0Wvxu5PUWyMPAP8a0ZRmVPyujp7pAuJkVgxmM6KGsp-lg-nA2g",
+        "evidence_type": "search_result"
+      },
+      {
+        "title": "RFC 2606: Reserved Top Level DNS Names",
+        "url": "https://www.google.com/goto?url=CAESWgHrOzAVSw9nkFtlv_R9fk9Su6RIUHOuG0bBCBCF6xR9AGnBpSBFcybcFf4ih-B1k99jordo8y0ddSNPZN5WER5PP6myMpDkfxettRSJkKPk3dIuGDvj8jjf5w",
+        "evidence_type": "search_result"
+      },
+      {
+        "title": "RFC 6761: Special-Use Domain Names",
+        "url": "https://www.google.com/goto?url=CAESWgHrOzAVlmI5uFKtJ7IR15Lws_jPgnYxW2Wg9Ib2aNnEIfukobhnH01BW3DaFU9Am_7iWzoGnilOYeF1VYv5rWqeT7GSIxJ27Vg6xFY_Hap_IINv4UamWZXcdw",
+        "evidence_type": "search_result"
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-17T11:56:59.837732Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://www.iana.org/domains/reserved"
+      ],
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-17T11:57:02.947484Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 0,
+      "pages": 1,
+      "evidence_chars": 28431
+    },
+    "pages": [
+      {
+        "url": "https://www.iana.org/domains/reserved",
+        "title": "IANA-managed Reserved Domains",
+        "outcome": "ok",
+        "evidence_type": "page"
+      }
+    ]
+  }
+]

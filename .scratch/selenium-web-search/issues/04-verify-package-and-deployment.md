@@ -126,3 +126,19 @@ new-release WhatsApp request timed out and its accurate timeout reply was record
 as sent. Direct installed page reading and cleanup passed. Google success and
 new-release final UI status remain unverified; see the
 [repair acceptance record](../evidence/google-javascript-fix.md).
+
+## Verified Google search and WhatsApp reply — 2026-10-17
+
+Deployed `e69864c083a706ec7f4e8d5bfc8cb0cda46ae17e` with isolated headed
+Chromium, minimal AutomationControlled flag, opaque Google result support,
+and request-owned Xvfb cleanup. Final native suite: **514 passed**. Follow-up
+independent Standards and Spec review: zero remaining findings on both axes.
+
+Real WhatsApp acceptance searched `site:iana.org example domains`, received
+four organic results, read IANA's official reserved-domains page and delivered
+a numbered citation to that page. Final status is idle, no pending action,
+12 saved permissions retained; service healthy and browser/profile cleanup
+verified. `SYSTEM.md` content is unchanged. Operation timeout is 60 seconds;
+count budgets are unchanged. Another query encountered a challenge, so future
+Google availability remains conditional. See the
+[full acceptance evidence](../evidence/stealth-browser-experiment.md).
