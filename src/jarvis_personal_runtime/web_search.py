@@ -8,6 +8,14 @@ from .web_browser import PublicUrlError, validate_public_url
 
 MAX_QUERY_LENGTH = 2048
 MAX_SNIPPET_LENGTH = 2000
+CHALLENGE_MESSAGES = (
+    "our systems have detected unusual traffic",
+    "before you continue to google",
+    "your computer or network may be sending automated queries",
+    "checking your browser",
+    "verify you are human",
+    "verify that you are human",
+)
 
 
 def destination_url(value: str) -> str:
@@ -39,6 +47,10 @@ def extract_google_results(html: str, limit: int, max_chars: int) -> dict[str, o
         '#captcha, .g-recaptcha, #challenge-form, [role="dialog"][aria-modal="true"], form[action*="consent.google.com"]'
     ):
         return {"outcome": "blocked", "results": []}
+    for dialog in soup.select('[role="dialog"]'):
+        text = dialog.get_text(" ", strip=True).casefold()
+        if any(message in text for message in CHALLENGE_MESSAGES):
+            return {"outcome": "blocked", "results": []}
     # Exclude whole containers before looking for headings, including citations
     # inside synthesized panels. Never treat an arbitrary heading/link as organic.
     for node in soup.select(
@@ -98,10 +110,8 @@ def extract_google_results(html: str, limit: int, max_chars: int) -> dict[str, o
     # A result snippet can discuss blocking. Only classify a known interstitial
     # message once organic extraction has found no sources.
     body = soup.get_text(" ", strip=True).casefold()
-    if not soup.select_one("h3") and (
-        "our systems have detected unusual traffic" in body
-        or "before you continue to google" in body
-        or "your computer or network may be sending automated queries" in body
+    if not soup.select_one("h3 a, a h3") and any(
+        message in body for message in CHALLENGE_MESSAGES
     ):
         return {"outcome": "blocked", "results": []}
     return {"outcome": "extraction_failed", "results": []}

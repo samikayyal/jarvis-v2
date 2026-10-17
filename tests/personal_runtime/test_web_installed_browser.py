@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import http.server
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -61,6 +62,8 @@ def browser_processes() -> set[int]:
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("headed", [False, True])
 def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed):
+    if headed and any(shutil.which(tool) is None for tool in ("xvfb-run", "xauth")):
+        pytest.skip("headed fixture requires xvfb-run and xauth")
     slow_started = threading.Event()
     release = threading.Event()
     cookies = []

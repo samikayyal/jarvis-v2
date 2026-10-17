@@ -3,6 +3,26 @@ import pytest
 from jarvis_personal_runtime.web_search import extract_google_results
 
 
+@pytest.mark.parametrize("message", ["Checking your browser", "Verify you are human"])
+@pytest.mark.parametrize("dialog", [False, True])
+def test_challenge_text_blocks_without_captcha_markup(message, dialog):
+    html = (
+        f'<div role="dialog"><h3>{message}</h3></div><div id="search">'
+        '<div class="g"><a href="https://example.com"><h3>Source</h3></a></div></div>'
+        if dialog
+        else f"<html><h3>{message}</h3></html>"
+    )
+    assert extract_google_results(html, 5, 100) == {
+        "outcome": "blocked",
+        "results": [],
+    }
+
+
+def test_challenge_words_in_organic_result_are_not_an_interstitial():
+    html = '<div id="search"><div class="g"><a href="https://example.com"><h3>Checking your browser explained</h3></a></div></div>'
+    assert extract_google_results(html, 5, 100)["outcome"] == "ok"
+
+
 def test_organic_sources_exclude_ads_and_synthesized_panels():
     html = """<div id="search">
       <div id="tads"><div class="g"><a href="https://ads.example/"><h3>Ad</h3></a></div></div>
