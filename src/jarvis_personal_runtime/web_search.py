@@ -95,22 +95,29 @@ def extract_google_results(html: str, limit: int, max_chars: int) -> dict[str, o
         return {"outcome": "ok", "results": results}
     # Non-modal date/filter/feedback dialogs also exist on ordinary result
     # pages. Their presence is not evidence of an access challenge.
-    # Google's dedicated empty-results message, not arbitrary source prose.
-    empty = soup.select_one("#topstuff")
-    text = empty.get_text(" ", strip=True).casefold() if empty else ""
-    if (
-        empty
-        and not empty.select_one("h3")
-        and (
-            (text.startswith("your search") and "did not match any documents" in text)
-            or text.startswith("no results found for")
-        )
-    ):
-        return {"outcome": "no_results", "results": []}
+    # A quoted search can have no exact matches but still offer unquoted
+    # sources. If those use an unknown layout, report an extraction failure
+    # instead of mistaking the exact-match notice for an empty search.
+    has_source_heading = soup.select_one("h3 a, a h3") is not None
+    if not has_source_heading:
+        # Google localizes its interface independently of the query language.
+        # Match only dedicated status containers, including the observed bottom
+        # message, never arbitrary source prose or a result-count estimate.
+        for empty in soup.select('#topstuff, #botstuff .JPMJ2c > [role="heading"]'):
+            text = empty.get_text(" ", strip=True).casefold()
+            if not empty.select_one("h3") and (
+                (
+                    text.startswith("your search")
+                    and "did not match any documents" in text
+                )
+                or text.startswith(("no results found for", "لا توجد نتائج لـ"))
+                or (text.startswith("لم ينجح بحثك عن") and "في إظهار أي نتائج" in text)
+            ):
+                return {"outcome": "no_results", "results": []}
     # A result snippet can discuss blocking. Only classify a known interstitial
     # message once organic extraction has found no sources.
     body = soup.get_text(" ", strip=True).casefold()
-    if not soup.select_one("h3 a, a h3") and any(
+    if not has_source_heading and any(
         message in body for message in CHALLENGE_MESSAGES
     ):
         return {"outcome": "blocked", "results": []}

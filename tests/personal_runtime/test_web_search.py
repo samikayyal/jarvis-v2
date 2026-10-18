@@ -140,3 +140,53 @@ def test_challenge_still_blocks_pages_with_opaque_result_links(marker):
 def test_unrecognized_links_with_optional_dialog_are_not_a_challenge():
     html = '<div role="dialog">Date range</div><div id="search"><div class="tF2Cxc"><a href="/unknown?url=token"><h3>Source</h3></a></div></div>'
     assert extract_google_results(html, 5, 1000)["outcome"] == "extraction_failed"
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        # Minimized from the live Arabic Google DOM on the Ubuntu host.
+        (
+            '<div id="topstuff"><div role="heading">لا توجد نتائج لـ '
+            '<b dir="ltr">"nonexistent-phrase"</b>.</div></div><div id="search"></div>'
+        ),
+        (
+            '<div id="search"></div><div id="botstuff"><div class="JPMJ2c">'
+            '<p role="heading">لم ينجح بحثك عن <em>nonexistent-phrase</em> '
+            "في إظهار أي نتائج.</p></div></div>"
+        ),
+        (
+            '<div id="search"></div><div id="botstuff"><div class="JPMJ2c">'
+            '<p role="heading">Your search - nonexistent-phrase - '
+            "did not match any documents.</p></div></div>"
+        ),
+    ],
+)
+def test_localized_and_bottom_empty_result_messages(html):
+    assert extract_google_results(html, 5, 1000) == {
+        "outcome": "no_results",
+        "results": [],
+    }
+
+
+@pytest.mark.parametrize("recognized", [False, True])
+def test_exact_phrase_notice_does_not_hide_unquoted_results(recognized):
+    # Google may show unquoted results after saying the exact phrase has none.
+    card_class = "g" if recognized else "future-organic-layout"
+    html = (
+        '<div id="topstuff">No results found for "exact phrase".</div>'
+        f'<div id="search"><div class="{card_class}">'
+        '<a href="https://example.com"><h3>Unquoted result</h3></a></div></div>'
+    )
+    assert extract_google_results(html, 5, 1000)["outcome"] == (
+        "ok" if recognized else "extraction_failed"
+    )
+
+
+def test_localized_empty_words_in_an_unknown_source_are_not_an_empty_search():
+    html = (
+        '<div id="search"><div class="future-layout">'
+        '<a href="https://example.com"><h3>لا توجد نتائج لـ بحثك</h3></a>'
+        "</div></div>"
+    )
+    assert extract_google_results(html, 5, 1000)["outcome"] == "extraction_failed"
