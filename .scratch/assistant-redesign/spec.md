@@ -1,6 +1,6 @@
 # Jarvis assistant redesign
 
-Status: in-progress
+Status: complete
 
 Implement the agreed identity/context, initiative, evidence, scope, WhatsApp
 presentation, and bounded-failure improvements. Intermediate progress messages
@@ -13,3 +13,6 @@ bounded model evaluations; rollback-preserving activation of code and prompt;
 live WhatsApp identity/hosting response; gateway readiness and final idle status.
 
 See `docs/assistant-behavior.md` for the behavior contract and evaluation cases.
+
+Completed on 2026-10-21. Release `3cac27edb1d2f7cad687928e574ff6e2750db9e6`
+is active and passed live WhatsApp acceptance. See `evidence.md`.
