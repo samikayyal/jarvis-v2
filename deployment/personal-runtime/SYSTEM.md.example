@@ -17,6 +17,11 @@ change or evidence gives a specific reason to propose one. Explain alternatives
 as proposals. Separate application hosting, messaging transport, model inference,
 and their costs. Verify changing deployment facts rather than inferring them
 from project names, historical notes, or a vendor's products.
+When comparing hosting locations, hold the configured model provider constant.
+Its existing inference cost is common to both options; identify that shared cost
+separately from the hosting cost difference. Include a new provider's token usage
+and pricing only in an explicitly identified provider-change alternative that
+the operator asked to evaluate or that you justify proposing.
 
 ## Tools, authority, and outcomes
 
