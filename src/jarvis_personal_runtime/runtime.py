@@ -19,6 +19,7 @@ from .config import (
 )
 from .dedup import CacheError, MessageIdCache
 from .permissions import PermissionRule, PermissionStoreError, TomlPermissionStore
+from .runtime_context import runtime_context
 from .trace import build_runtime_trace
 
 BUSY_NOTICE = "Jarvis is busy with another request. Use /cancel to stop it."
@@ -71,6 +72,7 @@ class RuntimeDisposition(str, Enum):
     REJECTED = "rejected"
     FAILED = "failed"
     CONTEXT_LIMIT = "context_limit"
+    INCOMPLETE = "incomplete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +138,14 @@ class ContextLimitReached:
     """The candidate request exceeded the configured local context gate."""
 
 
-RequestStep = Completed | ApprovalRequired | ContextLimitReached
+@dataclass(frozen=True, slots=True)
+class Incomplete:
+    """A bounded stop with a useful partial answer, not successful completion."""
+
+    reply: str
+
+
+RequestStep = Completed | ApprovalRequired | ContextLimitReached | Incomplete
 
 
 class RequestRunner(Protocol):
@@ -328,6 +337,17 @@ class PersonalRuntime:
         self._model = self.config.model
         self._reasoning = self.config.reasoning_effort
 
+    @property
+    def request_instructions(self) -> str:
+        session = self._session
+        facts = runtime_context(
+            self.config,
+            model=session.model if session else self._model,
+            reasoning=session.reasoning if session else self._reasoning,
+            now=self.clock.now(),
+        )
+        return f"{self.system_prompt.rstrip()}\n\n{facts}"
+
     def status(self) -> RuntimeStatus:
         session = self._session
         active = session.active if session else None
@@ -342,7 +362,7 @@ class PersonalRuntime:
             context_tokens = getattr(self.request_runner, "context_tokens", None)
             try:
                 context_used = (
-                    context_tokens(system_prompt=self.system_prompt)
+                    context_tokens(system_prompt=self.request_instructions)
                     if callable(context_tokens)
                     else None
                 )
@@ -495,6 +515,12 @@ class PersonalRuntime:
             step = await self.request_runner.resume(decision, continuation)
         except asyncio.CancelledError:
             return self._result(RuntimeDisposition.IGNORED)
+        except TimeoutError:
+            return await self._finish_failure(
+                "I reached the request time limit before finishing. Earlier tool results "
+                "remain in this session, and completed actions have not been undone. "
+                "An interrupted operation may have an uncertain outcome; verify it before retrying."
+            )
         except Exception:  # noqa: BLE001 - runner failures become bounded replies
             return await self._finish_failure()
         if decision is ApprovalDecision.REJECT and isinstance(step, Completed):
@@ -514,10 +540,16 @@ class PersonalRuntime:
                 text,
                 model=model,
                 reasoning=reasoning,
-                system_prompt=self.system_prompt,
+                system_prompt=self.request_instructions,
             )
         except asyncio.CancelledError:
             return self._result(RuntimeDisposition.IGNORED)
+        except TimeoutError:
+            return await self._finish_failure(
+                "I reached the request time limit before finishing. Earlier tool results "
+                "remain in this session, and completed actions have not been undone. "
+                "An interrupted operation may have an uncertain outcome; verify it before retrying."
+            )
         except Exception:  # noqa: BLE001 - runner failures become bounded replies
             return await self._finish_failure()
         async with self._lock:
@@ -530,6 +562,11 @@ class PersonalRuntime:
         return await self._apply_step(step)
 
     async def _apply_step(self, step: RequestStep) -> RuntimeResult:
+        if isinstance(step, Incomplete):
+            result = await self._finish(Completed(step.reply))
+            return RuntimeResult(
+                RuntimeDisposition.INCOMPLETE, result.replies, result.status
+            )
         if isinstance(step, ContextLimitReached):
             async with self._lock:
                 self._clear_session()
@@ -564,14 +601,19 @@ class PersonalRuntime:
             self._session.last_activity_at = _utc(self.clock.now())
         return self._result(RuntimeDisposition.COMPLETED, step.replies)
 
-    async def _finish_failure(self) -> RuntimeResult:
+    async def _finish_failure(self, notice: str | None = None) -> RuntimeResult:
         async with self._lock:
             if self._session:
                 self._session.active = None
                 self._session.pending = None
         return self._result(
             RuntimeDisposition.FAILED,
-            ("The request failed without completing the requested work.",),
+            (
+                notice
+                or "I couldn't finish this request. Earlier actions may already have "
+                "completed; their results remain in this session. Check any uncertain "
+                "outcome before retrying an action.",
+            ),
         )
 
     async def _command(self, text: str, now: datetime) -> RuntimeResult:

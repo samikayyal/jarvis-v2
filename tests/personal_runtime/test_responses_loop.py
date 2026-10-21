@@ -682,19 +682,16 @@ async def test_tool_round_limit_rejects_the_next_call_before_execution() -> None
         max_tool_rounds=1,
     )
 
-    with pytest.raises(RuntimeError, match="tool-round limit"):
-        await runner.run(
-            "Keep reading",
-            model="gpt-6-luna",
-            reasoning="medium",
-            system_prompt="Help.",
-        )
-
-    assert tools.calls == [("read_vault", {"query": "one"})]
-    assert trace.events[-1] == (
-        "request_error",
-        {"error": "RuntimeError: configured tool-round limit reached"},
+    result = await runner.run(
+        "Keep reading", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
+    assert "limit of 1 tool calls" in result.reply
+    assert tools.calls == [("read_vault", {"query": "one"})]
+    assert ("tool_round_limit", {"limit": 1}) in trace.events
+    summary = responses.calls[-1][0]
+    assert summary["tools"] == []
+    assert summary["tool_choice"] == "none"
+    assert '"outcome": "not_attempted"' in summary["input"][-1]["output"]
 
 
 @async_test

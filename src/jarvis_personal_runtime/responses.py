@@ -21,6 +21,7 @@ from .runtime import (
     ApprovalRequired,
     Completed,
     ContextLimitReached,
+    Incomplete,
 )
 from .trace import build_runtime_trace
 
@@ -410,7 +411,7 @@ class DirectResponsesRunner:
         model: str,
         reasoning: str,
         system_prompt: str,
-    ) -> Completed | ApprovalRequired | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         # A cancelled receive can finish cleanup after /cancel has replied.
         # Do not let the next request acquire its browser or counters meanwhile.
         async with self._request_lock:
@@ -425,7 +426,7 @@ class DirectResponsesRunner:
         model: str,
         reasoning: str,
         system_prompt: str,
-    ) -> Completed | ApprovalRequired | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         try:
             self._request_started()
             return await self._run_loop(
@@ -435,15 +436,18 @@ class DirectResponsesRunner:
                 system_prompt=system_prompt,
             )
         except asyncio.CancelledError:
+            self._seal_pending_calls()
             self._trace_local_cancellation()
             raise
         except TimeoutError:
+            self._seal_pending_calls()
             self._trace.record(
                 "request_timeout",
                 {"timeout_seconds": self._request_timeout_seconds},
             )
             raise
         except Exception as exc:
+            self._seal_pending_calls()
             self._trace.record(
                 "request_error",
                 {"error": f"{type(exc).__name__}: {exc}"},
@@ -459,7 +463,7 @@ class DirectResponsesRunner:
         model: str,
         reasoning: str,
         system_prompt: str,
-    ) -> Completed | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         transcript = [*self._transcript, {"role": "user", "content": text}]
         return await self._continue_loop(
             transcript,
@@ -477,11 +481,26 @@ class DirectResponsesRunner:
         reasoning: str,
         system_prompt: str,
         tool_rounds: int,
-    ) -> Completed | ApprovalRequired | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
+        summarize_only = False
         async with asyncio.timeout(self._request_timeout_seconds) as deadline:
             while True:
-                tools = list(self._tools.definitions)
+                exhausted = summarize_only
+                tools = [] if exhausted else list(self._tools.definitions)
                 instructions = self._instructions(system_prompt)
+                if exhausted:
+                    self._trace.record(
+                        "tool_round_limit", {"limit": self._max_tool_rounds}
+                    )
+                    instructions += (
+                        "\n\nThe runtime tool-call allowance for this request is exhausted. "
+                        "No further tools can run. Give a partial answer using the actual "
+                        "results already returned: what was verified or completed, what "
+                        "failed or remains uncertain, and what remains to do. Distinguish "
+                        "approved actions from completed ones. Do not claim the whole task "
+                        "is complete or promise background work. Cite available sources "
+                        "when relevant. The runtime will prefix the exact limit notice."
+                    )
                 candidate = {
                     "instructions": instructions,
                     "tools": tools,
@@ -504,20 +523,32 @@ class DirectResponsesRunner:
                             "max_context_tokens": self._max_context_tokens,
                         },
                     )
+                    if exhausted:
+                        return self._limit_result()
                     return ContextLimitReached()
                 request: dict[str, object] = {
                     "model": model,
                     "instructions": instructions,
-                    "input": transcript,
+                    "input": list(transcript),
                     "tools": tools,
                     "reasoning": {"effort": reasoning},
                     "parallel_tool_calls": False,
                     "store": False,
                     "truncation": "disabled",
                 }
+                if exhausted:
+                    request["tool_choice"] = "none"
                 self._trace.record("responses_request", {"request": request})
                 remaining = deadline.when() - asyncio.get_running_loop().time()
-                response = await self._responses.create(request, timeout=remaining)
+                try:
+                    response = await self._responses.create(request, timeout=remaining)
+                except Exception as exc:
+                    if not exhausted:
+                        raise
+                    self._trace.record(
+                        "partial_answer_error", {"error_type": type(exc).__name__}
+                    )
+                    return self._limit_result()
                 self._trace.record(
                     "responses_output",
                     {
@@ -536,6 +567,13 @@ class DirectResponsesRunner:
                     for item in response.output
                     if item.get("type") == "function_call"
                 ]
+                if exhausted:
+                    self._transcript = transcript
+                    self._seal_pending_calls(not_attempted=True)
+                    answer = response.output_text.strip() if not calls else ""
+                    if len(answer) > self._max_output_chars:
+                        answer = ""
+                    return self._limit_result(answer)
                 if not calls:
                     if not response.output_text.strip():
                         self._trace.record(
@@ -565,7 +603,10 @@ class DirectResponsesRunner:
                     raise RuntimeError("provider returned multiple function calls")
                 self._transcript = transcript
                 if tool_rounds >= self._max_tool_rounds:
-                    raise RuntimeError("configured tool-round limit reached")
+                    self._seal_pending_calls(not_attempted=True)
+                    transcript = self._transcript
+                    summarize_only = True
+                    continue
                 call = calls[0]
                 output = await self._execute_tool(call)
                 if isinstance(output, ApprovalRequired):
@@ -605,6 +646,46 @@ class DirectResponsesRunner:
                 ]
                 self._transcript = transcript
                 tool_rounds += 1
+
+    def _limit_result(self, answer: str = "") -> Incomplete:
+        notice = f"I reached the limit of {self._max_tool_rounds} tool calls for this request."
+        partial = answer or (
+            "I couldn't produce a partial summary. Earlier tool results remain in this "
+            "session; completed actions have not been undone. Further work was not attempted."
+        )
+        reply = f"{notice}\n\n{self._finish_answer(partial)}"
+        if len(reply) > self._max_output_chars:
+            reply = f"{notice}\n\nEarlier results remain in this session. The task is incomplete."
+        # Keep the stop itself in history so a follow-up can account for it.
+        self._transcript.append({"role": "assistant", "content": reply})
+        return Incomplete(reply)
+
+    def _seal_pending_calls(self, *, not_attempted: bool = False) -> None:
+        """Keep follow-up history valid without replaying an interrupted side effect."""
+        answered = {
+            item.get("call_id")
+            for item in self._transcript
+            if item.get("type") == "function_call_output"
+        }
+        missing = [
+            item
+            for item in self._transcript
+            if item.get("type") == "function_call"
+            and item.get("call_id") not in answered
+        ]
+        for item in missing:
+            self._transcript.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": json.dumps(
+                        {
+                            "outcome": "not_attempted" if not_attempted else "unknown",
+                            "reason": "Request stopped; verify uncertain outcomes before retrying.",
+                        }
+                    ),
+                }
+            )
 
     async def _execute_tool(self, call: dict[str, object]) -> str | ApprovalRequired:
         raw_arguments = str(call["arguments"])
@@ -677,13 +758,13 @@ class DirectResponsesRunner:
 
     async def resume(
         self, decision: ApprovalDecision, continuation: object
-    ) -> Completed | ApprovalRequired | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         async with self._request_lock:
             return await self._resume_request(decision, continuation)
 
     async def _resume_request(
         self, decision: ApprovalDecision, continuation: object
-    ) -> Completed | ApprovalRequired | ContextLimitReached:
+    ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         try:
             if not isinstance(continuation, _ResponsesContinuation):
                 raise TypeError("invalid Responses approval continuation")
@@ -746,6 +827,22 @@ class DirectResponsesRunner:
                 system_prompt=continuation.system_prompt,
                 tool_rounds=continuation.tool_rounds + 1,
             )
+        except asyncio.CancelledError:
+            self._seal_pending_calls()
+            self._trace_local_cancellation()
+            raise
+        except TimeoutError:
+            self._seal_pending_calls()
+            self._trace.record(
+                "request_timeout", {"timeout_seconds": self._request_timeout_seconds}
+            )
+            raise
+        except Exception as exc:
+            self._seal_pending_calls()
+            self._trace.record(
+                "request_error", {"error": f"{type(exc).__name__}: {exc}"}
+            )
+            raise
         finally:
             await self._close_request()
 
