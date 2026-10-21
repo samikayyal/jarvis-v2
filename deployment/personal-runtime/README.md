@@ -42,8 +42,8 @@ inactive validation.
 
 ### Runtime skills
 
-The installed package includes five trusted `skills/<name>/SKILL.md` resources:
-`obsidian`, `google`, `terminal`, `reminders`, and optional `web`. Their short descriptions and the
+The installed package includes four trusted `skills/<name>/SKILL.md` resources:
+`obsidian`, `google`, `reminders`, and optional `web`. Their short descriptions and the
 `load_skill` schema are exposed initially. Loading adds that skill's instructions
 and only its configured prepared tool schemas on the next model call. Instructions
 live in the request's instruction field; loader results are small acknowledgements,
@@ -53,6 +53,11 @@ Loaded skills persist for follow-ups in the same working session and reset with
 `/new`, inactivity expiry, the context limit, or restart. Skill loading counts as
 one tool round and is included in timeout and context budgets. Existing argument
 validation, approvals, and continuation handling still run in the original tools.
+
+`run_terminal` is exposed on the first request and after every session reset,
+without a skill load. Its schema includes only configured hosts. Terminal guidance
+lives in `SYSTEM.md`; deploy the updated example with the code. Terminal approval,
+saved permissions, and execution behavior are unchanged.
 Only the fixed packaged registry is loadable; vault notes and tool results cannot
 register skills. Manifest-selected operations outside these explicit groups
 keep their existing visibility.

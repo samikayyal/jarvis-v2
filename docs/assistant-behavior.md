@@ -20,6 +20,11 @@ Skills own domain procedures; retrieved notes cannot replace current runtime fac
 or override approval rules. Hosting comparisons hold inference constant as their
 baseline and explicitly separate any proposed provider migration.
 
+Terminal access is a core capability: `run_terminal` is exposed immediately and
+survives session resets without `load_skill`. `SYSTEM.md` contains its operating
+guidance. The tool schema lists configured hosts; visibility does not change
+command approval, saved permissions, or the dedicated vault-tool boundary.
+
 When the next tool call would exceed the request limit, the runtime records a
 `not_attempted` result and requests one summary with no tools and `tool_choice=none`.
 The existing request deadline still bounds this attempt. It returns an `incomplete`

@@ -8,6 +8,7 @@ import pytest
 
 from jarvis_personal_runtime.config import RuntimeConfig
 from jarvis_personal_runtime.google import _definitions as google_definitions
+from jarvis_personal_runtime.permissions import TomlPermissionStore
 from jarvis_personal_runtime.reminders import ReminderTools
 from jarvis_personal_runtime.responses import (
     DirectResponsesRunner,
@@ -24,7 +25,7 @@ from jarvis_personal_runtime.runtime import (
     PendingAction,
 )
 from jarvis_personal_runtime.skill_tools import SkillTools
-from jarvis_personal_runtime.terminal import RunTerminalTool
+from jarvis_personal_runtime.terminal import CommandResult, RunTerminalTool
 from jarvis_personal_runtime.vault import ReadVaultTool
 from jarvis_personal_runtime.vault_git import VaultTools
 
@@ -92,7 +93,6 @@ def names(definitions):
         ("obsidian", VaultTools.definitions),
         ("obsidian", ReadVaultTool.definitions),
         ("google", google_definitions()),
-        ("terminal", RunTerminalTool.definitions),
         ("reminders", ReminderTools.definitions),
     ],
 )
@@ -251,7 +251,7 @@ def test_loaded_instructions_and_schemas_are_subject_to_context_gate():
     assert len(observed[-1]["instructions"]) > len(observed[0]["instructions"])
 
 
-def test_default_builder_enables_skills_without_live_provider(
+def test_default_builder_exposes_terminal_without_live_provider(
     tmp_path: Path, monkeypatch
 ):
     responses = Responses(ResponsesResult(output=(), output_text="Hello."))
@@ -265,6 +265,69 @@ def test_default_builder_enables_skills_without_live_provider(
     )
     runner = build_direct_responses_runner("test-key", config)
     run(runner, "Hello")
-    loader = responses.requests[0]["tools"]
-    assert names(loader) == {"load_skill"}
-    assert loader[0]["parameters"]["properties"]["name"]["enum"] == ["terminal"]
+    exposed = responses.requests[0]["tools"]
+    assert names(exposed) == {"run_terminal"}
+    assert exposed[0]["parameters"]["properties"]["host"]["enum"] == ["ubuntu"]
+
+
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize("mode", ["read", "approve", "reject"])
+def test_direct_terminal_preserves_hosts_reset_and_approval(tmp_path, windows, mode):
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, command, **kwargs):
+            self.calls.append(command)
+            return CommandResult(exit_code=0, stdout="checked", stderr="")
+
+    executor = Executor()
+    terminal = RunTerminalTool(
+        working_directory=tmp_path,
+        read_only_prefixes=("hostname",),
+        permission_store=TomlPermissionStore(tmp_path / "permissions.toml"),
+        executor=executor,
+        windows_executor=executor if windows else None,
+        windows_working_directory="C:\\Work" if windows else None,
+        windows_read_only_prefixes=("hostname",),
+        timeout_seconds=10,
+        max_output_chars=1000,
+    )
+    tools = SkillTools(
+        PreparedToolCollection(terminal, Tools(ReadVaultTool.definitions))
+    )
+    initial = tools.definitions
+    assert names(initial) == {"load_skill", "run_terminal"}
+    assert initial[0]["parameters"]["properties"]["name"]["enum"] == ["obsidian"]
+    assert initial[1]["parameters"]["properties"]["host"]["enum"] == (
+        ["ubuntu", "windows"] if windows else ["ubuntu"]
+    )
+    asyncio.run(tools.execute("load_skill", {"name": "obsidian"}))
+    tools.start_session()
+    assert tools.definitions == initial
+    with pytest.raises(ValueError, match="unavailable skill"):
+        asyncio.run(tools.execute("load_skill", {"name": "terminal"}))
+
+    command = "hostname" if mode == "read" else "echo proposed-change"
+    responses = Responses(
+        call(
+            "run_terminal",
+            {"host": "windows" if windows else "ubuntu", "command": command},
+        ),
+        ResponsesResult(output=(), output_text="Handled."),
+    )
+    runner = DirectResponsesRunner(responses, tools=tools, request_timeout_seconds=30)
+    result = run(runner, "Check the host")
+    if mode != "read":
+        assert isinstance(result, ApprovalRequired)
+        assert executor.calls == []
+        decision = (
+            ApprovalDecision.APPROVE_ONCE
+            if mode == "approve"
+            else ApprovalDecision.REJECT
+        )
+        result = asyncio.run(runner.resume(decision, result.continuation))
+    assert result.reply == "Handled."
+    assert executor.calls == ([] if mode == "reject" else [command])
+    assert len(responses.requests) == 2
+    assert names(responses.requests[0]["tools"]) == {"load_skill", "run_terminal"}
