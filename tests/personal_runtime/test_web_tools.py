@@ -122,10 +122,10 @@ def test_search_outcomes_and_attempts_survive_cleanup(tmp_path, outcome):
             assert browser.attempts == 3
         answer = tool.finish_answer("Stable background.")
         if outcome == "no_results":
-            assert answer.startswith("No useful search results were found.")
+            assert "No useful search results were found." in answer
             assert "unavailable" not in answer
         else:
-            assert answer.startswith("Web access is unavailable")
+            assert "Web access is unavailable" in answer
         await tool.close_request()
         tool.request_started()
         await tool.execute("search_web", {"query": "new request", "depth": "quick"})
@@ -277,7 +277,7 @@ def test_page_led_research_uses_configured_limits_and_resets_next_request(
         assert upgraded["remaining"] == {
             "queries": 2,
             "pages": 0,
-            "evidence_chars": 31973,
+            "evidence_chars": 47973,
         }
         assert len(browser.urls) == 3
         assert upgraded["pages"][-1]["outcome"] == "unattempted"
@@ -289,7 +289,7 @@ def test_page_led_research_uses_configured_limits_and_resets_next_request(
                 {"urls": ["https://example.com/new"] * 2, "depth": "quick"},
             )
         )
-        assert fresh["remaining"] == {"queries": 1, "pages": 0, "evidence_chars": 31991}
+        assert fresh["remaining"] == {"queries": 1, "pages": 0, "evidence_chars": 47991}
         assert fresh["pages"][-1]["outcome"] == "unattempted"
         await tool.close_request()
 
@@ -366,7 +366,8 @@ def test_search_preserves_prior_evidence_when_later_blocked(tmp_path):
             await tool.execute("search_web", {"query": "second", "depth": "quick"})
         )
         assert cap["outcome"] == "limit_reached"
-        assert tool.finish_answer("Supported.") == "Supported."
+        assert "text allowance" in tool.finish_answer("Supported.")
+        assert "unavailable" not in tool.finish_answer("Supported.")
         await tool.close_request()
         tool = WebTools(
             replace(base, quick=replace(base.quick, max_queries=3)),
@@ -476,7 +477,8 @@ def test_failures_consume_attempts_and_disclose_only_real_access_failures(tmp_pa
             "read_web_pages",
             {"urls": ["https://example.com/good"] * 3, "depth": "quick"},
         )
-        assert tool.finish_answer("Answer") == "Answer"
+        assert "page allowance" in tool.finish_answer("Answer")
+        assert "unavailable" not in tool.finish_answer("Answer")
         await tool.close_request()
 
     asyncio.run(scenario())

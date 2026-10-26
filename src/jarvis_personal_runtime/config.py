@@ -92,7 +92,7 @@ class WebSearchConfig:
     operation_timeout_seconds: float = 20.0
     results_per_query: int = 5
     max_chars_per_page: int = 8_000
-    max_total_evidence_chars: int = 32_000
+    max_total_evidence_chars: int = 48_000
     quick: WebDepthLimits = field(
         default_factory=lambda: WebDepthLimits(max_queries=1, max_pages=2)
     )

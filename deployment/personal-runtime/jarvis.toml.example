@@ -52,7 +52,7 @@ enabled = false
 operation_timeout_seconds = 20
 results_per_query = 5
 max_chars_per_page = 8000
-max_total_evidence_chars = 32000
+max_total_evidence_chars = 48000
 
 [web_search.quick]
 max_queries = 1

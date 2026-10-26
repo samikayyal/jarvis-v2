@@ -214,7 +214,7 @@ def test_real_web_tool_supplies_evidence_and_enforces_failure_notice(tmp_path, o
             assert answer.reply == provider_answer
             assert evidence["pages"][0]["text"] == "The published value is 42."
         else:
-            assert answer.reply.startswith("Web access is unavailable")
+            assert "Web access is unavailable" in answer.reply
             assert "not current web verification" in answer.reply
         assert "untrusted evidence" in responses.requests[-1]["instructions"]
 
@@ -467,6 +467,70 @@ class ResearchBrowser:
         self.closed = True
 
 
+def test_model_loop_static_then_rendered_returns_readiness_and_closes_workers(tmp_path):
+    class DynamicBrowser(ResearchBrowser):
+        async def read(self, url, *, wait_for_text=None):
+            assert wait_for_text == "E2 hourly"
+            response = await super().read(url)
+            response.update(
+                text="E2 hourly USD 0.02",
+                source_chars=18,
+                render_mode="rendered",
+                render_wait="matched",
+            )
+            return response
+
+    async def scenario():
+        static, rendered = ResearchBrowser(), DynamicBrowser()
+        web = WebTools(
+            WebSearchConfig(enabled=True),
+            runtime_dir=tmp_path,
+            max_output_chars=65536,
+            browser_factory=lambda *a: static,
+            rendered_browser_factory=lambda *a: rendered,
+        )
+        responses = Responses(
+            web_step(
+                "read_web_pages",
+                urls=["https://example.com/prices"],
+                depth="moderate",
+                render_mode="static",
+                wait_for_text=None,
+            ),
+            web_step(
+                "read_web_pages",
+                urls=["https://example.com/prices"],
+                depth="moderate",
+                render_mode="rendered",
+                wait_for_text="E2 hourly",
+            ),
+            ResponsesResult(
+                output=(),
+                output_text="The fixture price is USD 0.02/hour [1]. https://example.com/prices",
+            ),
+        )
+        runner = DirectResponsesRunner(responses, tools=web, request_timeout_seconds=30)
+        result = await runner.run(
+            "Read the dynamic price",
+            model="gpt-6-luna",
+            reasoning="medium",
+            system_prompt="Help.",
+        )
+        outputs = tool_outputs(responses.requests[-1])
+        assert outputs[0]["pages"][0]["render_mode"] == "static"
+        assert outputs[1]["pages"][0]["render_wait"] == "matched"
+        assert outputs[1]["remaining"]["pages"] == 3
+        assert "USD 0.02/hour" in result.reply
+        assert static.closed and rendered.closed
+        definition = next(
+            t for t in responses.requests[-1]["tools"] if t["name"] == "read_web_pages"
+        )
+        schema = definition["parameters"]
+        assert set(schema["required"]) == set(schema["properties"])
+
+    run(scenario())
+
+
 def tool_outputs(request):
     return [
         json.loads(item["output"])
@@ -676,7 +740,7 @@ def test_cancel_or_new_during_moderate_research_closes_browser_without_late_repl
     run(scenario())
 
 
-@pytest.mark.parametrize("output_limit", [280, 600])
+@pytest.mark.parametrize("output_limit", [560, 900])
 def test_research_evidence_and_serialized_trace_stay_bounded_across_upgrade(
     tmp_path, output_limit
 ):
@@ -875,7 +939,7 @@ def test_failure_notice_keeps_a_fallback_answer_within_the_output_limit(tmp_path
         result = await runner.run(
             "Read this", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
         )
-        assert result.reply.startswith("Web access is unavailable")
+        assert "Web access is unavailable" in result.reply
         assert "Background knowledge." in result.reply
         assert "shortened" in result.reply
         assert len(result.reply) <= 500
@@ -990,6 +1054,6 @@ def test_search_model_loop_exposes_citations_privacy_and_fallback(
         elif outcome == "no_results":
             assert result.reply.startswith("No useful search results")
         else:
-            assert result.reply.startswith("Web access is unavailable")
+            assert "Web access is unavailable" in result.reply
 
     run(scenario())

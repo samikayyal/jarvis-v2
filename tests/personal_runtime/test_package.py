@@ -85,7 +85,7 @@ def test_example_configuration_carries_the_private_handoff_and_rotating_trace() 
         "operation_timeout_seconds": 20,
         "results_per_query": 5,
         "max_chars_per_page": 8000,
-        "max_total_evidence_chars": 32000,
+        "max_total_evidence_chars": 48000,
         "quick": {"max_queries": 1, "max_pages": 2},
         "moderate": {"max_queries": 3, "max_pages": 5},
     }

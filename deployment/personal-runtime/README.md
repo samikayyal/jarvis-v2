@@ -74,7 +74,9 @@ relevant sources and identifies material disagreements and coverage gaps.
 Web access is off when `[web_search]` is absent or `enabled = false`. The example
 TOML records the shared request allowances: quick one query/two pages, moderate
 three queries/five pages, five results per query, 8,000 characters per page,
-32,000 evidence characters, and a 20-second browser-operation timeout. The first
+48,000 evidence characters, and a 20-second browser-operation timeout. Existing
+deployments with an explicit 32,000 setting retain it until their TOML is updated.
+The first
 web call selects depth; a later moderate call upgrades quick without resetting
 usage, and later quick calls cannot downgrade it. Valid configuration changes
 take effect on the normal service restart.
@@ -105,6 +107,22 @@ work. Explicit rechecks and time-sensitive claims require fresh tools. Every
 ordinary request owns and closes its browser; no browser or separate evidence
 cache survives across requests. Session expiry, `/new`, context reset, and restart
 discard the old working-session evidence and loaded skills.
+
+Page reads default to static content. `read_web_pages` also accepts explicit
+`render_mode="rendered"` with `wait_for_text` (1–200 characters) after a static
+read of the same URL. Rendering consumes another page attempt and shares all
+request limits. A separate anonymous worker permits scripts while retaining
+the public proxy, sandbox, scheme/download blocks and supervised cleanup. Its
+bounded wait observes visible text, never clicks controls or solves challenges.
+Blocked/unsupported URLs cannot be render-retried in the same request. Both
+workers close on suspension/cancellation/completion; counters survive suspension.
+
+Results distinguish access from extraction: `truncated`, `source_chars`,
+`extraction_method`, `section_found`, `render_mode`, `render_wait`, and
+`stop_reason` describe evidence limits and readiness. Anchor presence does not
+mean that section was included: extraction remains a body prefix. Start with
+one or two sources and adapt; retain larger batches for known independent sources.
+Final notices distinguish search blocks, page failures and allowance limits.
 
 Google blocking or CAPTCHA stops further searches in the request. A recognized
 consent screen can reject optional cookies; challenges are never solved or

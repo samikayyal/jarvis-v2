@@ -23,7 +23,7 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from .web_browser import PublicUrlError, is_public_address, validate_public_url
 
@@ -375,6 +375,7 @@ class SeleniumPageReader:
         driver_binary: str | None = None,
         driver_factory: Any | None = None,
         headed: bool = False,
+        rendered: bool = False,
     ) -> None:
         self.profile_dir = Path(profile_dir)
         self.timeout = timeout
@@ -383,6 +384,7 @@ class SeleniumPageReader:
         self.driver_binary = driver_binary or find_chromedriver()
         self.driver_factory = driver_factory
         self.headed = headed
+        self.rendered = rendered
         self.proxy = PublicNetworkProxy()
         self.driver: Any | None = None
         self.unusable = False
@@ -438,7 +440,9 @@ class SeleniumPageReader:
                 "profile.password_manager_enabled": False,
                 "autofill.profile_enabled": False,
                 "autofill.credit_card_enabled": False,
-                "profile.default_content_setting_values.javascript": 2,
+                "profile.default_content_setting_values.javascript": 1
+                if self.rendered
+                else 2,
                 "profile.content_settings.exceptions.javascript": {
                     "https://www.google.com:443,*": {"setting": 1},
                     "https://consent.google.com:443,*": {"setting": 1},
@@ -498,6 +502,8 @@ class SeleniumPageReader:
                 raise RuntimeError("browser download blocking is unavailable") from exc
 
     def search(self, query: str, limit: int) -> dict[str, object]:
+        if self.rendered:
+            return {"outcome": "blocked", "reason": "rendered workers cannot search"}
         from urllib.parse import urlencode
 
         from .web_search import MAX_QUERY_LENGTH, extract_google_results
@@ -527,8 +533,19 @@ class SeleniumPageReader:
         except Exception:  # noqa: BLE001 - extraction must not masquerade as an empty search.
             return {"outcome": "extraction_failed", "results": []}
 
-    def read(self, url: str, *, search: bool = False) -> dict[str, object]:
+    def read(
+        self, url: str, *, search: bool = False, wait_for_text: str | None = None
+    ) -> dict[str, object]:
         requested = validate_public_url(url)
+        if self.rendered and (
+            search
+            or not isinstance(wait_for_text, str)
+            or not 1 <= len(wait_for_text.strip()) <= 200
+        ):
+            return self._result(
+                "unsupported", requested, reason="rendered reads require expected text"
+            )
+        deadline = time.monotonic() + max(0.1, self.timeout - 1)
         try:
             self._start()
             assert self.driver is not None
@@ -540,9 +557,9 @@ class SeleniumPageReader:
                     "Emulation.setScriptExecutionDisabled", {"value": True}
                 )
                 self.driver.get("about:blank")
-                if search:
-                    # Chrome's origin exceptions still deny scripts on other
-                    # sites, including redirects. Ordinary reads stay disabled.
+                if search or self.rendered:
+                    # Search retains origin-specific Chrome exceptions. Explicit
+                    # rendered reads use a separate script-enabled profile.
                     self.driver.execute_cdp_cmd(
                         "Emulation.setScriptExecutionDisabled", {"value": False}
                     )
@@ -618,6 +635,20 @@ class SeleniumPageReader:
                 return self._blocked(requested)
             if self.proxy.blocked_url(final_url):
                 return self._blocked(requested)
+            render_wait = "not_requested"
+            if self.rendered:
+                render_wait = self._wait_for_text(str(wait_for_text), deadline)
+                self.driver.execute_cdp_cmd(
+                    "Emulation.setScriptExecutionDisabled", {"value": True}
+                )
+                # Scripts can navigate while waiting. Revalidate the final document.
+                final_url = str(self.driver.current_url)
+                try:
+                    final_url = validate_public_url(final_url)
+                except PublicUrlError:
+                    return self._blocked(requested)
+                if self.proxy.blocked_url(final_url):
+                    return self._blocked(requested)
             content_type = str(
                 self.driver.execute_script("return document.contentType || '';") or ""
             ).casefold()
@@ -667,6 +698,7 @@ class SeleniumPageReader:
                 "checking your browser",
                 "challenge required",
                 "access denied",
+                "unusual traffic",
                 "cf-chl-",
             )
             if search:
@@ -692,6 +724,17 @@ class SeleniumPageReader:
                 "title": title,
                 "url": final_url[:2048],
                 "text": text[: self.max_chars],
+                "source_chars": len(text),
+                "truncated": len(text) > self.max_chars,
+                "extraction_method": "body_prefix",
+                "section_found": self._section_found(requested),
+                "render_mode": "rendered" if self.rendered else "static",
+                "render_wait": render_wait,
+                "stop_reason": "render_wait_timeout"
+                if render_wait == "timeout"
+                else "page_text_limit"
+                if len(text) > self.max_chars
+                else None,
             }
         except PublicUrlError:
             raise
@@ -723,6 +766,46 @@ class SeleniumPageReader:
     @staticmethod
     def _is_timeout(error: BaseException) -> bool:
         return type(error).__name__ in {"TimeoutException", "ScriptTimeoutException"}
+
+    def _section_found(self, requested: str) -> bool | None:
+        fragment = unquote(urlsplit(requested).fragment)
+        if not fragment:
+            return None
+        return bool(
+            self.driver.execute_script(
+                "return Boolean(document.getElementById(arguments[0]) || "
+                "document.getElementsByName(arguments[0]).length);",
+                fragment,
+            )
+        )
+
+    def _wait_for_text(self, expected: str, deadline: float) -> str:
+        """Poll visible content only; no clicks, challenges, or network-idle waits."""
+        needle = expected.strip().casefold()
+        while True:
+            state = self.driver.execute_script("""
+                return {body: document.body ? document.body.innerText : '',
+                    stop: Boolean(document.querySelector('input[type="password"], '
+                        + '.g-recaptcha, #captcha, [data-sitekey], '
+                        + 'iframe[src*="captcha" i], iframe[src*="challenge" i]'))};
+            """)
+            if isinstance(state, dict):
+                body = str(state.get("body", "")).casefold()
+                if state.get("stop") or any(
+                    marker in body
+                    for marker in (
+                        "verify you are human",
+                        "checking your browser",
+                        "unusual traffic",
+                    )
+                ):
+                    return "timeout"  # Normal access checks classify the challenge.
+                if needle in body:
+                    return "matched"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout"
+            time.sleep(min(0.1, remaining))
 
     def _blocked(self, requested: str) -> dict[str, object]:
         return self._result(
@@ -761,11 +844,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", required=True, type=float)
     parser.add_argument("--max-chars", required=True, type=int)
     parser.add_argument("--headed", action="store_true")
+    parser.add_argument("--rendered", action="store_true")
     args = parser.parse_args(argv)
     service: SeleniumPageReader | None = None
     try:
         service = SeleniumPageReader(
-            Path(args.profile_dir), args.timeout, args.max_chars, headed=args.headed
+            Path(args.profile_dir),
+            args.timeout,
+            args.max_chars,
+            headed=args.headed,
+            rendered=args.rendered,
         )
         for line in sys.stdin:
             try:
@@ -790,7 +878,9 @@ def main(argv: list[str] | None = None) -> int:
                     if not isinstance(url, str):
                         _send({"outcome": "blocked", "reason": "invalid URL"})
                         continue
-                    response = service.read(url)
+                    response = service.read(
+                        url, wait_for_text=request.get("wait_for_text")
+                    )
                 _send(response)
                 if service.unusable:
                     return 2

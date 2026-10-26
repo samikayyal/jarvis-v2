@@ -16,6 +16,7 @@ from jarvis_personal_runtime.vault_git import (
     VaultTools,
 )
 
+from .test_runtime import FakeRunner, inbound
 from .test_vault_regressions import edit, git, vault
 
 __all__ = ["vault"]
@@ -110,6 +111,45 @@ def test_saved_edit_permission_does_not_authorize_deletion(vault, tmp_path):
         "preview_shown": True,
         "source": "operator_reply",
     }
+
+
+@pytest.mark.parametrize("choice", ["1", "9"])
+def test_delete_runtime_offers_only_once_or_reject(vault, tmp_path, choice):
+    from jarvis_personal_runtime.runtime import ApprovalDecision, PersonalRuntime
+
+    clone, _, original = vault
+    store = TomlPermissionStore(tmp_path / "jarvis.toml")
+    tool = VaultTools(clone, original._settings, permission_store=store)
+
+    async def scenario():
+        step = await tool.execute("delete_vault", delete_args(clone))
+        runner = FakeRunner(step)
+        runtime = PersonalRuntime(request_runner=runner, permission_store=store)
+        pending = await runtime.receive(inbound("delete", "Delete the test note"))
+        assert pending.replies == (
+            step.action.display + "\nReply 1 to approve once or 9 to reject.",
+        )
+        ignored = await runtime.receive(inbound("save", "2"))
+        assert ignored.disposition == "ignored"
+        assert runtime.status().pending_action == step.action
+        assert runner.resumes == []
+        assert store.list_rules() == ()
+        assert (clone / "note.md").exists()
+
+        await runtime.receive(inbound("decision", choice))
+        decision = (
+            ApprovalDecision.APPROVE_ONCE if choice == "1" else ApprovalDecision.REJECT
+        )
+        assert runner.resumes == [(decision, step.continuation)]
+        assert runtime.status().pending_action is None
+        assert store.list_rules() == ()
+        result = json.loads(
+            await tool.resume(step.continuation, approved=choice == "1")
+        )
+        assert result["status"] == ("synced" if choice == "1" else "rejected")
+        assert (clone / "note.md").exists() == (choice == "9")
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("change", ["local", "remote", "offline"])

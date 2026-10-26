@@ -240,6 +240,7 @@ class BrowserWorker:
         process_factory: Callable[..., Awaitable[Any]] | None = None,
         python_executable: str | None = None,
         headed: bool = False,
+        rendered: bool = False,
     ) -> None:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
             raise TypeError("browser timeout must be a finite positive number")
@@ -260,6 +261,7 @@ class BrowserWorker:
         self._process_factory = process_factory or asyncio.create_subprocess_exec
         self._python_executable = python_executable or sys.executable
         self._headed = headed
+        self._rendered = rendered
         self._process: Any | None = None
         self._profile_dir: Path | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -272,16 +274,27 @@ class BrowserWorker:
     def usable(self) -> bool:
         return not self._dead and not self._closed
 
-    async def read(self, url: str) -> dict[str, object]:
+    async def read(
+        self, url: str, *, wait_for_text: str | None = None
+    ) -> dict[str, object]:
         """Read one public HTML page and return bounded structured evidence."""
 
         try:
             canonical = validate_public_url(url)
         except PublicUrlError as exc:
             return self._result(exc.outcome, url, reason=str(exc))
-        return await self._operate({"op": "read", "url": canonical}, canonical)
+        if self._rendered and (
+            not isinstance(wait_for_text, str)
+            or not 1 <= len(wait_for_text.strip()) <= 200
+        ):
+            raise ValueError("rendered reads require 1–200 characters of expected text")
+        return await self._operate(
+            {"op": "read", "url": canonical, "wait_for_text": wait_for_text}, canonical
+        )
 
     async def search(self, query: str, limit: int) -> dict[str, object]:
+        if self._rendered:
+            raise ValueError("rendered workers cannot search")
         from .web_search import MAX_QUERY_LENGTH
 
         if (
@@ -397,6 +410,8 @@ class BrowserWorker:
                 "--max-chars",
                 str(self.max_chars),
             ]
+            if self._rendered:
+                argv.append("--rendered")
             if self._headed:
                 xvfb = shutil.which("xvfb-run", path=environment.get("PATH"))
                 if os.name != "posix" or xvfb is None:
@@ -493,6 +508,10 @@ class BrowserWorker:
         reason = response.get("reason")
         if isinstance(reason, str) and reason:
             result["reason"] = reason[:512]
+        from .web_evidence import extraction_metadata
+
+        if outcome == "ok":
+            result.update(extraction_metadata(response, text))
         return result
 
     def _result(self, outcome: str, url: str, *, reason: str = "") -> dict[str, object]:

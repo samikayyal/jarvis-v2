@@ -4,6 +4,7 @@
 
 ## Personal runtime
 
+- [How web search works: Selenium, Google, page reading, evidence, and limits](web-search-tool.md)
 - [Reminder lifecycle and supervised acceptance](reminders.md)
 - [ADR-0002: Keep reminder scheduling in Jarvis](adr/0002-keep-reminder-scheduling-in-jarvis.md)
 

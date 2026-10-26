@@ -8,8 +8,10 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urldefrag
 
 from .config import WebSearchConfig
+from .web_evidence import extraction_metadata
 from .web_search import MAX_QUERY_LENGTH
 
 MAX_BATCH_URLS = 20
@@ -17,24 +19,32 @@ UNAVAILABLE_NOTICE = (
     "Web access is unavailable for this request; I could not verify current web evidence. "
     "Any answer below is based on existing knowledge, not current web verification."
 )
-PARTIAL_NOTICE = "Some web access failed; web coverage is incomplete."
 EMPTY_NOTICE = "No useful search results were found."
 
 
 class PageBrowser(Protocol):
     async def search(self, query: str, limit: int) -> dict[str, object]: ...
 
-    async def read(self, url: str) -> dict[str, object]: ...
+    async def read(
+        self, url: str, *, wait_for_text: str | None = None
+    ) -> dict[str, object]: ...
 
     async def close(self) -> None: ...
 
 
 def _browser(
-    runtime_dir: Path, timeout: float, max_chars: int, *, headed: bool = False
+    runtime_dir: Path,
+    timeout: float,
+    max_chars: int,
+    *,
+    headed: bool = False,
+    rendered: bool = False,
 ) -> PageBrowser:
     from .web_browser import BrowserWorker
 
-    return BrowserWorker(runtime_dir, timeout, max_chars, headed=headed)
+    return BrowserWorker(
+        runtime_dir, timeout, max_chars, headed=headed, rendered=rendered
+    )
 
 
 def _json(value: object) -> str:
@@ -51,6 +61,7 @@ class WebTools:
         runtime_dir: Path,
         max_output_chars: int,
         browser_factory: Callable[..., PageBrowser] | None = None,
+        rendered_browser_factory: Callable[..., PageBrowser] | None = None,
     ) -> None:
         if max_output_chars < 2:
             raise ValueError("web output capacity must hold a JSON object")
@@ -61,6 +72,10 @@ class WebTools:
             _browser, headed=config.browser_mode == "headed"
         )
         self._browser: PageBrowser | None = None
+        self._render_factory = rendered_browser_factory or partial(
+            _browser, headed=config.browser_mode == "headed", rendered=True
+        )
+        self._render_browser: PageBrowser | None = None
         self.request_started()
         self.definitions: tuple[dict[str, object], ...] = (
             (
@@ -93,7 +108,11 @@ class WebTools:
                     "description": (
                         "Read public HTML URLs sequentially for cited answers. Choose quick "
                         "or moderate depth; upgrading preserves all usage and later quick "
-                        "calls cannot downgrade. Allowances are shared across this request."
+                        "calls cannot downgrade. Start with 1–2 high-value pages, inspect "
+                        "results, then select the next source. Use larger batches only for "
+                        "known independent sources. Stop on evidence_limit. Static reads "
+                        "come first; rendered mode requires a prior static read of the same "
+                        "URL and expected visible text, and consumes another page attempt."
                     ),
                     "strict": True,
                     "parameters": {
@@ -106,8 +125,16 @@ class WebTools:
                                 "maxItems": MAX_BATCH_URLS,
                             },
                             "depth": {"type": "string", "enum": ["quick", "moderate"]},
+                            "render_mode": {
+                                "type": "string",
+                                "enum": ["static", "rendered"],
+                            },
+                            "wait_for_text": {
+                                "type": ["string", "null"],
+                                "maxLength": 200,
+                            },
                         },
-                        "required": ["urls", "depth"],
+                        "required": ["urls", "depth", "render_mode", "wait_for_text"],
                         "additionalProperties": False,
                     },
                 },
@@ -117,7 +144,7 @@ class WebTools:
         )
 
     def request_started(self) -> None:
-        if self._browser is not None:
+        if self._browser is not None or self._render_browser is not None:
             raise RuntimeError("close the previous web request before resetting")
         self._limits = self.config.quick
         self._pages_used = 0
@@ -128,11 +155,30 @@ class WebTools:
         self._access_failed = False
         self._has_evidence = False
         self._worker_failed = False
+        self._render_worker_failed = False
+        self._static_outcomes: dict[str, str] = {}
+        self._denied_urls: set[str] = set()
+        self._page_failures: dict[str, str] = {}
+        self._search_failure = ""
+        self._search_failure_reason = ""
+        self._pages_read = 0
+        self._limit_stops: set[str] = set()
+        self._render_timeouts = 0
 
     async def close_request(self) -> None:
-        browser, self._browser = self._browser, None
-        if browser is not None:
-            cleanup = asyncio.create_task(browser.close())
+        browsers = [b for b in (self._browser, self._render_browser) if b is not None]
+        self._browser = self._render_browser = None
+        if browsers:
+
+            async def close_all():
+                results = await asyncio.gather(
+                    *(b.close() for b in browsers), return_exceptions=True
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+            cleanup = asyncio.create_task(close_all())
             cancelled = False
             while not cleanup.done():
                 try:
@@ -144,15 +190,57 @@ class WebTools:
                 raise asyncio.CancelledError
 
     def finish_answer(self, text: str) -> str:
-        if not self._access_failed and not (
-            self._empty_search and not self._has_evidence
+        if (
+            not self._access_failed
+            and not self._limit_stops
+            and not self._render_timeouts
+            and not (self._empty_search and not self._has_evidence)
         ):
             return text
-        notice = (
-            (PARTIAL_NOTICE if self._has_evidence else UNAVAILABLE_NOTICE)
-            if self._access_failed
-            else EMPTY_NOTICE
-        )
+        facts = []
+        if self._search_failure:
+            facts.append(
+                {
+                    "blocked": "Google search was blocked.",
+                    "timeout": "Google search timed out.",
+                    "extraction_failed": "Google search results could not be extracted.",
+                }.get(self._search_failure, "Google search was unavailable.")
+            )
+        if self._page_failures:
+            counts = {
+                reason: list(self._page_failures.values()).count(reason)
+                for reason in sorted(set(self._page_failures.values()))
+            }
+            facts.append(
+                "Page access: "
+                + ", ".join(
+                    f"{count} {reason.replace('_', ' ')}"
+                    for reason, count in counts.items()
+                )
+                + "."
+            )
+        if self._pages_read:
+            noun = "page excerpt" if self._pages_read == 1 else "page excerpts"
+            facts.append(f"Read {self._pages_read} {noun}.")
+        for reason, sentence in (
+            ("evidence_limit", "The text allowance prevented further web reads."),
+            ("page_limit", "The page allowance prevented further page reads."),
+            ("query_limit", "The search allowance prevented further searches."),
+            ("output_limit", "The tool output limit restricted returned evidence."),
+        ):
+            if reason in self._limit_stops:
+                facts.append(sentence)
+        if self._render_timeouts:
+            facts.append(
+                "Requested dynamic content did not appear before the rendering wait ended."
+            )
+        if self._access_failed and not self._has_evidence:
+            facts.insert(0, UNAVAILABLE_NOTICE)
+        elif self._access_failed:
+            facts.append("Web coverage is incomplete.")
+        elif self._empty_search and not self._has_evidence:
+            facts.insert(0, EMPTY_NOTICE)
+        notice = " ".join(facts)
         answer = f"{notice}\n\n{text}"
         if len(answer) <= self.max_output_chars or len(text) > self.max_output_chars:
             return answer
@@ -176,9 +264,18 @@ class WebTools:
             ),
         }
 
-    def _error(self, outcome: str, reason: str) -> str:
+    def _error(
+        self, outcome: str, reason: str, *, stop_reason: str | None = None
+    ) -> str:
+        if stop_reason:
+            self._limit_stops.add(stop_reason)
         for result in (
-            {"outcome": outcome, "reason": reason, "remaining": self._remaining()},
+            {
+                "outcome": outcome,
+                "reason": reason,
+                "remaining": self._remaining(),
+                **({"stop_reason": stop_reason} if stop_reason else {}),
+            },
             {"outcome": outcome},
             {},
         ):
@@ -191,11 +288,18 @@ class WebTools:
         self, result: dict[str, object], pages: list[dict[str, object]]
     ) -> bool:
         """Shorten only excerpts, keeping every returned source identity intact."""
+        minimum = {**result, "pages": [{**page, "text": ""} for page in pages]}
+        if len(_json(minimum)) > self.max_output_chars:
+            return False
         while len(_json(result)) > self.max_output_chars:
             page = max(pages, key=lambda item: len(str(item["text"])))
             text = str(page["text"])
             if not text:
                 return False
+            page.update(
+                truncated=True, more_content_available=True, stop_reason="output_limit"
+            )
+            self._limit_stops.add("output_limit")
             self._fit_excerpt(result, page, "text", text)
             if not page["text"] and page["outcome"] == "ok":
                 page["outcome"] = "limit_reached"
@@ -219,7 +323,15 @@ class WebTools:
         source[key] = text[:low]
         return True
 
-    def _get_browser(self) -> PageBrowser:
+    def _get_browser(self, *, rendered: bool = False) -> PageBrowser:
+        if rendered:
+            if self._render_browser is None:
+                self._render_browser = self._render_factory(
+                    self.runtime_dir,
+                    self.config.operation_timeout_seconds,
+                    self.config.max_chars_per_page,
+                )
+            return self._render_browser
         if self._browser is None:
             self._browser = self._factory(
                 self.runtime_dir,
@@ -236,20 +348,42 @@ class WebTools:
         if name != "read_web_pages" or not self.config.enabled:
             raise ValueError("unavailable web tool")
         urls = arguments.get("urls")
+        mode = arguments.get("render_mode", "static")
+        wait_for_text = arguments.get("wait_for_text")
         if (
-            set(arguments) != {"urls", "depth"}
+            not {"urls", "depth"} <= set(arguments)
+            or set(arguments) - {"urls", "depth", "render_mode", "wait_for_text"}
+            or mode not in ("static", "rendered")
+            or (mode == "static" and wait_for_text is not None)
+            or (
+                mode == "rendered"
+                and (
+                    not isinstance(wait_for_text, str)
+                    or not 1 <= len(wait_for_text.strip()) <= 200
+                )
+            )
             or arguments.get("depth") not in ("quick", "moderate")
             or not isinstance(urls, list)
             or not 1 <= len(urls) <= MAX_BATCH_URLS
         ):
             return self._error(
-                "invalid_input", "Use quick or moderate depth and 1–20 public URLs."
+                "invalid_input",
+                "Use quick/moderate depth and 1–20 public URLs; rendered mode requires 1–200 characters of expected visible text.",
             )
         try:
             for url in urls:
                 if not isinstance(url, str):
                     raise TypeError("URLs must be strings")
-                validate_public_url(url)
+                canonical = urldefrag(validate_public_url(url))[0]
+                if mode == "rendered" and (
+                    self._static_outcomes.get(canonical)
+                    not in {"ok", "extraction_failed"}
+                    or canonical in self._denied_urls
+                ):
+                    return self._error(
+                        "invalid_input",
+                        "Rendered reads require a prior static read of the same URL without an access block.",
+                    )
         except (ValueError, TypeError):
             return self._error(
                 "blocked", "Only public HTTP(S) URLs without credentials are allowed."
@@ -280,23 +414,43 @@ class WebTools:
             return self._error(
                 "limit_reached",
                 "Batch source identities exceed the runtime output allowance; use a smaller batch.",
+                stop_reason="output_limit",
             )
 
         for index, url in enumerate(urls):
             batch_chars = sum(len(str(page["text"])) for page in pages)
             evidence_left = self._remaining()["evidence_chars"] - batch_chars
             if not self._remaining()["pages"] or evidence_left <= 0:
+                stop = "evidence_limit" if evidence_left <= 0 else "page_limit"
+                self._limit_stops.add(stop)
+                result["stop_reason"] = stop
+                for pending in pages[index:]:
+                    pending["reason"] = stop
                 break
-            if self._worker_failed:
+            canonical = urldefrag(validate_public_url(url))[0]
+            if canonical in self._denied_urls:
+                pages[index]["reason"] = "previous_access_block"
+                continue
+            if (
+                self._render_worker_failed
+                if mode == "rendered"
+                else self._worker_failed
+            ):
                 pages[index]["reason"] = "worker_unavailable"
                 continue
             self._pages_used += 1
             try:
-                page = await self._get_browser().read(url)
+                browser = self._get_browser(rendered=mode == "rendered")
+                page = (
+                    await browser.read(url, wait_for_text=wait_for_text)
+                    if mode == "rendered"
+                    else await browser.read(url)
+                )
             except (OSError, RuntimeError, ValueError):
                 page = {"outcome": "unavailable", "reason": "Browser worker failed."}
             outcome = str(page.get("outcome", "extraction_failed"))
             text = str(page.get("text", "")) if outcome == "ok" else ""
+            original_length = len(text)
             text = text[: min(self.config.max_chars_per_page, evidence_left)]
             if outcome == "ok" and not text.strip():
                 outcome = "extraction_failed"
@@ -311,37 +465,77 @@ class WebTools:
             }
             if page.get("reason"):
                 candidate["reason"] = str(page["reason"])
+            if outcome == "ok":
+                candidate.update(extraction_metadata(page, text))
+                if original_length > len(text):
+                    candidate.update(
+                        truncated=True,
+                        more_content_available=True,
+                        stop_reason=(
+                            "evidence_limit"
+                            if evidence_left
+                            < min(original_length, self.config.max_chars_per_page)
+                            else "page_text_limit"
+                        ),
+                    )
+                self._render_timeouts += candidate["render_wait"] == "timeout"
+            else:
+                self._page_failures[canonical] = outcome
+            if mode == "static":
+                self._static_outcomes[canonical] = outcome
+            if outcome in {"blocked", "unsupported"}:
+                self._denied_urls.add(canonical)
+            elif outcome == "ok":
+                self._page_failures.pop(canonical, None)
             pages[index] = candidate
             result["remaining"] = self._remaining()
             self._access_failed |= outcome not in {"ok", "limit_reached"}
-            self._worker_failed |= (
-                outcome == "unavailable" or page.get("usable") is False
-            )
+            failed = outcome == "unavailable" or page.get("usable") is False
+            if mode == "rendered":
+                self._render_worker_failed |= failed
+            else:
+                self._worker_failed |= failed
             # Metadata is never clipped into a different source identity.
             if not self._fit_text(result, pages):
                 pages[index] = {
                     "requested_url": url,
-                    "url": url,
-                    "title": "",
+                    "url": candidate["url"],
+                    "title": candidate["title"],
                     "text": "",
                     "outcome": "limit_reached",
                     "reason": "source_metadata_exceeds_output",
                 }
+                self._limit_stops.add("output_limit")
                 if not self._fit_text(result, pages):
                     return self._error(
                         "limit_reached",
                         "Source metadata exceeds the runtime output allowance.",
+                        stop_reason="output_limit",
                     )
 
+        # Late stop reasons change serialized size. Fit the final envelope before
+        # charging evidence, reserving the longest possible aggregate outcome.
+        result["outcome"] = "extraction_failed"
+        result["remaining"] = self._remaining()
+        if not self._fit_text(result, pages):
+            return self._error(
+                "limit_reached",
+                "Final source metadata exceeds output allowance.",
+                stop_reason="output_limit",
+            )
         batch_chars = sum(len(str(page["text"])) for page in pages)
-        self._evidence_chars += batch_chars
-        self._has_evidence |= bool(batch_chars)
         outcomes = {page["outcome"] for page in pages}
         if outcomes == {"ok"}:
             result["outcome"] = "ok"
         elif "ok" in outcomes:
             result["outcome"] = "partial"
-        elif outcomes == {"unattempted"} and self._worker_failed:
+        elif outcomes == {"unattempted"} and any(
+            page.get("reason") == "previous_access_block" for page in pages
+        ):
+            result["outcome"] = "blocked"
+        elif outcomes == {"unattempted"} and (
+            self._render_worker_failed if mode == "rendered" else self._worker_failed
+        ):
             result["outcome"] = "unavailable"
         elif outcomes <= {"unattempted", "limit_reached"}:
             result["outcome"] = "limit_reached"
@@ -350,9 +544,19 @@ class WebTools:
         else:
             result["outcome"] = "partial"
         result["remaining"] = self._remaining()
+        result["remaining"]["evidence_chars"] -= batch_chars
         encoded = _json(result)
         if len(encoded) > self.max_output_chars:
-            return self._error("limit_reached", "Runtime output allowance exhausted.")
+            return self._error(
+                "limit_reached",
+                "Runtime output allowance exhausted.",
+                stop_reason="output_limit",
+            )
+        self._pages_read += sum(
+            page["outcome"] == "ok" and bool(page["text"]) for page in pages
+        )
+        self._evidence_chars += batch_chars
+        self._has_evidence |= bool(batch_chars)
         return encoded
 
     async def _search(self, arguments: dict[str, object]) -> str:
@@ -372,11 +576,22 @@ class WebTools:
         if arguments["depth"] == "moderate":
             self._limits = self.config.moderate
         if self._search_blocked:
-            return self._error("blocked", "Google search is blocked for this request.")
+            return self._error(
+                "blocked",
+                self._search_failure_reason
+                or "Google search is blocked for this request.",
+            )
         if self._worker_failed:
             return self._error("unavailable", "Browser worker is unavailable.")
         if not self._remaining()["queries"] or not self._remaining()["evidence_chars"]:
-            return self._error("limit_reached", "Search allowance exhausted.")
+            stop = (
+                "evidence_limit"
+                if not self._remaining()["evidence_chars"]
+                else "query_limit"
+            )
+            return self._error(
+                "limit_reached", "Search allowance exhausted.", stop_reason=stop
+            )
         result: dict[str, object] = {
             "outcome": "extraction_failed",
             "query": query,
@@ -384,7 +599,11 @@ class WebTools:
             "remaining": self._remaining(),
         }
         if len(_json(result)) > self.max_output_chars:
-            return self._error("limit_reached", "Query exceeds output allowance.")
+            return self._error(
+                "limit_reached",
+                "Query exceeds output allowance.",
+                stop_reason="output_limit",
+            )
         self._queries_used += 1
         try:
             response = await self._get_browser().search(
@@ -393,6 +612,9 @@ class WebTools:
         except (OSError, RuntimeError, ValueError):
             response = {"outcome": "unavailable"}
         outcome = response.get("outcome")
+        if outcome not in {"ok", "no_results"}:
+            self._search_failure = str(outcome)
+            self._search_failure_reason = str(response.get("reason", ""))[:512]
         if outcome not in {
             "ok",
             "no_results",

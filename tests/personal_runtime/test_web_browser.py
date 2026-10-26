@@ -150,7 +150,7 @@ def test_browser_worker_is_lazy_and_cleans_profile(
         worker = BrowserWorker(tmp_path, 1, 100, process_factory=factory)
         assert not calls
         page = await worker.read("https://example.com")
-        assert page == {
+        assert {k: page[k] for k in ("outcome", "title", "url", "text")} == {
             "outcome": "ok",
             "title": "A",
             "url": "https://example.com/",

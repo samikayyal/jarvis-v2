@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,154 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed)
         asyncio.run(scenario())
     finally:
         release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("headed", [False, True])
+def test_real_rendered_content_is_bounded_isolated_and_public_only(tmp_path, headed):
+    """Exercise the real protocol/Chrome/proxy, without relying on a live website."""
+    private_requests = []
+    cookies = []
+    rendering_started = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/private":
+                private_requests.append(self.path)
+            if self.path == "/started":
+                rendering_started.set()
+            if self.path == "/dynamic":
+                cookies.append(self.headers.get("Cookie"))
+            script = {
+                "/dynamic": "setTimeout(() => {document.getElementById('prices').innerText = 'E2 hourly USD 0.02';}, 350);",
+                "/private-fetch": f"fetch('http://127.0.0.1:{self.server.server_port}/private').catch(() => {{document.body.innerText = 'Private request denied';}});",
+                "/private-redirect": f"location.href = 'http://127.0.0.1:{self.server.server_port}/private';",
+                "/cancel": "fetch('/started');",
+            }.get(self.path, "")
+            content = (
+                "Verify you are human"
+                if self.path == "/challenge"
+                else "Loading pricing"
+            )
+            body = (
+                f"<html><title>Pricing fixture</title><body><main><h1>VM prices</h1>"
+                f"<div id='prices'>{content}</div></main><script>{script}</script></body></html>"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "fixture=visited; Path=/")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    entrypoint = tmp_path / "render_fixture_worker.py"
+    entrypoint.write_text(
+        "from jarvis_personal_runtime import web_worker as w\n"
+        "original = w.resolve_public_addresses\n"
+        "w.resolve_public_addresses = lambda host, port: "
+        "('127.0.0.1',) if host == 'fixture.example' else original(host, port)\n"
+        f"w.find_chromium = lambda: {os.environ['JARVIS_TEST_CHROMIUM_BINARY']!r}\n"
+        f"w.find_chromedriver = lambda: {os.environ['JARVIS_TEST_CHROMEDRIVER_BINARY']!r}\n"
+        "raise SystemExit(w.main())\n",
+        encoding="utf-8",
+    )
+
+    async def scenario():
+        groups = []
+        profiles = []
+
+        async def factory(*argv, **kwargs):
+            profiles.append(Path(argv[argv.index("--profile-dir") + 1]))
+            process = await asyncio.create_subprocess_exec(
+                *argv[: argv.index(sys.executable)],
+                sys.executable,
+                str(entrypoint),
+                *argv[argv.index("--profile-dir") :],
+                **kwargs,
+            )
+            groups.append(process.pid)
+            return process
+
+        before = browser_processes()
+        auth_before = set(Path(tempfile.gettempdir()).glob("xvfb-run.*"))
+        runtime = tmp_path / "runtime"
+        static = BrowserWorker(
+            runtime, 15, 8000, process_factory=factory, headed=headed
+        )
+        rendered = BrowserWorker(
+            runtime, 20, 8000, process_factory=factory, headed=headed, rendered=True
+        )
+        base = f"http://fixture.example:{server.server_port}"
+        try:
+            first = await static.read(base + "/dynamic#prices")
+            assert first["outcome"] == "ok", first
+            assert "E2 hourly" not in first["text"]
+            assert first["section_found"] is True
+            result = await rendered.read(
+                base + "/dynamic#prices", wait_for_text="E2 hourly"
+            )
+            assert result["outcome"] == "ok", result
+            assert "E2 hourly USD 0.02" in result["text"]
+            assert result["render_wait"] == "matched"
+            assert result["render_mode"] == "rendered"
+            assert result["source_chars"] == len(result["text"])
+            assert cookies == [None, None]  # Rendering never inherits static cookies.
+            missing = await static.read(base + "/dynamic#missing")
+            assert missing["section_found"] is False
+            assert (
+                "E2 hourly" not in missing["text"]
+            )  # Rendering did not enable static scripts.
+            denied = await rendered.read(
+                base + "/private-fetch", wait_for_text="Private request denied"
+            )
+            assert denied["outcome"] == "ok", denied
+            assert not private_requests
+            blocked = await rendered.read(
+                base + "/private-redirect", wait_for_text="private"
+            )
+            assert blocked["outcome"] == "blocked", blocked
+            assert not private_requests
+            challenge = await rendered.read(base + "/challenge", wait_for_text="hourly")
+            assert challenge["outcome"] == "blocked", challenge
+            start = time.monotonic()
+            pending = await rendered.read(base + "/never", wait_for_text="E2 hourly")
+            assert pending["outcome"] == "ok", pending
+            assert pending["render_wait"] == "timeout"
+            assert pending["stop_reason"] == "render_wait_timeout"
+            assert time.monotonic() - start < 21
+            task = asyncio.create_task(
+                rendered.read(base + "/cancel", wait_for_text="absent price")
+            )
+            assert await asyncio.to_thread(rendering_started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            await static.close()
+            await rendered.close()
+        assert all(not p.exists() for p in profiles)
+        assert all(not active_group_members(g) for g in groups)
+        for _ in range(30):
+            if not browser_processes() - before:
+                break
+            await asyncio.sleep(0.1)
+        assert not browser_processes() - before
+        assert not set(Path(tempfile.gettempdir()).glob("xvfb-run.*")) - auth_before
+
+    try:
+        asyncio.run(scenario())
+    finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
