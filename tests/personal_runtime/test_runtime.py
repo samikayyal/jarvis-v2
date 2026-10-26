@@ -143,14 +143,14 @@ async def test_status_reports_retained_context_and_resets_after_new_and_expiry()
         "Context: ~0 / 100,000 tokens (0.0% used; local estimate)" in empty.replies[0]
     )
     assert empty.status.context_used_tokens == 0
-    baseline = runner.context_tokens(system_prompt=runtime.system_prompt)
+    baseline = runner.context_tokens(system_prompt=runtime.request_instructions)
 
     await runtime.receive(inbound("request", "Remember this conversation."))
-    used = runner.context_tokens(system_prompt=runtime.system_prompt)
+    used = runner.context_tokens(system_prompt=runtime.request_instructions)
     assert used > baseline
     assert used == local_input_tokens(
         {
-            "instructions": "Help the operator.",
+            "instructions": runtime.request_instructions,
             "tools": [],
             "input": [
                 {"role": "user", "content": "Remember this conversation."},
@@ -162,7 +162,7 @@ async def test_status_reports_retained_context_and_resets_after_new_and_expiry()
     assert status.status.context_used_tokens == used
     assert f"Context: ~{used:,} / 100,000 tokens" in status.replies[0]
     assert responses.calls == 1
-    assert runner.context_tokens(system_prompt=runtime.system_prompt) == used
+    assert runner.context_tokens(system_prompt=runtime.request_instructions) == used
 
     await runtime.receive(inbound("reset", "/new"))
     assert runtime.status().context_used_tokens == baseline
@@ -527,7 +527,9 @@ async def test_restart_discards_session_work_and_persists_message_ids(
     assert (await first.receive(inbound("durable-id", "hello"))).disposition == (
         "approval_required"
     )
-    assert first_runner.system_prompts == ["System instructions.\n"]
+    assert first_runner.system_prompts[0].startswith(
+        "System instructions.\n\n## Runtime context"
+    )
     before_restart = first.status()
     assert before_restart.session_id is not None
     assert before_restart.model == "gpt-6-astra"

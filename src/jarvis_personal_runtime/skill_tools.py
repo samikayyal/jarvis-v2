@@ -32,7 +32,6 @@ _TOOL_GROUPS = {
             "google_calendar_update",
         }
     ),
-    "terminal": frozenset({"run_terminal"}),
     "reminders": frozenset(
         {"create_reminder", "list_reminders", "edit_reminder", "cancel_reminder"}
     ),
@@ -127,7 +126,8 @@ class SkillTools:
         )
         return (
             "## Skills\n"
-            "Call load_skill before using a domain's tools. Load multiple skills when "
+            "Call load_skill for the domains listed below. Tools already exposed, "
+            "including run_terminal, need no skill load. Load multiple skills when "
             "needed. Loaded instructions and tools remain available until the working "
             "session ends. Loading a skill does not authorize an action. Only exposed "
             "tools are available; a skill may describe optional operations.\n"

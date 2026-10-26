@@ -18,6 +18,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import LoadedRuntimeConfig
 from .runtime import InboundText, PersonalRuntime, RuntimeResult, RuntimeTrace
+from .whatsapp_format import format_whatsapp
 
 
 def _required_text(value: str, name: str) -> str:
@@ -346,7 +347,12 @@ class OpenWAMessageFlow:
         chunks = tuple(
             chunk
             for reply in result.replies
-            for chunk in split_text(reply, self.settings.max_text_characters)
+            for chunk in split_text(
+                format_whatsapp(reply)
+                if result.disposition.value in {"completed", "incomplete", "rejected"}
+                else reply,
+                self.settings.max_text_characters,
+            )
         )
         outbound_ids: list[str] = []
         for chunk in chunks:
@@ -447,7 +453,8 @@ def split_text(text: str, limit: int) -> tuple[str, ...]:
         window = remaining[: limit + 1]
         newline = window.rfind("\n", 0, limit + 1)
         space = window.rfind(" ", 0, limit + 1)
-        split_at = max(newline, space)
+        paragraph = window.rfind("\n\n", 0, limit + 1)
+        split_at = paragraph if paragraph > 0 else newline if newline > 0 else space
         if split_at <= 0:
             split_at = limit
             chunks.append(remaining[:split_at])

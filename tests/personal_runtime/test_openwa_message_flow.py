@@ -17,7 +17,12 @@ from jarvis_personal_runtime.openwa import (
     OpenWASettings,
     WebhookDisposition,
 )
-from jarvis_personal_runtime.runtime import Completed, PersonalRuntime
+from jarvis_personal_runtime.runtime import (
+    ApprovalRequired,
+    Completed,
+    PendingAction,
+    PersonalRuntime,
+)
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
 SESSION_ID = "7316be1d-38d8-47c1-9d58-374f456b9629"
@@ -185,6 +190,42 @@ def test_reply_chunks_are_sent_once_each_in_deterministic_order() -> None:
         ]
         assert outcomes[0].outbound_ids == ("outbound-1", "outbound-2")
         assert outcomes[0].delivery is DeliveryDisposition.SENT
+
+    asyncio.run(scenario())
+
+
+def test_final_prose_is_formatted_but_approval_payload_is_exact() -> None:
+    class Runner:
+        async def run(self, text, **kwargs):
+            if text == "approval":
+                return ApprovalRequired(
+                    PendingAction(
+                        "ubuntu", "echo", "Run: **literal**\n## file content"
+                    ),
+                    object(),
+                )
+            return Completed("## Result\n**Done**. [Source](https://example.org)")
+
+    async def scenario():
+        for body, expected in (
+            ("answer", "*Result*\n*Done*. Source (https://example.org)"),
+            (
+                "approval",
+                "Run: **literal**\n## file content\nReply 1 to approve once, 2 to save permission, or 9 to reject.",
+            ),
+        ):
+            sender = _RecordingSender()
+            flow = OpenWAMessageFlow(
+                settings=_settings(),
+                signing_secret=SECRET,
+                runtime=PersonalRuntime(request_runner=Runner(), clock=_Clock()),
+                sender=sender,
+                clock=_Clock(),
+            )
+            raw_body = _event(body=body)
+            flow.receive_webhook(raw_body, _headers(raw_body))
+            await flow.drain()
+            assert sender.sent == [(OPERATOR, expected)]
 
     asyncio.run(scenario())
 

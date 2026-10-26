@@ -115,10 +115,12 @@ _Avoid_: Arbitrary capability, connector framework
 **Runtime skill**:
 A packaged set of trusted operating instructions and an explicit group of existing
 prepared tools. The model initially sees a short catalog and `load_skill`; loading
-`obsidian`, `google`, `terminal`, `reminders`, or `web` exposes only that group's configured
+`obsidian`, `google`, `reminders`, or `web` exposes only that group's configured
 tools and adds its instructions for the working session. Loading grants no action
 approval. New sessions discard all loaded skills. Unmapped manifest-selected tools
-retain their existing visibility and approval contracts.
+retain their existing visibility and approval contracts. `run_terminal` is always
+exposed, with operating guidance in `SYSTEM.md`; it requires no skill load and
+keeps its existing command approval rules.
 _Avoid_: New permission, arbitrary plugin, executable Markdown
 
 **Knowledge vault**:
