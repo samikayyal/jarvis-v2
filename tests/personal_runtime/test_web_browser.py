@@ -399,7 +399,7 @@ class _SignalDriver(_Driver):
     def execute_script(self, script: str) -> object:
         if "contentType" in script:
             return "text/html"
-        if "password:" in script:
+        if "challenge:" in script:
             return {
                 "password": self.password,
                 "challenge": self.challenge,
@@ -440,7 +440,7 @@ class _SearchDriver(_Driver):
     def execute_script(self, script):
         if "contentType" in script:
             return "text/html"
-        if "password:" in script:
+        if "challenge:" in script:
             return {
                 "password": False,
                 "challenge": self.state == "captcha",
@@ -580,9 +580,9 @@ def test_browser_worker_search_timeout_is_terminal(tmp_path):
 
 @pytest.mark.parametrize(
     ("password", "challenge", "outcome"),
-    [(True, False, "unsupported"), (False, True, "blocked")],
+    [(True, False, "ok"), (False, True, "blocked")],
 )
-def test_reader_discloses_auth_and_challenge_boundaries(
+def test_reader_allows_login_widgets_but_stops_challenges(
     tmp_path: Path, password: bool, challenge: bool, outcome: str
 ) -> None:
     from jarvis_personal_runtime.web_worker import SeleniumPageReader

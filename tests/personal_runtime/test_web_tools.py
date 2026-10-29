@@ -552,7 +552,10 @@ def test_cleanup_survives_a_second_cancellation(tmp_path):
     asyncio.run(scenario())
 
 
-def test_evidence_is_shortened_inside_valid_json_with_source_identity(tmp_path):
+@pytest.mark.parametrize("capacity", [800, 1000])
+def test_evidence_is_shortened_inside_valid_json_with_source_identity(
+    tmp_path, capacity
+):
     class LongBrowser(Browser):
         async def read(self, url):
             return {
@@ -568,7 +571,10 @@ def test_evidence_is_shortened_inside_valid_json_with_source_identity(tmp_path):
         max_total_evidence_chars=600,
     )
     tool = WebTools(
-        config, runtime_dir=tmp_path, max_output_chars=800, browser_factory=LongBrowser
+        config,
+        runtime_dir=tmp_path,
+        max_output_chars=capacity,
+        browser_factory=LongBrowser,
     )
     raw = asyncio.run(
         tool.execute(
@@ -579,13 +585,21 @@ def test_evidence_is_shortened_inside_valid_json_with_source_identity(tmp_path):
             },
         )
     )
-    assert len(raw) <= 800
+    assert len(raw) <= capacity
     result = json.loads(raw)
+    if capacity == 800:
+        # Both sources' full extraction metadata requires more than 800 chars
+        # even with empty text. Reject explicitly instead of dropping metadata.
+        assert result["outcome"] == "limit_reached"
+        assert result["stop_reason"] == "output_limit"
+        assert tool._remaining()["evidence_chars"] == 600
+        return
     assert [page["url"] for page in result["pages"]] == [
         "https://example.com/a",
         "https://example.com/b",
     ]
     assert all(page["title"] == 'A "quoted" source' for page in result["pages"])
+    assert all(page["extraction_method"] == "body_prefix" for page in result["pages"])
     evidence = sum(len(page["text"]) for page in result["pages"])
     assert 0 < evidence <= 600
     assert result["remaining"]["evidence_chars"] == 600 - evidence

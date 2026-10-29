@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .web_browser import PublicUrlError, is_public_address, validate_public_url
+from .web_evidence import is_access_challenge
 
 
 class PublicNetworkError(RuntimeError):
@@ -654,27 +655,8 @@ class SeleniumPageReader:
             ).casefold()
             if content_type not in {"text/html", "application/xhtml+xml", ""}:
                 return self._result("unsupported", final_url, reason="page is not HTML")
-            signals = self.driver.execute_script(
-                """
-                return {
-                    password: Boolean(document.querySelector(
-                        'input[type="password"], input[name*="password" i]'
-                    )),
-                    challenge: Boolean(document.querySelector(
-                        '.g-recaptcha, #captcha, [data-sitekey], '
-                        + 'iframe[src*="captcha" i], iframe[src*="challenge" i]'
-                    )),
-                    body: document.body ? document.body.innerText : ''
-                };
-                """
-            )
+            signals = self._page_state()
             if isinstance(signals, dict):
-                if bool(signals.get("password")):
-                    return self._result(
-                        "unsupported",
-                        final_url,
-                        reason="authenticated pages are unsupported",
-                    )
                 if bool(signals.get("challenge")):
                     return self._result(
                         "blocked", final_url, reason="page contains an access challenge"
@@ -692,24 +674,8 @@ class SeleniumPageReader:
                     final_url,
                     reason="visible text was unavailable",
                 )
-            lowered = text.casefold()
-            challenge_markers = (
-                "verify you are human",
-                "checking your browser",
-                "challenge required",
-                "access denied",
-                "unusual traffic",
-                "cf-chl-",
-            )
-            if search:
-                # Search snippets can quote challenge messages. The structured
-                # extractor distinguishes sources from Google's interstitials.
-                challenge_markers = ()
-            lowered_title = title.casefold()
-            if any(
-                marker in lowered or marker in lowered_title
-                for marker in challenge_markers
-            ):
+            # Google's structured extractor handles snippets quoting challenges.
+            if not search and is_access_challenge(text, title):
                 return self._result(
                     "blocked", final_url, reason="page contains an access challenge"
                 )
@@ -779,25 +745,27 @@ class SeleniumPageReader:
             )
         )
 
+    def _page_state(self) -> dict:
+        return self.driver.execute_script("""
+            return {body: document.body ? document.body.innerText : '',
+                title: document.title || '',
+                challenge: Array.from(document.querySelectorAll(
+                    '.g-recaptcha, #captcha, #challenge-form, '
+                    + 'iframe[src*="captcha" i], iframe[src*="challenge" i]'
+                )).some(node => node.getClientRects().length > 0)};
+        """)
+
     def _wait_for_text(self, expected: str, deadline: float) -> str:
         """Poll visible content only; no clicks, challenges, or network-idle waits."""
         needle = expected.strip().casefold()
         while True:
-            state = self.driver.execute_script("""
-                return {body: document.body ? document.body.innerText : '',
-                    stop: Boolean(document.querySelector('input[type="password"], '
-                        + '.g-recaptcha, #captcha, [data-sitekey], '
-                        + 'iframe[src*="captcha" i], iframe[src*="challenge" i]'))};
-            """)
+            state = self._page_state()
             if isinstance(state, dict):
                 body = str(state.get("body", "")).casefold()
-                if state.get("stop") or any(
-                    marker in body
-                    for marker in (
-                        "verify you are human",
-                        "checking your browser",
-                        "unusual traffic",
-                    )
+                if is_access_challenge(
+                    body,
+                    str(state.get("title", "")),
+                    challenge=bool(state.get("challenge")),
                 ):
                     return "timeout"  # Normal access checks classify the challenge.
                 if needle in body:

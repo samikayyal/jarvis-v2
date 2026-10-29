@@ -133,7 +133,7 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed)
             existing_browsers = browser_processes()
             display_auth_dirs = set(Path(tempfile.gettempdir()).glob("xvfb-run.*"))
             worker = BrowserWorker(
-                runtime, 20, 1000, process_factory=factory, headed=headed
+                runtime, 30, 1000, process_factory=factory, headed=headed
             )
             try:
                 result = await worker.read(
@@ -192,6 +192,7 @@ def test_real_rendered_content_is_bounded_isolated_and_public_only(tmp_path, hea
                 cookies.append(self.headers.get("Cookie"))
             script = {
                 "/dynamic": "setTimeout(() => {document.getElementById('prices').innerText = 'E2 hourly USD 0.02';}, 350);",
+                "/login-widget": "setTimeout(() => {document.getElementById('prices').innerText = 'Public documentation ready';}, 350);",
                 "/private-fetch": f"fetch('http://127.0.0.1:{self.server.server_port}/private').catch(() => {{document.body.innerText = 'Private request denied';}});",
                 "/private-redirect": f"location.href = 'http://127.0.0.1:{self.server.server_port}/private';",
                 "/cancel": "fetch('/started');",
@@ -203,7 +204,14 @@ def test_real_rendered_content_is_bounded_isolated_and_public_only(tmp_path, hea
             )
             body = (
                 f"<html><title>Pricing fixture</title><body><main><h1>VM prices</h1>"
-                f"<div id='prices'>{content}</div></main><script>{script}</script></body></html>"
+                f"<div id='prices'>{content}</div></main>"
+                + (
+                    "<input type='password'><p>Public documentation discusses access denied errors.</p>"
+                    "<div class='g-recaptcha' hidden></div>"
+                    if self.path == "/login-widget"
+                    else ""
+                )
+                + f"<script>{script}</script></body></html>"
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -252,8 +260,10 @@ def test_real_rendered_content_is_bounded_isolated_and_public_only(tmp_path, hea
         before = browser_processes()
         auth_before = set(Path(tempfile.gettempdir()).glob("xvfb-run.*"))
         runtime = tmp_path / "runtime"
+        # Cold Chrome startup on the deployment host can take almost 15 seconds
+        # even with the unchanged production worker; allow startup headroom.
         static = BrowserWorker(
-            runtime, 15, 8000, process_factory=factory, headed=headed
+            runtime, 30, 8000, process_factory=factory, headed=headed
         )
         rendered = BrowserWorker(
             runtime, 20, 8000, process_factory=factory, headed=headed, rendered=True
@@ -273,6 +283,14 @@ def test_real_rendered_content_is_bounded_isolated_and_public_only(tmp_path, hea
             assert result["render_mode"] == "rendered"
             assert result["source_chars"] == len(result["text"])
             assert cookies == [None, None]  # Rendering never inherits static cookies.
+            public = await static.read(base + "/login-widget")
+            assert public["outcome"] == "ok", public
+            assert "discusses access denied errors" in public["text"]
+            public_rendered = await rendered.read(
+                base + "/login-widget", wait_for_text="Public documentation ready"
+            )
+            assert public_rendered["outcome"] == "ok", public_rendered
+            assert public_rendered["render_wait"] == "matched"
             missing = await static.read(base + "/dynamic#missing")
             assert missing["section_found"] is False
             assert (

@@ -1,6 +1,6 @@
 # How Jarvis web search works
 
-Prepared on **26 October 2026** from the current local implementation.
+Prepared on **26 October 2026**, updated **29 October 2026** for the web-search simplification.
 
 Jarvis searches the public web by driving a real Chrome/Chromium browser with **Selenium**, opening Google's search page, parsing recognized organic result cards with **BeautifulSoup**, and optionally opening selected source pages to extract their visible text. The model chooses queries and sources and writes the answer; Python code controls browser access, validates destinations, enforces allowances, and returns structured evidence.
 
@@ -110,7 +110,7 @@ The result is a JSON string with an `outcome`, the `query`, a `results` list, an
 
 | Argument | Meaning |
 | --- | --- |
-| `urls` | Between one and 20 URLs in the interface; actual network work remains constrained by the remaining page allowance. |
+| `urls` | Between one and five URLs per call; actual network work remains constrained by the remaining page allowance. |
 | `depth` | `quick` or `moderate`, sharing the same request state as searches. |
 | `render_mode` | `static` for the initial read; `rendered` for an eligible explicit follow-up. |
 | `wait_for_text` | `null` for static reads; a nonempty expected visible string of at most 200 characters for rendered reads. |
@@ -119,7 +119,7 @@ The strict model-facing schema requires all four fields. The Python dispatcher a
 
 The result contains a `pages` list and remaining allowances. Each page preserves its requested URL and resulting URL so the model can distinguish a redirect from the original request. Every URL is validated before the batch starts. Source identities for the whole batch must fit in the output envelope before network work begins.
 
-Listing 20 URLs does not authorize 20 reads. With the default moderate allowance, only five page attempts are available. Entries that cannot be attempted remain explicitly `unattempted` rather than disappearing from the result.
+Listing five URLs does not reset the request allowance. With the default moderate allowance, only five page attempts are available across calls. Entries that cannot be attempted remain explicitly `unattempted` rather than disappearing from the result.
 
 Neither tool lets the model execute arbitrary JavaScript, click arbitrary controls, submit forms, log in, or operate a general browser UI.
 
@@ -194,7 +194,7 @@ For an ordinary static read, the worker:
 5. Navigates to the requested URL.
 6. Checks the final URL and whether the top-level destination was denied by the proxy.
 7. Examines `document.contentType`; HTML and XHTML are supported, while non-HTML content is rejected. An empty reported content type is tolerated by this check.
-8. Checks for password controls, CAPTCHA/challenge elements, and recognizable blocking text.
+8. Checks for visible CAPTCHA/challenge elements and narrowly recognized challenge interstitial text. Public text alongside a login widget is allowed; no credentials are entered.
 9. Reads the title and `document.body.innerText`.
 10. Returns the beginning of that text, bounded by `max_chars_per_page`, plus metadata describing the extraction.
 
@@ -411,7 +411,7 @@ Four distinct restrictions can shorten or limit evidence:
 
 `page_limit` and `query_limit` separately explain why additional operations cannot start.
 
-The JSON output cap matters because escaping and metadata consume space too. `_fit_excerpt()` uses a binary search to find the longest text prefix whose **serialized JSON** fits. `_fit_text()` reduces page excerpts, marks truncation, and preserves source identities. If metadata alone cannot fit, the adapter returns a bounded limit result instead of silently cutting a URL into a different identity.
+The JSON output cap matters because escaping and metadata consume space too. `_json_prefix()` fits text by each character's escaped JSON cost. `_fit_text()` reserves metadata once and distributes remaining space across excerpts, preserving source identities and complete small excerpts. Clipped excerpts carry output-limit metadata. If metadata alone cannot fit, the adapter returns a bounded limit result instead of silently cutting a URL into a different identity.
 
 For batches, fitting reserves entries for unread sources, revisits the final envelope after stop reasons are added, and charges the text actually returned. Search fitting similarly keeps accepted source identities intact and may omit later sources when the remaining capacity is insufficient.
 
@@ -437,7 +437,7 @@ Not every outcome appears identically at every layer. In particular, `_search()`
 
 ### Blocking stops further Google searches
 
-When a search returns `blocked`, `_search_blocked` latches for the remainder of the ordinary request. Additional search calls return a blocking result without making another Google request. The model is instructed not to solve challenges, silently retry, or wait for human challenge completion.
+When a search returns `blocked`, the recorded search failure stops further searches for the remainder of the ordinary request. Additional search calls return a blocking result without making another Google request. The model is instructed not to solve challenges, silently retry, or wait for human challenge completion.
 
 A Google search block does not automatically prohibit appropriate known public source URLs. Direct page reading can still work if its browser remains usable and page allowance remains. A dead static/search worker is a different condition and prevents further operations through that worker.
 
@@ -451,7 +451,7 @@ If access failed and no usable evidence exists, the notice states that current w
 
 This mechanism helps prevent the final answer from hiding a failed operation. It does not automatically verify every sentence or generate all citations. The model still has to connect claims to the returned evidence, explain important gaps, and disclose relevant per-page truncation.
 
-Failure history is conservative: an earlier access failure can remain recorded even if later work succeeds. The disclosure is a report of the request's coverage history, not a fresh health check of every source.
+Search failure history is conservative. Page failures are keyed by canonical URL and cleared by a successful reread of that URL; resolved page failures no longer produce a stale access-failure notice. Static and rendered worker availability remain separate.
 
 ## 14. Request lifecycle and follow-ups
 
@@ -545,7 +545,7 @@ The implementation is useful for bounded public research, but its current extrac
 - It can encounter Google CAPTCHA, consent, or traffic blocks. Headed mode does not eliminate them, and the tool does not infer an IP-reputation cause without diagnostic evidence.
 - It reads a visible body prefix. It does not retrieve arbitrary sections, continue at an offset, or automatically extract the most relevant paragraph.
 - It can wait for dynamic text, but cannot operate region selectors, tabs, calculators, login flows, or other interactive controls.
-- Password/challenge detection is heuristic. A public page with a password field or challenge-like wording can be rejected conservatively.
+- Challenge detection is heuristic. Static extraction and rendered waiting share the same narrow checks: visible CAPTCHA elements, exact challenge titles, or a recognized opening line in a short interstitial. Long articles and ordinary prose discussing access errors are readable, as is anonymous public text alongside a password field.
 - PDFs, downloads, authenticated pages, and general browser automation are outside the prepared tool's scope.
 - Repeated reads consume allowances, and output capacity can truncate evidence before the total evidence ceiling is reached.
 - Citation quality, source selection, and semantic correctness still require the model to use the evidence carefully.

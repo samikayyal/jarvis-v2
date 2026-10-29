@@ -14,7 +14,7 @@ from .config import WebSearchConfig
 from .web_evidence import extraction_metadata
 from .web_search import MAX_QUERY_LENGTH
 
-MAX_BATCH_URLS = 20
+MAX_BATCH_URLS = 5
 UNAVAILABLE_NOTICE = (
     "Web access is unavailable for this request; I could not verify current web evidence. "
     "Any answer below is based on existing knowledge, not current web verification."
@@ -49,6 +49,17 @@ def _browser(
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_prefix(text: str, capacity: int) -> str:
+    """Fit a prefix by escaped character cost, without repeated envelope encoding."""
+    if len(_json(text)) - 2 <= capacity:
+        return text
+    for index, character in enumerate(text):
+        capacity -= len(_json(character)) - 2
+        if capacity < 0:
+            return text[:index]
+    return text
 
 
 class WebTools:
@@ -149,18 +160,15 @@ class WebTools:
         self._limits = self.config.quick
         self._pages_used = 0
         self._queries_used = 0
-        self._search_blocked = False
         self._empty_search = False
         self._evidence_chars = 0
-        self._access_failed = False
         self._has_evidence = False
         self._worker_failed = False
         self._render_worker_failed = False
         self._static_outcomes: dict[str, str] = {}
         self._denied_urls: set[str] = set()
         self._page_failures: dict[str, str] = {}
-        self._search_failure = ""
-        self._search_failure_reason = ""
+        self._search_failure: dict[str, str] = {}
         self._pages_read = 0
         self._limit_stops: set[str] = set()
         self._render_timeouts = 0
@@ -190,8 +198,9 @@ class WebTools:
                 raise asyncio.CancelledError
 
     def finish_answer(self, text: str) -> str:
+        access_failed = bool(self._search_failure or self._page_failures)
         if (
-            not self._access_failed
+            not access_failed
             and not self._limit_stops
             and not self._render_timeouts
             and not (self._empty_search and not self._has_evidence)
@@ -204,7 +213,7 @@ class WebTools:
                     "blocked": "Google search was blocked.",
                     "timeout": "Google search timed out.",
                     "extraction_failed": "Google search results could not be extracted.",
-                }.get(self._search_failure, "Google search was unavailable.")
+                }.get(self._search_failure["outcome"], "Google search was unavailable.")
             )
         if self._page_failures:
             counts = {
@@ -234,9 +243,9 @@ class WebTools:
             facts.append(
                 "Requested dynamic content did not appear before the rendering wait ended."
             )
-        if self._access_failed and not self._has_evidence:
+        if access_failed and not self._has_evidence:
             facts.insert(0, UNAVAILABLE_NOTICE)
-        elif self._access_failed:
+        elif access_failed:
             facts.append("Web coverage is incomplete.")
         elif self._empty_search and not self._has_evidence:
             facts.insert(0, EMPTY_NOTICE)
@@ -287,40 +296,43 @@ class WebTools:
     def _fit_text(
         self, result: dict[str, object], pages: list[dict[str, object]]
     ) -> bool:
-        """Shorten only excerpts, keeping every returned source identity intact."""
-        minimum = {**result, "pages": [{**page, "text": ""} for page in pages]}
-        if len(_json(minimum)) > self.max_output_chars:
-            return False
-        while len(_json(result)) > self.max_output_chars:
-            page = max(pages, key=lambda item: len(str(item["text"])))
-            text = str(page["text"])
-            if not text:
-                return False
+        """Allocate output space once, retaining metadata for every source."""
+        if len(_json(result)) <= self.max_output_chars:
+            return True
+        excerpts = [(page, dict(page)) for page in pages if page["text"]]
+        for page, _ in excerpts:
             page.update(
-                truncated=True, more_content_available=True, stop_reason="output_limit"
+                text="",
+                outcome="limit_reached",
+                truncated=True,
+                more_content_available=True,
+                stop_reason="output_limit",
             )
-            self._limit_stops.add("output_limit")
-            self._fit_excerpt(result, page, "text", text)
-            if not page["text"] and page["outcome"] == "ok":
-                page["outcome"] = "limit_reached"
+        self._limit_stops.add("output_limit")
+        capacity = self.max_output_chars - len(_json(result))
+        if capacity < 0:
+            return False
+        for index, (page, original) in enumerate(excerpts):
+            share = capacity // (len(excerpts) - index)
+            empty_size = len(_json(page))
+            if len(_json(original)) - empty_size <= share:
+                page.clear()
+                page.update(original)
+            else:
+                page["text"] = _json_prefix(str(original["text"]), share)
+                if page["text"]:
+                    page["outcome"] = original["outcome"]
+            capacity -= len(_json(page)) - empty_size
         return True
 
     def _fit_excerpt(
         self, result: dict[str, object], source: dict, key: str, text: str
     ) -> bool:
-        """Keep the longest excerpt whose escaped JSON fits, or reject metadata."""
         source[key] = ""
-        if len(_json(result)) > self.max_output_chars:
+        capacity = self.max_output_chars - len(_json(result))
+        if capacity < 0:
             return False
-        low, high = 0, len(text)
-        while low < high:
-            middle = (low + high + 1) // 2
-            source[key] = text[:middle]
-            if len(_json(result)) <= self.max_output_chars:
-                low = middle
-            else:
-                high = middle - 1
-        source[key] = text[:low]
+        source[key] = _json_prefix(text, capacity)
         return True
 
     def _get_browser(self, *, rendered: bool = False) -> PageBrowser:
@@ -368,7 +380,7 @@ class WebTools:
         ):
             return self._error(
                 "invalid_input",
-                "Use quick/moderate depth and 1–20 public URLs; rendered mode requires 1–200 characters of expected visible text.",
+                "Use quick/moderate depth and 1–5 public URLs; rendered mode requires 1–200 characters of expected visible text.",
             )
         try:
             for url in urls:
@@ -489,30 +501,11 @@ class WebTools:
                 self._page_failures.pop(canonical, None)
             pages[index] = candidate
             result["remaining"] = self._remaining()
-            self._access_failed |= outcome not in {"ok", "limit_reached"}
             failed = outcome == "unavailable" or page.get("usable") is False
             if mode == "rendered":
                 self._render_worker_failed |= failed
             else:
                 self._worker_failed |= failed
-            # Metadata is never clipped into a different source identity.
-            if not self._fit_text(result, pages):
-                pages[index] = {
-                    "requested_url": url,
-                    "url": candidate["url"],
-                    "title": candidate["title"],
-                    "text": "",
-                    "outcome": "limit_reached",
-                    "reason": "source_metadata_exceeds_output",
-                }
-                self._limit_stops.add("output_limit")
-                if not self._fit_text(result, pages):
-                    return self._error(
-                        "limit_reached",
-                        "Source metadata exceeds the runtime output allowance.",
-                        stop_reason="output_limit",
-                    )
-
         # Late stop reasons change serialized size. Fit the final envelope before
         # charging evidence, reserving the longest possible aggregate outcome.
         result["outcome"] = "extraction_failed"
@@ -575,10 +568,10 @@ class WebTools:
             )
         if arguments["depth"] == "moderate":
             self._limits = self.config.moderate
-        if self._search_blocked:
+        if self._search_failure.get("outcome") == "blocked":
             return self._error(
                 "blocked",
-                self._search_failure_reason
+                self._search_failure.get("reason")
                 or "Google search is blocked for this request.",
             )
         if self._worker_failed:
@@ -613,8 +606,10 @@ class WebTools:
             response = {"outcome": "unavailable"}
         outcome = response.get("outcome")
         if outcome not in {"ok", "no_results"}:
-            self._search_failure = str(outcome)
-            self._search_failure_reason = str(response.get("reason", ""))[:512]
+            self._search_failure = {
+                "outcome": str(outcome),
+                "reason": str(response.get("reason", ""))[:512],
+            }
         if outcome not in {
             "ok",
             "no_results",
@@ -623,7 +618,6 @@ class WebTools:
             "unavailable",
         }:
             outcome = "unavailable" if outcome == "timeout" else "extraction_failed"
-        self._search_blocked |= outcome == "blocked"
         self._worker_failed |= (
             outcome == "unavailable" or response.get("usable") is False
         )
@@ -652,11 +646,7 @@ class WebTools:
                 )
         if outcome == "ok" and not sources:
             outcome = "extraction_failed"
-        self._access_failed |= outcome in {
-            "blocked",
-            "extraction_failed",
-            "unavailable",
-        }
+            self._search_failure = {"outcome": outcome, "reason": "No valid sources"}
         self._empty_search |= outcome == "no_results"
         # Reserve the longest possible outcome while fitting sources.
         result.update(outcome="extraction_failed", results=[])

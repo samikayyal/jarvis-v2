@@ -7,7 +7,26 @@ from dataclasses import replace
 import pytest
 
 from jarvis_personal_runtime.config import WebSearchConfig
+from jarvis_personal_runtime.web_evidence import is_access_challenge
 from jarvis_personal_runtime.web_tools import WebTools
+
+
+@pytest.mark.parametrize(
+    ("body", "title", "challenge", "blocked"),
+    [
+        ("Verify you are human", "", False, True),
+        ("Please wait", "Access denied", False, True),
+        ("Cloudflare\nChecking your browser...\nPlease wait", "", False, True),
+        ("Public article about access denied errors.", "Documentation", False, False),
+        ("How to resolve access denied\nUse these steps", "Guide", False, False),
+        ("Verify you are human\n" + "Article prose. " * 200, "Guide", False, False),
+        ("Public text", "", True, True),
+    ],
+)
+def test_challenge_detection_distinguishes_interstitials_from_prose(
+    body, title, challenge, blocked
+):
+    assert is_access_challenge(body, title, challenge=challenge) is blocked
 
 
 class Pages:
@@ -239,7 +258,7 @@ def test_final_limit_metadata_never_charges_omitted_evidence(tmp_path, capacity)
         raw = await tool.execute(
             "read_web_pages",
             {
-                "urls": ["https://example.com/a"] * 6,
+                "urls": ["https://example.com/a"] * 5,
                 "depth": "moderate",
             },
         )
@@ -249,6 +268,49 @@ def test_final_limit_metadata_never_charges_omitted_evidence(tmp_path, capacity)
         assert tool._remaining()["evidence_chars"] == 48000 - returned
         if "remaining" in result:
             assert result["remaining"]["evidence_chars"] == 48000 - returned
+        await tool.close_request()
+
+    asyncio.run(scenario())
+
+
+def test_oversized_batch_is_rejected_before_browser_work(tmp_path):
+    browser = Pages()
+    tool = make_tool(tmp_path, browser)
+    result = asyncio.run(read(tool, ["https://example.com/a"] * 6))
+    assert result["outcome"] == "invalid_input"
+    assert not browser.calls
+    assert tool._remaining()["pages"] == 2
+
+
+def test_output_fitting_retains_complete_small_source_metadata(tmp_path):
+    tool = make_tool(tmp_path, Pages(), output=600)
+    small = {
+        "text": "Complete",
+        "outcome": "ok",
+        "url": "https://example.com/a",
+        "truncated": False,
+        "more_content_available": False,
+    }
+    large = {"text": '"\\\n' * 2000, "outcome": "ok", "url": "https://example.com/b"}
+    original = dict(small)
+    result = {"pages": [small, large]}
+    assert tool._fit_text(result, result["pages"])
+    assert small == original
+    assert large["truncated"] is True
+    assert large["stop_reason"] == "output_limit"
+    assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) <= 600
+
+
+def test_successful_reread_clears_resolved_page_failure_notice(tmp_path):
+    async def scenario():
+        browser = Pages(outcome="extraction_failed")
+        tool = make_tool(tmp_path, browser)
+        url = "https://example.com/a"
+        await read(tool, [url])
+        assert "could not verify" in tool.finish_answer("No evidence")
+        browser.outcome = "ok"
+        await read(tool, [url])
+        assert tool.finish_answer("Verified excerpt") == "Verified excerpt"
         await tool.close_request()
 
     asyncio.run(scenario())

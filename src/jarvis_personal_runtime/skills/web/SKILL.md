@@ -18,16 +18,18 @@ continuations do not reset the ordinary request's budget.
 Clear organic result snippets can support a quick answer. Use `read_web_pages`
 for selected public HTTP(S) sources when snippets are insufficient, preferring
 relevant primary sources. Read a bounded batch sequentially in the same browser.
-Start with one or two high-value pages, inspect the returned evidence, and choose
-the next source to fill a specific gap. Larger batches are appropriate when the
+Read at most five URLs per call. Start with one or two high-value pages, inspect
+the returned evidence, and choose the next source to fill a specific gap.
+Larger batches are appropriate when the
 independent sources and needed facts are already clear. Follow stop_reason:
 evidence_limit ends all further web work for this request; page_limit ends reads;
 query_limit ends searches. Finish with supported findings and consequential gaps.
 Changing depth, URL fragments, or waiting cannot restore consumed allowances.
 Search and page reads share evidence allowance; direct links use page allowance.
 Do not use the Google Workspace connection for browser search. Do not use paid
-search, model, proxy, or browser services. Downloads, PDFs, authenticated pages,
-and general browser actions are outside this skill.
+search, model, proxy, or browser services. Public text on a page with a login widget
+is readable anonymously; entering credentials or accessing authenticated content,
+downloads, PDFs, and general browser actions are outside this skill.
 
 Use render_mode="static" and wait_for_text=null first. When a static read leaves
 needed dynamic content unloaded, explicitly reread the same URL with

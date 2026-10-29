@@ -3,6 +3,32 @@
 from __future__ import annotations
 
 
+def is_access_challenge(body: str, title: str = "", *, challenge: bool = False) -> bool:
+    """Recognize a challenge interstitial, not prose discussing access errors."""
+    if challenge:
+        return True
+    messages = (
+        "verify you are human",
+        "verify that you are human",
+        "checking your browser",
+        "our systems have detected unusual traffic",
+        "access denied",
+        "challenge required",
+    )
+    if title.strip().casefold().rstrip(".!…") in messages:
+        return True
+    # Real interstitials are short. Long articles and quoted phrases are evidence,
+    # not proof of a challenge. Structured CAPTCHA signals still stop any page.
+    if len(body) > 1200:
+        return False
+    lines = [
+        line.strip().casefold().rstrip(".!…")
+        for line in body.splitlines()
+        if line.strip()
+    ]
+    return any(line in messages for line in lines[:3])
+
+
 def extraction_metadata(source: dict, text: str) -> dict[str, object]:
     """Copy known facts only; a matching anchor is not proof of section coverage."""
     raw_length = source.get("source_chars")
