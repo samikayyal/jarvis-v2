@@ -2,6 +2,32 @@
 
 Status: in-progress
 
+## Latest checkpoint
+
+- Exact candidate: `f8f78112d5e1c98473be588709e1bd86c6d7f412`, committed and
+  pushed to GitHub main; exact remote hash verified before deployment attempt.
+- Ubuntu full suite PASSED: **581 passed, no skips, 207.90 seconds**; Ruff check,
+  formatting (59 files) and compileall passed. Log on Ubuntu at
+  `/home/samik/Projects/Jarvis/code/web-simplification-test-ImAQZT/suite-acceptance.log`.
+- Compared all 59 tested runtime/test files against the candidate release: match.
+- Hash-locked non-editable package built in `code/releases/<candidate>`;
+  service-account --check and all 28 installed files passed. Web schema maxItems=5,
+  both render modes, login-widget instructions, immediate terminal and pricing
+  guidance verified. Live prompt matches candidate after CRLF/LF normalization.
+- Real-browser test stabilization only: 30-second cold static/startup allowance
+  (production worker measured 13.93 seconds), and bounded polling after SIGKILL
+  for descendant exit. Render wait bound unchanged; all isolation/cleanup tests pass.
+- WhatsApp was reattached by the user. Visible predeployment /status at 04:13
+  Asia/Amman: active request none, pending action no. No acceptance scenarios sent.
+- **Activation not run:** SSH to 100.106.206.88:22 timed out before connection;
+  escalated read-only retry and TCP probe also failed. Last verified active source
+  remains `9520982fd6fc6f780dfe975b4a6bbe61789b7ff7`. Recheck before resuming.
+- Once SSH returns: read current and activation log first. Then run the committed
+  candidate's activate.py as root through uv; follow with visible WhatsApp tests,
+  final idle/cleanup, evidence commit/push, and complete status. Source work is done.
+
+## Earlier recovery history
+
 - Resumed independently in recovery chat `01a18521-54a9-7890-bf83-73c97b16ecd4`.
 - Seven saved implementation/test changes reviewed. Fixed final fitting to retain
   complete small excerpts and their metadata; added regression. Updated detailed
