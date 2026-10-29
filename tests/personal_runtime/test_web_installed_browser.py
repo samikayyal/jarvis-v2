@@ -153,11 +153,13 @@ def test_real_worker_profiles_and_process_tree_cleanup(tmp_path, cancel, headed)
                         await task
             finally:
                 await worker.close()
-            assert not active_group_members(groups[-1])
             for _ in range(20):
-                if not (browser_processes() - existing_browsers):
+                if not active_group_members(groups[-1]) and not (
+                    browser_processes() - existing_browsers
+                ):
                     break
                 await asyncio.sleep(0.1)
+            assert not active_group_members(groups[-1])
             assert not (browser_processes() - existing_browsers)
             assert not (
                 set(Path(tempfile.gettempdir()).glob("xvfb-run.*")) - display_auth_dirs
@@ -325,11 +327,15 @@ def test_real_rendered_content_is_bounded_isolated_and_public_only(tmp_path, hea
             await static.close()
             await rendered.close()
         assert all(not p.exists() for p in profiles)
-        assert all(not active_group_members(g) for g in groups)
         for _ in range(30):
-            if not browser_processes() - before:
+            # SIGKILL has been sent to the entire group, but descendants can
+            # remain visible briefly after the leader has been reaped.
+            if all(not active_group_members(g) for g in groups) and not (
+                browser_processes() - before
+            ):
                 break
             await asyncio.sleep(0.1)
+        assert all(not active_group_members(g) for g in groups)
         assert not browser_processes() - before
         assert not set(Path(tempfile.gettempdir()).glob("xvfb-run.*")) - auth_before
 
