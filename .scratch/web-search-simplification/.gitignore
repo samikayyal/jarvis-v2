@@ -1,6 +1,7 @@
 active-src/
 *.tar
 *.tar.gz
+*.bundle
 *.log
 *.png
 __pycache__/

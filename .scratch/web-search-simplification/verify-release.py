@@ -45,9 +45,9 @@ assert props["render_mode"]["enum"] == ["static", "rendered"]
 assert "Public text on a page with a login widget" in tools.instructions
 assert "For pricing comparisons" in tools.instructions
 prompt = (base / "other/runtime/SYSTEM.md").read_bytes()
-assert (
-    prompt == (release / "deployment/personal-runtime/SYSTEM.md.example").read_bytes()
-)
+assert prompt.replace(b"\r\n", b"\n") == (
+    release / "deployment/personal-runtime/SYSTEM.md.example"
+).read_bytes().replace(b"\r\n", b"\n")
 print(
     json.dumps(
         {
