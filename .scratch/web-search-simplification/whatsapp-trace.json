@@ -1,0 +1,256 @@
+[
+  {
+    "timestamp": "2026-10-29T09:42:09.862983Z",
+    "event": "tool_call",
+    "name": "load_skill",
+    "arguments": {
+      "name": "web"
+    }
+  },
+  {
+    "timestamp": "2026-10-29T09:42:09.863268Z",
+    "event": "tool_result",
+    "name": "load_skill",
+    "loaded": "web"
+  },
+  {
+    "timestamp": "2026-10-29T09:42:11.649915Z",
+    "event": "tool_call",
+    "name": "search_web",
+    "arguments": {
+      "query": "site:iana.org example domains example.com reserved",
+      "depth": "quick"
+    }
+  },
+  {
+    "timestamp": "2026-10-29T09:42:33.198798Z",
+    "event": "tool_result",
+    "name": "search_web",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 0,
+      "pages": 2,
+      "evidence_chars": 46971
+    },
+    "results": [
+      {
+        "title": "What is the shortest reserved (example) domain",
+        "url": "https://www.google.com/goto?url=CAESlAEB6zswFe646EQcm8KHnk1bWkCDAym4peoSZhxUD0td6r8D2Bh8d3l0gZY28PFTR6BvNJsVdvVzw8pFXyxWbe3BY6hDbDXY1VZuOl6qIQyk9jYF9xFtxTMK1fY7uTJtH9g0SFWTruljJKiPIhXwHvtPkr7Fb4DOurWgzpB1hNgPIOuuaoxPMSYOei8qOuN_huIf19oh",
+        "evidence_type": "search_result",
+        "text_chars": 0
+      },
+      {
+        "title": "IANA Special Use Domain Names: Invalid and Reserved ...",
+        "url": "https://www.google.com/goto?url=CAESjgEB6zswFWrCnEtor2L-3XCxXgGHQvkGmZ5MpxyD9KdgOyMAFaP6yrBt-VdYF-p8lagTcVnB2oLrVNVItRktNsU3pN76_GZ5bcc__wepkYli72J37PY438-yubHwyvIk8edvfw-5_52bcROEz-GNw67HsIPUhJBm2MeRljrNVm3WuiVBxTuqD7CXSbrHKLsH",
+        "evidence_type": "search_result",
+        "text_chars": 0
+      },
+      {
+        "title": "IANA Reserved Domain Names Overview | PDF",
+        "url": "https://www.google.com/goto?url=CAESggEB6zswFUcetCSjry0rHaEYEjIXh5xgXfIQ1rFiyouXBXV4-9DrcCPfDrcKztuDb-TiRQmNlZFviwwWQHVyA6SI09Lkc3KcGut7XsQ_tT8e-O0v8XAzZo2xxR4ZRtAavLPXtqCE1JtBLAR0xqn9le_KMRW-VVtRcVTNtxa8NBMlbyf6",
+        "evidence_type": "search_result",
+        "text_chars": 0
+      },
+      {
+        "title": "Example.com Domain Purpose And Operational Usage ...",
+        "url": "https://www.google.com/goto?url=CAESgQEB6zswFcy80m5dUyXik2AKEOxtBGJp7OEFPnk4kpw09HEI3mUwXHz1fxTa6QQXe1wdggTa2d6ohn5fvgo2Zq9OTdZcbGkXaLGFxRHx5UJ2fyrAYsllGvsET2a9RuVq2_YV57nDpO5luaVk0QKyQwXVpT2R8RdIZr9c-Hg8Lp9CFMo",
+        "evidence_type": "search_result",
+        "text_chars": 0
+      },
+      {
+        "title": "Reserved and Special Domain Names Registries",
+        "url": "https://www.google.com/goto?url=CAEShwEB6zswFf3cL7NUjcTgGkbj8UyAnofTOZLiTdsZ2tZXQRBJQ6Zm7IHSpfHWlLXP8OzPx6At7GIMxYdTLObjNfAZrfSLjj7o2aYd48FdR59mhQJ_CzmfUq0OUR2yYDKrJA7mG0izYPO-FnFFw--Q4pG2ukgpNPDMfa6MEF6n2IA0iLA75CeS-_s",
+        "evidence_type": "search_result",
+        "text_chars": 0
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-29T09:42:35.601591Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://www.iana.org/help/example-domains"
+      ],
+      "depth": "quick",
+      "render_mode": "static",
+      "wait_for_text": null
+    }
+  },
+  {
+    "timestamp": "2026-10-29T09:42:37.380119Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 0,
+      "pages": 1,
+      "evidence_chars": 45715
+    },
+    "pages": [
+      {
+        "requested_url": "https://www.iana.org/help/example-domains",
+        "url": "https://www.iana.org/help/example-domains",
+        "title": "Example Domains",
+        "outcome": "ok",
+        "evidence_type": "page",
+        "truncated": false,
+        "more_content_available": false,
+        "source_chars": 1256,
+        "extraction_method": "body_prefix",
+        "section_found": null,
+        "render_mode": "static",
+        "render_wait": "not_requested",
+        "stop_reason": null,
+        "text_chars": 1256
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-29T09:42:41.653491Z",
+    "event": "openwa_send_result",
+    "disposition": "sent"
+  },
+  {
+    "timestamp": "2026-10-29T09:43:13.762181Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://quotes.toscrape.com/js/"
+      ],
+      "depth": "quick",
+      "render_mode": "static",
+      "wait_for_text": null
+    }
+  },
+  {
+    "timestamp": "2026-10-29T09:43:28.108768Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 1,
+      "pages": 1,
+      "evidence_chars": 47922
+    },
+    "pages": [
+      {
+        "requested_url": "https://quotes.toscrape.com/js/",
+        "url": "https://quotes.toscrape.com/js/",
+        "title": "Quotes to Scrape",
+        "outcome": "ok",
+        "evidence_type": "page",
+        "truncated": false,
+        "more_content_available": false,
+        "source_chars": 78,
+        "extraction_method": "body_prefix",
+        "section_found": null,
+        "render_mode": "static",
+        "render_wait": "not_requested",
+        "stop_reason": null,
+        "text_chars": 78
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-29T09:43:29.823962Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://quotes.toscrape.com/js/"
+      ],
+      "depth": "quick",
+      "render_mode": "rendered",
+      "wait_for_text": "Albert Einstein"
+    }
+  },
+  {
+    "timestamp": "2026-10-29T09:43:47.057251Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 1,
+      "pages": 0,
+      "evidence_chars": 46423
+    },
+    "pages": [
+      {
+        "requested_url": "https://quotes.toscrape.com/js/",
+        "url": "https://quotes.toscrape.com/js/",
+        "title": "Quotes to Scrape",
+        "outcome": "ok",
+        "evidence_type": "page",
+        "truncated": false,
+        "more_content_available": false,
+        "source_chars": 1499,
+        "extraction_method": "body_prefix",
+        "section_found": null,
+        "render_mode": "rendered",
+        "render_wait": "matched",
+        "stop_reason": null,
+        "text_chars": 1499
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-29T09:43:51.439373Z",
+    "event": "openwa_send_result",
+    "disposition": "sent"
+  },
+  {
+    "timestamp": "2026-10-29T09:44:26.461477Z",
+    "event": "tool_call",
+    "name": "read_web_pages",
+    "arguments": {
+      "urls": [
+        "https://quotes.toscrape.com/login"
+      ],
+      "depth": "quick",
+      "render_mode": "static",
+      "wait_for_text": null
+    }
+  },
+  {
+    "timestamp": "2026-10-29T09:44:41.382412Z",
+    "event": "tool_result",
+    "name": "read_web_pages",
+    "outcome": "ok",
+    "remaining": {
+      "queries": 1,
+      "pages": 1,
+      "evidence_chars": 47911
+    },
+    "pages": [
+      {
+        "requested_url": "https://quotes.toscrape.com/login",
+        "url": "https://quotes.toscrape.com/login",
+        "title": "Quotes to Scrape",
+        "outcome": "ok",
+        "evidence_type": "page",
+        "truncated": false,
+        "more_content_available": false,
+        "source_chars": 89,
+        "extraction_method": "body_prefix",
+        "section_found": null,
+        "render_mode": "static",
+        "render_wait": "not_requested",
+        "stop_reason": null,
+        "text_chars": 89
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-29T09:44:45.104028Z",
+    "event": "openwa_send_result",
+    "disposition": "sent"
+  },
+  {
+    "timestamp": "2026-10-29T09:45:18.035026Z",
+    "event": "openwa_send_result",
+    "disposition": "sent"
+  }
+]
