@@ -70,21 +70,17 @@ configured tools and packaged frontmatter; do not duplicate it in `SYSTEM.md`.
 
 ### Optional web research and public-page reading
 
-The `web` skill exposes `search_web` and `read_web_pages` at `quick` and `moderate` depth.
-Jarvis loads it for explicit searches and freshness or verification needs, or
-to read a supplied public HTML link. Answers cite source titles and URLs and
-distinguish search snippets from actually read pages. Moderate research compares
-relevant sources and identifies material disagreements and coverage gaps.
+The `web` skill exposes `search_web`, `read_web_page(url, query)`, and
+`ask_page_reader(reader_id, query, refresh=false)`. Search uses quick/moderate
+request allowances. Every selected page gets an isolated reader conversation;
+only compact findings reach the main assistant. See [the reader contract](../../docs/page-reader.md).
 
-Web access is off when `[web_search]` is absent or `enabled = false`. The example
-TOML records the shared request allowances: quick one query/two pages, moderate
-three queries/five pages, five results per query, 8,000 characters per page,
-48,000 evidence characters, and a 20-second browser-operation timeout. Existing
-deployments with an explicit 32,000 setting retain it until their TOML is updated.
-The first
-web call selects depth; a later moderate call upgrades quick without resetting
-usage, and later quick calls cannot downgrade it. Valid configuration changes
-take effect on the normal service restart.
+Web access is off when `[web_search]` is absent or disabled. Configure
+`[web_reader]` with `model = "gpt-6-luna"` and `reasoning_effort = "low"`.
+A missing reader configuration reports configuration_error; no model fallback
+occurs. Restart normally after configuration changes. Existing query/page
+allowances and browser-operation timeout still apply. Captures use the reader's
+separate character limit, bypassing the legacy body-prefix evidence cap.
 
 `browser_mode = "headless"` is the default. The opt-in `"headed"` mode requires
 Ubuntu packages `xvfb` and `xauth` (provision with `sudo apt-get install xvfb xauth`).
@@ -104,30 +100,19 @@ its redirects through the public-network proxy. A successful read supplies the
 final source URL for citations. An optional filter/feedback dialog alone is not
 classified as a CAPTCHA.
 
-Query and page attempts (including failures) count across calls and approval continuations;
-a new ordinary request resets the allowance. Runtime output, tool-round, and
-overall request limits also apply. There is no separate research timer.
-Follow-ups can reuse evidence from the working-session transcript without network
-work. Explicit rechecks and time-sensitive claims require fresh tools. Every
-ordinary request owns and closes its browser; no browser or separate evidence
-cache survives across requests. Session expiry, `/new`, context reset, and restart
-discard the old working-session evidence and loaded skills.
+Query and page attempts (including failures) count across calls and approval
+continuations; a new ordinary request resets the allowance. Reader calls have
+an additional bounded invocation deadline. Ordinary follow-ups can inspect
+retained chunks without network work. Explicit refresh fetches again and replaces
+evidence on success; failure preserves old evidence without claiming fresh verification.
 
-Page reads default to static content. `read_web_pages` also accepts explicit
-`render_mode="rendered"` with `wait_for_text` (1–200 characters) after a static
-read of the same URL. Rendering consumes another page attempt and shares all
-request limits. A separate anonymous worker permits scripts while retaining
-the public proxy, sandbox, scheme/download blocks and supervised cleanup. Its
-bounded wait observes visible text, never clicks controls or solves challenges.
-Blocked/unsupported URLs cannot be render-retried in the same request. Both
-workers close on suspension/cancellation/completion; counters survive suspension.
-
-Results distinguish access from extraction: `truncated`, `source_chars`,
-`extraction_method`, `section_found`, `render_mode`, `render_wait`, and
-`stop_reason` describe evidence limits and readiness. Anchor presence does not
-mean that section was included: extraction remains a body prefix. Start with
-one or two sources and adapt; retain larger batches for known independent sources.
-Final notices distinguish search blocks, page failures and allowance limits.
+Reader-only display actions can render, expand sections, select regions, and switch
+listed tabs within the assigned page. Each capture uses an anonymous worker and
+closes it before returning; retained evidence requires no browser. Display-state
+labels stay attached to chunks. Session expiry, `/new`, context reset, and restart
+discard readers and loaded skills. Cancellation closes active work and preserves
+completed evidence. Coverage reports inspected chunks separately from captured
+chunks, including incomplete capture and output shortening.
 
 Google blocking or CAPTCHA stops further searches in the request. A recognized
 consent screen can reject optional cookies; challenges are never solved or

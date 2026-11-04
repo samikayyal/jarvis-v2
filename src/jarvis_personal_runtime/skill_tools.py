@@ -35,7 +35,9 @@ _TOOL_GROUPS = {
     "reminders": frozenset(
         {"create_reminder", "list_reminders", "edit_reminder", "cancel_reminder"}
     ),
-    "web": frozenset({"search_web", "read_web_pages"}),
+    "web": frozenset(
+        {"search_web", "read_web_pages", "read_web_page", "ask_page_reader"}
+    ),
 }
 
 
@@ -101,6 +103,9 @@ class SkillTools:
 
     def start_session(self) -> None:
         self._loaded.clear()
+        callback = getattr(self._tools, "start_session", None)
+        if callable(callback):
+            callback()
 
     @property
     def definitions(self) -> tuple[dict[str, object], ...]:

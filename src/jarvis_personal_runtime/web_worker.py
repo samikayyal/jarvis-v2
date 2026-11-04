@@ -28,6 +28,54 @@ from urllib.parse import unquote, urlsplit
 from .web_browser import PublicUrlError, is_public_address, validate_public_url
 from .web_evidence import is_access_challenge
 
+DISPLAY_CONTROLS = """
+const controls = [...document.querySelectorAll('summary, select, [role=tab]')]
+  .filter(e => e.getClientRects().length && !e.closest('form') && !e.closest('a[href]')
+    && (e.tagName === 'SUMMARY' || e.tagName === 'SELECT'
+      || (e.getAttribute('role') === 'tab' && e.getAttribute('aria-controls')
+          && e.getAttribute('type') !== 'submit')));
+const label = e => (e.getAttribute('aria-label') ||
+  (e.labels && [...e.labels].map(l => l.innerText).join(' ')) ||
+  (e.tagName === 'SELECT' ? e.name || e.id : e.innerText) || '').trim();
+"""
+CAPTURE_SCRIPT = (
+    DISPLAY_CONTROLS
+    + """
+const clone = document.body.cloneNode(true);
+const originals = [document.body, ...document.body.querySelectorAll('*')];
+const copies = [clone, ...clone.querySelectorAll('*')];
+originals.forEach((e, i) => {
+  if (getComputedStyle(e).display === 'none' || getComputedStyle(e).visibility === 'hidden')
+    copies[i].remove();
+});
+return {html: clone.outerHTML, controls: controls.slice(0, 100).map((e, i) => ({
+  id: String(i), label: label(e), kind: e.tagName.toLowerCase(),
+  selected: e.tagName === 'SELECT' ? [...e.selectedOptions].map(o => o.text).join(', ') : '',
+  options: e.tagName === 'SELECT' ? [...e.options].map(o => o.text) : []
+}))};
+"""
+)
+DISPLAY_SCRIPT = (
+    DISPLAY_CONTROLS
+    + """
+const a = arguments[0], e = controls[Number(a.id)];
+if (!e || label(e) !== a.label || e.disabled) return null;
+// Block form submission and navigation initiated by display event handlers.
+window.addEventListener('submit', event => event.preventDefault(), true);
+if (window.navigation) window.navigation.addEventListener('navigate', event => {
+  if (event.destination.url.split('#')[0] !== location.href.split('#')[0]) event.preventDefault();
+});
+if (e.tagName === 'SUMMARY') e.parentElement.open = true;
+else if (e.tagName === 'SELECT') {
+  const option = [...e.options].find(o => o.text === a.option && !o.disabled);
+  if (!option) return null;
+  e.value = option.value;
+  e.dispatchEvent(new Event('change', {bubbles:true}));
+} else e.click();
+return label(e) + (a.option ? ': ' + a.option : ': expanded/selected');
+"""
+)
+
 
 class PublicNetworkError(RuntimeError):
     """DNS or connection policy rejected a destination."""
@@ -535,13 +583,23 @@ class SeleniumPageReader:
             return {"outcome": "extraction_failed", "results": []}
 
     def read(
-        self, url: str, *, search: bool = False, wait_for_text: str | None = None
+        self,
+        url: str,
+        *,
+        search: bool = False,
+        wait_for_text: str | None = None,
+        structured: bool = False,
+        display: list[dict] | None = None,
     ) -> dict[str, object]:
         requested = validate_public_url(url)
-        if self.rendered and (
-            search
-            or not isinstance(wait_for_text, str)
-            or not 1 <= len(wait_for_text.strip()) <= 200
+        if (
+            self.rendered
+            and not structured
+            and (
+                search
+                or not isinstance(wait_for_text, str)
+                or not 1 <= len(wait_for_text.strip()) <= 200
+            )
         ):
             return self._result(
                 "unsupported", requested, reason="rendered reads require expected text"
@@ -637,7 +695,38 @@ class SeleniumPageReader:
             if self.proxy.blocked_url(final_url):
                 return self._blocked(requested)
             render_wait = "not_requested"
-            if self.rendered:
+            display_state = []
+            if structured and display:
+                # Only identified display controls are operable. Replay on a fresh
+                # anonymous page; label checks reject changed control identities.
+                for action in display:
+                    if action.get("id") == "render":
+                        if action.get("option"):
+                            render_wait = self._wait_for_text(
+                                action["option"][:200], deadline
+                            )
+                        display_state.append("Rendered page; default display state")
+                        continue
+                    before = str(self.driver.current_url)
+                    state = self._page_state()
+                    if is_access_challenge(
+                        str(state.get("body", "")),
+                        str(state.get("title", "")),
+                        challenge=bool(state.get("challenge")),
+                    ):
+                        return self._result(
+                            "blocked", requested, reason="access challenge"
+                        )
+                    label = self.driver.execute_script(DISPLAY_SCRIPT, action)
+                    time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+                    if not label or str(self.driver.current_url) != before:
+                        return self._result(
+                            "blocked",
+                            requested,
+                            reason="not an assigned-page display control",
+                        )
+                    display_state.append(label)
+            if self.rendered and not structured:
                 render_wait = self._wait_for_text(str(wait_for_text), deadline)
                 self.driver.execute_cdp_cmd(
                     "Emulation.setScriptExecutionDisabled", {"value": True}
@@ -685,6 +774,22 @@ class SeleniumPageReader:
                 return self._result(
                     "extraction_failed", final_url, reason="page has no visible text"
                 )
+            controls = []
+            if structured:
+                from .page_document import convert_html
+
+                if str(self.driver.current_url) != final_url:
+                    return self._result(
+                        "blocked", requested, reason="display left assigned page"
+                    )
+                captured = self.driver.execute_script(CAPTURE_SCRIPT)
+                text = convert_html(captured["html"], final_url)
+                controls = captured["controls"]
+                display_state.extend(
+                    c["label"] + ": " + c["selected"]
+                    for c in controls
+                    if c.get("selected")
+                )
             return {
                 "outcome": "ok",
                 "title": title,
@@ -692,7 +797,9 @@ class SeleniumPageReader:
                 "text": text[: self.max_chars],
                 "source_chars": len(text),
                 "truncated": len(text) > self.max_chars,
-                "extraction_method": "body_prefix",
+                "extraction_method": "structured_html" if structured else "body_prefix",
+                "controls": controls,
+                "display_state": display_state,
                 "section_found": self._section_found(requested),
                 "render_mode": "rendered" if self.rendered else "static",
                 "render_wait": render_wait,
@@ -829,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not isinstance(request, dict) or request.get("op") not in {
                     "read",
                     "search",
+                    "capture",
                 }:
                     _send(
                         {
@@ -847,7 +955,10 @@ def main(argv: list[str] | None = None) -> int:
                         _send({"outcome": "blocked", "reason": "invalid URL"})
                         continue
                     response = service.read(
-                        url, wait_for_text=request.get("wait_for_text")
+                        url,
+                        wait_for_text=request.get("wait_for_text"),
+                        structured=request["op"] == "capture",
+                        display=request.get("display"),
                     )
                 _send(response)
                 if service.unusable:

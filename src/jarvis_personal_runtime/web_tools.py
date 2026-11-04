@@ -352,6 +352,34 @@ class WebTools:
             )
         return self._browser
 
+    async def capture_page(self, url: str, max_chars: int, display: list[dict]) -> dict:
+        """Capture for a reader, charging the same request's page allowance."""
+        from .web_browser import validate_public_url
+
+        canonical = urldefrag(validate_public_url(url))[0]
+        if canonical in self._denied_urls:
+            return {"outcome": "blocked"}
+        if not self._remaining()["pages"]:
+            self._limit_stops.add("page_limit")
+            return {"outcome": "page_limit"}
+        self._pages_used += 1
+        factory = self._render_factory if display else self._factory
+        browser = factory(
+            self.runtime_dir, self.config.operation_timeout_seconds, max_chars
+        )
+        try:
+            result = await browser.capture(url, display)
+        finally:
+            await browser.close()
+        if result["outcome"] == "ok":
+            self._has_evidence = True
+            self._page_failures.pop(canonical, None)
+        else:
+            self._page_failures[canonical] = str(result["outcome"])
+            if result["outcome"] == "blocked":
+                self._denied_urls.add(canonical)
+        return result
+
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
         from .web_browser import validate_public_url
 

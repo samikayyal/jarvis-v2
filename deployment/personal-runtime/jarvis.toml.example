@@ -54,6 +54,11 @@ results_per_query = 5
 max_chars_per_page = 8000
 max_total_evidence_chars = 48000
 
+[web_reader]
+model = "gpt-6-luna"
+reasoning_effort = "low"
+# Other reader limits use the defaults in WebReaderConfig.
+
 [web_search.quick]
 max_queries = 1
 max_pages = 2

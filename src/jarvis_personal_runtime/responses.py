@@ -184,6 +184,12 @@ class PreparedToolCollection:
             continuation.continuation, approved=approved
         )
 
+    def start_session(self) -> None:
+        for tool in self._tools:
+            callback = getattr(tool, "start_session", None)
+            if callable(callback):
+                callback()
+
     def request_started(self) -> None:
         """Reset request-owned state on every ordinary request.
 
@@ -298,6 +304,11 @@ class OpenAIRawResponsesAdapter:
         client = AsyncOpenAI(api_key=api_key, http_client=http_client)
         return cls(client, trace=sink, owned_http_client=http_client)
 
+    def without_retries(self):
+        return OpenAIRawResponsesAdapter(
+            self._client.with_options(max_retries=0), trace=self._trace
+        )
+
     async def create(
         self, request: dict[str, object], *, timeout: float
     ) -> ResponsesResult:
@@ -392,6 +403,8 @@ class DirectResponsesRunner:
     def _instructions(self, system_prompt: str) -> str:
         extra = getattr(self._tools, "instructions", "")
         return f"{system_prompt.rstrip()}\n\n{extra}" if extra else system_prompt
+
+    end_session = start_session
 
     def context_tokens(self, *, system_prompt: str) -> int:
         """Estimate retained context, including instructions and tool definitions."""
@@ -889,6 +902,7 @@ def build_direct_responses_runner(
     """Compose the pinned SDK adapter with the configured loop limits."""
 
     sink = trace or build_runtime_trace(config)
+    adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     if tools is None:
         from .permissions import TomlPermissionStore
         from .terminal import (
@@ -951,13 +965,19 @@ def build_direct_responses_runner(
         )
         web_search = getattr(config, "web_search", None)
         if web_search is not None and web_search.enabled:
+            from .page_reader import PageReaderTools
             from .web_tools import WebTools
 
             configured_tools.append(
-                WebTools(
-                    web_search,
-                    runtime_dir=config.root / "data" / "web",
-                    max_output_chars=config.max_output_chars,
+                PageReaderTools(
+                    WebTools(
+                        web_search,
+                        runtime_dir=config.root / "data" / "web",
+                        max_output_chars=config.max_output_chars,
+                    ),
+                    config.web_reader,
+                    adapter.without_retries(),
+                    trace=sink,
                 )
             )
         from .skill_tools import SkillTools
@@ -965,7 +985,6 @@ def build_direct_responses_runner(
         tools = SkillTools(PreparedToolCollection(*configured_tools, *additional_tools))
     elif additional_tools:
         raise ValueError("additional_tools cannot be combined with tools")
-    adapter = OpenAIRawResponsesAdapter.from_api_key(api_key, trace=sink)
     return DirectResponsesRunner(
         adapter,
         tools=tools,

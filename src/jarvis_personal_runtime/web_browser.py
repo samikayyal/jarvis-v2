@@ -33,7 +33,7 @@ from urllib.parse import urlsplit, urlunsplit
 MAX_PUBLIC_URL_LENGTH = 2048
 MAX_TITLE_LENGTH = 512
 MAX_RETURNED_URL_LENGTH = 2048
-_PROTOCOL_LIMIT = 1_048_576
+_PROTOCOL_LIMIT = 8_388_608
 _ALLOWED_OUTCOMES = frozenset(
     {"ok", "blocked", "unsupported", "extraction_failed", "unavailable", "timeout"}
 )
@@ -310,6 +310,12 @@ class BrowserWorker:
             "https://www.google.com/search",
         )
 
+    async def capture(self, url: str, display: list[dict]) -> dict[str, object]:
+        canonical = validate_public_url(url)
+        return await self._operate(
+            {"op": "capture", "url": canonical, "display": display}, canonical
+        )
+
     async def _operate(
         self, payload: dict[str, object], canonical: str
     ) -> dict[str, object]:
@@ -512,6 +518,10 @@ class BrowserWorker:
 
         if outcome == "ok":
             result.update(extraction_metadata(response, text))
+            if response.get("extraction_method") == "structured_html":
+                result["extraction_method"] = "structured_html"
+                result["controls"] = response.get("controls", [])
+                result["display_state"] = response.get("display_state", [])
         return result
 
     def _result(self, outcome: str, url: str, *, reason: str = "") -> dict[str, object]:
