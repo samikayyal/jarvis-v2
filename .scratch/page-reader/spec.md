@@ -1,10 +1,12 @@
 # Conversational page reader
 
-Status: ready-for-agent
+Status: implemented; live WhatsApp acceptance pending
 
 Design accepted and specification completed: 2026-11-03 (Asia/Amman).
 
-This publishes the agreed design and initial limits. Runtime implementation and deployment require a separate instruction; this specification does not claim either has happened.
+This publishes the agreed design and initial limits. Implementation and deployment
+were separately authorized on 2026-11-04; see [verification](deployment-verification.md)
+for the deployed candidate and remaining live acceptance gate.
 
 ## Problem Statement
 

@@ -17,3 +17,8 @@ through WhatsApp in the in-app browser. Finish idle with clean browser resources
   remain untouched. Windows initial suite: 583 passed, 9 platform skips.
   Ubuntu real structured-capture fixture and configured-provider IANA check passed.
   Deployment and visible WhatsApp acceptance remain pending.
+- 2026-11-04: Candidate `f273314789764641de5b8fd9ab15775b54400b80` pushed,
+  GitHub-verified and activated. Final suites: Windows 597 passed/9 skips;
+  Ubuntu 606 passed/no skips. See [verification](../deployment-verification.md).
+  Only visible in-app WhatsApp acceptance remains open; browser automation
+  is currently unavailable in the chat.
