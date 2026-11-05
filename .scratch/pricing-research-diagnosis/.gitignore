@@ -1,0 +1,3 @@
+# Local diagnostic captures; retain on disk without publishing verbatim data.
+*.json
+*.jpg

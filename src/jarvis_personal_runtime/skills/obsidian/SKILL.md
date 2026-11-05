@@ -11,6 +11,8 @@ Use `list_vault_tree` to discover paths without reading contents; use `read_vaul
 
 ## Edit and delete
 
+With runtime full access on, submit edits and deletions directly; the runtime approves them without a preview or confirmation prompt. The approval choices below describe normal mode.
+
 Read an existing note before editing, preserve unrelated content, and prepare exact Markdown changes below the configured note directories using `edit_vault`. Use one file per proposal to offer per-file approval. The runtime handles 1 (approve once), 2 (remember approval for this exact file), or 9 (reject). Report saved approval only when the result confirms it.
 
 For whole-note deletion, read the exact path and synchronized base revision first, then use `delete_vault`. The runtime previews the full note and offers only 1 (approve once) and 9 (reject). Never offer option 2 for deletion; saved edit permissions do not apply. Git history is retained. A truncated preview cannot authorize a write.

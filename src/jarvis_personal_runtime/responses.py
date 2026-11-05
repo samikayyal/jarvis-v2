@@ -113,7 +113,9 @@ class PreparedTools(Protocol):
         self, name: str, arguments: dict[str, object]
     ) -> str | ApprovalRequired: ...
 
-    async def resume(self, continuation: object, *, approved: bool) -> str: ...
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str: ...
 
 
 class TraceSink(Protocol):
@@ -131,7 +133,9 @@ class _NoTools:
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
         raise RuntimeError(f"unknown prepared tool: {name}")
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
         raise RuntimeError("unknown prepared tool continuation")
 
     def request_started(self) -> None:
@@ -177,11 +181,15 @@ class PreparedToolCollection:
                 return result
         raise RuntimeError(f"unknown prepared tool: {name}")
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
         if not isinstance(continuation, _PreparedToolContinuation):
             raise TypeError("invalid prepared tool continuation")
         return await continuation.tool.resume(
-            continuation.continuation, approved=approved
+            continuation.continuation,
+            approved=approved,
+            **({"full_access": True} if full_access else {}),
         )
 
     def request_started(self) -> None:
@@ -357,6 +365,7 @@ class DirectResponsesRunner:
         max_context_tokens: int = 100_000,
         max_output_chars: int = 65_536,
         context_counter: Callable[[dict[str, object]], int] = local_input_tokens,
+        full_access: Callable[[], bool] | None = None,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -374,6 +383,7 @@ class DirectResponsesRunner:
             raise ValueError("max_output_chars must be positive")
         self._max_output_chars = max_output_chars
         self._context_counter = context_counter
+        self._full_access = full_access
         self._transcript: list[dict[str, object]] = []
         self._request_lock = asyncio.Lock()
 
@@ -391,7 +401,17 @@ class DirectResponsesRunner:
 
     def _instructions(self, system_prompt: str) -> str:
         extra = getattr(self._tools, "instructions", "")
-        return f"{system_prompt.rstrip()}\n\n{extra}" if extra else system_prompt
+        instructions = (
+            f"{system_prompt.rstrip()}\n\n{extra}" if extra else system_prompt
+        )
+        if self._full_access is not None:
+            instructions += (
+                f"\n\nFull access: {'on' if self._full_access() else 'off'}. "
+                "When on, the operator authorizes actions needed for their requests "
+                "across available tools without individual approval prompts. "
+                "Existing tool boundaries still apply. When off, use normal approvals."
+            )
+        return instructions
 
     def context_tokens(self, *, system_prompt: str) -> int:
         """Estimate retained context, including instructions and tool definitions."""
@@ -713,7 +733,17 @@ class DirectResponsesRunner:
         }
         self._trace.record("tool_call", tool_event)
         try:
-            return await self._tools.execute(str(call["name"]), arguments)
+            output = await self._tools.execute(str(call["name"]), arguments)
+            if (
+                isinstance(output, ApprovalRequired)
+                and self._full_access
+                and self._full_access()
+            ):
+                self._trace.record("full_access_approval", tool_event)
+                return await self._tools.resume(
+                    output.continuation, approved=True, full_access=True
+                )
+            return output
         except Exception as exc:  # noqa: BLE001 - errors continue via the model
             self._trace.record(
                 "tool_error",
@@ -885,6 +915,7 @@ def build_direct_responses_runner(
     tools: PreparedTools | None = None,
     additional_tools: tuple[PreparedTools, ...] = (),
     trace: TraceSink | None = None,
+    full_access: Callable[[], bool] | None = None,
 ) -> DirectResponsesRunner:
     """Compose the pinned SDK adapter with the configured loop limits."""
 
@@ -974,6 +1005,7 @@ def build_direct_responses_runner(
         max_tool_rounds=config.max_tool_rounds,
         max_context_tokens=config.max_context_tokens,
         max_output_chars=config.max_output_chars,
+        full_access=full_access,
     )
 
 

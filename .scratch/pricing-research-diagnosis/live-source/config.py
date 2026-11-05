@@ -1,0 +1,1443 @@
+"""Configuration loading for the fresh personal assistant runtime.
+
+The replacement runtime deliberately has a small configuration boundary.  The
+``.env`` file is read as a source of credentials, ``jarvis.toml`` contains only
+non-secret runtime settings, and ``SYSTEM.md`` is the editable system prompt.
+Loading never mutates the process environment and no writer in this module can
+write the credential file. Runtime-owned paths stay beneath the runtime root;
+the configured vault may be an external absolute directory.
+"""
+
+from __future__ import annotations
+
+import ast
+import ipaddress
+import math
+import re
+import tomllib
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from .vault_git import VaultGitSettings
+
+DEFAULT_ALLOWED_MODELS = (
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-luna",
+)
+MODEL_ALIASES = MappingProxyType(
+    {
+        "astra": "gpt-6-astra",
+        "6-astra": "gpt-6-astra",
+        "sol": "gpt-6-sol",
+        "6-sol": "gpt-6-sol",
+        "terra": "gpt-5.6-terra",
+        "5.6-terra": "gpt-5.6-terra",
+        "luna": "gpt-6-luna",
+        "6-luna": "gpt-6-luna",
+    }
+)
+DEFAULT_ALLOWED_REASONING_EFFORTS = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+MODEL_REASONING_EFFORTS = MappingProxyType(
+    {
+        "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
+        "gpt-6-sol": DEFAULT_ALLOWED_REASONING_EFFORTS,
+        "gpt-5.6-terra": DEFAULT_ALLOWED_REASONING_EFFORTS,
+        "gpt-6-luna": DEFAULT_ALLOWED_REASONING_EFFORTS,
+    }
+)
+GOOGLE_MCP_ENDPOINTS = {
+    "google-gmail": "https://gmailmcp.googleapis.com/mcp/v1",
+    "google-drive": "https://drivemcp.googleapis.com/mcp/v1",
+    "google-calendar": "https://calendarmcp.googleapis.com/mcp/v1",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class WebDepthLimits:
+    """Per-request query and page ceilings for one web research depth."""
+
+    max_queries: int
+    max_pages: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_queries", self.max_queries),
+            ("max_pages", self.max_pages),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"web depth {name} must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class WebSearchConfig:
+    """Validated non-secret settings for Selenium-backed public web access."""
+
+    enabled: bool = False
+    browser_mode: str = "headless"
+    operation_timeout_seconds: float = 20.0
+    results_per_query: int = 5
+    max_chars_per_page: int = 8_000
+    max_total_evidence_chars: int = 48_000
+    quick: WebDepthLimits = field(
+        default_factory=lambda: WebDepthLimits(max_queries=1, max_pages=2)
+    )
+    moderate: WebDepthLimits = field(
+        default_factory=lambda: WebDepthLimits(max_queries=3, max_pages=5)
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("web_search.enabled must be a boolean")
+        if self.browser_mode not in ("headless", "headed"):
+            raise ValueError("web_search.browser_mode must be headless or headed")
+        if not isinstance(self.quick, WebDepthLimits):
+            raise TypeError("web_search.quick must be a WebDepthLimits value")
+        if not isinstance(self.moderate, WebDepthLimits):
+            raise TypeError("web_search.moderate must be a WebDepthLimits value")
+        if (
+            isinstance(self.operation_timeout_seconds, bool)
+            or not isinstance(self.operation_timeout_seconds, (int, float))
+            or not math.isfinite(float(self.operation_timeout_seconds))
+            or self.operation_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "web_search.operation_timeout_seconds must be a positive finite number"
+            )
+        for name, value in (
+            ("results_per_query", self.results_per_query),
+            ("max_chars_per_page", self.max_chars_per_page),
+            ("max_total_evidence_chars", self.max_total_evidence_chars),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"web_search.{name} must be a positive integer")
+        if self.quick.max_queries > self.moderate.max_queries:
+            raise ValueError(
+                "web_search.quick.max_queries must not exceed web_search.moderate.max_queries"
+            )
+        if self.quick.max_pages > self.moderate.max_pages:
+            raise ValueError(
+                "web_search.quick.max_pages must not exceed web_search.moderate.max_pages"
+            )
+        if self.max_total_evidence_chars < self.max_chars_per_page:
+            raise ValueError(
+                "web_search.max_total_evidence_chars must be at least web_search.max_chars_per_page"
+            )
+
+
+# This is for typing
+class _RuntimeDefaults(TypedDict):
+    model: str
+    allowed_models: tuple[str, ...]
+    reasoning_effort: str
+    allowed_reasoning_efforts: tuple[str, ...]
+    inactivity_minutes: int
+    max_context_tokens: int
+    request_timeout_seconds: float
+    max_tool_rounds: int
+    command_timeout_seconds: float
+    max_output_chars: int
+    ubuntu_working_directory: str
+    ubuntu_read_only_prefixes: tuple[str, ...]
+    windows_ssh_host: None
+    windows_ssh_user: None
+    windows_ssh_identity_file: None
+    windows_working_directory: None
+    windows_read_only_prefixes: tuple[str, ...]
+    message_cache_path: str
+    message_cache_retention_days: int
+    operator_timezone: str
+    reminder_database_path: str
+    trace_path: str
+    trace_max_bytes: int
+    listener_host: None
+    listener_port: None
+    system_prompt_path: str
+    vault_path: None
+    vault_git: None
+    openwa_api_base_url: None
+    openwa_internal_session_id: None
+    openwa_named_session: None
+    openwa_authorized_operator_number: None
+    openwa_operator_chat_id: None
+    web_search: WebSearchConfig
+
+
+# Keep defaults in one immutable mapping so a loader and callers constructing
+# a RuntimeConfig manually cannot accidentally drift apart.
+DEFAULTS: _RuntimeDefaults = cast(
+    _RuntimeDefaults,
+    MappingProxyType(
+        {
+            "model": "gpt-6-luna",
+            "allowed_models": DEFAULT_ALLOWED_MODELS,
+            "reasoning_effort": "medium",
+            "allowed_reasoning_efforts": DEFAULT_ALLOWED_REASONING_EFFORTS,
+            "inactivity_minutes": 60,
+            "max_context_tokens": 100_000,
+            "request_timeout_seconds": 600,
+            "max_tool_rounds": 8,
+            "command_timeout_seconds": 300,
+            "max_output_chars": 65_536,
+            "ubuntu_working_directory": ".",
+            "ubuntu_read_only_prefixes": (),
+            "windows_ssh_host": None,
+            "windows_ssh_user": None,
+            "windows_ssh_identity_file": None,
+            "windows_working_directory": None,
+            "windows_read_only_prefixes": (),
+            "message_cache_path": "data/message-cache.json",
+            "message_cache_retention_days": 7,
+            "operator_timezone": "Asia/Amman",
+            "reminder_database_path": "data/reminders.sqlite3",
+            "trace_path": "data/runtime-trace.jsonl",
+            "trace_max_bytes": 10 * 1024 * 1024,
+            "listener_host": None,
+            "listener_port": None,
+            "system_prompt_path": "SYSTEM.md",
+            "vault_path": None,
+            "vault_git": None,
+            "openwa_api_base_url": None,
+            "openwa_internal_session_id": None,
+            "openwa_named_session": None,
+            "openwa_authorized_operator_number": None,
+            "openwa_operator_chat_id": None,
+            "web_search": WebSearchConfig(),
+        }
+    ),
+)
+
+
+def normalize_model_alias(value: str) -> str:
+    """Resolve the short model names accepted in operator configuration."""
+
+    return MODEL_ALIASES.get(value, value)
+
+
+# Readable aliases are useful to downstream code, while DEFAULTS remains the
+# single source of the actual values.
+DEFAULT_MODEL = DEFAULTS["model"]
+DEFAULT_REASONING_EFFORT = DEFAULTS["reasoning_effort"]
+DEFAULT_INACTIVITY_MINUTES = DEFAULTS["inactivity_minutes"]
+DEFAULT_MAX_CONTEXT_TOKENS = DEFAULTS["max_context_tokens"]
+DEFAULT_REQUEST_TIMEOUT_SECONDS = DEFAULTS["request_timeout_seconds"]
+DEFAULT_MAX_TOOL_ROUNDS = DEFAULTS["max_tool_rounds"]
+DEFAULT_COMMAND_TIMEOUT_SECONDS = DEFAULTS["command_timeout_seconds"]
+DEFAULT_MAX_OUTPUT_CHARS = DEFAULTS["max_output_chars"]
+DEFAULT_MESSAGE_CACHE_RETENTION_DAYS = DEFAULTS["message_cache_retention_days"]
+
+
+class ConfigError(ValueError):
+    """A configuration error tied to the exact file that caused it."""
+
+    def __init__(self, path: str | Path, message: str) -> None:
+        self.path = Path(path)
+        self.message = message
+        super().__init__(f"{self.path}: {message}")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSecrets:
+    """Credentials loaded from ``.env``.
+
+    The runtime requires credentials for OpenAI and OpenWA, including the
+    webhook signing secret used to authenticate inbound messages.
+    ``repr`` is redacted so an accidental diagnostic cannot print secrets.
+    """
+
+    openai_api_key: str = field(repr=False)
+    openwa_api_key: str = field(repr=False)
+    openwa_webhook_signing_secret: str = field(repr=False)
+    google_oauth_client_id: str | None = field(default=None, repr=False)
+    google_oauth_client_secret: str | None = field(default=None, repr=False)
+    google_oauth_refresh_token: str | None = field(default=None, repr=False)
+
+    @property
+    def webhook_signing_secret(self) -> str:
+        """Compatibility spelling for the OpenWA signing secret."""
+
+        return self.openwa_webhook_signing_secret
+
+    @property
+    def openwa_webhook_secret(self) -> str:
+        return self.openwa_webhook_signing_secret
+
+    def __repr__(self) -> str:
+        present = tuple(
+            name
+            for name, value in (
+                ("openai_api_key", self.openai_api_key),
+                ("openwa_api_key", self.openwa_api_key),
+                (
+                    "openwa_webhook_signing_secret",
+                    self.openwa_webhook_signing_secret,
+                ),
+                ("google_oauth_client_id", self.google_oauth_client_id),
+                ("google_oauth_client_secret", self.google_oauth_client_secret),
+                ("google_oauth_refresh_token", self.google_oauth_refresh_token),
+            )
+            if value
+        )
+        return f"RuntimeSecrets(present={present!r})"
+
+
+@dataclass(frozen=True, slots=True)
+class McpServiceConfig:
+    id: str
+    endpoint: str
+    manifest_path: Path
+    max_output_chars: int
+
+    def __post_init__(self) -> None:
+        if not self.id.strip():
+            raise ValueError("configured MCP service id must be non-empty")
+        endpoint = urlsplit(self.endpoint)
+        if endpoint.scheme != "https" or not endpoint.netloc:
+            raise ValueError("configured MCP service endpoint must be an HTTPS URL")
+        if not self.manifest_path.name:
+            raise ValueError("configured MCP manifest path must identify a file")
+        if self.max_output_chars < 2:
+            raise ValueError(
+                "configured MCP output limit must be at least 2 characters"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleApiConfig:
+    """Non-secret settings for the direct Google API prepared tool."""
+
+    account: str
+    max_output_chars: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.account, str)
+            or not self.account.strip()
+            or self.account.count("@") != 1
+            or any(character.isspace() for character in self.account)
+        ):
+            raise ValueError("configured Google account must be an email address")
+        if (
+            isinstance(self.max_output_chars, bool)
+            or not isinstance(self.max_output_chars, int)
+            or self.max_output_chars < 2
+        ):
+            raise ValueError(
+                "configured Google output limit must be at least 2 characters"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    """Validated, non-secret settings for one runtime process."""
+
+    root: Path = field(default_factory=Path.cwd)
+    model: str = DEFAULTS["model"]
+    allowed_models: tuple[str, ...] = DEFAULTS["allowed_models"]
+    reasoning_effort: str = DEFAULTS["reasoning_effort"]
+    allowed_reasoning_efforts: tuple[str, ...] = DEFAULTS["allowed_reasoning_efforts"]
+    inactivity_minutes: int = DEFAULTS["inactivity_minutes"]
+    max_context_tokens: int = DEFAULTS["max_context_tokens"]
+    request_timeout_seconds: float = DEFAULTS["request_timeout_seconds"]
+    max_tool_rounds: int = DEFAULTS["max_tool_rounds"]
+    command_timeout_seconds: float = DEFAULTS["command_timeout_seconds"]
+    max_output_chars: int = DEFAULTS["max_output_chars"]
+    ubuntu_working_directory: Path = Path(DEFAULTS["ubuntu_working_directory"])
+    ubuntu_read_only_prefixes: tuple[str, ...] = DEFAULTS["ubuntu_read_only_prefixes"]
+    windows_ssh_host: str | None = DEFAULTS["windows_ssh_host"]
+    windows_ssh_user: str | None = DEFAULTS["windows_ssh_user"]
+    windows_ssh_identity_file: Path | None = DEFAULTS["windows_ssh_identity_file"]
+    windows_working_directory: str | None = DEFAULTS["windows_working_directory"]
+    windows_read_only_prefixes: tuple[str, ...] = DEFAULTS["windows_read_only_prefixes"]
+    message_cache_path: Path = Path(DEFAULTS["message_cache_path"])
+    message_cache_retention_days: int = DEFAULTS["message_cache_retention_days"]
+    operator_timezone: str = DEFAULTS["operator_timezone"]
+    reminder_database_path: Path = Path(DEFAULTS["reminder_database_path"])
+    trace_path: Path = Path(DEFAULTS["trace_path"])
+    trace_max_bytes: int = DEFAULTS["trace_max_bytes"]
+    listener_host: str | None = DEFAULTS["listener_host"]
+    listener_port: int | None = DEFAULTS["listener_port"]
+    system_prompt_path: Path = Path(DEFAULTS["system_prompt_path"])
+    vault_path: Path | None = DEFAULTS["vault_path"]
+    openwa_api_base_url: str | None = DEFAULTS["openwa_api_base_url"]
+    openwa_internal_session_id: str | None = DEFAULTS["openwa_internal_session_id"]
+    openwa_named_session: str | None = DEFAULTS["openwa_named_session"]
+    openwa_authorized_operator_number: str | None = DEFAULTS[
+        "openwa_authorized_operator_number"
+    ]
+    openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
+    web_search: WebSearchConfig = DEFAULTS["web_search"]
+    mcp_services: tuple[McpServiceConfig, ...] = ()
+    google: GoogleApiConfig | None = None
+    vault_git: VaultGitSettings | None = DEFAULTS["vault_git"]
+
+    def __post_init__(self) -> None:
+        if self.model not in self.allowed_models:
+            raise ValueError("model must be included in allowed_models")
+        if self.reasoning_effort not in self.allowed_reasoning_efforts:
+            raise ValueError(
+                "reasoning_effort must be included in allowed_reasoning_efforts"
+            )
+        if self.reasoning_effort not in MODEL_REASONING_EFFORTS.get(self.model, ()):
+            raise ValueError(
+                f"reasoning_effort {self.reasoning_effort!r} is unsupported "
+                f"for model {self.model}"
+            )
+        if self.vault_git is not None and self.vault_path is None:
+            raise ValueError("vault_git requires vault_path")
+
+    @property
+    def reasoning(self) -> str:
+        return self.reasoning_effort
+
+    @property
+    def session_inactivity_minutes(self) -> int:
+        return self.inactivity_minutes
+
+    @property
+    def inactivity_timeout_minutes(self) -> int:
+        return self.inactivity_minutes
+
+    @property
+    def context_token_limit(self) -> int:
+        return self.max_context_tokens
+
+    @property
+    def request_timeout(self) -> float:
+        return self.request_timeout_seconds
+
+    @property
+    def command_timeout(self) -> float:
+        return self.command_timeout_seconds
+
+    @property
+    def output_limit(self) -> int:
+        return self.max_output_chars
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedRuntimeConfig:
+    """The complete immutable configuration loaded for one runtime root."""
+
+    config: RuntimeConfig
+    secrets: RuntimeSecrets
+    system_prompt: str
+    toml_path: Path
+
+    @property
+    def runtime(self) -> RuntimeConfig:
+        return self.config
+
+    @property
+    def runtime_config(self) -> RuntimeConfig:
+        return self.config
+
+    @property
+    def runtime_secrets(self) -> RuntimeSecrets:
+        return self.secrets
+
+    @property
+    def root(self) -> Path:
+        return self.config.root
+
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RUNTIME_KEYS = {
+    "model",
+    "allowed_models",
+    "reasoning",
+    "reasoning_effort",
+    "allowed_reasoning_efforts",
+    "allowed_reasoning",
+    "inactivity_minutes",
+    "session_inactivity_minutes",
+    "inactivity_timeout_minutes",
+    "max_context_tokens",
+    "context_token_limit",
+    "request_timeout_seconds",
+    "request_timeout",
+    "max_tool_rounds",
+    "command_timeout_seconds",
+    "command_timeout",
+    "max_output_chars",
+    "output_limit",
+    "ubuntu_working_directory",
+    "ubuntu_read_only_prefixes",
+    "windows_ssh_host",
+    "windows_ssh_user",
+    "windows_ssh_identity_file",
+    "windows_working_directory",
+    "windows_read_only_prefixes",
+    "message_cache_path",
+    "message_cache_retention_days",
+    "operator_timezone",
+    "reminder_database_path",
+    "trace_path",
+    "trace_max_bytes",
+    "listener_host",
+    "listener_port",
+    "system_prompt_path",
+    "vault_path",
+    "openwa_api_base_url",
+    "openwa_internal_session_id",
+    "openwa_named_session",
+    "openwa_authorized_operator_number",
+    "openwa_operator_chat_id",
+}
+
+
+def _read_utf8(path: Path, *, kind: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(path, f"required {kind} file is missing") from exc
+    except IsADirectoryError as exc:
+        raise ConfigError(path, f"expected a {kind} file, found a directory") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(path, f"{kind} is not valid UTF-8") from exc
+    except OSError as exc:
+        raise ConfigError(path, f"cannot read {kind}: {exc}") from exc
+
+
+def _parse_env(path: Path) -> dict[str, str]:
+    text = _read_utf8(path, kind=".env")
+    values: dict[str, str] = {}
+    for line_number, original_line in enumerate(text.splitlines(), start=1):
+        line = original_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ConfigError(path, f"invalid .env entry on line {line_number}")
+        name, raw_value = line.split("=", 1)
+        name = name.strip()
+        if not _ENV_NAME.fullmatch(name):
+            raise ConfigError(path, f"invalid .env variable name on line {line_number}")
+        raw_value = raw_value.strip()
+        if (
+            len(raw_value) >= 2
+            and raw_value[0] == raw_value[-1]
+            and raw_value[0] in "'\""
+        ):
+            try:
+                parsed = ast.literal_eval(raw_value)
+            except (SyntaxError, ValueError) as exc:
+                raise ConfigError(
+                    path, f"invalid quoted value on line {line_number}"
+                ) from exc
+            if not isinstance(parsed, str):
+                raise ConfigError(path, f"invalid quoted value on line {line_number}")
+            raw_value = parsed
+        values[name] = raw_value
+    return values
+
+
+def _env_value(values: Mapping[str, str], path: Path, *names: str) -> str | None:
+    present = [(name, values[name]) for name in names if name in values]
+    nonempty = [(name, value) for name, value in present if value.strip()]
+    if len({value for _, value in nonempty}) > 1:
+        joined = ", ".join(name for name, _ in nonempty)
+        raise ConfigError(path, f"conflicting values for {joined}")
+    if not nonempty:
+        return None
+    return nonempty[0][1]
+
+
+def _load_secrets(path: Path) -> RuntimeSecrets:
+    values = _parse_env(path)
+    openai = _env_value(values, path, "OPENAI_API_KEY", "JARVIS_OPENAI_API_KEY")
+    if openai is None:
+        raise ConfigError(path, "missing non-empty OPENAI_API_KEY")
+    openwa_api_key = _env_value(values, path, "OPENWA_API_KEY", "OPENWA_API_MASTER_KEY")
+    if openwa_api_key is None:
+        raise ConfigError(path, "missing non-empty OPENWA_API_KEY")
+    openwa_webhook_signing_secret = _env_value(
+        values,
+        path,
+        "OPENWA_WEBHOOK_SIGNING_SECRET",
+        "OPENWA_WEBHOOK_SECRET",
+        "JARVIS_WEBHOOK_SIGNING_SECRET",
+    )
+    if openwa_webhook_signing_secret is None:
+        raise ConfigError(path, "missing non-empty OPENWA_WEBHOOK_SIGNING_SECRET")
+    return RuntimeSecrets(
+        openai_api_key=openai,
+        openwa_api_key=openwa_api_key,
+        openwa_webhook_signing_secret=openwa_webhook_signing_secret,
+        google_oauth_client_id=_env_value(values, path, "GOOGLE_OAUTH_CLIENT_ID"),
+        google_oauth_client_secret=_env_value(
+            values, path, "GOOGLE_OAUTH_CLIENT_SECRET"
+        ),
+        google_oauth_refresh_token=_env_value(
+            values, path, "GOOGLE_OAUTH_REFRESH_TOKEN"
+        ),
+    )
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    text = _read_utf8(path, kind="jarvis.toml")
+    try:
+        result = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(path, f"invalid TOML: {exc}") from exc
+    if not isinstance(result, dict):  # pragma: no cover - tomllib's contract
+        raise ConfigError(path, "top-level TOML value must be a table")
+    return result
+
+
+def _ensure_table(value: Any, path: Path, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConfigError(path, f"{name} must be a table")
+    return value
+
+
+def _collect_runtime_values(raw: Mapping[str, Any], path: Path) -> dict[str, Any]:
+    runtime = raw.get("runtime", {})
+    runtime_table = _ensure_table(runtime, path, "[runtime]")
+    for key in runtime_table:
+        if key not in _RUNTIME_KEYS:
+            raise ConfigError(path, f"unknown runtime setting: {key}")
+
+    values: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in {
+            "runtime",
+            "saved_permissions",
+            "mcp_services",
+            "google",
+            "vault_git",
+            "web_search",
+        }:
+            if key not in _RUNTIME_KEYS:
+                raise ConfigError(path, f"unknown top-level setting: {key}")
+            values[key] = value
+    for key, value in runtime_table.items():
+        if key in values and values[key] != value:
+            raise ConfigError(path, f"setting {key!r} is defined twice")
+        values[key] = value
+    return values
+
+
+def _setting(values: Mapping[str, Any], *names: str, default: Any) -> Any:
+    present = [(name, values[name]) for name in names if name in values]
+    if not present:
+        return default
+    first = present[0][1]
+    if any(value != first for _, value in present[1:]):
+        names_text = ", ".join(name for name, _ in present)
+        raise ValueError(f"conflicting aliases: {names_text}")
+    return first
+
+
+def _required_setting(values: Mapping[str, Any], path: Path, name: str) -> Any:
+    if name not in values:
+        raise ConfigError(path, f"missing required runtime setting: {name}")
+    return values[name]
+
+
+def _string(value: Any, path: Path, name: str, *, nonempty: bool = True) -> str:
+    if not isinstance(value, str) or (nonempty and not value.strip()):
+        raise ConfigError(path, f"{name} must be a non-empty string")
+    return value.strip() if nonempty else value
+
+
+def _string_list(value: Any, path: Path, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ConfigError(path, f"{name} must be a non-empty array of strings")
+    result = tuple(_string(item, path, name) for item in value)
+    if len(set(result)) != len(result):
+        raise ConfigError(path, f"{name} must not contain duplicates")
+    return result
+
+
+def _string_list_or_empty(value: Any, path: Path, name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(path, f"{name} must be an array of strings")
+    if not value:
+        return ()
+    result = tuple(_string(item, path, name) for item in value)
+    if len(set(result)) != len(result):
+        raise ConfigError(path, f"{name} must not contain duplicates")
+    if any(
+        any(ord(character) < 32 or ord(character) == 127 for character in item)
+        for item in result
+    ):
+        raise ConfigError(path, f"{name} must not contain control characters")
+    return result
+
+
+def _positive_int(value: Any, path: Path, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(path, f"{name} must be a positive integer")
+    return value
+
+
+def _optional_string(value: Any, path: Path, name: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, path, name)
+
+
+def _positive_number(value: Any, path: Path, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(path, f"{name} must be a positive number")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise ConfigError(path, f"{name} must be a positive number")
+    return result
+
+
+def _build_web_depth_limits(
+    value: Any, default: WebDepthLimits, path: Path, name: str
+) -> WebDepthLimits:
+    if value is None:
+        return default
+    table = _ensure_table(value, path, f"[{name}]")
+    allowed = {"max_queries", "max_pages"}
+    if set(table) - allowed:
+        raise ConfigError(path, f"[{name}] has unknown fields")
+    try:
+        return WebDepthLimits(
+            max_queries=_positive_int(
+                table.get("max_queries", default.max_queries),
+                path,
+                f"{name}.max_queries",
+            ),
+            max_pages=_positive_int(
+                table.get("max_pages", default.max_pages),
+                path,
+                f"{name}.max_pages",
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
+
+
+def _build_web_search_config(raw: Mapping[str, Any], path: Path) -> WebSearchConfig:
+    defaults = cast(WebSearchConfig, DEFAULTS["web_search"])
+    if "web_search" not in raw:
+        return defaults
+    table = _ensure_table(raw["web_search"], path, "[web_search]")
+    allowed = {
+        "enabled",
+        "browser_mode",
+        "operation_timeout_seconds",
+        "results_per_query",
+        "max_chars_per_page",
+        "max_total_evidence_chars",
+        "quick",
+        "moderate",
+    }
+    if set(table) - allowed:
+        raise ConfigError(path, "[web_search] has unknown fields")
+
+    enabled = table.get("enabled", defaults.enabled)
+    if not isinstance(enabled, bool):
+        raise ConfigError(path, "web_search.enabled must be a boolean")
+    quick = _build_web_depth_limits(
+        table.get("quick"), defaults.quick, path, "web_search.quick"
+    )
+    moderate = _build_web_depth_limits(
+        table.get("moderate"), defaults.moderate, path, "web_search.moderate"
+    )
+    try:
+        return WebSearchConfig(
+            enabled=enabled,
+            browser_mode=table.get("browser_mode", defaults.browser_mode),
+            operation_timeout_seconds=_positive_number(
+                table.get(
+                    "operation_timeout_seconds", defaults.operation_timeout_seconds
+                ),
+                path,
+                "web_search.operation_timeout_seconds",
+            ),
+            results_per_query=_positive_int(
+                table.get("results_per_query", defaults.results_per_query),
+                path,
+                "web_search.results_per_query",
+            ),
+            max_chars_per_page=_positive_int(
+                table.get("max_chars_per_page", defaults.max_chars_per_page),
+                path,
+                "web_search.max_chars_per_page",
+            ),
+            max_total_evidence_chars=_positive_int(
+                table.get(
+                    "max_total_evidence_chars", defaults.max_total_evidence_chars
+                ),
+                path,
+                "web_search.max_total_evidence_chars",
+            ),
+            quick=quick,
+            moderate=moderate,
+        )
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
+
+
+def _rooted_path(value: Any, root: Path, path: Path, name: str) -> Path:
+    value_text = _string(value, path, name)
+    candidate = Path(value_text)
+    if candidate.is_absolute():
+        raise ConfigError(path, f"{name} must be relative to the runtime root")
+    root_resolved = root.resolve()
+    resolved = (root / candidate).resolve()
+    try:
+        relative = resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ConfigError(path, f"{name} must remain beneath the runtime root") from exc
+    if not relative.parts:
+        raise ConfigError(path, f"{name} must identify a path beneath the runtime root")
+    return resolved
+
+
+def _optional_configured_path(
+    value: Any, root: Path, path: Path, name: str
+) -> Path | None:
+    if value is None:
+        return None
+    candidate = Path(_string(value, path, name)).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return candidate.resolve()
+    except OSError as exc:
+        raise ConfigError(path, f"cannot resolve {name}: {exc}") from exc
+
+
+def _bounded_text(value: Any, path: Path, name: str, *, maximum: int) -> str:
+    result = _string(value, path, name)
+    if len(result) > maximum:
+        raise ConfigError(path, f"{name} must not exceed {maximum} characters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in result):
+        raise ConfigError(path, f"{name} must not contain control characters")
+    return result
+
+
+def _vault_note_directories(value: Any, path: Path, name: str) -> tuple[str, ...]:
+    directories = _string_list(value, path, name)
+    if len(directories) > 128:
+        raise ConfigError(path, f"{name} must not contain more than 128 directories")
+
+    validated: list[str] = []
+    for directory in directories:
+        if len(directory) > 512:
+            raise ConfigError(path, f"{name} entries must not exceed 512 characters")
+        if any(ord(character) < 32 or ord(character) == 127 for character in directory):
+            raise ConfigError(
+                path, f"{name} entries must not contain control characters"
+            )
+        if directory == ".":
+            validated.append(directory)
+            continue
+        if "\\" in directory:
+            raise ConfigError(path, f"{name} entries must use POSIX relative paths")
+        if PureWindowsPath(directory).drive or PurePosixPath(directory).is_absolute():
+            raise ConfigError(
+                path, f"{name} entries must be vault-relative directories"
+            )
+        parts = PurePosixPath(directory).parts
+        if not parts or any(part in {".", ".."} for part in parts):
+            raise ConfigError(path, f"{name} entries must not contain dot segments")
+        if any(part.startswith(".") for part in parts):
+            raise ConfigError(path, f"{name} entries must be ordinary directories")
+        if str(PurePosixPath(directory)) != directory:
+            raise ConfigError(path, f"{name} entries must be normalized POSIX paths")
+        validated.append(directory)
+    return tuple(validated)
+
+
+def _absolute_configured_file(value: Any, path: Path, name: str) -> Path | None:
+    if value is None:
+        return None
+    value_text = _bounded_text(value, path, name, maximum=4096)
+    candidate = Path(value_text).expanduser()
+    if not candidate.is_absolute():
+        raise ConfigError(path, f"{name} must be an absolute file path")
+    try:
+        return candidate.resolve()
+    except OSError as exc:
+        raise ConfigError(path, f"cannot resolve {name}: {exc}") from exc
+
+
+def _git_branch(value: Any, path: Path, name: str) -> str:
+    branch = _bounded_text(value, path, name, maximum=255)
+    forbidden = set(" ~^:?*[\\")
+    components = branch.split("/")
+    if (
+        branch.startswith(("-", "/", "."))
+        or branch.endswith(("/", ".", ".lock"))
+        or ".." in branch
+        or "//" in branch
+        or "@{" in branch
+        or branch == "@"
+        or any(character in forbidden for character in branch)
+        or any(
+            not component
+            or component.startswith(".")
+            or component.endswith((".", ".lock"))
+            for component in components
+        )
+    ):
+        raise ConfigError(path, f"{name} must be a valid Git branch name")
+    return branch
+
+
+def _build_vault_git_settings(
+    raw: Mapping[str, Any], vault_path: Path | None, path: Path
+) -> VaultGitSettings | None:
+    if "vault_git" not in raw:
+        return None
+    if vault_path is None:
+        raise ConfigError(path, "[vault_git] requires vault_path")
+    from .vault_git import VaultGitSettings
+
+    table = _ensure_table(raw["vault_git"], path, "[vault_git]")
+    required = {"remote", "branch", "note_directories"}
+    optional = {
+        "author_name",
+        "author_email",
+        "ssh_identity_file",
+        "ssh_known_hosts_file",
+    }
+    if not required.issubset(table) or set(table) - required - optional:
+        raise ConfigError(path, "[vault_git] has unknown or missing fields")
+
+    remote = _bounded_text(table["remote"], path, "vault_git.remote", maximum=2048)
+    if remote.startswith("-"):
+        raise ConfigError(path, "vault_git.remote must not begin with '-'")
+    branch = _git_branch(table["branch"], path, "vault_git.branch")
+    note_directories = _vault_note_directories(
+        table["note_directories"], path, "vault_git.note_directories"
+    )
+    author_name = _bounded_text(
+        table.get("author_name", "Jarvis"),
+        path,
+        "vault_git.author_name",
+        maximum=128,
+    )
+    author_email = _bounded_text(
+        table.get("author_email", "jarvis@samikayyal.com"),
+        path,
+        "vault_git.author_email",
+        maximum=320,
+    )
+    if author_email.count("@") != 1 or any(
+        character.isspace() for character in author_email
+    ):
+        raise ConfigError(path, "vault_git.author_email must be an email address")
+    ssh_identity_file = _absolute_configured_file(
+        table.get("ssh_identity_file"), path, "vault_git.ssh_identity_file"
+    )
+    ssh_known_hosts_file = _absolute_configured_file(
+        table.get("ssh_known_hosts_file"), path, "vault_git.ssh_known_hosts_file"
+    )
+    if (ssh_identity_file is None) != (ssh_known_hosts_file is None):
+        raise ConfigError(
+            path,
+            "vault_git.ssh_identity_file and vault_git.ssh_known_hosts_file must be configured together",
+        )
+    try:
+        return VaultGitSettings(
+            remote=remote,
+            branch=branch,
+            note_directories=note_directories,
+            author_name=author_name,
+            author_email=author_email,
+            ssh_identity_file=ssh_identity_file,
+            ssh_known_hosts_file=ssh_known_hosts_file,
+        )
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
+
+
+def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConfig:
+    values = _collect_runtime_values(raw, path)
+
+    configured_services: list[McpServiceConfig] = []
+    raw_services = raw.get("mcp_services", [])
+    if not isinstance(raw_services, list):
+        raise ConfigError(path, "mcp_services must be an array of tables")
+    for index, raw_service in enumerate(raw_services):
+        service = _ensure_table(raw_service, path, f"mcp_services[{index}]")
+        if set(service) != {"id", "endpoint", "manifest_path", "max_output_chars"}:
+            raise ConfigError(
+                path, f"mcp_services[{index}] has unknown or missing fields"
+            )
+        try:
+            configured_services.append(
+                McpServiceConfig(
+                    id=_string(service["id"], path, f"mcp_services[{index}].id"),
+                    endpoint=_string(
+                        service["endpoint"], path, f"mcp_services[{index}].endpoint"
+                    ),
+                    manifest_path=_rooted_path(
+                        service["manifest_path"],
+                        root,
+                        path,
+                        f"mcp_services[{index}].manifest_path",
+                    ),
+                    max_output_chars=_positive_int(
+                        service["max_output_chars"],
+                        path,
+                        f"mcp_services[{index}].max_output_chars",
+                    ),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(path, str(exc)) from exc
+    ids = [service.id for service in configured_services]
+    if len(ids) != len(set(ids)):
+        raise ConfigError(path, "configured MCP service ids must be unique")
+    for service in configured_services:
+        if GOOGLE_MCP_ENDPOINTS.get(service.id) != service.endpoint:
+            raise ConfigError(
+                path,
+                f"{service.id} must use its official Google MCP endpoint",
+            )
+
+    google: GoogleApiConfig | None = None
+    if "google" in raw:
+        google_table = _ensure_table(raw["google"], path, "[google]")
+        if set(google_table) != {"account", "max_output_chars"}:
+            raise ConfigError(path, "[google] has unknown or missing fields")
+        try:
+            google = GoogleApiConfig(
+                account=_string(google_table["account"], path, "google.account"),
+                max_output_chars=_positive_int(
+                    google_table["max_output_chars"],
+                    path,
+                    "google.max_output_chars",
+                ),
+            )
+        except ValueError as exc:
+            raise ConfigError(path, str(exc)) from exc
+    if google is not None and configured_services:
+        raise ConfigError(
+            path,
+            "[google] cannot be combined with configured Google MCP services",
+        )
+    web_search = _build_web_search_config(raw, path)
+
+    try:
+        model = _setting(values, "model", default=DEFAULTS["model"])
+        allowed_models_value = _setting(
+            values, "allowed_models", default=list(DEFAULTS["allowed_models"])
+        )
+        reasoning = _setting(
+            values,
+            "reasoning_effort",
+            "reasoning",
+            default=DEFAULTS["reasoning_effort"],
+        )
+        allowed_reasoning_value = _setting(
+            values,
+            "allowed_reasoning_efforts",
+            "allowed_reasoning",
+            default=list(DEFAULTS["allowed_reasoning_efforts"]),
+        )
+        inactivity = _setting(
+            values,
+            "inactivity_minutes",
+            "session_inactivity_minutes",
+            "inactivity_timeout_minutes",
+            default=DEFAULTS["inactivity_minutes"],
+        )
+        context_limit = _setting(
+            values,
+            "max_context_tokens",
+            "context_token_limit",
+            default=DEFAULTS["max_context_tokens"],
+        )
+        request_timeout = _setting(
+            values,
+            "request_timeout_seconds",
+            "request_timeout",
+            default=DEFAULTS["request_timeout_seconds"],
+        )
+        command_timeout = _setting(
+            values,
+            "command_timeout_seconds",
+            "command_timeout",
+            default=DEFAULTS["command_timeout_seconds"],
+        )
+        output_limit = _setting(
+            values,
+            "max_output_chars",
+            "output_limit",
+            default=DEFAULTS["max_output_chars"],
+        )
+        ubuntu_working_directory_value = _setting(
+            values,
+            "ubuntu_working_directory",
+            default=DEFAULTS["ubuntu_working_directory"],
+        )
+        ubuntu_read_only_prefixes_value = _setting(
+            values,
+            "ubuntu_read_only_prefixes",
+            default=list(DEFAULTS["ubuntu_read_only_prefixes"]),
+        )
+        windows_ssh_host_value = _setting(
+            values, "windows_ssh_host", default=DEFAULTS["windows_ssh_host"]
+        )
+        windows_ssh_user_value = _setting(
+            values, "windows_ssh_user", default=DEFAULTS["windows_ssh_user"]
+        )
+        windows_ssh_identity_file_value = _setting(
+            values,
+            "windows_ssh_identity_file",
+            default=DEFAULTS["windows_ssh_identity_file"],
+        )
+        windows_working_directory_value = _setting(
+            values,
+            "windows_working_directory",
+            default=DEFAULTS["windows_working_directory"],
+        )
+        windows_read_only_prefixes_value = _setting(
+            values,
+            "windows_read_only_prefixes",
+            default=list(DEFAULTS["windows_read_only_prefixes"]),
+        )
+        max_tool_rounds = _setting(
+            values, "max_tool_rounds", default=DEFAULTS["max_tool_rounds"]
+        )
+        cache_path_value = _setting(
+            values, "message_cache_path", default=DEFAULTS["message_cache_path"]
+        )
+        retention = _setting(
+            values,
+            "message_cache_retention_days",
+            default=DEFAULTS["message_cache_retention_days"],
+        )
+        operator_timezone_value = _required_setting(values, path, "operator_timezone")
+        reminder_database_path_value = _required_setting(
+            values, path, "reminder_database_path"
+        )
+        trace_path_value = _setting(
+            values, "trace_path", default=DEFAULTS["trace_path"]
+        )
+        trace_max_bytes = _setting(
+            values, "trace_max_bytes", default=DEFAULTS["trace_max_bytes"]
+        )
+        listener_host_value = _setting(
+            values, "listener_host", default=DEFAULTS["listener_host"]
+        )
+        listener_port_value = _setting(
+            values, "listener_port", default=DEFAULTS["listener_port"]
+        )
+        prompt_path_value = _setting(
+            values, "system_prompt_path", default=DEFAULTS["system_prompt_path"]
+        )
+        vault_path_value = _setting(
+            values, "vault_path", default=DEFAULTS["vault_path"]
+        )
+        openwa_api_base_url = _setting(
+            values, "openwa_api_base_url", default=DEFAULTS["openwa_api_base_url"]
+        )
+        openwa_internal_session_id = _setting(
+            values,
+            "openwa_internal_session_id",
+            default=DEFAULTS["openwa_internal_session_id"],
+        )
+        openwa_named_session = _setting(
+            values,
+            "openwa_named_session",
+            default=DEFAULTS["openwa_named_session"],
+        )
+        openwa_authorized_operator_number = _setting(
+            values,
+            "openwa_authorized_operator_number",
+            default=DEFAULTS["openwa_authorized_operator_number"],
+        )
+        openwa_operator_chat_id = _setting(
+            values,
+            "openwa_operator_chat_id",
+            default=DEFAULTS["openwa_operator_chat_id"],
+        )
+
+        model = normalize_model_alias(_string(model, path, "model"))
+        allowed_models = _string_list(allowed_models_value, path, "allowed_models")
+        if any(item not in DEFAULT_ALLOWED_MODELS for item in allowed_models):
+            raise ConfigError(path, "allowed_models contains an unsupported model")
+        if model not in allowed_models:
+            raise ConfigError(path, "model must be included in allowed_models")
+
+        reasoning = _string(reasoning, path, "reasoning_effort")
+        allowed_reasoning = _string_list(
+            allowed_reasoning_value, path, "allowed_reasoning_efforts"
+        )
+        if any(
+            item not in DEFAULT_ALLOWED_REASONING_EFFORTS for item in allowed_reasoning
+        ):
+            raise ConfigError(
+                path, "allowed_reasoning_efforts contains an unsupported value"
+            )
+        if reasoning not in allowed_reasoning:
+            raise ConfigError(
+                path, "reasoning_effort must be included in allowed_reasoning_efforts"
+            )
+        if reasoning not in MODEL_REASONING_EFFORTS[model]:
+            raise ConfigError(
+                path,
+                f"reasoning_effort {reasoning!r} is unsupported for model {model}",
+            )
+
+        inactivity = _positive_int(inactivity, path, "inactivity_minutes")
+        context_limit = _positive_int(context_limit, path, "max_context_tokens")
+        request_timeout = _positive_number(
+            request_timeout, path, "request_timeout_seconds"
+        )
+        command_timeout = _positive_number(
+            command_timeout, path, "command_timeout_seconds"
+        )
+        max_tool_rounds = _positive_int(max_tool_rounds, path, "max_tool_rounds")
+        output_limit = _positive_int(output_limit, path, "max_output_chars")
+        retention = _positive_int(retention, path, "message_cache_retention_days")
+        operator_timezone = _string(operator_timezone_value, path, "operator_timezone")
+        try:
+            ZoneInfo(operator_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConfigError(
+                path, "operator_timezone must be a valid IANA timezone"
+            ) from exc
+        trace_max_bytes = _positive_int(trace_max_bytes, path, "trace_max_bytes")
+        listener_host = _optional_string(listener_host_value, path, "listener_host")
+        listener_port = listener_port_value
+        if (listener_host is None) != (listener_port is None):
+            raise ConfigError(
+                path, "listener_host and listener_port must be configured together"
+            )
+        if listener_host is not None:
+            try:
+                listener_address = ipaddress.IPv4Address(listener_host)
+            except ipaddress.AddressValueError as exc:
+                raise ConfigError(
+                    path, "listener_host must be a private IPv4 address"
+                ) from exc
+            private_networks = (
+                ipaddress.IPv4Network("10.0.0.0/8"),
+                ipaddress.IPv4Network("172.16.0.0/12"),
+                ipaddress.IPv4Network("192.168.0.0/16"),
+            )
+            if not any(listener_address in network for network in private_networks):
+                raise ConfigError(path, "listener_host must be a private IPv4 address")
+            listener_port = _positive_int(listener_port, path, "listener_port")
+            if listener_port > 65_535:
+                raise ConfigError(path, "listener_port must not exceed 65535")
+        if retention != DEFAULTS["message_cache_retention_days"]:
+            raise ConfigError(path, "message_cache_retention_days is fixed at 7")
+        cache_path = _rooted_path(cache_path_value, root, path, "message_cache_path")
+        reminder_database_path = _rooted_path(
+            reminder_database_path_value,
+            root,
+            path,
+            "reminder_database_path",
+        )
+        trace_path = _rooted_path(trace_path_value, root, path, "trace_path")
+        prompt_path = _rooted_path(prompt_path_value, root, path, "system_prompt_path")
+        ubuntu_working_directory = _optional_configured_path(
+            ubuntu_working_directory_value,
+            root,
+            path,
+            "ubuntu_working_directory",
+        )
+        assert ubuntu_working_directory is not None
+        ubuntu_read_only_prefixes = _string_list_or_empty(
+            ubuntu_read_only_prefixes_value, path, "ubuntu_read_only_prefixes"
+        )
+        windows_ssh_host = _optional_string(
+            windows_ssh_host_value, path, "windows_ssh_host"
+        )
+        windows_ssh_user = _optional_string(
+            windows_ssh_user_value, path, "windows_ssh_user"
+        )
+        windows_ssh_identity_file = _optional_configured_path(
+            windows_ssh_identity_file_value,
+            root,
+            path,
+            "windows_ssh_identity_file",
+        )
+        windows_working_directory = _optional_string(
+            windows_working_directory_value, path, "windows_working_directory"
+        )
+        windows_read_only_prefixes = _string_list_or_empty(
+            windows_read_only_prefixes_value, path, "windows_read_only_prefixes"
+        )
+        windows_connection = (
+            windows_ssh_host,
+            windows_ssh_user,
+            windows_ssh_identity_file,
+            windows_working_directory,
+        )
+        if any(value is not None for value in windows_connection) and any(
+            value is None for value in windows_connection
+        ):
+            raise ConfigError(
+                path,
+                "Windows SSH host, user, identity file, and working directory must be configured together",
+            )
+        vault_path = _optional_configured_path(
+            vault_path_value, root, path, "vault_path"
+        )
+        vault_git = _build_vault_git_settings(raw, vault_path, path)
+        openwa_api_base_url = _optional_string(
+            openwa_api_base_url, path, "openwa_api_base_url"
+        )
+        openwa_internal_session_id = _optional_string(
+            openwa_internal_session_id, path, "openwa_internal_session_id"
+        )
+        openwa_named_session = _optional_string(
+            openwa_named_session, path, "openwa_named_session"
+        )
+        openwa_authorized_operator_number = _optional_string(
+            openwa_authorized_operator_number,
+            path,
+            "openwa_authorized_operator_number",
+        )
+        openwa_operator_chat_id = _optional_string(
+            openwa_operator_chat_id, path, "openwa_operator_chat_id"
+        )
+    except ConfigError:
+        raise
+    except ValueError as exc:
+        raise ConfigError(path, str(exc)) from exc
+
+    return RuntimeConfig(
+        root=root,
+        model=model,
+        allowed_models=allowed_models,
+        reasoning_effort=reasoning,
+        allowed_reasoning_efforts=allowed_reasoning,
+        inactivity_minutes=inactivity,
+        max_context_tokens=context_limit,
+        request_timeout_seconds=request_timeout,
+        max_tool_rounds=max_tool_rounds,
+        command_timeout_seconds=command_timeout,
+        max_output_chars=output_limit,
+        ubuntu_working_directory=ubuntu_working_directory,
+        ubuntu_read_only_prefixes=ubuntu_read_only_prefixes,
+        windows_ssh_host=windows_ssh_host,
+        windows_ssh_user=windows_ssh_user,
+        windows_ssh_identity_file=windows_ssh_identity_file,
+        windows_working_directory=windows_working_directory,
+        windows_read_only_prefixes=windows_read_only_prefixes,
+        message_cache_path=cache_path,
+        message_cache_retention_days=retention,
+        operator_timezone=operator_timezone,
+        reminder_database_path=reminder_database_path,
+        trace_path=trace_path,
+        trace_max_bytes=trace_max_bytes,
+        listener_host=listener_host,
+        listener_port=listener_port,
+        system_prompt_path=prompt_path,
+        vault_path=vault_path,
+        openwa_api_base_url=openwa_api_base_url,
+        openwa_internal_session_id=openwa_internal_session_id,
+        openwa_named_session=openwa_named_session,
+        openwa_authorized_operator_number=openwa_authorized_operator_number,
+        openwa_operator_chat_id=openwa_operator_chat_id,
+        web_search=web_search,
+        mcp_services=tuple(configured_services),
+        google=google,
+        vault_git=vault_git,
+    )
+
+
+def load_runtime_config(
+    root: str | Path = ".", *, config_path: str | Path | None = None
+) -> LoadedRuntimeConfig:
+    """Load and validate ``.env``, ``jarvis.toml`` and ``SYSTEM.md``.
+
+    ``root`` contains ``.env`` and ``SYSTEM.md`` and anchors runtime-owned
+    paths. ``config_path`` may place ``jarvis.toml`` elsewhere; it defaults to
+    the runtime root. An external absolute ``vault_path`` is kept.
+    """
+
+    root_path = Path(root).expanduser()
+    try:
+        root_path = root_path.resolve()
+    except OSError as exc:
+        raise ConfigError(root_path, f"cannot resolve runtime root: {exc}") from exc
+    if not root_path.is_dir():
+        raise ConfigError(root_path, "runtime root must be a directory")
+
+    secrets = _load_secrets(root_path / ".env")
+    toml_path = (
+        root_path / "jarvis.toml"
+        if config_path is None
+        else Path(config_path).expanduser()
+    )
+    try:
+        toml_path = toml_path.resolve()
+    except OSError as exc:
+        raise ConfigError(toml_path, f"cannot resolve jarvis.toml: {exc}") from exc
+    raw = _load_toml(toml_path)
+    config = _build_config(raw, root_path, toml_path)
+    if config.mcp_services or config.google is not None:
+        google_credentials = (
+            secrets.google_oauth_client_id,
+            secrets.google_oauth_client_secret,
+            secrets.google_oauth_refresh_token,
+        )
+        if any(value is None for value in google_credentials):
+            missing = next(
+                name
+                for name, value in zip(
+                    (
+                        "GOOGLE_OAUTH_CLIENT_ID",
+                        "GOOGLE_OAUTH_CLIENT_SECRET",
+                        "GOOGLE_OAUTH_REFRESH_TOKEN",
+                    ),
+                    google_credentials,
+                    strict=True,
+                )
+                if value is None
+            )
+            raise ConfigError(root_path / ".env", f"missing non-empty {missing}")
+    prompt = _read_utf8(config.system_prompt_path, kind="SYSTEM.md")
+    if not prompt.strip():
+        raise ConfigError(config.system_prompt_path, "SYSTEM.md must be non-empty")
+    return LoadedRuntimeConfig(
+        config=config,
+        secrets=secrets,
+        system_prompt=prompt,
+        toml_path=toml_path,
+    )
+
+
+def load_config(root: str | Path = ".") -> LoadedRuntimeConfig:
+    """Short alias for :func:`load_runtime_config`."""
+
+    return load_runtime_config(root)
+
+
+__all__ = [
+    "DEFAULTS",
+    "DEFAULT_ALLOWED_MODELS",
+    "DEFAULT_ALLOWED_REASONING_EFFORTS",
+    "ConfigError",
+    "GoogleApiConfig",
+    "LoadedRuntimeConfig",
+    "McpServiceConfig",
+    "RuntimeConfig",
+    "RuntimeSecrets",
+    "WebDepthLimits",
+    "WebSearchConfig",
+    "load_config",
+    "load_runtime_config",
+]

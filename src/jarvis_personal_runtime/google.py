@@ -730,7 +730,9 @@ class GoogleApiTools:
         except Exception:  # noqa: BLE001 - external API details stay private
             return _error("unavailable")
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
         if not isinstance(continuation, _WriteContinuation):
             raise TypeError("invalid Google write continuation")
         if continuation.resolved:

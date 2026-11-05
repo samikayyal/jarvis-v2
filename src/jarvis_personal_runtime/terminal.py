@@ -319,7 +319,9 @@ class RunTerminalTool:
         )
         return self._bounded_result(result)
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
         if not isinstance(continuation, TerminalContinuation):
             raise TypeError("invalid terminal approval continuation")
         if not approved:

@@ -3,7 +3,7 @@ name: google
 description: Search and read Gmail, Drive, and Calendar; send or reply to email and create or update calendar events.
 ---
 
-Use the exposed bounded Google tools for the configured account. Loading this skill neither connects an account nor approves a write. Gmail and Calendar writes use the runtime's exact approval flow; Drive is read-only.
+Use the exposed bounded Google tools for the configured account. Loading this skill neither connects an account nor approves a write. Gmail and Calendar writes use the runtime's approval flow: full access authorizes them without individual prompts; normal mode requests exact approval. Drive is read-only.
 
 ## Gmail
 

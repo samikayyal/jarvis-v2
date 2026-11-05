@@ -339,12 +339,14 @@ def test_async_service_composition_uses_one_direct_google_api_tool(
         config_path: Path,
         trace: object,
         additional_tools: tuple[object, ...],
+        full_access: object,
     ) -> object:
         captured["api_key"] = api_key
         captured["config"] = config
         captured["config_path"] = config_path
         captured["trace"] = trace
         captured["additional_tools"] = additional_tools
+        captured["full_access"] = full_access
         return object()
 
     monkeypatch.setattr(service_module, "build_direct_responses_runner", runner)
@@ -370,6 +372,7 @@ def test_async_service_composition_uses_one_direct_google_api_tool(
     application, config = asyncio.run(build_service_async(root))
 
     assert isinstance(application, WebhookHttpApplication)
+    assert captured["full_access"]() is False
     assert config.google is not None
     assert captured["config_path"] == root / "jarvis.toml"
     tools = captured["additional_tools"]

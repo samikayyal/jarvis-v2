@@ -560,7 +560,9 @@ class ConfiguredMcpService:
             )
         return await self._call(operation, frozen, connection, write=False)
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
         if not isinstance(continuation, _WriteContinuation):
             raise TypeError("invalid MCP write continuation")
         if continuation.resolved:

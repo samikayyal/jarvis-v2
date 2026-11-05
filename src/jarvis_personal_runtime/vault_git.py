@@ -504,7 +504,9 @@ class VaultTools:
             )
         raise VaultToolError(f"unknown prepared tool: {name}")
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
         if not isinstance(continuation, _EditContinuation):
             raise TypeError("invalid vault edit continuation")
         async with self._lock:
@@ -524,7 +526,10 @@ class VaultTools:
                     },
                     limit=self._max_result_chars,
                 )
-            if self._has_saved_permissions(continuation.changes):
+            if full_access:
+                continuation.state.approval_decision = "full_access"
+                continuation.state.preview_shown = False
+            elif self._has_saved_permissions(continuation.changes):
                 continuation.state.approval_decision = "approved_and_saved"
             return await self._execute_approved(continuation)
 
@@ -1306,7 +1311,9 @@ class VaultTools:
             "approval": {
                 "decision": continuation.state.approval_decision,
                 "preview_shown": continuation.state.preview_shown,
-                "source": "operator_reply"
+                "source": "full_access"
+                if continuation.state.approval_decision == "full_access"
+                else "operator_reply"
                 if continuation.state.preview_shown
                 else "saved_permission",
             },
