@@ -1,7 +1,7 @@
 # Page reader implementation and acceptance
 
-Date: 2026-11-04 (Asia/Amman)
-Status: implemented and deployed; visible in-app WhatsApp acceptance pending.
+Date: 2026-11-05 (Asia/Amman)
+Status: complete; implemented, deployed, and visibly accepted through WhatsApp in Chrome.
 
 ## Scope
 
@@ -67,12 +67,70 @@ No service, database, queue, persistent reader history or dependency was added.
 - Post-activation: service active/running, NRestarts=0; OpenWA HTTP 200 and exact
   named session ready; zero browser worker processes and zero temporary profiles.
 
-## Remaining acceptance gate
+## Visible WhatsApp acceptance
 
-Visible WhatsApp GCP discovery/pricing, ordinary follow-up, explicit refresh,
-and cancellation through the in-app browser. End with idle `/status`, service
-health, ready OpenWA session and no browser workers/profiles.
+On 2026-11-05 the operator explicitly switched from the unavailable in-app
+browser to Chrome ("use chrome bro"). Tests used the existing Jarvis WhatsApp
+chat, with read-only public-web prompts, from 04:10 to 04:16 Asia/Amman.
 
-At the latest retry, in-app browser-control tools were absent and the native
-Computer Use helper returned `native pipe is unavailable` even after reset.
-This does not count as WhatsApp acceptance. The operator has been notified.
+- Discovery searched first, read the official Compute Engine overview, followed
+  its returned General-purpose pricing link, and selected chunks 4 and 7 of 7.
+  The visible answer verified Iowa (us-central1), e2-standard-2, 2 vCPUs, 8 GiB,
+  Default/on-demand USD $0.06701142/hour. It included a source excerpt, both
+  official links, separate-cost exclusions from the overview, and gaps in
+  purchase conditions and total running cost. Search returned unhelpful
+  third-party snippets; Jarvis used the official overview directly instead.
+- Reader `7777e2451b0f` owned the overview; `aeb666468bdd` owned General-purpose
+  pricing. Raw request inspection confirmed low-reasoning reader requests had
+  only `read_page_chunk` and `display_page`, isolated from the main assistant's
+  medium-reasoning conversation/tools. Full selected chunks stayed in reader
+  input; the main transcript received compact findings and IDs.
+- The explicit evidence-only follow-up used `aeb666468bdd`, refresh=false,
+  actions=0, page_work=0. The visible reply explained default versus CUD columns
+  and disclosed unverified inclusions/terms.
+- Explicit refresh used the same ID, page_work=1, and new captured evidence.
+  The first refreshed model request contained only three initial input items
+  and no previous chunk exchanges; inspection reset to chunk 4 of 7. The visible
+  reply quoted the current table labels and row. The price was unchanged.
+- A new reader began capture at 01:15:33Z, then `/cancel` interrupted it.
+  Its trace outcome was `cancelled` after 12.039 seconds, with no inference
+  attempts and no inspected chunks. WhatsApp confirmed cancellation. No late
+  comparison answer appeared during subsequent follow-up and final status.
+- The earlier completed reader survived cancellation. An ordinary follow-up
+  inspected previously unread chunk 7 of the refreshed capture, retained chunk
+  4, and did zero page work. Its visible answer correctly restricted the
+  one-minute billing statement to RHEL images rather than VM compute and
+  disclosed remaining unread chunks.
+- Final visible `/status` at 04:16: active request none; pending action no;
+  main model gpt-6-luna (medium); context about 26,695/250,000 tokens.
+  Post-test health confirmed the exact active release above, active/running
+  service, NRestarts=0, zero browser processes and zero temporary profiles.
+  OpenWA returned HTTP 200, exact named session ready, identity matching.
+  Prompt/config hashes still matched the recorded deployment values.
+
+### Reader latency and provider usage
+
+Input/output counts below sum model calls within each invocation, including
+cached input and repeated retained context; they are not peak context sizes.
+All completed invocations returned `ok`, with zero transient retries.
+
+| Invocation | Seconds | Model calls | Actions | Page work | Input tokens | Output tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Overview | 21.394 | 1 | 0 | 1 | 7,119 | 448 |
+| General-purpose pricing | 53.105 | 3 | 2 | 1 | 24,270 | 683 |
+| Jarvis's automatic conditions follow-up | 11.341 | 3 | 2 | 0 | 65,676 | 893 |
+| Explicit evidence-only follow-up | 4.762 | 1 | 0 | 0 | 29,229 | 386 |
+| Explicit refresh | 43.668 | 2 | 1 | 1 | 9,802 | 323 |
+| Follow-up after cancellation | 7.600 | 2 | 1 | 0 | 23,672 | 507 |
+
+The automatic conditions follow-up reread selected chunks locally, increasing
+retained context and token usage without refetching. This is permitted by the
+bounded contract; no optimization framework was added. General compute billing
+minimums and full commitment terms remain source-coverage gaps, not verified
+claims. Cost is not estimated without applicable verified model pricing.
+
+Local evidence: `whatsapp-trace.log` and `whatsapp-audit.log` under this scratch
+directory (ignored evidence), plus pricing and final-status screenshots in the
+chat's visualization directory. These
+logs contain only acceptance-window selected events and request-shape summaries,
+not credentials. Screenshot evidence remains local and is not pushed to GitHub.

@@ -1,12 +1,12 @@
 # Conversational page reader
 
-Status: implemented; live WhatsApp acceptance pending
+Status: complete
 
 Design accepted and specification completed: 2026-11-03 (Asia/Amman).
 
 This publishes the agreed design and initial limits. Implementation and deployment
 were separately authorized on 2026-11-04; see [verification](deployment-verification.md)
-for the deployed candidate and remaining live acceptance gate.
+for the deployed candidate and completed live acceptance.
 
 ## Problem Statement
 
