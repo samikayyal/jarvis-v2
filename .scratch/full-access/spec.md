@@ -100,8 +100,13 @@ identify automatic approval without claiming that a preview was shown.
 
 ## Delivery state
 
-Local implementation complete. No commit, push, deployment, or live WhatsApp
-acceptance has been performed for this feature.
+Implementation committed on 2026-11-05 in `b05ace7` and integrated on `main`
+with the completed page-reader branch. This integration does not deploy full
+access; Ubuntu deployment and live WhatsApp acceptance remain outstanding.
+
+Integration verification on 2026-11-05 (Windows): `uv run pytest -q` passed
+with 609 tests and 9 skips. `uv run ruff check src tests`,
+`uv run ruff format --check src tests`, and `git diff --cached --check` passed.
 
 Verification on 2026-11-01:
 

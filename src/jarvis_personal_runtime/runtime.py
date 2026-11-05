@@ -828,7 +828,7 @@ class PersonalRuntime:
         if now - self._session.last_activity_at >= timedelta(
             minutes=self.config.inactivity_minutes
         ):
-            self._session = None
+            self._clear_session()
 
     def _pending(self) -> _Pending:
         if self._session is None or self._session.pending is None:
@@ -842,6 +842,9 @@ class PersonalRuntime:
             else None
         )
         self._session = None
+        end_session = getattr(self.request_runner, "end_session", None)
+        if callable(end_session):
+            end_session()
         return task
 
     def _cancel_work(self, now: datetime) -> asyncio.Task[object] | None:

@@ -71,10 +71,13 @@ within the working session; explicit rechecks and time-sensitive claims need fre
 tool work. Search snippets and actually read pages retain distinct provenance.
 _Avoid_: Unverified fallback, raw search results
 
-**Page reader** (agreed design; not implemented):
-A delegated assistant that answers focused questions about one webpage and
-provides supporting source evidence and unresolved gaps. The main assistant
-chooses which pages to visit and combines their findings.
+**Page reader**:
+A delegated assistant that answers focused questions about one assigned public
+webpage using source quotes, relevant links, explicit gaps, and inspection
+coverage. Its captured page and selected evidence remain in the working session.
+The main assistant chooses other pages and combines findings. Explicit refresh
+replaces reader evidence only after successful capture; ordinary follow-ups
+reuse it.
 _Avoid_: Autonomous researcher, generic page summary
 
 **Reminder**:
@@ -122,7 +125,7 @@ One deliberately implemented operation exposed to the model-and-tool loop. The
 current prepared tools are `read_vault`, `list_vault_tree`, the optional Git-backed `edit_vault` and
 `delete_vault`,
 `run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
-`list_reminders`, `cancel_reminder`, optional `search_web` and `read_web_pages`, and the manifest-selected bounded
+`list_reminders`, `cancel_reminder`, optional `search_web`, `read_web_page`, and `ask_page_reader`, and the manifest-selected bounded
 operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
 

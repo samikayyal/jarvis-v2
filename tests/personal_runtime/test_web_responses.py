@@ -27,6 +27,9 @@ from jarvis_personal_runtime.web_tools import WebTools
 
 
 class Responses:
+    def without_retries(self):
+        return self
+
     def __init__(self, *results: ResponsesResult) -> None:
         self.results = list(results)
         self.requests = []
@@ -158,7 +161,7 @@ def test_web_skill_exposes_tools_only_after_loading() -> None:
         run(tools.execute("read_web_pages", {"urls": [], "depth": "quick"}))
 
     run(tools.execute("load_skill", {"name": "web"}))
-    assert "read_web_pages" in tools.instructions
+    assert "read_web_page" in tools.instructions
     assert tools.definitions[1]["name"] == "read_web_pages"
 
 

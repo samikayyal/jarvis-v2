@@ -783,3 +783,31 @@ def test_invalid_web_search_settings_are_path_specific_config_errors(
 
     assert caught.value.path == tmp_path / "jarvis.toml"
     assert needle in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        'reasoning_effort = "low"',
+        'model = "invalid"',
+        'model = "gpt-6-luna"\ncontext_tokens = 0',
+        'model = "gpt-6-luna"\nmax_actions = true',
+        'model = "gpt-6-luna"\nunknown_limit = 1',
+    ],
+)
+def test_reader_configuration_rejects_missing_or_invalid_values(tmp_path, table):
+    _write_runtime_files(tmp_path, toml="[web_reader]\n" + table + "\n")
+    with pytest.raises(ConfigError):
+        load_runtime_config(tmp_path)
+
+
+def test_reader_configuration_is_independent_of_main_model(tmp_path):
+    _write_runtime_files(
+        tmp_path,
+        toml='model = "gpt-6-sol"\n[web_reader]\nmodel = "gpt-6-luna"\nreasoning_effort = "low"\n',
+    )
+    config = load_runtime_config(tmp_path).config
+    assert config.model == "gpt-6-sol"
+    assert config.web_reader.model == "gpt-6-luna"
+    assert config.web_reader.reasoning_effort == "low"
+    assert config.web_reader.context_tokens == 64000

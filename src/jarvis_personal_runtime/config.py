@@ -139,6 +139,36 @@ class WebSearchConfig:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class WebReaderConfig:
+    model: str = "gpt-6-luna"
+    reasoning_effort: str = "low"
+    chunk_tokens: int = 12_000
+    context_tokens: int = 64_000
+    timeout_seconds: int = 120
+    max_attempts: int = 8
+    max_actions: int = 8
+    findings_tokens: int = 2_000
+    output_tokens: int = 8_000
+    max_readers: int = 8
+    capture_chars: int = 1_000_000
+
+    def __post_init__(self) -> None:
+        if self.reasoning_effort not in MODEL_REASONING_EFFORTS.get(self.model, ()):
+            raise ValueError("unsupported web_reader model/reasoning configuration")
+        for name in self.__dataclass_fields__:
+            if name not in {"model", "reasoning_effort"}:
+                value = getattr(self, name)
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"web_reader.{name} must be a positive integer")
+        if self.context_tokens > 64_000 or self.output_tokens >= self.context_tokens:
+            raise ValueError("web_reader context must be <= 64000 with response space")
+        if self.chunk_tokens < 128 or self.findings_tokens < 512:
+            raise ValueError(
+                "web_reader chunks/findings must allow structural metadata"
+            )
+
+
 # This is for typing
 class _RuntimeDefaults(TypedDict):
     model: str
@@ -381,6 +411,7 @@ class RuntimeConfig:
     ]
     openwa_operator_chat_id: str | None = DEFAULTS["openwa_operator_chat_id"]
     web_search: WebSearchConfig = DEFAULTS["web_search"]
+    web_reader: WebReaderConfig | None = None
     mcp_services: tuple[McpServiceConfig, ...] = ()
     google: GoogleApiConfig | None = None
     vault_git: VaultGitSettings | None = DEFAULTS["vault_git"]
@@ -622,6 +653,7 @@ def _collect_runtime_values(raw: Mapping[str, Any], path: Path) -> dict[str, Any
             "google",
             "vault_git",
             "web_search",
+            "web_reader",
         }:
             if key not in _RUNTIME_KEYS:
                 raise ConfigError(path, f"unknown top-level setting: {key}")
@@ -1033,6 +1065,15 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             "[google] cannot be combined with configured Google MCP services",
         )
     web_search = _build_web_search_config(raw, path)
+    web_reader = None
+    if "web_reader" in raw:
+        try:
+            table = _ensure_table(raw["web_reader"], path, "[web_reader]")
+            if not table.get("model"):
+                raise ValueError("web_reader.model is required")
+            web_reader = WebReaderConfig(**table)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(path, str(exc)) from exc
 
     try:
         model = _setting(values, "model", default=DEFAULTS["model"])
@@ -1352,6 +1393,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         openwa_authorized_operator_number=openwa_authorized_operator_number,
         openwa_operator_chat_id=openwa_operator_chat_id,
         web_search=web_search,
+        web_reader=web_reader,
         mcp_services=tuple(configured_services),
         google=google,
         vault_git=vault_git,

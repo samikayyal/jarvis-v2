@@ -2,6 +2,10 @@
 
 Prepared on **26 October 2026**, updated **29 October 2026** for the web-search simplification.
 
+> Historical raw-reader description. The search and network sections remain
+> relevant; [page-reader.md](page-reader.md) documents the current page-reading
+> interface, retained conversations, refresh behavior, and limits.
+
 Jarvis searches the public web by driving a real Chrome/Chromium browser with **Selenium**, opening Google's search page, parsing recognized organic result cards with **BeautifulSoup**, and optionally opening selected source pages to extract their visible text. The model chooses queries and sources and writes the answer; Python code controls browser access, validates destinations, enforces allowances, and returns structured evidence.
 
 This document describes the working-tree source, including existing uncommitted web changes, at base commit `1a8421858032546dbf6bb865fdc789c68cb8f1d8`. That commit alone does not identify all the code described here. Historical deployment evidence is separated in section 16. The running server was not inspected for this documentation task.
