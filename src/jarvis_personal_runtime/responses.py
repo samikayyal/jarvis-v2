@@ -230,6 +230,12 @@ class PreparedToolCollection:
         if first_error is not None:
             raise first_error
 
+    def set_request_deadline(self, deadline: float) -> None:
+        for tool in self._tools:
+            callback = getattr(tool, "set_request_deadline", None)
+            if callable(callback):
+                callback(deadline)
+
     def finish_answer(self, text: str) -> str:
         """Apply result-path answer annotations supplied by prepared tools."""
 
@@ -517,6 +523,9 @@ class DirectResponsesRunner:
     ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         summarize_only = False
         async with asyncio.timeout(self._request_timeout_seconds) as deadline:
+            set_deadline = getattr(self._tools, "set_request_deadline", None)
+            if callable(set_deadline):
+                set_deadline(deadline.when())
             while True:
                 exhausted = summarize_only
                 tools = [] if exhausted else list(self._tools.definitions)

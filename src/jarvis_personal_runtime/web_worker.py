@@ -212,6 +212,10 @@ class _ProxyServer(socketserver.ThreadingTCPServer):
 
 class _ProxyHandler(socketserver.StreamRequestHandler):
     server: _ProxyServer
+    # Headers are parsed here, then the remaining request bytes are relayed
+    # directly from the socket. Buffered read-ahead would strand a POST body
+    # in rfile and make public website search forms time out upstream.
+    rbufsize = 0
 
     def handle(self) -> None:
         self.request.settimeout(10)
@@ -297,7 +301,6 @@ class _ProxyHandler(socketserver.StreamRequestHandler):
                 "proxy-connection",
                 "connection",
                 "keep-alive",
-                "transfer-encoding",
             }:
                 continue
             if lowered == "host":

@@ -36,7 +36,16 @@ _TOOL_GROUPS = {
         {"create_reminder", "list_reminders", "edit_reminder", "cancel_reminder"}
     ),
     "web": frozenset(
-        {"search_web", "read_web_pages", "read_web_page", "ask_page_reader"}
+        {
+            "search_web",
+            "read_web_pages",
+            "read_web_page",
+            "ask_page_reader",
+            "start_browser_reader",
+            "browser_reader_status",
+            "wait_browser_reader",
+            "cancel_browser_reader",
+        }
     ),
 }
 
@@ -169,6 +178,11 @@ class SkillTools:
         callback = getattr(self._tools, "request_started", None)
         if callable(callback):
             callback()
+
+    def set_request_deadline(self, deadline: float) -> None:
+        callback = getattr(self._tools, "set_request_deadline", None)
+        if callable(callback):
+            callback(deadline)
 
     async def close_request(self) -> None:
         callback = getattr(self._tools, "close_request", None)
