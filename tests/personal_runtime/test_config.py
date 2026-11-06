@@ -791,6 +791,8 @@ def test_invalid_web_search_settings_are_path_specific_config_errors(
         'reasoning_effort = "low"',
         'model = "invalid"',
         'model = "gpt-6-luna"\ncontext_tokens = 0',
+        'model = "gpt-6-luna"\ncontext_tokens = 128001',
+        'model = "gpt-6-luna"\ncontext_tokens = 128000\noutput_tokens = 128000',
         'model = "gpt-6-luna"\nmax_actions = true',
         'model = "gpt-6-luna"\nunknown_limit = 1',
     ],
@@ -810,4 +812,7 @@ def test_reader_configuration_is_independent_of_main_model(tmp_path):
     assert config.model == "gpt-6-sol"
     assert config.web_reader.model == "gpt-6-luna"
     assert config.web_reader.reasoning_effort == "low"
-    assert config.web_reader.context_tokens == 64000
+    assert config.web_reader.context_tokens == 128000
+    assert config.web_reader.max_attempts == 24
+    assert config.web_reader.max_actions == 18
+    assert config.web_reader.timeout_seconds == 120

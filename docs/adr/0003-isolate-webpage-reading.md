@@ -19,3 +19,7 @@ Chunks selected by the reader stay in its model conversation for follow-ups; the
 Reader calls run sequentially as ordinary tools within the existing runtime process. Cancellation stops active work and closes its browser resources, preserving completed reader evidence for the rest of the working session. Acceptance uses repeatable fixtures and a live GCP check, evaluating source fidelity, follow-ups, refresh, context isolation, failures, cost, and latency.
 
 Per-call duration, model/tool rounds, and final-response length have configurable limits. Limit outcomes preserve selected chunks and return usable findings when available. The [ready-for-agent specification](../../.scratch/page-reader/spec.md) defines the initial limits: 120 seconds, eight model attempts, eight reader actions, a 64,000-token context budget with response reservation, and a 2,000-token returned result. Reader count and captured-document size also have explicit bounds. These starting values are tuned during implementation and acceptance testing; specification publication does not authorize implementation or deployment.
+
+[ADR 0004](0004-enforce-page-reader-coverage.md) extends this design with mandatory
+bounded fallback and measured coverage, and updates the reader defaults to 24
+model turns, 18 actions and 128,000 context tokens while retaining 120 seconds.

@@ -80,6 +80,13 @@ replaces reader evidence only after successful capture; ordinary follow-ups
 reuse it.
 _Avoid_: Autonomous researcher, generic page summary
 
+**Inspection coverage**:
+The extent of a page reader's investigation for a question, including which captured
+content was searched or reviewed and which relevant content remains unchecked.
+It describes the investigation's scope, not proof that information is absent or
+that every reviewed passage was understood correctly.
+_Avoid_: Proof of absence, guaranteed comprehension
+
 **Reminder**:
 A one-time instruction for Jarvis to send exact stored reminder text to the
 authorized operator at a requested future time. It may be edited or cancelled
