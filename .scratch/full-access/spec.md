@@ -101,8 +101,11 @@ identify automatic approval without claiming that a preview was shown.
 ## Delivery state
 
 Implementation committed on 2026-11-05 in `b05ace7` and integrated on `main`
-with the completed page-reader branch. This integration does not deploy full
-access; Ubuntu deployment and live WhatsApp acceptance remain outstanding.
+with the completed page-reader branch. This integration did not itself deploy
+full access. On 2026-11-06, combined commit
+`39765480870245a87abc6ee5d9d689af5d6f8aee` was deployed to Ubuntu.
+Core WhatsApp full-access checks passed; remaining UI checks are incomplete.
+See [deployment verification](deployment-verification.md) for evidence and limits.
 
 Integration verification on 2026-11-05 (Windows): `uv run pytest -q` passed
 with 609 tests and 9 skips. `uv run ruff check src tests`,
