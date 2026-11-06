@@ -41,6 +41,8 @@ def answer(text="Verified price", chunk="1", quote=QUOTE):
         json.dumps(
             {
                 "answer": text,
+                "answered": True,
+                "display_checked": True,
                 "evidence": [{"chunk_id": chunk, "quote": quote}],
                 "gaps": [],
                 "links": [],
@@ -141,6 +143,7 @@ def test_main_reader_isolation_followup_refresh_and_reset(tmp_path):
             "ask_page_reader",
         }
         assert {t["name"] for t in reader_model.requests[0]["tools"]} == {
+            "search_page",
             "read_page_chunk",
             "display_page",
         }
@@ -249,7 +252,7 @@ def test_context_check_and_capture_disclosure(tmp_path):
         tools = setup(tmp_path, model, browser, capture_chars=500)
         first = await create(tools)
         assert first["coverage"]["incomplete_capture"]
-        result = await ask(tools, first["reader_id"], "oversized " * 70000)
+        result = await ask(tools, first["reader_id"], "oversized " * 140000)
         assert result["outcome"] == "context_limit"
         assert len(model.requests) == 1
         assert tokens(json.dumps(result)) <= 2000
@@ -293,7 +296,7 @@ def test_attempt_action_and_retry_limits(tmp_path):
         )
         browser = Browser({"outcome": "ok", "text": QUOTE})
         model = Responses(transient, *[call("read_page_chunk", chunk_id="1")] * 8)
-        tools = setup(tmp_path, model, browser)
+        tools = setup(tmp_path, model, browser, max_attempts=8, max_actions=8)
         result = await create(tools)
         assert result["outcome"] == "attempt_limit" and len(model.requests) == 8
         tools.config = replace(tools.config, max_attempts=10)
@@ -410,6 +413,8 @@ def test_overview_link_leads_main_to_late_pricing_evidence(tmp_path):
             json.dumps(
                 {
                     "answer": "Follow the E2 page",
+                    "answered": False,
+                    "display_checked": True,
                     "evidence": [],
                     "gaps": ["Prices are on another page"],
                     "links": [{"label": "E2", "url": target_url}],

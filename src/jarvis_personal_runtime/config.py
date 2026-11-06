@@ -144,10 +144,10 @@ class WebReaderConfig:
     model: str = "gpt-6-luna"
     reasoning_effort: str = "low"
     chunk_tokens: int = 12_000
-    context_tokens: int = 64_000
+    context_tokens: int = 128_000
     timeout_seconds: int = 120
-    max_attempts: int = 8
-    max_actions: int = 8
+    max_attempts: int = 24
+    max_actions: int = 18
     findings_tokens: int = 2_000
     output_tokens: int = 8_000
     max_readers: int = 8
@@ -161,8 +161,8 @@ class WebReaderConfig:
                 value = getattr(self, name)
                 if type(value) is not int or value <= 0:
                     raise ValueError(f"web_reader.{name} must be a positive integer")
-        if self.context_tokens > 64_000 or self.output_tokens >= self.context_tokens:
-            raise ValueError("web_reader context must be <= 64000 with response space")
+        if self.context_tokens > 128_000 or self.output_tokens >= self.context_tokens:
+            raise ValueError("web_reader context must be <= 128000 with response space")
         if self.chunk_tokens < 128 or self.findings_tokens < 512:
             raise ValueError(
                 "web_reader chunks/findings must allow structural metadata"
