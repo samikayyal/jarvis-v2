@@ -153,6 +153,12 @@ with the same ty version reports the same 14. This ticket does not claim that th
 existing codebase passes a newly introduced repository-wide typecheck.
 
 The focused browser/reader, existing web-boundary and main Responses regression
-run on 2026-11-06 completed with 70 passed and 2 skipped. The skipped checks were
-opt-in fixtures; the billed reader screenshot fixture was run separately as
+run on 2026-11-06 completed with 70 passed and 2 skipped. The skipped checks require
+explicit browser/model provisioning; the billed reader screenshot fixture was run separately as
 recorded above. Lint and formatting checks pass for all modified Python files.
+
+After resolving all three Spec-review findings and synchronizing deployment
+dependencies, the final full suite passed with **651 passed, 11 skipped** in
+399.89 seconds. Both review axes have no remaining findings. The verified source
+commit is `2953ec18ba77bf6c1649d870c5315685f429b664`; see the
+[ticket verification](../.scratch/parallel-page-readers/verification.md).

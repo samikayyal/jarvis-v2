@@ -4,21 +4,21 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** claimed
+**Status:** complete
 
-- [ ] Start returns a reader ID immediately; status, result collection and waiting work through the main assistant's tool interface. A controlled scenario demonstrates that main Jarvis can do other work before the reader completes.
-- [ ] Use asynchronous Python Playwright with an isolated browser context. Provision its dependency and browser requirements reproducibly using the project's uv workflow. Preserve public-address checks and existing private-network protections across initial loads, redirects and subsequent browser traffic.
-- [ ] Supply full extracted readable initial content, preserving headings, tables and links without prior summary or relevance filtering. The reader receives only supplied task context and its own conversation, not private tools or automatic main-history access.
-- [ ] Browser tools support inspect, click, type, select, scroll, back, forward, reload and tab list/switch/close. Links may cross domains, but no reader web-search tool, arbitrary-URL navigation tool, arbitrary-code interface or recursive delegation is exposed.
-- [ ] Public website search/filter/calculator interactions work. Account login, private-account actions, purchases and resource creation remain outside reader authority; page content cannot expand that authority.
-- [ ] Content-changing actions return updated readable content and element references. Browser tools handle normal loading waits; scrolling may return compact observations. Tabs and popups remain inside the reader context.
-- [ ] A screenshot-request tool supplies images only when explicitly called. Verify that the configured reader model can receive and use them; unsupported capability fails clearly without silently switching models or claiming visual inspection.
-- [ ] Initial reader configuration remains independently selected gpt-6-luna with low reasoning, 120 seconds per assignment, 24 model turns and configured context capacity with output reservation. Browser-operation timeouts and the earlier main-request deadline apply; no separate reader action/page allowances apply.
-- [ ] Oversized initial or updated content is explicitly identified and remains fully available for optional local search and selected reading. No silent truncation, mandatory inspection order or exhaustive sweep is introduced.
-- [ ] Context exhaustion returns an explicit limit with available findings, without silently dropping or summarizing history. Useful findings can be reported before exhaustion.
-- [ ] The reader returns ordinary written findings with source URLs, optional useful excerpts and specific uncertainty. Its completion is not gated by quote validation, coverage accounting or a mandatory evidence schema.
-- [ ] Action failures return actionable errors; uncertain clicks are not blindly replayed. Browser crashes disclose lost interactive state. Cancellation, timeouts and completion of the containing request close the single-reader resources.
-- [ ] Repeatable real-browser fixtures verify dynamic selection, updated observations, cross-domain links, tabs, explicit screenshot delivery, oversized content access, limits and failure cleanup. A model-boundary test verifies screenshot input handling and plain-result delivery through main Jarvis.
+- [x] Start returns a reader ID immediately; status, result collection and waiting work through the main assistant's tool interface. A controlled scenario demonstrates that main Jarvis can do other work before the reader completes.
+- [x] Use asynchronous Python Playwright with an isolated browser context. Provision its dependency and browser requirements reproducibly using the project's uv workflow. Preserve public-address checks and existing private-network protections across initial loads, redirects and subsequent browser traffic.
+- [x] Supply full extracted readable initial content, preserving headings, tables and links without prior summary or relevance filtering. The reader receives only supplied task context and its own conversation, not private tools or automatic main-history access.
+- [x] Browser tools support inspect, click, type, select, scroll, back, forward, reload and tab list/switch/close. Links may cross domains, but no reader web-search tool, arbitrary-URL navigation tool, arbitrary-code interface or recursive delegation is exposed.
+- [x] Public website search/filter/calculator interactions work. Account login, private-account actions, purchases and resource creation remain outside reader authority; page content cannot expand that authority.
+- [x] Content-changing actions return updated readable content and element references. Browser tools handle normal loading waits; scrolling may return compact observations. Tabs and popups remain inside the reader context.
+- [x] A screenshot-request tool supplies images only when explicitly called. Verify that the configured reader model can receive and use them; unsupported capability fails clearly without silently switching models or claiming visual inspection.
+- [x] Initial reader configuration remains independently selected gpt-6-luna with low reasoning, 120 seconds per assignment, 24 model turns and configured context capacity with output reservation. Browser-operation timeouts and the earlier main-request deadline apply; no separate reader action/page allowances apply.
+- [x] Oversized initial or updated content is explicitly identified and remains fully available for optional local search and selected reading. No silent truncation, mandatory inspection order or exhaustive sweep is introduced.
+- [x] Context exhaustion returns an explicit limit with available findings, without silently dropping or summarizing history. Useful findings can be reported before exhaustion.
+- [x] The reader returns ordinary written findings with source URLs, optional useful excerpts and specific uncertainty. Its completion is not gated by quote validation, coverage accounting or a mandatory evidence schema.
+- [x] Action failures return actionable errors; uncertain clicks are not blindly replayed. Browser crashes disclose lost interactive state. Cancellation, timeouts and completion of the containing request close the single-reader resources.
+- [x] Repeatable real-browser fixtures verify dynamic selection, updated observations, cross-domain links, tabs, explicit screenshot delivery, oversized content access, limits and failure cleanup. A model-boundary test verifies screenshot input handling and plain-result delivery through main Jarvis.
 
 ## Scope notes
 
@@ -35,3 +35,12 @@ authorized live `gpt-6-luna` screenshot check passed in two turns, reading the
 canvas-only code `ORCHID 7391`. Full-suite verification and the required two-axis
 review remain before completion. See `docs/playwright-reader.md` for setup,
 assembly, limits and verification scope. No deployment is part of this ticket.
+
+2026-11-06 completion: all acceptance items above are implemented on the opt-in
+single-reader path. Source and review fixes are committed at
+`2953ec18ba77bf6c1649d870c5315685f429b664`. The required Standards review found
+no actionable issue; the Spec review's three findings were reproduced, fixed and
+independently rechecked as resolved. Final full suite: 651 passed, 11 skipped;
+repository lint/format and focused typechecks pass. See
+[verification](../verification.md) and [trial documentation](../../../docs/playwright-reader.md).
+Concurrent scheduling/retention and production cutover remain in tickets 02/03.
