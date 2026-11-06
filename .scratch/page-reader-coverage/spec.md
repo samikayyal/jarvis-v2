@@ -16,7 +16,8 @@ Final alignment was confirmed with the operator's instruction to implement Q17
 and use 24 model turns, 18 actions, 120 seconds and 128,000 context tokens.
 Local runtime implementation and verification are complete. See
 [verification.md](verification.md) for checks and their limits. Subsequent deployment
-was authorized and completed; visible WhatsApp acceptance is blocked as recorded in
+was authorized and completed; visible WhatsApp acceptance is partial, with refresh
+interpretation and quote-repair failures recorded in
 [deployment-verification.md](deployment-verification.md).
 
 ## Consolidated implementation contract

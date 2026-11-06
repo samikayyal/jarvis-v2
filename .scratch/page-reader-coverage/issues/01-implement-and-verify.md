@@ -3,7 +3,9 @@
 Status: complete
 
 Scope: local implementation and validation of the accepted
-[specification](../spec.md). Local implementation is complete; deployment is not requested.
+[specification](../spec.md). Local implementation is complete. Subsequent deployment
+was authorized and completed; see [live acceptance](../deployment-verification.md)
+and the [open feedback issue](02-live-reader-feedback.md).
 
 ## Acceptance
 
