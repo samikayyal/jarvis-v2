@@ -59,6 +59,11 @@ def public_fixture(monkeypatch):
                 body = """<form role="search" method="post" action="/search-form">
                 <label>Site query<input type="search" name="q"></label>
                 <button type="submit">Search site</button></form>"""
+            if self.path == "/unrelated-write":
+                body = f"""<h1>Public preview</h1><button onclick="fetch('http://other.example:{self.server.server_port}/create',
+                {{method:'POST',body:'resource=yes'}})">Search preview</button>
+                <form role="search" method="post" action="/create-resource">
+                <button type="submit">Create resource</button></form>"""
             if self.path == "/set-state":
                 body = """<h1>State fixture</h1><script>document.cookie='research=one';
                 localStorage.setItem('private-research-state','one');</script>"""
@@ -247,6 +252,25 @@ def test_anonymous_context_does_not_inherit_previous_browser_state(monkeypatch):
         finally:
             await first.close()
             await second.close()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))
+
+
+def test_research_click_cannot_authorize_unrelated_posts_or_resource_creation(
+    monkeypatch,
+):
+    async def scenario(url):
+        browser = PlaywrightBrowser(timeout_seconds=5)
+        try:
+            initial = await browser.open(url + "unrelated-write")
+            assert not any(e["label"] == "Create resource" for e in initial["elements"])
+            result = await browser.act(
+                "click", {"ref": element(initial, "Search preview")}
+            )
+            assert result["blocked_requests"], result
+        finally:
+            await browser.close()
 
     with public_fixture(monkeypatch) as url:
         asyncio.run(scenario(url))

@@ -357,6 +357,60 @@ def test_unsupported_image_input_fails_clearly_without_model_fallback(monkeypatc
         asyncio.run(scenario(url))
 
 
+def test_provider_context_limit_preserves_reported_findings(monkeypatch):
+    async def scenario(url):
+        def reject_context(request):
+            raise BadRequestError(
+                "Maximum context length exceeded",
+                response=httpx.Response(
+                    400,
+                    request=httpx.Request(
+                        "POST", "https://api.openai.com/v1/responses"
+                    ),
+                ),
+                body={"code": "context_length_exceeded"},
+            )
+
+        model = ScriptedModel(
+            [
+                call("report_findings", text="Supported partial fact: " + url),
+                reject_context,
+            ]
+        )
+        tools = PlaywrightReaderTools(WebReaderConfig(), model)
+        try:
+            result = await finished(tools, url)
+            assert result["state"] == "limit", result
+            assert result["reason"] == "context_limit"
+            assert "Supported partial fact" in result["findings"]
+        finally:
+            await tools.close_request()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))
+
+
+def test_tool_call_commentary_does_not_replace_reported_findings_before_limit(
+    monkeypatch,
+):
+    async def scenario(url):
+        commentary = call("browser_inspect")
+        commentary = ResponsesResult(commentary.output, "I will inspect more.")
+        model = ScriptedModel(
+            [call("report_findings", text="Supported partial fact: " + url), commentary]
+        )
+        tools = PlaywrightReaderTools(replace(WebReaderConfig(), max_attempts=2), model)
+        try:
+            result = await finished(tools, url)
+            assert result["state"] == "limit", result
+            assert "Supported partial fact" in result["findings"]
+        finally:
+            await tools.close_request()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))
+
+
 def test_main_model_delegates_works_collects_and_closes_reader(monkeypatch):
     async def scenario(url):
         reader_model = ControlledModel()

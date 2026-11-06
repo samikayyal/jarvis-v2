@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import os
+from urllib.parse import urldefrag
 from uuid import uuid4
 
 from playwright.async_api import Error, async_playwright
@@ -40,15 +41,25 @@ DESCRIBE = r"""e => {
   const form = e.closest('form');
   const scope = [label, e.name, e.id, e.getAttribute('href'),
     form && form.getAttribute('action')].filter(Boolean).join(' ');
-  const forbidden = /\b(log[ -]?in|sign[ -]?in|sign[ -]?up|register|password|checkout|purchase|buy|add to cart|delete|upload|subscribe|create account|place order|payment)\b/i;
+  const forbidden = /\b(log[ -]?in|sign[ -]?in|sign[ -]?up|register|password|checkout|purchase|buy|add to cart|delete|upload|subscribe|create|save|send|invite|book|reserve|place order|payment)\b/i;
   const sensitiveForm = form && form.querySelector(
     'input[type=password],input[type=email],input[type=file],input[autocomplete=cc-number]');
   const allowed = !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden' &&
     !e.disabled && !sensitiveForm && !forbidden.test(scope) &&
     !['password','email','file','hidden'].includes(type) && !e.isContentEditable;
+  const research = /search|filter|calculat/i.test(scope) || type === 'search' ||
+    !!(form && (form.getAttribute('role') === 'search' || form.querySelector('input[type=search]')));
+  const submit = (e.tagName === 'BUTTON' || e.tagName === 'INPUT') && e.type === 'submit';
+  const method = form && (e.getAttribute('formmethod') || form.method).toLowerCase();
+  const enctype = form && (e.getAttribute('formenctype') || form.enctype).toLowerCase();
+  const post = allowed && research && submit && method === 'post' &&
+    enctype === 'application/x-www-form-urlencoded' ? {
+      url:e.hasAttribute('formaction') ? e.formAction : form.action,
+      body:new URLSearchParams([...new FormData(form, e)].map(([k,v]) =>
+        [k, String(v).replace(/\r?\n/g,'\r\n')])).toString()
+    } : null;
   return {label, kind:e.tagName.toLowerCase(), type, allowed,
-    research: /search|filter|calculat/i.test(scope) || type === 'search' ||
-      !!(form && (form.getAttribute('role') === 'search' || form.querySelector('input[type=search]'))),
+    post,
     href:e.href || '', target:e.target || '', options:e.tagName === 'SELECT' ?
       [...e.options].map(o => ({label:o.text, value:o.value, disabled:o.disabled})) : []};
 }"""
@@ -71,7 +82,7 @@ class PlaywrightBrowser:
         self._proxy = PublicNetworkProxy()
         self._elements = {}
         self._tabs = {}
-        self._research_action = False
+        self._post_permit = None
         self._blocked = []
 
     async def open(self, url: str) -> dict:
@@ -127,10 +138,23 @@ class PlaywrightBrowser:
         request = route.request
         try:
             validate_public_url(request.url)
-            if request.method not in {"GET", "HEAD", "OPTIONS"} and (
-                request.method != "POST" or not self._research_action
-            ):
-                raise PublicUrlError("Non-research write request blocked")
+            if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                permit = self._post_permit
+                if not (
+                    permit is not None
+                    and request.method == "POST"
+                    and request.is_navigation_request()
+                    and request.frame == permit[2]
+                    and request.url == permit[0]
+                    and request.post_data == permit[1]
+                    and request.headers.get("content-type", "").startswith(
+                        "application/x-www-form-urlencoded"
+                    )
+                ):
+                    raise PublicUrlError(
+                        "Write blocked: only the exact observed public research form submission is permitted"
+                    )
+                self._post_permit = None
             await route.continue_()
         except PublicUrlError as exc:
             self._blocked.append(str(exc))
@@ -174,6 +198,7 @@ class PlaywrightBrowser:
             if not description.pop("allowed"):
                 await handle.dispose()
                 continue
+            description.pop("post")
             ref = uuid4().hex[:12]
             self._elements[ref] = handle
             elements.append({"ref": ref, **description})
@@ -236,10 +261,16 @@ class PlaywrightBrowser:
                 description = await handle.evaluate(DESCRIBE)
                 if not description["allowed"]:
                     raise ValueError("Control is outside public research authority.")
-                self._research_action = description["research"]
                 if action == "click":
                     if description["href"]:
                         validate_public_url(description["href"])
+                    if description["post"]:
+                        post = description["post"]
+                        self._post_permit = (
+                            urldefrag(validate_public_url(post["url"]))[0],
+                            post["body"],
+                            await handle.owner_frame(),
+                        )
                     attempted = True
                     if description["target"] == "_blank":
                         async with self._context.expect_page() as popup:
@@ -291,7 +322,7 @@ class PlaywrightBrowser:
                 "next_step": "Inspect current state before choosing another action; do not blindly replay.",
             }
         finally:
-            self._research_action = False
+            self._post_permit = None
 
     async def close(self):
         self.closed = True

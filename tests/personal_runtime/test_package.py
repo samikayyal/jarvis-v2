@@ -13,6 +13,7 @@ def test_replacement_package_has_valid_dependency_pins() -> None:
         "beautifulsoup4==4.15.0",
         "httpx==0.28.1",
         "openai==2.53.0",
+        "playwright==1.58.0",
         "selenium==4.50.0",
         "setuptools==80.10.2",
         "tiktoken==0.14.0",
@@ -129,6 +130,7 @@ def test_only_personal_runtime_source_and_dependencies_remain() -> None:
         "beautifulsoup4==4.15.0",
         "httpx==0.28.1",
         "openai==2.53.0",
+        "playwright==1.58.0",
         "selenium==4.50.0",
         "tiktoken==0.14.0",
     ]

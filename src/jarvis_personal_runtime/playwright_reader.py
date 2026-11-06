@@ -431,6 +431,8 @@ class PlaywrightReaderTools:
                             ),
                         )
                     except APIStatusError as exc:
+                        if exc.code == "context_length_exceeded":
+                            raise ReaderLimit("context_limit") from exc
                         if exc.status_code in {400, 404, 422}:
                             has_image = any(
                                 isinstance(i.get("content"), list)
@@ -457,7 +459,12 @@ class PlaywrightReaderTools:
                                 "usage": response.usage,
                             },
                         )
-                    if response.output_text.strip():
+                    calls = [
+                        item
+                        for item in response.output
+                        if item.get("type") == "function_call"
+                    ]
+                    if response.output_text.strip() and not calls:
                         reader.findings = response.output_text
                     self._append(
                         reader,
@@ -466,11 +473,6 @@ class PlaywrightReaderTools:
                             for item in response.output
                         ],
                     )
-                    calls = [
-                        item
-                        for item in response.output
-                        if item.get("type") == "function_call"
-                    ]
                     if not calls:
                         reader.state = "completed" if reader.findings else "failed"
                         reader.reason = (

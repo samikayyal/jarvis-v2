@@ -95,9 +95,13 @@ written findings before a later execution limit.
 The reader's authority is public research, including website search, filtering and
 calculators. Account login, private-account actions, purchases, uploads and resource
 creation are excluded in trusted instructions. Sensitive controls are omitted and
-rechecked before use. Non-read HTTP requests are blocked except POST requests
-during an observed search/filter/calculator interaction. This is a conservative
-interaction guard, not semantic proof that arbitrary website behavior is read-only.
+rechecked before use. Non-read HTTP requests are blocked except one exact observed
+public research form submission: a URL-encoded POST must match the form's action,
+expected payload and submitting frame, and be a navigation request. The permit is
+consumed once; unrelated scripts and background POSTs remain blocked. Obvious
+create/save/send/account/purchase controls are excluded. This conservative guard
+supports public forms; arbitrary AJAX write endpoints are outside this trial
+path. It is not semantic proof that arbitrary website behavior is read-only.
 Web content cannot grant authority. No model-facing arbitrary URL, JavaScript,
 terminal, private-tool, web-search or recursive-reader interface exists.
 
