@@ -4,7 +4,8 @@
 
 Implemented the final agreed design, including reinstated Q17 and defaults of
 24 model attempts, 18 reader actions, 120 seconds and 128,000 context tokens.
-No live service settings, deployment, commit or push were performed.
+This record covers local implementation checks. Subsequent authorized deployment
+and GitHub synchronization are recorded in [deployment-verification.md](deployment-verification.md).
 
 ## Completed checks
 
