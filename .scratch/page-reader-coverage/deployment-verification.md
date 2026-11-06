@@ -1,7 +1,7 @@
 # Page reader coverage deployment
 
 Date: 2026-11-06 (Asia/Amman)
-Status: deployed; visible WhatsApp acceptance blocked by Codex browser-control initialization.
+Status: deployed; visible WhatsApp acceptance executed with failures in refresh interpretation and quote repair.
 
 ## Source synchronization and scope
 
@@ -49,25 +49,47 @@ Status: deployed; visible WhatsApp acceptance blocked by Codex browser-control i
   - Config SHA256: `9d76db623deef741509923396b36e46c67d5b4ab94ffa8a07a105ebb94f90c59`.
   - Prompt SHA256: `33ca22c6f7c7b5b162bd29014139b10ee5b192fec3395136d6bac1672306ba0a`.
 
-## WhatsApp acceptance: blocked, not passed
+## WhatsApp acceptance: partial, not a clean pass
 
-The operator authorized testing through the open in-app WhatsApp tab, then
-explicitly instructed using Chrome. Both browser-control initialization and the
-Windows computer-use JS runtime failed with:
+Browser-control initialization initially failed before connection. Following the
+operator's request to retry the in-app browser, it recovered. The tests below
+were sent through the visible Jarvis WhatsApp conversation in the in-app browser
+on 2026-11-06, 15:58-16:27 Asia/Amman (12:58-13:27 UTC). Replies were read in
+the UI and correlated with `page_reader` and model-call trace events. No direct
+API/webhook message substitute was used. The active runtime was not redeployed.
 
-> failed to write kernel assets: The system cannot find the path specified. (os error 3)
+| Scenario | Observed result |
+| --- | --- |
+| Buried RFC 9110 section 15.5.20 answer | Initial reader `c1dc2ad34632` searched and inspected chunk 18, but repeatedly proposed a noncontiguous quote combining a heading and paragraph. Validation rejected it; mandatory search/fallback ran. Ended `context_limit`, 10/25 chunks, 91.896 s, 15 attempts, 14 actions, 1 page operation, 2 searches. |
+| Recovery using the section URL | Main assistant opened `c21967d47989` at the section anchor. `ok`, valid contiguous retry-permission quote from chunk 18, 1/25 chunks, 47.809 s, 3 attempts, 2 actions, 1 page operation, 1 search. Visible answer included the initial reader's source-specific context-limit disclosure. |
+| Retained RFC follow-up | Same `c21967d47989`, `refresh=false`; `ok`, 3.032 s, 1 attempt, 0 actions, **0 page operations**. Visible quote and explanation that MAY is optional. |
+| Explicit RFC refresh | Same `c21967d47989`, `refresh=true`. Runtime fetched a replacement capture, then an extra rendered capture. Model incorrectly treated freshness as unverified. `context_limit`, 9/38 chunks, incomplete second capture, 110.146 s, 14 attempts/actions, 2 page operations, 2 searches. Visible reply disclosed failure; **refresh interpretation failed acceptance**. |
+| Missing monthly hosting price on example.com | `30214cb9ec26`, `unresolved`, 18.110 s, 1 attempt, 0 actions, 1 page operation. Complete 1/1 captured chunks inspected. Visible answer limited its conclusion to the captured page and included captured-content-exhaustion disclosure; no links followed. |
+| Cancellation during initial capture | New RFC reader `d3551bce8559` was cancelled after 7.794 s, 1 page operation, 0 model attempts/actions. Visible cancellation acknowledgement; no late answer observed through final status, more than two minutes later. |
+| Completed evidence after cancellation | Same example.com reader `30214cb9ec26`, `refresh=false`; `ok`, 1.993 s, 1 attempt, 0 actions, **0 page operations**. Visible exact sentence. The prior unrelated missing-price notice correctly remained. |
+| Explicit short-page refresh | Same `30214cb9ec26`, `refresh=true`; confirmed replacement capture plus rendered capture, 2/2 chunks inspected, 44.004 s, 5 attempts, 3 actions, 2 page operations. Model still incorrectly claimed no refresh capability/freshness verification. `unresolved`; visible failure and source notices. This reproduces the freshness problem without a large page or context limit. |
 
-Browser and Windows runtime resets did not resolve the error. Failure occurs
-before tab/window enumeration, so neither Chrome nor the in-app WhatsApp UI was
-read or controlled. No WhatsApp prompts were sent, and no API/webhook substitute
-was used. Service/gateway health and fixture tests do not establish visible
-end-to-end WhatsApp acceptance or live model quality.
+The requested budgets remained active throughout. The checks establish local
+search, mandatory fallback, validated quote recovery, retained evidence reuse,
+cancellation and final disclosure behavior. They do **not** establish reliable
+freshness interpretation or efficient quote repair. Official-source search/link
+discovery was not rerun: these prompts supplied source URLs directly. The
+follow-up quote also exposed malformed nested-link formatting in WhatsApp.
 
-## Resume acceptance
+Tracked follow-up: [reader freshness and quote-repair feedback](issues/02-live-reader-feedback.md).
+The local implementation ticket remains complete; live quality acceptance is
+partial. No claim of eliminating all false negatives is justified.
 
-After the Codex browser/computer-use runtime is repaired, use the existing Jarvis
-conversation in Chrome. Test a long-page question with a buried answer, an
-unresolved question exercising mandatory fallback/disclosure, evidence reuse,
-explicit refresh and final idle status. Inspect bounded reader trace facts and
-source quotes; verify cleanup and service health afterward. Do not redeploy
-solely to resume the UI acceptance test.
+## Final verification
+
+- Visible `/status` at 16:27: **Active request: none; pending action: no**.
+- Active source still `df91f127224c7c5789d6aabbeee15f656139849e`.
+- All 30 installed source/skill files still match the candidate archive.
+- Effective limits still 24 attempts, 18 actions, 120 seconds, 128000 tokens.
+- Config and prompt hashes match the values above.
+- OpenWA readiness HTTP 200; exact configured session ready, identity matched.
+- Service active/running, `NRestarts=0`; zero service-account browser/worker
+  processes and zero temporary profiles after the UI scenarios.
+- A verification helper initially asserted on the literal `current` symlink
+  path versus the release path; rerunning with the resolved candidate interpreter
+  passed. This was a probe path mismatch, not an installed-source mismatch.
