@@ -1,11 +1,11 @@
 # Playwright reader trial path
 
-Ticket 01 implements one asynchronous public browser reader as
-`PlaywrightReaderTools`. It is available to the main Responses tool loop when
+Tickets 01–02 implement concurrent asynchronous public browser readers as
+`PlaywrightReaderTools`. They are available to the main Responses tool loop when
 explicitly assembled as an additional prepared tool. The default runner still
-constructs the existing page reader. Concurrent scheduling and retained follow-ups
-belong to ticket 02; production discovery/instructions and removal of the old
-reader belong to ticket 03. No deployment or production cutover is performed here.
+constructs the existing page reader. Ticket 02 adds scheduling and retained
+follow-ups; production instructions and removal of the old reader belong to
+ticket 03. No deployment or production cutover is performed here.
 
 ## Provision and run
 
@@ -14,7 +14,7 @@ Use the locked uv environment and Playwright's matching browser revision:
 ```sh
 uv sync --locked
 uv run playwright install --with-deps chromium
-uv run pytest tests/personal_runtime/test_playwright_browser.py tests/personal_runtime/test_playwright_reader.py
+uv run pytest tests/personal_runtime/test_playwright_browser.py tests/personal_runtime/test_playwright_reader.py tests/personal_runtime/test_concurrent_readers.py
 ```
 
 On Windows, `uv run playwright install chromium` provisions the browser without
@@ -52,27 +52,56 @@ the reader task itself runs independently.
 ## Main operations and lifecycle
 
 `start_browser_reader(url, prompt)` validates a public starting URL, receives a
-self-contained task prompt and returns an ID immediately. One assignment can run
-at a time; another start returns capacity immediately rather than queueing.
+self-contained task prompt and returns an ID immediately. Initially three readers
+can run concurrently. Starts beyond capacity fail immediately without a queue.
 `browser_reader_status(reader_id)` returns current state and available written
 findings. `wait_browser_reader(reader_id, seconds)` waits at most 30 seconds without
 cancelling the reader when that wait ends. `cancel_browser_reader(reader_id)` stops
-work and closes its browser.
+work and closes its browser. `follow_up_browser_reader(reader_id, prompt)` starts
+another assignment using the retained conversation and surviving browser state;
+a busy reader returns `reader_busy` without queuing the prompt.
+`release_browser_reader(reader_id)` cancels work, closes the browser and discards
+the conversation/findings. Released and reset IDs return `expired_reader_id`.
+
+`WebReaderConfig` exposes three independent positive integer limits, also accepted
+in `[web_reader]`: `max_active_readers = 3`, `max_browser_contexts = 3`, and
+`max_readers = 8` (retained conversations). Browser capacity also bounds active
+assignments because each requires a context. At conversation capacity, explicitly
+release a reader; conversation or findings are never silently evicted. At browser
+capacity, a new assignment reclaims the least recently used idle browser, never
+one with an active assignment. Result fields `browser_state` and
+`browser_state_notice` disclose closed/reclaimed state. A reopened browser loads
+the last successfully observed URL with fresh cookies, storage and tabs; the next
+reader observation explicitly discloses the lost interactive state.
+
+Each reader currently owns a separate Chromium process and isolated context.
+Browser work overlaps; only short context allocation/reclamation is serialized.
+There is no shared browser process to propagate failures between readers. A
+disconnect or tab crash fails that reader even while it is awaiting a model,
+closes its resources, and leaves other readers working. Reader tools cannot start
+readers or invoke main tools. The main Responses loop still executes one prepared
+tool at a time, so this does not enable concurrent vault or other main mutations.
 
 States are `running`, `completed`, `failed`, `cancelled` and `limit`. Limit reasons
 distinguish `time_limit`, `turn_limit` and `context_limit`. Reader configuration is
 independent of main model selection: defaults remain `gpt-6-luna`, low reasoning,
 120 seconds, 24 model turns, 128,000 context tokens and 8,000 reserved output tokens.
 The earlier containing-request deadline wins, including time spent before reader
-start. Each browser operation has a separate configurable timeout (15 seconds by
+start. Every follow-up resets the assignment's time and turn budget while the
+retained conversation still consumes context. Each browser operation has a separate configurable timeout (15 seconds by
 default). No reader page/action/capture allowance or findings schema is applied.
 Legacy `WebReaderConfig` fields remain for the old implementation during migration.
 
 Completed browsers remain open through the containing request. Main completion,
 timeout, approval suspension or cancellation cancels unfinished work and closes all
-reader resources. Trial results remain collectable until the next request/session
-reset; cross-request retention is not implemented by this ticket. Session reset
-discards these conversations. There is no background WhatsApp send path.
+reader resources. Completed findings and conversations remain collectable across
+ordinary requests in the working session; later follow-ups explicitly reopen a
+fresh browser. `/cancel` retains completed findings. `/new`, inactivity reset,
+main-context reset and restart discard all readers and close resources. Cleanup
+is awaited before a later assignment acquires resources. Interrupted browser tool
+calls are recorded as interrupted in retained history and are never replayed.
+Cancelled work cannot publish late findings, including a provider returning after
+cancellation. There is no background WhatsApp send path.
 
 ## Reader observations and authority
 
@@ -157,8 +186,18 @@ run on 2026-11-06 completed with 70 passed and 2 skipped. The skipped checks req
 explicit browser/model provisioning; the billed reader screenshot fixture was run separately as
 recorded above. Lint and formatting checks pass for all modified Python files.
 
-After resolving all three Spec-review findings and synchronizing deployment
+For ticket 01, after resolving all three Spec-review findings and synchronizing deployment
 dependencies, the final full suite passed with **651 passed, 11 skipped** in
 399.89 seconds. Both review axes have no remaining findings. The verified source
 commit is `2953ec18ba77bf6c1649d870c5315685f429b664`; see the
 [ticket verification](../.scratch/parallel-page-readers/verification.md).
+
+Ticket 02 adds real-browser tests for three overlapping assignments, independent
+out-of-order collection, bounded waiting, configurable capacity, busy follow-ups,
+fresh budgets with the main deadline, retained context limits, idle reclamation,
+explicit release, concurrent context isolation, surviving tabs, crashes during
+model waits, navigation cancellation, interrupted history, late-provider rejection,
+runtime `/cancel`/`/new`/inactivity/context resets and restart. Resource verification
+observes context-close events, driver process exit and proxy-thread termination.
+Its validation and review record is in
+[ticket 02 verification](../.scratch/parallel-page-readers/verification-02.md).

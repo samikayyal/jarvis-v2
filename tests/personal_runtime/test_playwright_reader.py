@@ -258,7 +258,9 @@ def test_limits_return_previously_reported_findings_without_history_eviction(
 def test_cancel_closes_active_reader_and_capacity_has_no_queue(monkeypatch):
     async def scenario(url):
         model = ControlledModel()
-        tools = PlaywrightReaderTools(WebReaderConfig(), model)
+        tools = PlaywrightReaderTools(
+            replace(WebReaderConfig(), max_active_readers=1), model
+        )
         try:
             start = json.loads(
                 await tools.execute(

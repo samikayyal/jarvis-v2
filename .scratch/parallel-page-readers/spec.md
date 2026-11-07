@@ -1,14 +1,15 @@
 # Concurrent browser readers
 
-Status: design accepted; ticket 01 complete; tickets 02–04 pending
+Status: design accepted; ticket 01 complete; ticket 02 implementation under verification; tickets 03–04 pending
 Date: 2026-11-06 (Asia/Amman)
 
 The operator approved publication of the four implementation tickets after reviewing
 the consolidated design and reduced breakdown. This consolidates all accepted answers in [the interview](design.md). It describes
 the replacement, not currently deployed behavior. Ticket 01 is implemented and
 verified on the opt-in single-reader path; see [verification](verification.md).
-Concurrency, retained follow-ups, production integration and deployment remain
-in tickets 02–04.
+Ticket 02 adds concurrency and retained follow-ups on the opt-in path; see
+[its verification](verification-02.md). Production integration and deployment
+remain in tickets 03–04.
 
 ## Purpose and scope
 

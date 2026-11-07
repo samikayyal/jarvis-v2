@@ -84,10 +84,11 @@ The accepted replacement design broadens **Page reader** to a
 delegated public-web researcher given a focused prompt and an initial webpage;
 the initial webpage is a starting point, not a navigation restriction. It may
 investigate other public sources and reports findings to the main assistant.
-Ticket 01 implements this behavior on an opt-in single-reader path; concurrent
-scheduling, retained follow-ups and production integration remain in tickets 02/03.
+Tickets 01–02 implement this behavior on an opt-in Playwright path, with concurrent
+assignments and retained follow-ups. Production integration remains in ticket 03.
 See [the replacement specification](.scratch/parallel-page-readers/spec.md) and
 [ticket 01 verification](.scratch/parallel-page-readers/verification.md).
+See also [ticket 02 verification](.scratch/parallel-page-readers/verification-02.md).
 The current definition and invariants above describe the deployed implementation.
 
 **Inspection coverage**:

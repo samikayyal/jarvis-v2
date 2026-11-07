@@ -1,4 +1,4 @@
-"""Opt-in single Playwright reader through the main prepared-tool interface.
+"""Opt-in concurrent Playwright readers through the main prepared-tool interface.
 
 The deployed page reader remains separate until the later cutover ticket. This
 module has no dependency on its quote, coverage, page or action accounting.
@@ -130,10 +130,13 @@ class BrowserReader:
     browser: PlaywrightBrowser | None = None
     task: asyncio.Task | None = None
     turns: int = 0
+    browser_state_notice: str = ""
+    last_used: float = 0
+    reported_in_assignment: bool = False
 
 
 class PlaywrightReaderTools:
-    """One active assignment; concurrency/retained follow-ups belong to ticket 02."""
+    """Session-owned conversations with request-owned, isolated browsers."""
 
     def __init__(
         self,
@@ -150,11 +153,17 @@ class PlaywrightReaderTools:
         self.readers: dict[str, BrowserReader] = {}
         self._deadline = None
         self._cleanup_tasks = set()
+        self._browser_lock = asyncio.Lock()
         self.definitions = (
             tool(
                 "start_browser_reader",
-                "Start one public browser investigation and immediately return its ID. Only one assignment can run on this trial path.",
+                "Start a public browser investigation and immediately return its ID. Capacity failures never queue work.",
                 {"url": STRING, "prompt": STRING},
+            ),
+            tool(
+                "follow_up_browser_reader",
+                "Assign a follow-up to an idle retained reader. Reuse conversation and any surviving browser; busy readers never queue work.",
+                {"reader_id": STRING, "prompt": STRING},
             ),
             tool(
                 "browser_reader_status",
@@ -174,51 +183,100 @@ class PlaywrightReaderTools:
                 "Cancel this reader and close its browser resources.",
                 {"reader_id": STRING},
             ),
+            tool(
+                "release_browser_reader",
+                "Stop and discard a retained reader, closing its browser and freeing conversation capacity. The ID expires.",
+                {"reader_id": STRING},
+            ),
         )
 
     def start_session(self):
-        for reader in self.readers.values():
-            if reader.task and not reader.task.done():
-                reader.task.cancel()
-                self._cleanup_tasks.add(reader.task)
-            if reader.browser:
-                self._cleanup_tasks.add(asyncio.create_task(reader.browser.close()))
+        previous = list(self.readers.values())
+        for reader in previous:
+            self._interrupt(reader, "Working session ended.")
+        if previous:
+            self._cleanup_tasks.add(asyncio.create_task(self._dispose(previous)))
         self.readers.clear()
         self._deadline = None
 
     def request_started(self):
-        self.start_session()
+        self._deadline = None
 
     def set_request_deadline(self, deadline: float):
         self._deadline = deadline
 
     async def close_request(self):
-        tasks = set(self._cleanup_tasks)
-        for reader in self.readers.values():
-            if reader.task:
-                if not reader.task.done():
-                    reader.task.cancel()
-                tasks.add(reader.task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for reader in self.readers.values():
-            if reader.state == "running":
-                reader.state, reader.reason = (
-                    "cancelled",
-                    "Containing request completed.",
-                )
+        await self._finish_cleanup(list(self.readers.values()))
+        await self._drain_cleanup()
+
+    async def _finish_cleanup(self, readers):
+        cleanup = asyncio.create_task(self._dispose(readers))
+        self._cleanup_tasks.add(cleanup)
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A slash command can interrupt a request already in its finally
+            # block. Its cleanup still owns these browsers until it finishes.
+            await asyncio.shield(cleanup)
+            raise
+        finally:
+            if cleanup.done():
+                self._cleanup_tasks.discard(cleanup)
+
+    def _interrupt(self, reader, reason):
+        # Mark before cancellation: even a provider that swallows CancelledError
+        # cannot publish a late result or make this reader completed again.
+        if reader.state == "running":
+            reader.state, reader.reason = "cancelled", reason
+            if reader.task and not reader.task.done() and not reader.task.cancelling():
+                reader.task.cancel()
+
+    async def _dispose(self, readers):
+        for reader in readers:
+            self._interrupt(reader, "Containing request completed or cancelled.")
+        await asyncio.gather(
+            *(r.task for r in readers if r.task), return_exceptions=True
+        )
         results = await asyncio.gather(
             *(
-                reader.browser.close()
-                for reader in self.readers.values()
-                if reader.browser
+                self._close_browser(r, "Browser closed; interactive state was lost.")
+                for r in readers
             ),
             return_exceptions=True,
         )
-        self._cleanup_tasks.clear()
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+
+    async def _drain_cleanup(self):
+        tasks = set(self._cleanup_tasks)
+        if tasks:
+            results = await asyncio.gather(
+                *(asyncio.shield(t) for t in tasks), return_exceptions=True
+            )
+            self._cleanup_tasks.difference_update(tasks)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def _close_browser(self, reader, notice):
+        if reader.browser:
+            reader.browser_state_notice = notice
+            await reader.browser.close()
+
+    def _check_assignment(self, reader):
+        if reader.state != "running":
+            raise asyncio.CancelledError
+
+    def _busy(self, reader):
+        return reader.state == "running" or (
+            reader.task is not None and not reader.task.done()
+        )
+
+    def _at_active_capacity(self):
+        return sum(self._busy(r) for r in self.readers.values()) >= min(
+            self.config.max_active_readers, self.config.max_browser_contexts
+        )
 
     async def resume(
         self, continuation: object, *, approved: bool, full_access: bool = False
@@ -241,18 +299,18 @@ class PlaywrightReaderTools:
                 url = validate_public_url(arguments["url"])
             except (ValueError, TypeError) as exc:
                 return encode({"error": str(exc)})
-            if any(r.state == "running" for r in self.readers.values()):
+            if self._at_active_capacity():
                 return encode(
                     {
                         "error": "reader_capacity",
-                        "reason": "One reader is already running; no queue.",
+                        "reason": "Active reader capacity reached; no queue.",
                     }
                 )
             if len(self.readers) >= self.config.max_readers:
                 return encode(
                     {
                         "error": "reader_capacity",
-                        "reason": "Request reader capacity reached.",
+                        "reason": "Retained conversation capacity reached; explicitly release a reader before starting another.",
                     }
                 )
             reader = BrowserReader(uuid4().hex[:12], url, arguments["prompt"])
@@ -263,20 +321,76 @@ class PlaywrightReaderTools:
         reader = self.readers.get(reader_id) if isinstance(reader_id, str) else None
         if reader is None:
             return encode({"error": "expired_reader_id"})
-        if name == "wait_browser_reader":
+        if name == "follow_up_browser_reader":
+            if (
+                not isinstance(arguments["prompt"], str)
+                or not arguments["prompt"].strip()
+            ):
+                return encode({"error": "Supply a nonempty self-contained prompt"})
+            if self._busy(reader):
+                return encode(
+                    {"error": "reader_busy", "reason": "Reader is busy; no queue."}
+                )
+            if self._at_active_capacity():
+                return encode(
+                    {
+                        "error": "reader_capacity",
+                        "reason": "Active reader capacity reached; no queue.",
+                    }
+                )
+            reader.prompt = arguments["prompt"]
+            reader.state, reader.reason, reader.turns = "running", "", 0
+            reader.reported_in_assignment = False
+            reader.task = asyncio.create_task(self._run(reader))
+        elif name == "wait_browser_reader":
             seconds = arguments["seconds"]
             if type(seconds) not in {int, float} or not 0 <= seconds <= 30:
                 return encode({"error": "Wait seconds must be between 0 and 30"})
             if reader.task:
                 await asyncio.wait({reader.task}, timeout=seconds)
-        elif name == "cancel_browser_reader":
-            if reader.task and not reader.task.done():
-                reader.task.cancel()
-                await asyncio.gather(reader.task, return_exceptions=True)
-                reader.state = "cancelled"
-            if reader.browser:
-                await reader.browser.close()
+        elif name in {"cancel_browser_reader", "release_browser_reader"}:
+            await self._finish_cleanup([reader])
+            if name == "release_browser_reader":
+                del self.readers[reader.reader_id]
+                return encode({"reader_id": reader.reader_id, "state": "released"})
         return encode(self._result(reader))
+
+    async def _browser_for(self, reader):
+        # Reserve slots under a lock, but open/navigate outside it so real browser
+        # work overlaps. A running assignment's reservation is never reclaimed.
+        async with self._browser_lock:
+            if reader.browser and not reader.browser.closed:
+                return reader.browser, False
+            opened = [
+                r for r in self.readers.values() if r.browser and not r.browser.closed
+            ]
+            if len(opened) >= self.config.max_browser_contexts:
+                idle = [r for r in opened if not self._busy(r)]
+                if not idle:
+                    raise RuntimeError("No idle browser context available; no queue.")
+                oldest = min(idle, key=lambda r: r.last_used)
+                await self._close_browser(
+                    oldest,
+                    "Idle browser reclaimed for capacity; interactive state was lost. "
+                    "Conversation and findings remain available.",
+                )
+            reader.browser = PlaywrightBrowser(
+                timeout_seconds=self.browser_timeout_seconds,
+                on_state_lost=lambda: self._browser_lost(reader),
+            )
+            return reader.browser, True
+
+    def _browser_lost(self, reader):
+        reason = "Browser crashed or disconnected; interactive state was lost."
+        reader.browser_state_notice = reason
+        if reader.state == "running":
+            reader.state, reader.reason = "failed", reason
+            if reader.task and not reader.task.done() and not reader.task.cancelling():
+                reader.task.cancel()
+        else:
+            self._cleanup_tasks.add(
+                asyncio.create_task(self._close_browser(reader, reason))
+            )
 
     def _result(self, reader):
         return {
@@ -286,6 +400,10 @@ class PlaywrightReaderTools:
             "findings": reader.findings,
             "reason": reader.reason,
             "model_turns": reader.turns,
+            "browser_state": "open"
+            if reader.browser and not reader.browser.closed
+            else "closed",
+            "browser_state_notice": reader.browser_state_notice,
         }
 
     def _request(self, transcript):
@@ -326,6 +444,30 @@ class PlaywrightReaderTools:
             raise ReaderLimit("context_limit")
         reader.transcript.extend(messages)
 
+    def _seal_interrupted_calls(self, reader):
+        answered = {
+            item.get("call_id")
+            for item in reader.transcript
+            if item.get("type") == "function_call_output"
+        }
+        self._append(
+            reader,
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": encode(
+                        {
+                            "error": "Assignment interrupted; action outcome may be uncertain. Inspect before choosing another action; do not replay it."
+                        }
+                    ),
+                }
+                for item in reader.transcript
+                if item.get("type") == "function_call"
+                and item["call_id"] not in answered
+            ],
+        )
+
     def _observation(self, reader, observation):
         snapshot_id = uuid4().hex[:12]
         content = encode(observation)
@@ -340,6 +482,7 @@ class PlaywrightReaderTools:
             "url": observation.get("url", reader.url),
             "characters": len(content),
             "reason": "Full observation exceeds remaining context; retained completely for optional search_content and read_content.",
+            "browser_state_notice": reader.browser_state_notice,
         }
 
     async def _action(self, reader, name, arguments):
@@ -357,6 +500,7 @@ class PlaywrightReaderTools:
             ):
                 return {"error": "Invalid argument type"}
         if name == "report_findings":
+            reader.reported_in_assignment = True
             reader.findings = "\n\n".join(
                 filter(None, [reader.findings, arguments["text"]])
             )
@@ -405,11 +549,18 @@ class PlaywrightReaderTools:
             deadline = min(deadline, self._deadline)
         try:
             async with asyncio.timeout_at(deadline):
-                reader.browser = PlaywrightBrowser(
-                    timeout_seconds=self.browser_timeout_seconds
-                )
+                await self._drain_cleanup()
+                self._check_assignment(reader)
+                self._seal_interrupted_calls(reader)
                 self._append(reader, [{"role": "user", "content": reader.prompt}])
-                initial = await reader.browser.open(reader.url)
+                browser, fresh = await self._browser_for(reader)
+                if fresh:
+                    initial = await browser.open(reader.url)
+                    if reader.browser_state_notice:
+                        initial["browser_state_notice"] = reader.browser_state_notice
+                else:
+                    initial = await reader.browser.act("inspect", {})
+                self._check_assignment(reader)
                 reader.url = initial["url"]
                 observation = self._observation(reader, initial)
                 self._append(reader, [{"role": "user", "content": encode(observation)}])
@@ -431,6 +582,7 @@ class PlaywrightReaderTools:
                             ),
                         )
                     except APIStatusError as exc:
+                        self._check_assignment(reader)
                         if exc.code == "context_length_exceeded":
                             raise ReaderLimit("context_limit") from exc
                         if exc.status_code in {400, 404, 422}:
@@ -449,6 +601,7 @@ class PlaywrightReaderTools:
                             reader.state = "failed"
                             return
                         raise
+                    self._check_assignment(reader)
                     if self.trace:
                         self.trace.record(
                             "playwright_reader_output",
@@ -471,14 +624,21 @@ class PlaywrightReaderTools:
                         [
                             {k: v for k, v in item.items() if k != "status"}
                             for item in response.output
-                        ],
+                        ]
+                        or (
+                            [{"role": "assistant", "content": response.output_text}]
+                            if response.output_text
+                            else []
+                        ),
                     )
                     if not calls:
-                        reader.state = "completed" if reader.findings else "failed"
+                        completed = (
+                            bool(response.output_text.strip())
+                            or reader.reported_in_assignment
+                        )
+                        reader.state = "completed" if completed else "failed"
                         reader.reason = (
-                            ""
-                            if reader.findings
-                            else "Model returned no written findings."
+                            "" if completed else "Model returned no written findings."
                         )
                         return
                     for call in calls:
@@ -487,6 +647,7 @@ class PlaywrightReaderTools:
                             if not isinstance(arguments, dict):
                                 raise TypeError("Arguments must be an object")
                             result = await self._action(reader, call["name"], arguments)
+                            self._check_assignment(reader)
                         except (ValueError, KeyError, TypeError) as exc:
                             result = {
                                 "error": str(exc),
@@ -525,16 +686,20 @@ class PlaywrightReaderTools:
         except TimeoutError:
             reader.state, reader.reason = "limit", "time_limit"
         except asyncio.CancelledError:
-            reader.state, reader.reason = (
-                "cancelled",
-                "Containing request or reader was cancelled.",
-            )
+            if reader.state == "running":
+                reader.state, reader.reason = (
+                    "cancelled",
+                    "Containing request or reader was cancelled.",
+                )
             raise
         except Exception as exc:  # noqa: BLE001 - contain provider/browser task failures
             reader.state, reader.reason = "failed", f"{type(exc).__name__}: {exc}"
         finally:
+            reader.last_used = asyncio.get_running_loop().time()
             if reader.state != "completed" and reader.browser:
-                await reader.browser.close()
+                await self._close_browser(
+                    reader, "Browser closed; interactive state was lost."
+                )
             if self.trace:
                 self.trace.record(
                     "playwright_reader_finished",

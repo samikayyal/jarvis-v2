@@ -151,6 +151,8 @@ class WebReaderConfig:
     findings_tokens: int = 2_000
     output_tokens: int = 8_000
     max_readers: int = 8
+    max_active_readers: int = 3
+    max_browser_contexts: int = 3
     capture_chars: int = 1_000_000
 
     def __post_init__(self) -> None:

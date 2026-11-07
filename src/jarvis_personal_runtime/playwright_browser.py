@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import os
+from collections.abc import Callable
 from urllib.parse import urldefrag
 from uuid import uuid4
 
@@ -70,8 +71,14 @@ class BrowserStateLost(RuntimeError):
 
 
 class PlaywrightBrowser:
-    def __init__(self, *, timeout_seconds: float = 15):
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 15,
+        on_state_lost: Callable[[], None] | None = None,
+    ):
         self.timeout_seconds = timeout_seconds
+        self._on_state_lost = on_state_lost
         self.closed = False
         self._lost = False
         self._playwright = None
@@ -127,8 +134,10 @@ class PlaywrightBrowser:
             raise
 
     def _state_lost(self, *_):
-        if not self.closed:
+        if not self.closed and not self._lost:
             self._lost = True
+            if self._on_state_lost:
+                self._on_state_lost()
 
     def _new_page(self, page):
         self._tabs[uuid4().hex[:10]] = page
@@ -215,6 +224,17 @@ class PlaywrightBrowser:
         return result
 
     async def act(self, action: str, arguments: dict) -> dict:
+        # Let Playwright finish observing a closed target instead of abandoning
+        # its navigation waiter, whose later exception would otherwise leak.
+        operation = asyncio.create_task(self._act(action, arguments))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await self.close()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
+
+    async def _act(self, action: str, arguments: dict) -> dict:
         self._check()
         assert self._page is not None and self._context is not None
         attempted = False

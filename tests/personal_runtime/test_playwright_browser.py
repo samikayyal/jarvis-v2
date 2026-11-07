@@ -12,7 +12,7 @@ from jarvis_personal_runtime.playwright_browser import PlaywrightBrowser
 
 
 @contextmanager
-def public_fixture(monkeypatch):
+def public_fixture(monkeypatch, *, slow_page=None):
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
@@ -25,6 +25,9 @@ def public_fixture(monkeypatch):
             self.wfile.write(payload)
 
         def do_GET(self):
+            if self.path == "/slow" and slow_page is not None:
+                slow_page[0].set()
+                slow_page[1].wait(20)
             if self.path == "/redirect-private":
                 self.send_response(302)
                 self.send_header(
@@ -44,6 +47,8 @@ def public_fixture(monkeypatch):
             <label>Password<input type="password"></label><button>Sign in</button>
             <a href="/redirect-private">Private redirect</a><a href="/large">Large page</a>
             """
+            if slow_page is not None:
+                body += '<a href="/slow">Slow page</a>'
             if self.path == "/large":
                 body = (
                     "<h1>Large source</h1>"
@@ -66,7 +71,8 @@ def public_fixture(monkeypatch):
                 <button type="submit">Create resource</button></form>"""
             if self.path == "/set-state":
                 body = """<h1>State fixture</h1><script>document.cookie='research=one';
-                localStorage.setItem('private-research-state','one');</script>"""
+                localStorage.setItem('private-research-state','one');</script>
+                <a href="/show-state">Show state</a><a target="_blank" href="/popup">Open tab</a>"""
             if self.path == "/show-state":
                 body = """<h1>State fixture</h1><p id="state"></p><script>
                 document.querySelector('#state').textContent = document.cookie +
@@ -76,7 +82,10 @@ def public_fixture(monkeypatch):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            with suppress(
+                BrokenPipeError, ConnectionResetError, ConnectionAbortedError
+            ):
+                self.wfile.write(payload)
 
         def log_message(self, *_):
             pass

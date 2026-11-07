@@ -45,6 +45,8 @@ _TOOL_GROUPS = {
             "browser_reader_status",
             "wait_browser_reader",
             "cancel_browser_reader",
+            "follow_up_browser_reader",
+            "release_browser_reader",
         }
     ),
 }
