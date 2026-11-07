@@ -14,19 +14,51 @@ cmp "$root/SYSTEM.md" "$candidate/deployment/personal-runtime/SYSTEM.md.example"
 sudo -n -H -u jarvis-personal-runtime "$candidate/.venv/bin/jarvis-personal-runtime" --root "$root" --config "$config" --check
 sudo -n -H -u jarvis-personal-runtime uv run --no-project --python "$candidate/.venv/bin/python" "$base/verify-04.py"
 systemd-analyze verify /etc/systemd/system/jarvis-personal-runtime.service
-rollback() {
-  sudo -n systemctl stop jarvis-personal-runtime
-  sudo -n ln -sfn "$previous" "$base/current.parallel-rollback"
-  sudo -n mv -Tf "$base/current.parallel-rollback" "$base/current"
-  sudo -n systemctl start jarvis-personal-runtime
+verify_health() {
+  expected=$1
+  sleep 3
+  sudo -n systemctl is-active --quiet jarvis-personal-runtime || return 1
+  systemctl is-enabled --quiet jarvis-personal-runtime || return 1
+  test "$(readlink -f "$base/current")" = "$expected" || return 1
+  test "$(systemctl show jarvis-personal-runtime -p NRestarts --value)" = 0 || return 1
+  ss -ltnH | awk '$4 == "172.20.0.1:9011" { found=1 } END { exit !found }' || return 1
+  sudo -n -H -u jarvis-personal-runtime "$expected/.venv/bin/jarvis-personal-runtime" --root "$root" --config "$config" --check || return 1
+  sudo -n -H -u jarvis-personal-runtime uv run --no-project --python "$candidate/.venv/bin/python" "$base/verify-04.py" || return 1
 }
-trap 'rollback' HUP INT TERM
-sudo -n systemctl stop jarvis-personal-runtime
+rollback() {
+  sudo -n systemctl stop jarvis-personal-runtime || return 1
+  sudo -n ln -sfn "$previous" "$base/current.parallel-rollback" || return 1
+  sudo -n mv -Tf "$base/current.parallel-rollback" "$base/current" || return 1
+  sudo -n systemctl start jarvis-personal-runtime || return 1
+  verify_health "$previous"
+}
+# Prepare the symlink while the previous service is still running. Every later
+# failure or signal must recover, validate recovery, and terminate this attempt.
 sudo -n ln -sfn "$candidate" "$base/current.parallel-next"
-if ! sudo -n mv -Tf "$base/current.parallel-next" "$base/current"; then rollback; exit 1; fi
-if ! sudo -n systemctl start jarvis-personal-runtime; then rollback; exit 1; fi
-if ! sudo -n systemctl is-active --quiet jarvis-personal-runtime; then rollback; exit 1; fi
-trap - HUP INT TERM
+activation_complete=0
+on_exit() {
+  result=$1
+  trap - EXIT HUP INT TERM
+  if test "$activation_complete" = 0; then
+    if rollback; then
+      echo 'Candidate activation failed; previous release restored and health gates passed.' >&2
+    else
+      echo 'Candidate activation failed; rollback health could not be verified. Inspect the service.' >&2
+    fi
+    test "$result" != 0 || result=1
+  fi
+  exit "$result"
+}
+trap 'on_exit $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+sudo -n systemctl stop jarvis-personal-runtime
+sudo -n mv -Tf "$base/current.parallel-next" "$base/current"
+sudo -n systemctl start jarvis-personal-runtime
+verify_health "$candidate"
+activation_complete=1
+trap - EXIT HUP INT TERM
 readlink -f "$base/current"
 systemctl show jarvis-personal-runtime -p ActiveState -p SubState -p NRestarts -p MainPID
 systemctl is-enabled jarvis-personal-runtime
