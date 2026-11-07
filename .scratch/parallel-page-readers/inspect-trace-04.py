@@ -12,17 +12,23 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--since", required=True, help="UTC ISO timestamp")
+parser.add_argument("--until", help="Inclusive UTC ISO endpoint for a finished run")
 args = parser.parse_args()
 rows = []
+since_timestamp = datetime.fromisoformat(args.since).timestamp()
 for path in Path("/home/samik/Projects/Jarvis/other/runtime/data").glob(
     "runtime-trace.jsonl*"
 ):
+    if path.stat().st_mtime < since_timestamp:
+        continue
     for line in path.open():
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue  # A writer may still be appending the last line.
-        if row["timestamp"] >= args.since:
+        if row["timestamp"] >= args.since and (
+            args.until is None or row["timestamp"] <= args.until
+        ):
             rows.append(row)
 rows.sort(key=lambda row: row["timestamp"])
 counts = Counter(row["event"] for row in rows)
@@ -36,6 +42,8 @@ selected = {
     "openwa_reply_discarded",
     "openwa_progress_attempt",
     "openwa_progress_result",
+    "openwa_progress",
+    "openwa_progress_error",
     "tool_call",
     "tool_result",
     "tool_error",
@@ -47,6 +55,33 @@ selected = {
 for row in rows:
     if row["event"] in selected:
         print(json.dumps(row))
+    elif row["event"] in {
+        "responses_request",
+        "responses_output",
+        "playwright_reader_request",
+        "playwright_reader_output",
+    }:
+        # Timing and usage only; omit transcripts, screenshots and model bodies.
+        print(
+            json.dumps(
+                {
+                    **row,
+                    "payload": {
+                        key: value
+                        for key, value in row["payload"].items()
+                        if key
+                        in {
+                            "run_id",
+                            "reader_id",
+                            "assignment_id",
+                            "model_call",
+                            "elapsed_seconds",
+                            "usage",
+                        }
+                    },
+                }
+            )
+        )
 
 
 def stamp(value):

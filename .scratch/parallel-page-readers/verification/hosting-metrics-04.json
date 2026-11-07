@@ -1,0 +1,123 @@
+{
+  "candidate_sha": "551ed852b16f17f87e149feae1690da39114fc5b",
+  "outcome": "request timed out; no edit_vault call, note absent before recovery",
+  "admission": "2026-11-07T14:16:15.130033Z",
+  "runtime_result": "2026-11-07T14:26:15.240008Z",
+  "delivered": "2026-11-07T14:26:18.542122Z",
+  "admission_to_runtime_result_seconds": 600.1099750995636,
+  "admission_to_delivery_seconds": 603.412089,
+  "main_calls": 49,
+  "reader_calls": 8,
+  "main_completed_model_seconds": 303.0368355065584,
+  "main_unfinished_model_local_wait_seconds": 27.27559518814087,
+  "reader_model_seconds_nested_within_reader_wall": 27.723087683320045,
+  "reader_assignment_union_seconds_overlapping_main_work": 397.1167776584625,
+  "main_tool_seconds": {
+    "load_skill": 0.0006089210510253906,
+    "run_terminal": 5.551336765289307,
+    "search_web": 91.28298282623291,
+    "start_browser_reader": 0.34772801399230957,
+    "browser_reader_status": 0.012598752975463867,
+    "wait_browser_reader": 153.77917194366455,
+    "follow_up_browser_reader": 0.0005669593811035156,
+    "list_vault_tree": 3.5318429470062256,
+    "read_vault": 4.579253196716309,
+    "release_browser_reader": 1.9627537727355957
+  },
+  "http_attempts": 57,
+  "reader_assignments": [
+    {
+      "reader_id": "83a2223bea9c",
+      "assignment_id": "750fc20802f1",
+      "state": "limit",
+      "reason": "time_limit",
+      "url": "https://cloud.google.com/compute/disks-image-pricing",
+      "model_turns": 0,
+      "elapsed_seconds": 122.50940255634487
+    },
+    {
+      "reader_id": "1b95cf1d9575",
+      "assignment_id": "c744ae8bcba9",
+      "state": "limit",
+      "reason": "time_limit",
+      "url": "https://cloud.google.com/compute/vm-instance-pricing",
+      "model_turns": 0,
+      "elapsed_seconds": 127.2816500198096
+    },
+    {
+      "reader_id": "93cfb21b0bc9",
+      "assignment_id": "c62c64fc2440",
+      "state": "limit",
+      "reason": "time_limit",
+      "url": "https://cloud.google.com/vpc/network-pricing",
+      "model_turns": 0,
+      "elapsed_seconds": 120.93003948777914
+    },
+    {
+      "reader_id": "1b95cf1d9575",
+      "assignment_id": "bc650956b428",
+      "state": "completed",
+      "reason": "",
+      "url": "https://cloud.google.com/products/compute/pricing",
+      "model_turns": 1,
+      "elapsed_seconds": 58.61311339214444
+    },
+    {
+      "reader_id": "ee599699d5d0",
+      "assignment_id": "d667d4044ccd",
+      "state": "completed",
+      "reason": "",
+      "url": "https://docs.cloud.google.com/compute/docs/regions-zones",
+      "model_turns": 1,
+      "elapsed_seconds": 37.24410060234368
+    },
+    {
+      "reader_id": "f532b8d6130b",
+      "assignment_id": "24b6aa639b43",
+      "state": "completed",
+      "reason": "",
+      "url": "https://cloud.google.com/products/compute/pricing/general-purpose",
+      "model_turns": 1,
+      "elapsed_seconds": 90.35952157527208
+    },
+    {
+      "reader_id": "04fe7b40ac3c",
+      "assignment_id": "b9e671863b02",
+      "state": "completed",
+      "reason": "",
+      "url": "https://cloud.google.com/compute/disks-image-pricing",
+      "model_turns": 1,
+      "elapsed_seconds": 47.43447336927056
+    },
+    {
+      "reader_id": "454982ef3184",
+      "assignment_id": "3d8b7a23d89c",
+      "state": "completed",
+      "reason": "",
+      "url": "https://cloud.google.com/vpc/network-pricing",
+      "model_turns": 2,
+      "elapsed_seconds": 61.80374479480088
+    },
+    {
+      "reader_id": "72fa4c9c9fdb",
+      "assignment_id": "526fd5c10104",
+      "state": "limit",
+      "reason": "time_limit",
+      "url": "https://cloud.google.com/products/calculator",
+      "model_turns": 2,
+      "elapsed_seconds": 120.4245335124433
+    }
+  ],
+  "first_progress_after_admission_seconds": 28.183969974517822,
+  "progress_acknowledged": 7,
+  "progress_send_errors_or_uncertainty": 1,
+  "baseline": {
+    "before_completion_seconds": 458.128,
+    "through_delivery_seconds": 460.284,
+    "main_calls": 22,
+    "reader_calls": 27
+  },
+  "target_seconds": 120,
+  "functional_acceptance": false,
+  "performance_target_met": false
+}

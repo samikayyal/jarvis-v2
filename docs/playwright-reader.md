@@ -4,8 +4,10 @@ The normal Responses runner composes `WebTools` for main Google search and
 `PlaywrightReaderTools` for public-page investigations when web search is enabled.
 Loading the packaged web skill exposes all six reader lifecycle tools. The old
 reader and its quote, fallback, chunk and coverage policies are removed in ticket 03.
-This describes repository behavior. Ubuntu deployment and live acceptance remain
-in ticket 04; see [predeployment verification](../.scratch/parallel-page-readers/verification-03.md).
+Source `551ed85` was deployed to Ubuntu on 2026-11-07. The original hosting-and-note
+request timed out, so live end-to-end acceptance and the speed target remain
+unmet. See [deployment and acceptance](../.scratch/parallel-page-readers/deployment-verification-04.md)
+and [predeployment verification](../.scratch/parallel-page-readers/verification-03.md).
 
 ## Provision and run
 
@@ -71,7 +73,8 @@ The earlier containing-request deadline wins, including time spent before reader
 start. Every follow-up resets the assignment's time and turn budget while the
 retained conversation still consumes context. Each browser operation has a separate configurable timeout (15 seconds by
 default). No reader page/action/capture allowance or findings schema is applied.
-Legacy `WebReaderConfig` fields remain for the old implementation during migration.
+Retired reader configuration keys are rejected explicitly; remove them before
+activating a replacement release, as described in the deployment runbook.
 
 Completed browsers remain open through the containing request. Main completion,
 timeout, approval suspension or cancellation cancels unfinished work and closes all

@@ -1,0 +1,22 @@
+{
+  "cancel_admitted": "2026-11-07T14:49:37.190352Z",
+  "cancel_runtime_result": "2026-11-07T14:49:37.238086Z",
+  "cancel_delivered": "2026-11-07T14:49:38.950020Z",
+  "cancelled_request_final_sends_after_cancel": 0,
+  "active_reader_cancelled": [
+    {
+      "reader_id": "1b2fcc559ec5",
+      "state": "cancelled",
+      "browser_state": "closed",
+      "model_turns": 0
+    }
+  ],
+  "final_observed_utc": "2026-11-07T14:55:06Z",
+  "no_late_reply_visible_through_final_observation": true,
+  "reader_browser_or_driver_processes_at_final_check": 0,
+  "full_access_final": "off",
+  "active_request_final": "none",
+  "pending_action_final": false,
+  "saved_permissions_final": 15,
+  "provider_cancellation_confirmed": false
+}

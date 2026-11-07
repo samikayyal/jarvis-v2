@@ -1,0 +1,85 @@
+{
+  "package": "/home/samik/Projects/Jarvis/code/releases/551ed852b16f17f87e149feae1690da39114fc5b/.venv/lib/python3.14/site-packages/jarvis_personal_runtime",
+  "dependencies": [
+    "beautifulsoup4==4.15.0",
+    "httpx==0.28.1",
+    "openai==2.53.0",
+    "playwright==1.58.0",
+    "selenium==4.50.0",
+    "tiktoken==0.14.0"
+  ],
+  "uid": 997,
+  "provider": "scripted; no keys, model accuracy or WhatsApp acceptance",
+  "binaries": {
+    "browser": "/usr/bin/google-chrome-stable",
+    "driver": "/usr/local/bin/chromedriver"
+  },
+  "evidence": [
+    {
+      "outcome": "unavailable",
+      "query": "site:iana.org example domains",
+      "results": [],
+      "remaining": {
+        "queries": 0,
+        "evidence_chars": 48000
+      },
+      "reason": "browser operation timed out"
+    },
+    {
+      "reader_id": "f9883ebc87d2",
+      "state": "running",
+      "url": "https://www.iana.org/help/example-domains",
+      "findings": "",
+      "reason": "",
+      "model_turns": 0,
+      "assignment_id": "66f526295038",
+      "browser_state": "closed",
+      "browser_state_notice": ""
+    },
+    {
+      "reader_id": "f9883ebc87d2",
+      "state": "completed",
+      "url": "https://www.iana.org/help/example-domains",
+      "findings": "Observed excerpt: [](https://www.iana.org/)\n\n[Domains](https://www.iana.org/domains)\n\n[Protocols](https://www.iana.org/protocols)\n\n[Numbers](https://www.iana.org/numbers)\n\n[About](https://www.iana.org/about)\n\n[Instructions and Guides](https://www.iana.org/he Source: https://www.iana.org/help/example-domains. Scripted probe; no model accuracy claim.",
+      "reason": "",
+      "model_turns": 1,
+      "assignment_id": "66f526295038",
+      "browser_state": "open",
+      "browser_state_notice": ""
+    },
+    {
+      "reader_id": "f9883ebc87d2",
+      "state": "running",
+      "url": "https://www.iana.org/help/example-domains",
+      "findings": "Observed excerpt: [](https://www.iana.org/)\n\n[Domains](https://www.iana.org/domains)\n\n[Protocols](https://www.iana.org/protocols)\n\n[Numbers](https://www.iana.org/numbers)\n\n[About](https://www.iana.org/about)\n\n[Instructions and Guides](https://www.iana.org/he Source: https://www.iana.org/help/example-domains. Scripted probe; no model accuracy claim.",
+      "reason": "",
+      "model_turns": 0,
+      "assignment_id": "4a34fb184188",
+      "browser_state": "closed",
+      "browser_state_notice": "Browser closed; interactive state was lost."
+    },
+    {
+      "reader_id": "f9883ebc87d2",
+      "state": "completed",
+      "url": "https://www.iana.org/help/example-domains",
+      "findings": "Observed excerpt: [](https://www.iana.org/)\n\n[Domains](https://www.iana.org/domains)\n\n[Protocols](https://www.iana.org/protocols)\n\n[Numbers](https://www.iana.org/numbers)\n\n[About](https://www.iana.org/about)\n\n[Instructions and Guides](https://www.iana.org/he Source: https://www.iana.org/help/example-domains. Scripted probe; no model accuracy claim.",
+      "reason": "",
+      "model_turns": 1,
+      "assignment_id": "4a34fb184188",
+      "browser_state": "open",
+      "browser_state_notice": "Browser closed; interactive state was lost."
+    }
+  ],
+  "search_reply": "No source findings are available.",
+  "search_reply_seconds": 20.064442859962583,
+  "profile_cleanup": true,
+  "reader_browser_cleanup": true,
+  "page_reply": "Observed excerpt: [](https://www.iana.org/)\n\n[Domains](https://www.iana.org/domains)\n\n[Protocols](https://www.iana.org/protocols)\n\n[Numbers](https://www.iana.org/numbers)\n\n[About](https://www.iana.org/about)\n\n[Instructions and Guides](https://www.iana.org/he Source: https://www.iana.org/help/example-domains. Scripted probe; no model accuracy claim.",
+  "page_reply_seconds": 23.173112154006958,
+  "follow_up_reply": "Observed excerpt: [](https://www.iana.org/)\n\n[Domains](https://www.iana.org/domains)\n\n[Protocols](https://www.iana.org/protocols)\n\n[Numbers](https://www.iana.org/numbers)\n\n[About](https://www.iana.org/about)\n\n[Instructions and Guides](https://www.iana.org/he Source: https://www.iana.org/help/example-domains. Scripted probe; no model accuracy claim.",
+  "follow_up_reply_seconds": 0.004146300256252289,
+  "recheck_reply": "Observed excerpt: [](https://www.iana.org/)\n\n[Domains](https://www.iana.org/domains)\n\n[Protocols](https://www.iana.org/protocols)\n\n[Numbers](https://www.iana.org/numbers)\n\n[About](https://www.iana.org/about)\n\n[Instructions and Guides](https://www.iana.org/he Source: https://www.iana.org/help/example-domains. Scripted probe; no model accuracy claim.",
+  "recheck_reply_seconds": 14.38476194627583,
+  "scripted_main_calls": 10,
+  "scripted_reader_calls": 2
+}

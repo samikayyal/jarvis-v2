@@ -119,10 +119,13 @@ progress send drains before the final response. New ordinary messages receive a
 busy response; `/status` and `/cancel` remain deterministic. Final answers contain
 the model's concise uncertainty and citations, without code-owned source warnings.
 
-This is a source/predeployment change. Ticket 04 must commit/push and verify the
-exact GitHub candidate SHA before Ubuntu activation, then repeat the hosting and
-vault-save scenario with actual wall time and main/reader model-call counts.
-Vault edit approval, frozen proposals and synchronization behavior are unchanged.
+Source `551ed85` was committed, pushed and exact-SHA verified on GitHub before
+Ubuntu activation on 2026-11-07. The original visible hosting-and-note scenario
+timed out without saving its note; neither functional end-to-end acceptance nor
+the under-two-minute target passed. A separately corrected recovery note saved
+and synced. See [ticket 04's measured record](../../.scratch/parallel-page-readers/deployment-verification-04.md)
+for provisioning, rollback, installed-source checks and live outcomes. Vault edit
+approval, frozen proposals and synchronization behavior are unchanged.
 
 #### Provision and verify a browser candidate
 

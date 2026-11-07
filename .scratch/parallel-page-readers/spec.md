@@ -1,6 +1,6 @@
 # Concurrent browser readers
 
-Status: design accepted; tickets 01–03 complete; ticket 04 pending
+Status: design accepted; tickets 01–03 complete; ticket 04 deployed, live acceptance failed and remains open
 Date: 2026-11-06 (Asia/Amman)
 
 The operator approved publication of the four implementation tickets after reviewing
@@ -10,7 +10,9 @@ verified on the opt-in single-reader path; see [verification](verification.md).
 Ticket 02 adds concurrency and retained follow-ups on the opt-in path; see
 [its verification](verification-02.md). Ticket 03 integrates the normal runtime and removes the old reader policy; see
 [predeployment verification](verification-03.md). Deployment and live acceptance
-remain in ticket 04.
+are owned by ticket 04. Its [deployment/acceptance record](deployment-verification-04.md)
+reports the 2026-11-07 deployment and failed original hosting-and-note repeat;
+the under-two-minute target has not been met.
 
 ## Purpose and scope
 

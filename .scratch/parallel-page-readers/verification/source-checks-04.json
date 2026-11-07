@@ -1,0 +1,25 @@
+{
+  "candidate_sha": "551ed852b16f17f87e149feae1690da39114fc5b",
+  "pricing_primary_url": "https://cloud.google.com/products/compute/pricing/general-purpose",
+  "reader_id": "f532b8d6130b",
+  "assignment_id": "24b6aa639b43",
+  "inspected_observation_region": "Iowa (us-central1)",
+  "inspected_default_price_row": {
+    "machine_type": "e2-standard-2",
+    "virtual_cpus": 2,
+    "memory": "8 GiB",
+    "default_usd_per_hour": "0.06701142"
+  },
+  "independent_region_primary_url": "https://docs.cloud.google.com/compute/docs/regions-zones",
+  "independent_region_check": "me-central1-a/b/c list Doha, Qatar, Middle East and E2",
+  "doha_monthly_quote_verified": false,
+  "laptop_power_cost_measured": false,
+  "vault_commit": "a8e0335ee7fcf614b1c1050f99b6ce78bfcd58ff",
+  "vault_local_head_matches_github_main": true,
+  "vault_worktree_clean": true,
+  "note_path": "Technical/Jarvis hosting comparison.md",
+  "note_saved_during_original_benchmark": false,
+  "note_saved_during_corrected_recovery": true,
+  "recovery_continuation": "working-session context limit after successful synced write",
+  "fresh_session_visible_read_confirmation": "Yes—the note is present at Technical/Jarvis hosting comparison.md. It is synced."
+}
