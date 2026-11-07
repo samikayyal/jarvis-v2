@@ -274,6 +274,40 @@ def test_inflight_progress_is_drained_before_cancel_reply():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("command", ["/cancel", "/new"])
+def test_control_after_model_completion_discards_final_waiting_for_progress(command):
+    async def scenario():
+        runner, sender = _BlockingRunner(), _BlockingSender()
+        runtime = PersonalRuntime(request_runner=runner, clock=_Clock())
+        flow = OpenWAMessageFlow(
+            settings=_settings(),
+            signing_secret=SECRET,
+            runtime=runtime,
+            sender=sender,
+            clock=_Clock(),
+            progress_interval_seconds=0.02,
+        )
+        raw = _event()
+        flow.receive_webhook(raw, _headers(raw))
+        await runner.entered.wait()
+        assert await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), 1)
+        runner.release.set()
+        for _ in range(100):
+            if runtime.status().active_request is None:
+                break
+            await asyncio.sleep(0.001)
+        assert runtime.status().active_request is None
+        raw = _event(message_id="control", body=command)
+        flow.receive_webhook(raw, _headers(raw))
+        await asyncio.sleep(0.02)
+        sender.release.set()
+        await asyncio.wait_for(flow.drain(), 1)
+        assert all(text != "done" for _, text in sender.sent)
+        assert len(sender.sent) == 2
+
+    asyncio.run(scenario())
+
+
 def test_reply_chunks_are_sent_once_each_in_deterministic_order() -> None:
     async def scenario() -> None:
         runner = _BlockingRunner("alpha beta gamma delta")

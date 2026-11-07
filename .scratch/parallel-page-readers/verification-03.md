@@ -8,8 +8,8 @@ activation, live WhatsApp acceptance or hosting-performance claim is part of
 ticket 03. Ticket 04 owns those steps and the exact-SHA GitHub activation gate.
 
 Review baseline: `80af6449de38c29a5721e2a1063bd706336798c5`, the clean current
-branch at task start. The final source candidate and full-suite result will be
-recorded below after review and validation.
+branch at task start. Initial implementation: `85c51c6672c71204639b4345b2bd5a1214e74f3c`.
+The final reviewed candidate and full-suite result will be recorded below.
 
 ## Implementation
 
@@ -21,6 +21,8 @@ recorded below after review and validation.
 - Progress defaults to 20 seconds and reflects the owning active request or
   observed reader-state counts. Repeated state is suppressed. Progress sends
   drain before final/cancel delivery; busy rejection and status/cancel remain.
+  Cancellation/session resets invalidate any reply still awaiting transport,
+  checked under the send lock before each chunk, including after model completion.
 - Deleted the old reader, chunk splitter, structured Selenium capture/display
   interface, quote validation, mandatory fallback/sweeps, coverage accounting,
   required findings schema, reader action/page allowances and automatic answer
@@ -91,4 +93,32 @@ capability result is in docs/playwright-reader.md. No billed check was run here.
 
 ## Final validation and review
 
-Pending the source commit, full suite and independent Standards/Spec reviews.
+Focused configuration/progress/search/skill checks: 119 passed. Real browser,
+reader, concurrent lifecycle and default-assembly integration checks: 34 passed,
+1 skipped (345.78 seconds). Smoke-probe contracts, search regressions and added
+assembly/instrumentation checks: 23 passed. Cancellation-fix OpenWA/runtime/full
+access regressions: 43 passed. Focused typechecks, lint, formatting and diff checks
+pass. The default smoke probe ran without --live or credentials; its report
+records Windows source-path provisioning observations, not installed Ubuntu proof.
+
+### Standards
+
+Independent review of the complete implementation and follow-up: 0 hard violations
+and 0 actionable smells. Domain vocabulary, issue-tracker conventions, uv use,
+ADR supersession and predeployment/deployment boundaries follow repository rules.
+Progress forwarding uses the existing prepared-tool composition boundary. Runtime
+owns reply invalidation and OpenWA checks it under the send lock; assignment IDs
+are available before immediate start/follow-up returns.
+
+### Spec
+
+Independent review reproduced one P1: when a progress send was blocked, model
+completion cleared the active request; /cancel or /new could reply before the
+old final answer. Red regressions reproduced both commands. Delivery-generation
+invalidation now discards the final and checks each chunk before starting a send.
+The reviewer independently reran 5 relevant regressions (12 deselected), confirmed
+the fix and reported 0 remaining actionable Spec findings. No additional scope
+creep or omissions were found. This review is not live acceptance.
+
+Summary: Standards 0 findings; Spec 1 P1 found and resolved, 0 remaining.
+The final exact-source full suite and wheel record remain pending.

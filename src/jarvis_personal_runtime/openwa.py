@@ -351,6 +351,7 @@ class OpenWAMessageFlow:
             result = await self._runtime.receive(
                 InboundText(message.message_id, message.body, self._clock.now())
             )
+            delivery_generation = self._runtime.delivery_generation
         finally:
             stopped.set()
             # Drain any already-started send before final/cancel delivery. Never
@@ -375,6 +376,15 @@ class OpenWAMessageFlow:
             )
             try:
                 async with self._send_lock:
+                    if delivery_generation != self._runtime.delivery_generation:
+                        self._trace.record(
+                            "openwa_reply_discarded",
+                            {
+                                "message_id": message.message_id,
+                                "reason": "cancelled_or_reset_before_delivery",
+                            },
+                        )
+                        break
                     outbound_id = await asyncio.to_thread(
                         self._sender.send_text,
                         self.settings.operator_chat_id,
@@ -407,7 +417,7 @@ class OpenWAMessageFlow:
                     message.message_id, result, tuple(outbound_ids), delivery
                 )
         delivery = (
-            DeliveryDisposition.SENT if chunks else DeliveryDisposition.NOT_NEEDED
+            DeliveryDisposition.SENT if outbound_ids else DeliveryDisposition.NOT_NEEDED
         )
         return MessageOutcome(message.message_id, result, tuple(outbound_ids), delivery)
 

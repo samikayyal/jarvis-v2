@@ -339,6 +339,12 @@ class PersonalRuntime:
         self._session: _Session | None = None
         self._model = self.config.model
         self._reasoning = self.config.reasoning_effort
+        self._delivery_generation = 0
+
+    @property
+    def delivery_generation(self) -> int:
+        """Invalidate replies still awaiting transport after cancellation/reset."""
+        return self._delivery_generation
 
     @property
     def full_access(self) -> bool:
@@ -850,6 +856,7 @@ class PersonalRuntime:
         return self._session.pending
 
     def _clear_session(self) -> asyncio.Task[object] | None:
+        self._delivery_generation += 1
         task = (
             self._session.active.task
             if self._session and self._session.active
@@ -862,6 +869,7 @@ class PersonalRuntime:
         return task
 
     def _cancel_work(self, now: datetime) -> asyncio.Task[object] | None:
+        self._delivery_generation += 1
         if self._session is None:
             return None
         task = self._session.active.task if self._session.active else None

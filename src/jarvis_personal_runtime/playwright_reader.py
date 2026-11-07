@@ -130,7 +130,7 @@ class BrowserReader:
     last_used: float = 0
     reported_in_assignment: bool = False
     deadline: float | None = None
-    assignment_id: str = ""
+    assignment_id: str = field(default_factory=lambda: uuid4().hex[:12])
 
 
 class PlaywrightReaderTools:
@@ -373,6 +373,7 @@ class PlaywrightReaderTools:
                     }
                 )
             reader.prompt = arguments["prompt"]
+            reader.assignment_id = uuid4().hex[:12]
             self._request_readers.add(reader.reader_id)
             reader.state, reader.reason, reader.turns = "running", "", 0
             reader.reported_in_assignment = False
@@ -580,7 +581,6 @@ class PlaywrightReaderTools:
 
     async def _run(self, reader):
         started = asyncio.get_running_loop().time()
-        reader.assignment_id = uuid4().hex[:12]
         deadline = started + self.config.timeout_seconds
         if self._deadline is not None:
             deadline = min(deadline, self._deadline)
