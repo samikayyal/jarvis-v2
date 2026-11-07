@@ -16,12 +16,18 @@ sudo -n -H -u jarvis-personal-runtime uv run --no-project --python "$candidate/.
 systemd-analyze verify /etc/systemd/system/jarvis-personal-runtime.service
 verify_health() {
   expected=$1
-  sleep 3
-  sudo -n systemctl is-active --quiet jarvis-personal-runtime || return 1
+  # Type=simple reports active before Python imports and listener startup finish.
+  # Bound actual listener readiness instead of assuming a three-second startup.
+  attempt=0
+  until sudo -n systemctl is-active --quiet jarvis-personal-runtime &&
+    ss -ltnH | awk '$4 == "172.20.0.1:9011" { found=1 } END { exit !found }'; do
+    attempt=$((attempt + 1))
+    test "$attempt" -lt 45 || return 1
+    sleep 1
+  done
   systemctl is-enabled --quiet jarvis-personal-runtime || return 1
   test "$(readlink -f "$base/current")" = "$expected" || return 1
   test "$(systemctl show jarvis-personal-runtime -p NRestarts --value)" = 0 || return 1
-  ss -ltnH | awk '$4 == "172.20.0.1:9011" { found=1 } END { exit !found }' || return 1
   sudo -n -H -u jarvis-personal-runtime "$expected/.venv/bin/jarvis-personal-runtime" --root "$root" --config "$config" --check || return 1
   sudo -n -H -u jarvis-personal-runtime uv run --no-project --python "$candidate/.venv/bin/python" "$base/verify-04.py" || return 1
 }
