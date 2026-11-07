@@ -769,3 +769,42 @@ def test_followup_budget_is_fresh_but_main_deadline_and_retained_context_still_a
 
     with public_fixture(monkeypatch) as url:
         asyncio.run(scenario(url))
+
+
+def test_main_deadline_rejects_provider_answer_returned_after_timeout(monkeypatch):
+    class LateAfterTimeout:
+        calls = 0
+
+        async def create(self, request, *, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                return ResponsesResult((), "Completed findings survive")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return ResponsesResult((), "Late after deadline")
+
+    async def scenario(url):
+        tools = PlaywrightReaderTools(WebReaderConfig(), LateAfterTimeout())
+        try:
+            start = await invoke(
+                tools, "start_browser_reader", url=url, prompt="initial"
+            )
+            rid = start["reader_id"]
+            await invoke(tools, "wait_browser_reader", reader_id=rid, seconds=15)
+            tools.set_request_deadline(asyncio.get_running_loop().time() + 2)
+            await invoke(
+                tools, "follow_up_browser_reader", reader_id=rid, prompt="deadline"
+            )
+            result = await invoke(
+                tools, "wait_browser_reader", reader_id=rid, seconds=10
+            )
+            assert result["state"] == "limit" and result["reason"] == "time_limit", (
+                result
+            )
+            assert result["findings"] == "Completed findings survive"
+        finally:
+            await tools.close_request()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))

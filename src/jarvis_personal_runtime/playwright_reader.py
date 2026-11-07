@@ -133,6 +133,7 @@ class BrowserReader:
     browser_state_notice: str = ""
     last_used: float = 0
     reported_in_assignment: bool = False
+    deadline: float | None = None
 
 
 class PlaywrightReaderTools:
@@ -267,6 +268,11 @@ class PlaywrightReaderTools:
     def _check_assignment(self, reader):
         if reader.state != "running":
             raise asyncio.CancelledError
+        if (
+            reader.deadline is not None
+            and asyncio.get_running_loop().time() >= reader.deadline
+        ):
+            raise ReaderLimit("time_limit")
 
     def _busy(self, reader):
         return reader.state == "running" or (
@@ -547,6 +553,7 @@ class PlaywrightReaderTools:
         deadline = started + self.config.timeout_seconds
         if self._deadline is not None:
             deadline = min(deadline, self._deadline)
+        reader.deadline = deadline
         try:
             async with asyncio.timeout_at(deadline):
                 await self._drain_cleanup()
@@ -631,6 +638,7 @@ class PlaywrightReaderTools:
                             else []
                         ),
                     )
+                    self._check_assignment(reader)
                     if not calls:
                         completed = (
                             bool(response.output_text.strip())
