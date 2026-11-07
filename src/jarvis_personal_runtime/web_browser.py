@@ -310,12 +310,6 @@ class BrowserWorker:
             "https://www.google.com/search",
         )
 
-    async def capture(self, url: str, display: list[dict]) -> dict[str, object]:
-        canonical = validate_public_url(url)
-        return await self._operate(
-            {"op": "capture", "url": canonical, "display": display}, canonical
-        )
-
     async def _operate(
         self, payload: dict[str, object], canonical: str
     ) -> dict[str, object]:
@@ -518,10 +512,6 @@ class BrowserWorker:
 
         if outcome == "ok":
             result.update(extraction_metadata(response, text))
-            if response.get("extraction_method") == "structured_html":
-                result["extraction_method"] = "structured_html"
-                result["controls"] = response.get("controls", [])
-                result["display_state"] = response.get("display_state", [])
         return result
 
     def _result(self, outcome: str, url: str, *, reason: str = "") -> dict[str, object]:

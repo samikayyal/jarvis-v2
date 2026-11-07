@@ -1,5 +1,11 @@
 # Isolate webpage reading from the main assistant
 
+Partially superseded in the repository by [ADR 0005](0005-simplify-and-parallelize-page-readers.md)
+and ticket 03 on 2026-11-07. Private-context isolation and model selection remain;
+assigned-page restrictions, chunks, sequential readers, refresh replacement,
+quote policy and action/page limits have been replaced. The text below is
+historical. See [current operations](../page-reader.md); no deployment is claimed.
+
 Design accepted and final alignment confirmed 2026-11-03. The design interview is complete; implementation is not yet authorized.
 
 Delegate questions about individual webpages to a page reader, keeping full page content outside the main assistant's conversation. Basic document conversion preserves content, headings, tables, and link destinations; the reader model selects relevant evidence and returns concise answers with supporting excerpts, conditions, and unresolved gaps. The main assistant controls navigation between pages and synthesis across sources, trading an additional model call and possible summarization errors for focused reading and reduced main-context growth.

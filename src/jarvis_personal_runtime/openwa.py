@@ -263,6 +263,7 @@ class OpenWAMessageFlow:
         sender: OpenWASender,
         clock: Clock | None = None,
         trace: RuntimeTrace | None = None,
+        progress_interval_seconds: float = 20,
     ) -> None:
         if not isinstance(signing_secret, bytes):
             raise TypeError("signing_secret must be bytes")
@@ -275,6 +276,10 @@ class OpenWAMessageFlow:
         self._clock = clock or _SystemClock()
         self._trace = trace or runtime.trace
         self._tasks: set[asyncio.Task[MessageOutcome]] = set()
+        if progress_interval_seconds <= 0:
+            raise ValueError("progress interval must be positive")
+        self._progress_interval = progress_interval_seconds
+        self._send_lock = asyncio.Lock()
 
     def receive_webhook(
         self, raw_body: bytes, headers: Mapping[str, str]
@@ -338,11 +343,19 @@ class OpenWAMessageFlow:
 
     async def _process(self, message: _AdmittedMessage) -> MessageOutcome:
         await self._set_typing(message.message_id, active=True)
+        stopped = asyncio.Event()
+        progress = asyncio.create_task(
+            self._report_progress(message, asyncio.current_task(), stopped)
+        )
         try:
             result = await self._runtime.receive(
                 InboundText(message.message_id, message.body, self._clock.now())
             )
         finally:
+            stopped.set()
+            # Drain any already-started send before final/cancel delivery. Never
+            # abandon a thread-backed send whose transport outcome is uncertain.
+            await asyncio.shield(progress)
             await self._set_typing(message.message_id, active=False)
         chunks = tuple(
             chunk
@@ -361,11 +374,12 @@ class OpenWAMessageFlow:
                 {"message_id": message.message_id, "text": chunk},
             )
             try:
-                outbound_id = await asyncio.to_thread(
-                    self._sender.send_text,
-                    self.settings.operator_chat_id,
-                    chunk,
-                )
+                async with self._send_lock:
+                    outbound_id = await asyncio.to_thread(
+                        self._sender.send_text,
+                        self.settings.operator_chat_id,
+                        chunk,
+                    )
                 outbound_ids.append(outbound_id)
                 self._trace.record(
                     "openwa_send_result",
@@ -396,6 +410,39 @@ class OpenWAMessageFlow:
             DeliveryDisposition.SENT if chunks else DeliveryDisposition.NOT_NEEDED
         )
         return MessageOutcome(message.message_id, result, tuple(outbound_ids), delivery)
+
+    async def _report_progress(self, message, owner, stopped):
+        previous = None
+        while not stopped.is_set():
+            try:
+                await asyncio.wait_for(stopped.wait(), self._progress_interval)
+                return
+            except TimeoutError:
+                pass
+            async with self._send_lock:
+                text = self._runtime.progress_for(owner)
+                if stopped.is_set() or text is None:
+                    return
+                if text == previous:
+                    continue
+                previous = text
+                try:
+                    outbound_id = await asyncio.to_thread(
+                        self._sender.send_text, self.settings.operator_chat_id, text
+                    )
+                    self._trace.record(
+                        "openwa_progress",
+                        {
+                            "message_id": message.message_id,
+                            "text": text,
+                            "outbound_id": outbound_id,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 - progress is best effort and never retried
+                    self._trace.record(
+                        "openwa_progress_error", {"message_id": message.message_id}
+                    )
+                    return
 
     async def _set_typing(self, message_id: str, *, active: bool) -> None:
         state = "typing" if active else "paused"

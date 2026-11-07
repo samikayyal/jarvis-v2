@@ -1,11 +1,11 @@
-# Playwright reader trial path
+# Concurrent Playwright readers
 
-Tickets 01–02 implement concurrent asynchronous public browser readers as
-`PlaywrightReaderTools`. They are available to the main Responses tool loop when
-explicitly assembled as an additional prepared tool. The default runner still
-constructs the existing page reader. Ticket 02 adds scheduling and retained
-follow-ups; production instructions and removal of the old reader belong to
-ticket 03. No deployment or production cutover is performed here.
+The normal Responses runner composes `WebTools` for main Google search and
+`PlaywrightReaderTools` for public-page investigations when web search is enabled.
+Loading the packaged web skill exposes all six reader lifecycle tools. The old
+reader and its quote, fallback, chunk and coverage policies are removed in ticket 03.
+This describes repository behavior. Ubuntu deployment and live acceptance remain
+in ticket 04; see [predeployment verification](../.scratch/parallel-page-readers/verification-03.md).
 
 ## Provision and run
 
@@ -23,31 +23,12 @@ startup fails rather than silently disabling the sandbox. Playwright uses an
 anonymous browser process and a fresh context, with a minimal browser environment,
 blocked service workers, downloads and WebSockets, and no operator profile.
 
-The application assembly seam is the existing `additional_tools` parameter:
-
-```python
-from jarvis_personal_runtime.config import WebReaderConfig
-from jarvis_personal_runtime.playwright_reader import PlaywrightReaderTools
-from jarvis_personal_runtime.responses import (
-    OpenAIRawResponsesAdapter,
-    build_direct_responses_runner,
-)
-
-adapter = OpenAIRawResponsesAdapter.from_api_key(existing_key)
-readers = PlaywrightReaderTools(WebReaderConfig(), adapter.without_retries())
-runner = build_direct_responses_runner(
-    existing_key, config, additional_tools=(readers,)
-)
-# In a controlled request, explicitly instruct main Jarvis to use the trial
-# start_browser_reader / browser_reader_status / wait_browser_reader tools.
-# Close the externally owned adapter when the enclosing runtime shuts down.
-```
-
-The web skill gates these tool definitions through ordinary main-tool discovery.
-The controlled integration fixture assembles only the new reader with a second
-main tool, delegates a task, does other work while the reader runs, collects the
-written result and verifies final browser cleanup. Main tool calls stay sequential;
-the reader task itself runs independently.
+Normal service assembly uses the configured independent reader model through the
+same provider adapter with automatic retries disabled. No additional-tools setup
+is needed. Main tool calls stay sequential while reader tasks run independently.
+The default-assembly integration fixture starts two readers, reads vault context
+while they work, synthesizes a concise answer, releases one conversation, and
+checks that remaining browsers close while completed findings survive.
 
 ## Main operations and lifecycle
 
@@ -129,7 +110,7 @@ public research form submission: a URL-encoded POST must match the form's action
 expected payload and submitting frame, and be a navigation request. The permit is
 consumed once; unrelated scripts and background POSTs remain blocked. Obvious
 create/save/send/account/purchase controls are excluded. This conservative guard
-supports public forms; arbitrary AJAX write endpoints are outside this trial
+supports public forms; arbitrary AJAX write endpoints are outside this browser
 path. It is not semantic proof that arbitrary website behavior is read-only.
 Web content cannot grant authority. No model-facing arbitrary URL, JavaScript,
 terminal, private-tool, web-search or recursive-reader interface exists.
@@ -169,38 +150,13 @@ or the later hosting-comparison performance target.
 ## Validation scope
 
 Real Chromium fixtures cover dynamic controls, public form POSTs, fresh observations,
-cross-domain history, popups/tabs, explicit screenshots, private redirects and
-subrequests, stale references, anonymous state isolation, browser crashes and
-cleanup. Model-boundary fixtures cover ordinary findings, private-context isolation,
-large initial/updated observations, limits, cancellation, unsupported screenshots
-and main-tool coordination. The live provider fixture is opt-in; normal tests make
-no provider requests.
+cross-domain history, tabs, screenshots, overflow, context isolation, limits,
+crashes, cancellation, retained follow-ups and actual resource teardown. Scripted
+provider boundaries make ordinary tests reproducible without billed API calls.
+The opt-in screenshot test above records historical capability verification; this
+ticket does not repeat it or claim live WhatsApp acceptance.
 
-Focused `ty check` covers the two new modules. A wider check of the existing
-Responses module reports 14 diagnostics; checking the starting commit's module
-with the same ty version reports the same 14. This ticket does not claim that the
-existing codebase passes a newly introduced repository-wide typecheck.
-
-The focused browser/reader, existing web-boundary and main Responses regression
-run on 2026-11-06 completed with 70 passed and 2 skipped. The skipped checks require
-explicit browser/model provisioning; the billed reader screenshot fixture was run separately as
-recorded above. Lint and formatting checks pass for all modified Python files.
-
-For ticket 01, after resolving all three Spec-review findings and synchronizing deployment
-dependencies, the final full suite passed with **651 passed, 11 skipped** in
-399.89 seconds. Both review axes have no remaining findings. The verified source
-commit is `2953ec18ba77bf6c1649d870c5315685f429b664`; see the
-[ticket verification](../.scratch/parallel-page-readers/verification.md).
-
-Ticket 02 adds real-browser tests for three overlapping assignments, independent
-out-of-order collection, bounded waiting, configurable capacity, busy follow-ups,
-fresh budgets with the main deadline, retained context limits, idle reclamation,
-explicit release, concurrent context isolation, surviving tabs, crashes during
-model waits, navigation cancellation, interrupted history, late-provider rejection,
-runtime `/cancel`/`/new`/inactivity/context resets and restart. Resource verification
-observes context-close events, driver process exit and proxy-thread termination.
-Its validation and review record is in
-[ticket 02 verification](../.scratch/parallel-page-readers/verification-02.md).
-Final ticket 02 full suite: **664 passed, 11 skipped** in 560.60 seconds. Standards
-and Spec reviews have no remaining actionable findings. Post-suite resource
-inspection found no Playwright browser/driver worker processes.
+Focused typechecking covers Playwright readers/browser, HTML conversion and main
+search. Existing broader runtime/Responses type diagnostics are recorded separately.
+The source, full-suite result, review and reproducible commands for this candidate
+are recorded in [ticket 03 verification](../.scratch/parallel-page-readers/verification-03.md).

@@ -1,0 +1,26 @@
+BASELINE\src\jarvis_personal_runtime\config.py:766:16: warning[redundant-cast] Value is already of type `WebSearchConfig`
+BASELINE\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `int`, found `str | None`
+BASELINE\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+BASELINE\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+BASELINE\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+BASELINE\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+BASELINE\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+BASELINE\src\jarvis_personal_runtime\responses.py:57:9: error[invalid-argument-type] Argument to function `canonical_context` is incorrect: Expected `tuple[dict[str, object], ...] | list[dict[str, object]]`, found `object`
+BASELINE\src\jarvis_personal_runtime\responses.py:58:9: error[invalid-argument-type] Argument to function `canonical_context` is incorrect: Expected `tuple[dict[str, object], ...] | list[dict[str, object]]`, found `object`
+BASELINE\src\jarvis_personal_runtime\responses.py:330:25: error[no-matching-overload] No overload matches arguments
+BASELINE\src\jarvis_personal_runtime\responses.py:508:13: error[invalid-argument-type] Argument to bound method `DirectResponsesRunner._continue_loop` is incorrect: Expected `list[dict[str, object]]`, found `list[dict[str, object] | dict[str, str]]`
+BASELINE\src\jarvis_personal_runtime\responses.py:551:58: error[invalid-argument-type] Argument is incorrect: Expected `dict[str, object]`, found `dict[str, str | list[dict[str, object]]]`
+BASELINE\src\jarvis_personal_runtime\responses.py:584:29: error[unsupported-operator] Operator `-` is not supported between objects of type `float | None` and `float`
+BASELINE\src\jarvis_personal_runtime\responses.py:744:45: error[invalid-argument-type] Argument to bound method `TraceSink.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str]`
+BASELINE\src\jarvis_personal_runtime\responses.py:756:41: error[invalid-argument-type] Argument to bound method `TraceSink.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str | (Any & dict[Unknown, Unknown])]`
+BASELINE\src\jarvis_personal_runtime\responses.py:764:60: error[invalid-argument-type] Argument to bound method `TraceSink.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str | (Any & dict[Unknown, Unknown])]`
+BASELINE\src\jarvis_personal_runtime\responses.py:874:13: error[invalid-assignment] Object of type `list[dict[str, object] | dict[str, str]]` is not assignable to attribute `_transcript` of type `list[dict[str, object]]`
+BASELINE\src\jarvis_personal_runtime\responses.py:876:17: error[invalid-argument-type] Argument to bound method `DirectResponsesRunner._continue_loop` is incorrect: Expected `list[dict[str, object]]`, found `list[dict[str, object] | dict[str, str]]`
+BASELINE\src\jarvis_personal_runtime\responses.py:975:17: error[invalid-argument-type] Argument to bound method `list.append` is incorrect: Expected `PreparedTools`, found `ReadVaultTool`
+BASELINE\src\jarvis_personal_runtime\responses.py:997:17: error[invalid-argument-type] Argument to `RunTerminalTool.__init__` is incorrect: Expected `CommandExecutor`, found `NativeUbuntuExecutor`
+BASELINE\src\jarvis_personal_runtime\responses.py:1012:17: error[invalid-argument-type] Argument to bound method `list.append` is incorrect: Expected `PreparedTools`, found `PageReaderTools`
+BASELINE\src\jarvis_personal_runtime\runtime.py:433:25: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
+BASELINE\src\jarvis_personal_runtime\runtime.py:434:29: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
+BASELINE\src\jarvis_personal_runtime\runtime.py:480:46: error[index-out-of-bounds] Index 2 is out of bounds for tuple `tuple[str, object]` with length 2
+BASELINE\src\jarvis_personal_runtime\runtime.py:912:9: error[invalid-argument-type] Argument to `PersonalRuntime.__init__` is incorrect: Expected `PermissionStore | None`, found `TomlPermissionStore`
+Found 25 diagnostics

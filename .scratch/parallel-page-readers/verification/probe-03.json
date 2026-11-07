@@ -1,0 +1,17 @@
+{
+  "package": "D:\\Projects\\Jarvis-v2\\src\\jarvis_personal_runtime",
+  "dependencies": [
+    "beautifulsoup4==4.15.0",
+    "httpx==0.28.1",
+    "openai==2.53.0",
+    "playwright==1.58.0",
+    "selenium==4.50.0",
+    "tiktoken==0.14.0"
+  ],
+  "uid": null,
+  "provider": "scripted; no keys, model accuracy or WhatsApp acceptance",
+  "binaries": {
+    "browser": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "driver": null
+  }
+}

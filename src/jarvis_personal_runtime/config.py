@@ -143,17 +143,13 @@ class WebSearchConfig:
 class WebReaderConfig:
     model: str = "gpt-6-luna"
     reasoning_effort: str = "low"
-    chunk_tokens: int = 12_000
     context_tokens: int = 128_000
     timeout_seconds: int = 120
     max_attempts: int = 24
-    max_actions: int = 18
-    findings_tokens: int = 2_000
     output_tokens: int = 8_000
     max_readers: int = 8
     max_active_readers: int = 3
     max_browser_contexts: int = 3
-    capture_chars: int = 1_000_000
 
     def __post_init__(self) -> None:
         if self.reasoning_effort not in MODEL_REASONING_EFFORTS.get(self.model, ()):
@@ -165,10 +161,6 @@ class WebReaderConfig:
                     raise ValueError(f"web_reader.{name} must be a positive integer")
         if self.context_tokens > 128_000 or self.output_tokens >= self.context_tokens:
             raise ValueError("web_reader context must be <= 128000 with response space")
-        if self.chunk_tokens < 128 or self.findings_tokens < 512:
-            raise ValueError(
-                "web_reader chunks/findings must allow structural metadata"
-            )
 
 
 # This is for typing
@@ -1073,6 +1065,16 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             table = _ensure_table(raw["web_reader"], path, "[web_reader]")
             if not table.get("model"):
                 raise ValueError("web_reader.model is required")
+            retired = sorted(
+                set(table)
+                & {"chunk_tokens", "max_actions", "findings_tokens", "capture_chars"}
+            )
+            if retired:
+                raise ValueError(
+                    "Retired web_reader settings: "
+                    + ", ".join(retired)
+                    + "; remove these keys for concurrent browser readers."
+                )
             web_reader = WebReaderConfig(**table)
         except (TypeError, ValueError) as exc:
             raise ConfigError(path, str(exc)) from exc

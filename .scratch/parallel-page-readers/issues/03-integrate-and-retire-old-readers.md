@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — Add concurrent readers and retained follow-ups.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Normal main-agent tool discovery and runtime instructions expose reader start, collection/status, wait, follow-up, cancellation and release coherently. A complete model-and-tool scenario demonstrates delegation, other main work, result synthesis and final cleanup.
 - [ ] Provide a brief factual progress message after roughly 20 seconds if processing continues, then only on meaningful developments. Progress reflects observable work, does not narrate each action, and stops on cancellation, failure or final completion without racing a late message.

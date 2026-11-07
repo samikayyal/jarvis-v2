@@ -210,8 +210,6 @@ def test_oversized_content_is_complete_and_optionally_searchable(monkeypatch, up
             WebReaderConfig(),
             context_tokens=7000,
             output_tokens=512,
-            capture_chars=1,
-            max_actions=1,
         )
         steps = ([click_large] if updated else []) + [search, read_match, report]
         tools = PlaywrightReaderTools(config, ScriptedModel(steps))

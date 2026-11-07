@@ -1,8 +1,13 @@
 ---
-status: accepted
+status: superseded
 ---
 
 # Enforce page reader fallback and measured coverage
+
+Superseded in the repository by [ADR 0005](0005-simplify-and-parallelize-page-readers.md)
+and ticket 03 on 2026-11-07. The enforced quote/fallback/coverage policy and its
+configuration were removed. The text below records the historical decision;
+it is not the current implementation contract. Deployment remains separate.
 
 The page-reader coverage design retains the isolated, session-retained reader of
 [ADR 0003](0003-isolate-webpage-reading.md) and adds local full-text search returning

@@ -38,9 +38,6 @@ _TOOL_GROUPS = {
     "web": frozenset(
         {
             "search_web",
-            "read_web_pages",
-            "read_web_page",
-            "ask_page_reader",
             "start_browser_reader",
             "browser_reader_status",
             "wait_browser_reader",
@@ -193,8 +190,6 @@ class SkillTools:
             if inspect.isawaitable(result):
                 await result
 
-    def finish_answer(self, text: str) -> str:
-        callback = getattr(self._tools, "finish_answer", None)
-        if not callable(callback):
-            return text
-        return callback(text)
+    def progress(self) -> str | None:
+        callback = getattr(self._tools, "progress", None)
+        return callback() if callable(callback) else None

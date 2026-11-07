@@ -70,99 +70,59 @@ configured tools and packaged frontmatter; do not duplicate it in `SYSTEM.md`.
 
 ### Optional web research and public-page reading
 
-The `web` skill exposes `search_web`, `read_web_page(url, query)`, and
-`ask_page_reader(reader_id, query, refresh=false)`. Search uses quick/moderate
-request allowances. Every selected page gets an isolated reader conversation;
-only compact findings reach the main assistant. See [the reader contract](../../docs/page-reader.md).
+The `web` skill exposes main `search_web` and reader start/status/wait/follow-up/
+cancel/release operations. Main search stays Selenium-backed with quick/moderate
+query and snippet-text allowances. Browser readers use asynchronous Playwright,
+with three active assignments, three isolated browser contexts and eight retained
+conversations by default. Main tools remain sequential. See [reader operations](../../docs/playwright-reader.md).
 
 Web access is off when `[web_search]` is absent or disabled. Configure
-`[web_reader]` with `model = "gpt-6-luna"` and `reasoning_effort = "low"`.
-A missing reader configuration reports configuration_error; no model fallback
-occurs. Restart normally after configuration changes. Existing query/page
-allowances and browser-operation timeout still apply. Captures use the reader's
-separate character limit, bypassing the legacy body-prefix evidence cap.
+`[web_reader]` with an explicit model (`gpt-6-luna`) and reasoning effort (`low`).
+Missing reader settings return `reader_configuration_error`; there is no model
+fallback. Reader defaults are 120 seconds, 24 model turns, 128,000 context tokens
+and 8,000 reserved output tokens. The earlier main deadline wins. Browser actions
+retain operation timeouts; reader action/page counts have been removed.
 
-`browser_mode = "headless"` is the default. The opt-in `"headed"` mode requires
-Ubuntu packages `xvfb` and `xauth` (provision with `sudo apt-get install xvfb xauth`).
-It starts a private 1280x900 Xvfb display in each worker's supervised process
-group, uses headed Chrome, and disables the Blink `AutomationControlled` feature.
-The sandbox, fresh HOME/profile, public-network proxy, script restrictions and
-challenge-stop behavior remain enabled. No personal desktop/session is reused.
-Missing Xvfb fails the request as unavailable; it does not silently retry in
-another browser mode. Neither mode guarantees Google acceptance. Roll back by
-restoring `browser_mode = "headless"` and restarting; before rolling back to a
-release that predates this setting, remove the setting from TOML as well.
+Before using this release with an existing deployed TOML, remove
+`web_reader.chunk_tokens`, `max_actions`, `findings_tokens` and `capture_chars`.
+`--check` rejects these retired keys with a migration message; do not change the
+active release until configuration validation and provisioning pass. Existing
+`web_search.quick.max_pages` and `moderate.max_pages` are accepted for configuration
+compatibility but do not constrain readers. `max_chars_per_page` still bounds
+search snippets; `max_total_evidence_chars` still bounds search evidence.
 
-Some Google results use opaque `/goto?url=...` redirects. Search evidence preserves
-the actual returned link; it does not invent a destination from a shortened
-display URL. Reading that link consumes the normal page allowance and validates
-its redirects through the public-network proxy. A successful read supplies the
-final source URL for citations. An optional filter/feedback dialog alone is not
-classified as a CAPTCHA.
+Provision both browser stacks under the service account: the matching
+Chromium/ChromeDriver pair for main search, and Playwright's locked Chromium
+revision for readers (`uv run playwright install --with-deps chromium` in the
+locked project environment). See the [Playwright runbook](../../docs/playwright-reader.md).
+Reader screenshots are on demand; the historical authorized model capability
+check is recorded there. Normal fixture tests make no provider requests.
 
-Query and page attempts (including failures) count across calls and approval
-continuations; a new ordinary request resets the allowance. Reader calls have
-an additional bounded invocation deadline. Ordinary follow-ups can inspect
-retained chunks without network work. Explicit refresh fetches again and replaces
-evidence on success; failure preserves old evidence without claiming fresh verification.
+The search-only `browser_mode = "headed"` option requires Ubuntu `xvfb` and
+`xauth`; default headless mode remains unchanged. It does not select the reader
+browser mode. Both stacks use anonymous state and the public-network proxy;
+no operator browser, Workspace tokens or OpenWA state are reused. Google blocking
+or CAPTCHA stops further searches in the request; readers can still investigate
+appropriate known direct sources. No challenge-solving or automatic retry occurs.
 
-Reader-only display actions can render, expand sections, select regions, and switch
-listed tabs within the assigned page. Each capture uses an anonymous worker and
-closes it before returning; retained evidence requires no browser. Display-state
-labels stay attached to chunks. Session expiry, `/new`, context reset, and restart
-discard readers and loaded skills. Cancellation closes active work and preserves
-completed evidence. Coverage reports inspected chunks separately from captured
-chunks, including incomplete capture and output shortening.
+Reader findings and conversations survive ordinary requests. Browsers close on
+completion, approval suspension, timeout or cancellation; later follow-ups reopen
+with explicit loss-of-state disclosure. Release discards a retained conversation;
+session reset, expiry and restart discard all readers. Public site research
+controls are allowed; account actions, purchases, uploads and resource creation
+remain outside authority. Failed or uncertain actions are never blindly replayed.
 
-Google blocking or CAPTCHA stops further searches in the request. A recognized
-consent screen can reject optional cookies; challenges are never solved or
-retried. Empty results, changed layouts, access failures, and exhausted allowances
-have distinct outcomes. Browser HTML fixtures require no live Google access;
-they do not establish that Google will accept searches from the production host.
+Progress starts after roughly 20 seconds while the owning request is still active,
+then changes only with observable reader-state counts. Duplicate progress is
+suppressed. Progress and final/cancel sends are ordered, so an already-started
+progress send drains before the final response. New ordinary messages receive a
+busy response; `/status` and `/cancel` remain deterministic. Final answers contain
+the model's concise uncertainty and citations, without code-owned source warnings.
 
-Provision compatible Chromium and ChromeDriver on the Ubuntu host before
-enabling this feature. Both binaries must be installed explicitly by the
-operator; the runtime never runs a package manager or Selenium Manager and never
-downloads drivers. Check browser and driver versions under the service account.
-Discovery prefers `/usr/bin/google-chrome-stable`, then `/usr/bin/google-chrome`,
-`/usr/bin/chromium`, and `/usr/bin/chromium-browser`, with
-`/usr/local/bin/chromedriver` preferred over `/usr/bin/chromedriver`. This lets an
-explicit native pair take precedence over Ubuntu's Snap compatibility launchers.
-Pin a mutually compatible
-browser/driver pair through the host's provisioning process and verify both with
-`--version`; an arbitrary driver on the inherited shell `PATH` is not used.
-The Chromium sandbox must work for that account; do not use `--no-sandbox`.
-Missing or incompatible binaries produce an unavailable-web outcome. No browser
-provisioning or production activation is implied by installing this package.
-
-The request owns a separate Python worker and one anonymous browser profile in
-the private runtime directory. Its fresh `HOME` is inside that profile so native
-Chrome can create auxiliary state without inheriting the service account's home;
-both are removed together. Browser work does not use terminal permissions,
-Google Workspace tokens, personal browser profiles, or `openwa-data`. It returns
-bounded visible HTML text, titles, and URLs; PDFs, downloads, authenticated pages,
-and general browser actions are unsupported. Failed reads are not retried.
-Page JavaScript is disabled for ordinary reads; content that requires page
-scripts may be incomplete or unavailable. Search permits scripts only on the
-HTTPS `www.google.com` and `consent.google.com` origins, then disables execution
-before ordinary page reads. Search stops at Google's anti-bot challenges and
-reports the specific navigation failure when available. Enabling JavaScript
-does not guarantee that Google will accept automated traffic from the host.
-Selenium's own bounded extraction
-still reads visible rendered text. Every HTTP(S) connection, including redirects
-and subresources, passes through a local proxy that rejects non-public DNS
-answers and connects to the validated address. Non-HTTP schemes and downloads
-are blocked by Chromium controls. No private-destination bypass is configurable.
-Completion, approval suspension, cancellation, and shutdown close the worker's
-process group and remove its profile. A failed browser stays unavailable for
-the rest of that request. Partial evidence remains usable with a coverage notice.
-
-Use the existing config editor/restart procedure to set `enabled = true` only
-after the host prerequisites are checked. Validate with the packaged CLI's
-`--check`, restart normally, and exercise a direct public link. Disable by setting
-`enabled = false` and restarting; roll back the release through the existing
-stopped-service rollback procedure. Runtime checks do not prove live web egress
-or end-to-end WhatsApp readiness.
+This is a source/predeployment change. Ticket 04 must commit/push and verify the
+exact GitHub candidate SHA before Ubuntu activation, then repeat the hosting and
+vault-save scenario with actual wall time and main/reader model-call counts.
+Vault edit approval, frozen proposals and synchronization behavior are unchanged.
 
 #### Provision and verify a browser candidate
 
@@ -213,16 +173,17 @@ sudo -u jarvis-personal-runtime sh -c 'umask 077; cd /var/lib/jarvis-personal-ru
   --live --output web-verification.json'
 ```
 
-The probe records installed package paths, pins, executable versions, a real
+The probe records installed package paths, pins, executable locations, a real
 Google query, a selected IANA page read, a session follow-up, a fresh recheck, and
 profile removal. Its Responses provider is scripted: it spends nothing on model
 or search services and demonstrates tool/evidence flow, not live-model judgment.
 Inspect the JSON outcomes and supporting excerpts. Exit zero means the probe
 finished; it does **not** mean Google succeeded. `blocked`, CAPTCHA,
 `extraction_failed`, `timeout`, or `unavailable` remain failed lookup evidence.
-The normal runtime fallback notice must accompany a reply with no usable web
-evidence; a genuinely empty search has a different notice. Never fabricate a
-successful lookup or solve/retry a CAPTCHA to pass acceptance.
+The scripted probe reports unavailable findings explicitly. Real-model acceptance
+must check that the answer explains consequential gaps naturally; the runtime
+adds no warning paragraphs. Never fabricate a successful lookup or solve/retry
+a CAPTCHA to pass acceptance.
 
 The opt-in browser tests are independent of Google:
 
@@ -266,9 +227,9 @@ verification environment, not the service's runtime dependencies.
    saved permissions and runtime data. Do not change OpenWA's image, pairing,
    volume, credentials, or deployment. Use the general rollback procedure below.
 
-All search/page traffic is anonymous public browsing. There are no paid search
-APIs, paid proxies, extra model services, Workspace credentials, or OpenWA browser
-state in this path. Existing assistant model usage is a separate expense.
+All search/page traffic is anonymous public browsing without paid search APIs,
+paid proxies, Workspace credentials or OpenWA browser state. Main and reader
+model calls use the existing provider and incur their configured model usage.
 
 ### Configuration files
 

@@ -72,31 +72,27 @@ tool work. Search snippets and actually read pages retain distinct provenance.
 _Avoid_: Unverified fallback, raw search results
 
 **Page reader**:
-A delegated assistant that answers focused questions about one assigned public
-webpage using source quotes, relevant links, explicit gaps, and inspection
-coverage. Its captured page and selected evidence remain in the working session.
-The main assistant chooses other pages and combines findings. Explicit refresh
-replaces reader evidence only after successful capture; ordinary follow-ups
-reuse it.
-_Avoid_: Autonomous researcher, generic page summary
+A delegated public-web researcher given a focused prompt and an initial webpage.
+It investigates public sources and returns written findings, source URLs and
+specific uncertainty to the main assistant, which judges sufficiency and combines
+findings. Its starting page is a starting point, not a navigation restriction.
+_Avoid_: Generic page summary, verified answer, private-tool assistant
 
-The accepted replacement design broadens **Page reader** to a
-delegated public-web researcher given a focused prompt and an initial webpage;
-the initial webpage is a starting point, not a navigation restriction. It may
-investigate other public sources and reports findings to the main assistant.
-Tickets 01–02 implement this behavior on an opt-in Playwright path, with concurrent
-assignments and retained follow-ups. Production integration remains in ticket 03.
-See [the replacement specification](.scratch/parallel-page-readers/spec.md) and
-[ticket 01 verification](.scratch/parallel-page-readers/verification.md).
-See also [ticket 02 verification](.scratch/parallel-page-readers/verification-02.md).
-The current definition and invariants above describe the deployed implementation.
+**Reader assignment**:
+One focused investigation by a page reader, with explicit execution limits and
+one running assignment per reader. Completed findings can inform another assignment.
+_Avoid_: Queued request, semantic verification, exhaustive scan
 
-**Inspection coverage**:
-The extent of a page reader's investigation for a question, including which captured
-content was searched or reviewed and which relevant content remains unchecked.
-It describes the investigation's scope, not proof that information is absent or
-that every reviewed passage was understood correctly.
-_Avoid_: Proof of absence, guaranteed comprehension
+**Retained reader**:
+A page reader whose conversation and findings remain available for follow-ups in
+the working session until explicit release or session end.
+_Avoid_: Durable memory, preserved browser state
+
+**Reader browser**:
+The anonymous interactive public-web state belonging to one page reader. It may
+survive assignments within an active request, but ends at request completion or
+cancellation and may be reclaimed while idle. Reopening discloses lost state.
+_Avoid_: Operator browser, retained conversation, authenticated account
 
 **Reminder**:
 A one-time instruction for Jarvis to send exact stored reminder text to the
@@ -143,7 +139,7 @@ One deliberately implemented operation exposed to the model-and-tool loop. The
 current prepared tools are `read_vault`, `list_vault_tree`, the optional Git-backed `edit_vault` and
 `delete_vault`,
 `run_terminal`, the bounded Google API tools, `create_reminder`, `edit_reminder`,
-`list_reminders`, `cancel_reminder`, optional `search_web`, `read_web_page`, and `ask_page_reader`, and the manifest-selected bounded
+`list_reminders`, `cancel_reminder`, optional `search_web`, reader start/status/wait/follow-up/cancel/release, and the manifest-selected bounded
 operations of configured MCP services.
 _Avoid_: Arbitrary capability, connector framework
 
@@ -236,7 +232,7 @@ _Avoid_: Sanitized application log, hidden model reasoning
 - The webhook authenticates the exact raw body and acknowledges promptly.
   Excluded or malformed traffic is ignored before runtime work.
 - There is one working session, at most one active request, and at most one
-  pending action. There is no request queue or parallel tool execution.
+  pending action. There is no request queue or parallel main-tool execution. Delegated reader assignments can run concurrently while the main loop continues sequentially.
 - Runtime sessions are memory-only. Restart discards the working session, active
   request, and pending action; nothing resumes or replays.
 - The seven-day OpenWA message-ID cache prevents duplicate admission. It is not
@@ -278,12 +274,21 @@ _Avoid_: Sanitized application log, hidden model reasoning
   before sending the completed reply.
 - Retrieved vault content and terminal output are untrusted data. They cannot
   grant authority, alter policy, select another host, or approve work.
-- Public web evidence is also untrusted. One ordinary request owns its anonymous
-  browser and cumulative query/page/evidence allowance, including approval continuations.
-  Browser cleanup occurs on suspension, completion, timeout, and cancellation;
-  only a fresh ordinary request resets counters. Public navigation passes through
-  address checks before connections, including redirects, with no Workspace or
-  OpenWA credentials. Failed verification is disclosed in the answer.
+- Public web evidence is also untrusted. Main Google search retains cumulative
+  per-request query and snippet-text allowances, including approval continuations.
+  Reader assignments have time, model-turn and context limits, with no separate
+  action/page allowance or mandatory inspection policy. Public navigation passes
+  through address checks before connections, including redirects, without
+  Workspace or OpenWA credentials. Findings and material uncertainty are assessed
+  by the agents; execution completion does not establish semantic verification.
+- Main-request completion, suspension, timeout and cancellation stop reader work
+  and close its browsers. Completed findings survive in the working session.
+  Session reset discards all reader state; release explicitly frees retention
+  capacity. Browser reclamation preserves conversations and discloses lost state.
+- Lengthy active requests receive factual progress after roughly 20 seconds, then
+  only for observable developments. Progress is stopped and outstanding sends
+  drained before final delivery. New ordinary messages remain busy rejections;
+  deterministic status and cancellation remain available.
 - Runtime traces are sensitive verbatim data. Hidden model reasoning is not
   available and is never claimed as trace content.
 
@@ -306,3 +311,6 @@ private bridge listener, OpenWA is healthy with the configured named session
 `ready`, the single webhook targets that listener, and a real authorized message
 produces one expected phone reply. A listener check or OpenWA `/ready` response
 alone is not end-to-end acceptance.
+
+The source implementation uses concurrent readers under ADR 0005. This describes
+repository behavior; deployment and live acceptance remain ticket 04 work.

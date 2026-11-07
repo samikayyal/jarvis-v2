@@ -814,5 +814,17 @@ def test_reader_configuration_is_independent_of_main_model(tmp_path):
     assert config.web_reader.reasoning_effort == "low"
     assert config.web_reader.context_tokens == 128000
     assert config.web_reader.max_attempts == 24
-    assert config.web_reader.max_actions == 18
     assert config.web_reader.timeout_seconds == 120
+
+
+@pytest.mark.parametrize(
+    "setting", ["chunk_tokens", "max_actions", "findings_tokens", "capture_chars"]
+)
+def test_retired_reader_settings_require_explicit_migration(tmp_path, setting):
+    _write_runtime_files(
+        tmp_path, toml=f'[web_reader]\nmodel = "gpt-6-luna"\n{setting} = 1000\n'
+    )
+    with pytest.raises(
+        ConfigError, match=f"Retired web_reader settings: {setting}.*remove"
+    ):
+        load_runtime_config(tmp_path)

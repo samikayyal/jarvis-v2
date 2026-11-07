@@ -9,6 +9,8 @@ from threading import Event
 from typing import Self
 from urllib.request import Request
 
+import pytest
+
 from jarvis_personal_runtime.openwa import (
     DeliveryDisposition,
     OpenWAHttpSender,
@@ -154,6 +156,120 @@ def test_signed_direct_text_is_acknowledged_before_runtime_work_finishes() -> No
             ("paused", OPERATOR),
         ]
         assert sender.sent == [(OPERATOR, "done")]
+
+    asyncio.run(scenario())
+
+
+def test_long_request_reports_progress_once_and_keeps_busy_status_cancel_responsive():
+    async def scenario():
+        runner = _BlockingRunner()
+        sender = _RecordingSender()
+        runtime = PersonalRuntime(request_runner=runner, clock=_Clock())
+        flow = OpenWAMessageFlow(
+            settings=_settings(),
+            signing_secret=SECRET,
+            runtime=runtime,
+            sender=sender,
+            clock=_Clock(),
+            progress_interval_seconds=0.03,
+        )
+        raw = _event(body="Research sources")
+        flow.receive_webhook(raw, _headers(raw))
+        await runner.entered.wait()
+        await asyncio.sleep(0.12)
+        assert sender.sent == [(OPERATOR, "I'm still working on your request.")]
+        for message_id, body in (
+            ("busy", "Another request"),
+            ("status", "/status"),
+            ("cancel", "/cancel"),
+        ):
+            raw = _event(message_id=message_id, body=body)
+            flow.receive_webhook(raw, _headers(raw))
+            await asyncio.sleep(0.02)
+        await asyncio.wait_for(flow.drain(), 1)
+        texts = [text for _, text in sender.sent]
+        assert any(
+            "already" in text.lower() or "busy" in text.lower() for text in texts
+        )
+        assert any("Active request: processing" in text for text in texts)
+        assert any("cancel" in text.lower() for text in texts)
+        before = list(sender.sent)
+        runner.release.set()
+        await asyncio.sleep(0.08)
+        assert sender.sent == before
+        assert all(text != "done" for _, text in sender.sent)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_progress_changes_only_for_developments_and_stops_at_completion(failure):
+    class Runner(_BlockingRunner):
+        observation = "Web research: 2 running."
+
+        def progress(self):
+            return self.observation
+
+        async def run(self, *args, **kwargs):
+            result = await super().run(*args, **kwargs)
+            if failure:
+                raise RuntimeError("provider unavailable")
+            return result
+
+    async def scenario():
+        runner, sender = Runner(), _RecordingSender()
+        flow = OpenWAMessageFlow(
+            settings=_settings(),
+            signing_secret=SECRET,
+            runtime=PersonalRuntime(request_runner=runner, clock=_Clock()),
+            sender=sender,
+            clock=_Clock(),
+            progress_interval_seconds=0.02,
+        )
+        raw = _event()
+        flow.receive_webhook(raw, _headers(raw))
+        await runner.entered.wait()
+        await asyncio.sleep(0.07)
+        assert sender.sent == [(OPERATOR, "Web research: 2 running.")]
+        runner.observation = "Web research: 1 running, 1 completed."
+        await asyncio.sleep(0.06)
+        assert sender.sent[-1] == (OPERATOR, runner.observation)
+        assert len(sender.sent) == 2
+        runner.release.set()
+        await flow.drain()
+        assert len(sender.sent) == 3
+        assert (sender.sent[-1][1] == "done") is not failure
+        await asyncio.sleep(0.05)
+        assert len(sender.sent) == 3
+
+    asyncio.run(scenario())
+
+
+def test_inflight_progress_is_drained_before_cancel_reply():
+    async def scenario():
+        runner, sender = _BlockingRunner(), _BlockingSender()
+        flow = OpenWAMessageFlow(
+            settings=_settings(),
+            signing_secret=SECRET,
+            runtime=PersonalRuntime(request_runner=runner, clock=_Clock()),
+            sender=sender,
+            clock=_Clock(),
+            progress_interval_seconds=0.02,
+        )
+        raw = _event()
+        flow.receive_webhook(raw, _headers(raw))
+        await runner.entered.wait()
+        await asyncio.wait_for(asyncio.to_thread(sender.entered.wait), 1)
+        raw = _event(message_id="cancel", body="/cancel")
+        assert flow.receive_webhook(raw, _headers(raw)).status_code == 202
+        await asyncio.sleep(0.02)
+        sender.release.set()
+        await asyncio.wait_for(flow.drain(), 1)
+        assert sender.sent[0][1] == "I'm still working on your request."
+        assert "cancel" in sender.sent[-1][1].lower()
+        before = list(sender.sent)
+        await asyncio.sleep(0.05)
+        assert sender.sent == before
 
     asyncio.run(scenario())
 

@@ -37,21 +37,19 @@ def test_probe_follow_up_needs_evidence_in_runtime_transcript(probe):
     provider = probe.ScriptedProvider()
     provider.reuse_session = True
     page = {
-        "outcome": "ok",
-        "title": "Source",
-        "text": "Value is 42.",
-        "url": "https://example.com/",
+        "state": "completed",
+        "findings": "Value is 42. Source: https://example.com/",
     }
     source = {
         "type": "function_call_output",
-        "output": json.dumps({"outcome": "ok", "pages": [page]}),
+        "output": json.dumps(page),
     }
     first = asyncio.run(provider.create({"input": [source]}, timeout=1))
-    assert "Value is 42. [1]" in first.output_text
+    assert "Value is 42." in first.output_text
     # A broken runtime dropping history must not pass by using provider memory.
     missing = asyncio.run(provider.create({"input": []}, timeout=1))
-    assert missing.output_text == "No verified source text is available."
-    assert provider.supporting_page is None
+    assert missing.output_text == "No source findings are available."
+    assert provider.supporting_findings is None
 
 
 def test_probe_failed_recheck_cannot_quote_previous_success(probe):
@@ -61,21 +59,20 @@ def test_probe_failed_recheck_cannot_quote_previous_success(probe):
         "type": "function_call_output",
         "output": json.dumps(
             {
-                "outcome": "ok",
-                "pages": [
-                    {
-                        "outcome": "ok",
-                        "text": "Old value",
-                        "title": "Old",
-                        "url": "https://example.com/",
-                    }
-                ],
+                "state": "completed",
+                "findings": "Old value. Source: https://example.com/",
             }
         ),
     }
     failed = {
         "type": "function_call_output",
-        "output": json.dumps({"outcome": "unavailable", "pages": []}),
+        "output": json.dumps(
+            {
+                "state": "failed",
+                "reason": "unavailable",
+                "findings": "Old value. Source: https://example.com/",
+            }
+        ),
     }
     reply = asyncio.run(provider.create({"input": [old, failed]}, timeout=1))
-    assert reply.output_text == "No verified source text is available."
+    assert reply.output_text == "No source findings are available."

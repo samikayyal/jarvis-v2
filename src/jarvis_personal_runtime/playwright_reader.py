@@ -1,8 +1,4 @@
-"""Opt-in concurrent Playwright readers through the main prepared-tool interface.
-
-The deployed page reader remains separate until the later cutover ticket. This
-module has no dependency on its quote, coverage, page or action accounting.
-"""
+"""Concurrent public browser readers through the main prepared-tool interface."""
 
 from __future__ import annotations
 
@@ -134,6 +130,7 @@ class BrowserReader:
     last_used: float = 0
     reported_in_assignment: bool = False
     deadline: float | None = None
+    assignment_id: str = ""
 
 
 class PlaywrightReaderTools:
@@ -141,13 +138,13 @@ class PlaywrightReaderTools:
 
     def __init__(
         self,
-        config: WebReaderConfig,
+        config: WebReaderConfig | None,
         responses,
         *,
         trace=None,
         browser_timeout_seconds: float = 15,
     ):
-        self.config = config
+        self._config = config
         self.responses = responses
         self.trace = trace
         self.browser_timeout_seconds = browser_timeout_seconds
@@ -155,6 +152,7 @@ class PlaywrightReaderTools:
         self._deadline = None
         self._cleanup_tasks = set()
         self._browser_lock = asyncio.Lock()
+        self._request_readers: set[str] = set()
         self.definitions = (
             tool(
                 "start_browser_reader",
@@ -191,6 +189,12 @@ class PlaywrightReaderTools:
             ),
         )
 
+    @property
+    def config(self) -> WebReaderConfig:
+        if self._config is None:
+            raise ValueError("Configure [web_reader] with an explicit model")
+        return self._config
+
     def start_session(self):
         previous = list(self.readers.values())
         for reader in previous:
@@ -202,6 +206,22 @@ class PlaywrightReaderTools:
 
     def request_started(self):
         self._deadline = None
+        self._request_readers.clear()
+
+    def progress(self):
+        states = [
+            self.readers[r].state for r in self._request_readers if r in self.readers
+        ]
+        if not states:
+            return (
+                "Web research: reader work released." if self._request_readers else None
+            )
+        counts = [
+            f"{states.count(state)} {state}"
+            for state in ("running", "completed", "failed", "limit", "cancelled")
+            if state in states
+        ]
+        return "Web research: " + ", ".join(counts) + "."
 
     def set_request_deadline(self, deadline: float):
         self._deadline = deadline
@@ -295,6 +315,13 @@ class PlaywrightReaderTools:
             raise ValueError("Unavailable browser reader tool")
         if set(arguments) != set(definition["parameters"]["properties"]):
             return encode({"error": "invalid_input"})
+        if self._config is None:
+            return encode(
+                {
+                    "error": "reader_configuration_error",
+                    "reason": "Configure [web_reader] with an explicit model before using browser readers.",
+                }
+            )
         if name == "start_browser_reader":
             if (
                 not isinstance(arguments["prompt"], str)
@@ -321,6 +348,7 @@ class PlaywrightReaderTools:
                 )
             reader = BrowserReader(uuid4().hex[:12], url, arguments["prompt"])
             self.readers[reader.reader_id] = reader
+            self._request_readers.add(reader.reader_id)
             reader.task = asyncio.create_task(self._run(reader))
             return encode(self._result(reader))
         reader_id = arguments["reader_id"]
@@ -345,6 +373,7 @@ class PlaywrightReaderTools:
                     }
                 )
             reader.prompt = arguments["prompt"]
+            self._request_readers.add(reader.reader_id)
             reader.state, reader.reason, reader.turns = "running", "", 0
             reader.reported_in_assignment = False
             reader.task = asyncio.create_task(self._run(reader))
@@ -406,6 +435,7 @@ class PlaywrightReaderTools:
             "findings": reader.findings,
             "reason": reader.reason,
             "model_turns": reader.turns,
+            "assignment_id": reader.assignment_id,
             "browser_state": "open"
             if reader.browser and not reader.browser.closed
             else "closed",
@@ -550,6 +580,7 @@ class PlaywrightReaderTools:
 
     async def _run(self, reader):
         started = asyncio.get_running_loop().time()
+        reader.assignment_id = uuid4().hex[:12]
         deadline = started + self.config.timeout_seconds
         if self._deadline is not None:
             deadline = min(deadline, self._deadline)
@@ -578,9 +609,15 @@ class PlaywrightReaderTools:
                     if self.trace:
                         self.trace.record(
                             "playwright_reader_request",
-                            {"reader_id": reader.reader_id, "request": request},
+                            {
+                                "reader_id": reader.reader_id,
+                                "assignment_id": reader.assignment_id,
+                                "model_call": reader.turns + 1,
+                                "request": request,
+                            },
                         )
                     reader.turns += 1
+                    call_started = asyncio.get_running_loop().time()
                     try:
                         response = await self.responses.create(
                             request,
@@ -614,6 +651,10 @@ class PlaywrightReaderTools:
                             "playwright_reader_output",
                             {
                                 "reader_id": reader.reader_id,
+                                "assignment_id": reader.assignment_id,
+                                "model_call": reader.turns,
+                                "elapsed_seconds": asyncio.get_running_loop().time()
+                                - call_started,
                                 "output": response.output,
                                 "text": response.output_text,
                                 "usage": response.usage,

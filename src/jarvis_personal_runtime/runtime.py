@@ -394,6 +394,20 @@ class PersonalRuntime:
             full_access=self.full_access,
         )
 
+    def progress_for(self, task: asyncio.Task[object] | None) -> str | None:
+        """Describe observable work only for the task owning the active request."""
+        active = self._session.active if self._session else None
+        if (
+            active is None
+            or active.task is not task
+            or active.phase not in {"processing", "resuming"}
+        ):
+            return None
+        progress = getattr(self.request_runner, "progress", None)
+        return (
+            progress() if callable(progress) else None
+        ) or "I'm still working on your request."
+
     async def receive(self, message: InboundText) -> RuntimeResult:
         now = _utc(self.clock.now())
         self.trace.record(

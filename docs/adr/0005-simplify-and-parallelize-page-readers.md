@@ -60,8 +60,10 @@ These choices supersede the conflicting assigned-page and sequential-execution d
 [ADR 0004](0004-enforce-page-reader-coverage.md) for the replacement design.
 The operator reviewed [the interview](../../.scratch/parallel-page-readers/design.md)
 and consolidated [specification](../../.scratch/parallel-page-readers/spec.md), then
-approved the reduced four-ticket breakdown for publication. Ticket 01 is now
-implemented and verified on the opt-in single-reader path; see
-[verification](../../.scratch/parallel-page-readers/verification.md). Concurrent
-scheduling, retained follow-ups, production integration and deployment remain in
-tickets 02â€“04. Acceptance of this design is not evidence of changed live behavior.
+approved the reduced four-ticket breakdown for publication. Tickets 01–03 now
+implement this design in the repository: normal web-skill discovery exposes the
+concurrent workflow, request progress uses observable state, and retired reader
+policy is removed. See [ticket 03 verification](../../.scratch/parallel-page-readers/verification-03.md).
+Ticket 04 owns Ubuntu activation and live hosting-comparison acceptance. Source
+implementation and fixture checks do not establish deployment or the two-minute
+performance target.

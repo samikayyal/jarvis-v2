@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 import httpx
 import tiktoken
@@ -144,9 +145,6 @@ class _NoTools:
     async def close_request(self) -> None:
         return None
 
-    def finish_answer(self, text: str) -> str:
-        return text
-
 
 @dataclass(frozen=True, slots=True)
 class _PreparedToolContinuation:
@@ -236,15 +234,14 @@ class PreparedToolCollection:
             if callable(callback):
                 callback(deadline)
 
-    def finish_answer(self, text: str) -> str:
-        """Apply result-path answer annotations supplied by prepared tools."""
-
-        answer = text
+    def progress(self) -> str | None:
         for tool in self._tools:
-            callback = getattr(tool, "finish_answer", None)
+            callback = getattr(tool, "progress", None)
             if callable(callback):
-                answer = callback(answer)
-        return answer
+                text = callback()
+                if text:
+                    return text
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,10 +400,16 @@ class DirectResponsesRunner:
         self._full_access = full_access
         self._transcript: list[dict[str, object]] = []
         self._request_lock = asyncio.Lock()
+        self._run_id = ""
+        self._model_calls = 0
 
     @property
     def trace(self) -> TraceSink:
         return self._trace
+
+    def progress(self) -> str | None:
+        callback = getattr(self._tools, "progress", None)
+        return callback() if callable(callback) else None
 
     def start_session(self) -> None:
         """Start ownership of a fresh in-memory working-session transcript."""
@@ -466,6 +469,8 @@ class DirectResponsesRunner:
         reasoning: str,
         system_prompt: str,
     ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
+        self._run_id = uuid4().hex
+        self._model_calls = 0
         try:
             self._request_started()
             return await self._run_loop(
@@ -580,7 +585,16 @@ class DirectResponsesRunner:
                 }
                 if exhausted:
                     request["tool_choice"] = "none"
-                self._trace.record("responses_request", {"request": request})
+                self._model_calls += 1
+                call_started = asyncio.get_running_loop().time()
+                self._trace.record(
+                    "responses_request",
+                    {
+                        "request": request,
+                        "run_id": self._run_id,
+                        "model_call": self._model_calls,
+                    },
+                )
                 remaining = deadline.when() - asyncio.get_running_loop().time()
                 try:
                     response = await self._responses.create(request, timeout=remaining)
@@ -598,6 +612,10 @@ class DirectResponsesRunner:
                         "output_text": response.output_text,
                         "usage": response.usage,
                         "projected_input_tokens": projected_tokens,
+                        "run_id": self._run_id,
+                        "model_call": self._model_calls,
+                        "elapsed_seconds": asyncio.get_running_loop().time()
+                        - call_started,
                     },
                 )
                 transcript = [
@@ -623,7 +641,7 @@ class DirectResponsesRunner:
                             {"reason": "missing_final_text"},
                         )
                         raise RuntimeError("provider response has no final text")
-                    answer = self._finish_answer(response.output_text)
+                    answer = response.output_text
                     if len(answer) > self._max_output_chars:
                         self._trace.record(
                             "output_limit_exceeded",
@@ -695,7 +713,7 @@ class DirectResponsesRunner:
             "I couldn't produce a partial summary. Earlier tool results remain in this "
             "session; completed actions have not been undone. Further work was not attempted."
         )
-        reply = f"{notice}\n\n{self._finish_answer(partial)}"
+        reply = f"{notice}\n\n{partial}"
         if len(reply) > self._max_output_chars:
             reply = f"{notice}\n\nEarlier results remain in this session. The task is incomplete."
         # Keep the stop itself in history so a follow-up can account for it.
@@ -919,15 +937,6 @@ class DirectResponsesRunner:
                 {"error": f"{type(exc).__name__}: {exc}"},
             )
 
-    def _finish_answer(self, text: str) -> str:
-        callback = getattr(self._tools, "finish_answer", None)
-        if not callable(callback):
-            return text
-        result = callback(text)
-        if not isinstance(result, str):
-            raise TypeError("prepared answer finisher must return a string")
-        return result
-
 
 def build_direct_responses_runner(
     api_key: str,
@@ -1005,19 +1014,22 @@ def build_direct_responses_runner(
         )
         web_search = getattr(config, "web_search", None)
         if web_search is not None and web_search.enabled:
-            from .page_reader import PageReaderTools
+            from .playwright_reader import PlaywrightReaderTools
             from .web_tools import WebTools
 
             configured_tools.append(
-                PageReaderTools(
-                    WebTools(
-                        web_search,
-                        runtime_dir=config.root / "data" / "web",
-                        max_output_chars=config.max_output_chars,
-                    ),
+                WebTools(
+                    web_search,
+                    runtime_dir=config.root / "data" / "web",
+                    max_output_chars=config.max_output_chars,
+                )
+            )
+            configured_tools.append(
+                PlaywrightReaderTools(
                     config.web_reader,
                     adapter.without_retries(),
                     trace=sink,
+                    browser_timeout_seconds=web_search.operation_timeout_seconds,
                 )
             )
         from .skill_tools import SkillTools
