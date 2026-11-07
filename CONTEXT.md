@@ -80,6 +80,16 @@ replaces reader evidence only after successful capture; ordinary follow-ups
 reuse it.
 _Avoid_: Autonomous researcher, generic page summary
 
+The accepted replacement design broadens **Page reader** to a
+delegated public-web researcher given a focused prompt and an initial webpage;
+the initial webpage is a starting point, not a navigation restriction. It may
+investigate other public sources and reports findings to the main assistant.
+Ticket 01 implements this behavior on an opt-in single-reader path; concurrent
+scheduling, retained follow-ups and production integration remain in tickets 02/03.
+See [the replacement specification](.scratch/parallel-page-readers/spec.md) and
+[ticket 01 verification](.scratch/parallel-page-readers/verification.md).
+The current definition and invariants above describe the deployed implementation.
+
 **Inspection coverage**:
 The extent of a page reader's investigation for a question, including which captured
 content was searched or reviewed and which relevant content remains unchecked.
