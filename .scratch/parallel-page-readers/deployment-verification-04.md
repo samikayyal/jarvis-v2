@@ -260,3 +260,12 @@ route, preserve completion/save budget, and test lifecycle/context-limit reporti
 No vault-edit redesign was attempted. Ticket 04 remains open until a fresh repeat
 of the original scenario actually completes and saves/syncs its note; the initial
 under-two-minute target must still be assessed separately from functional success.
+
+## Delivery
+
+Operational changes, final measured outcomes, sanitized evidence and follow-up
+scope were committed to the current `main` branch and pushed. GitHub main was
+verified at `b1cf9b01d7584f0a7ebf228438b29bf623edb4d4` after that evidence push;
+the final documentation-only commit records this result and the issue checklist.
+The deployed runtime source remains immutable at `551ed85`. Sensitive live trace
+extracts and WhatsApp screenshots remain in ignored `private/`, outside Git.

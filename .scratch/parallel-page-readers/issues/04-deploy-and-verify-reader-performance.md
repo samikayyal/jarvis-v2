@@ -14,7 +14,7 @@
 - [x] Observe the concurrent-reader path, meaningful progress and browser lifecycle. Exercise live follow-up/cancellation as appropriate and verify no late replies or leftover reader browsers/workers. Keep end-to-end acceptance distinct from health checks and unit-test success.
 - [x] Report total time from admission through completion and delivery, main and reader model-call counts, and available component timings against the baseline of 458 seconds before completion, 22 main calls and 27 reader calls. Do not double-count reader model time inside reader wall time.
 - [x] Assess the initial under-two-minute target for the complete hosting-and-note scenario. If missed, record actual results, remaining bottlenecks and follow-up work; do not claim the speed problem solved or expand into vault-edit redesign incidentally. Distinguish functional acceptance from performance-target attainment.
-- [ ] Commit and push resulting deployment/acceptance documentation and verify GitHub is current. Record incomplete live checks or unavailable browser-control access honestly; do not substitute infrastructure checks for visible acceptance.
+- [x] Commit and push resulting deployment/acceptance documentation and verify GitHub is current. Record incomplete live checks or unavailable browser-control access honestly; do not substitute infrastructure checks for visible acceptance.
 
 ## Completion interpretation
 

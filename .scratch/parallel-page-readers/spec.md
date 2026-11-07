@@ -5,7 +5,8 @@ Date: 2026-11-06 (Asia/Amman)
 
 The operator approved publication of the four implementation tickets after reviewing
 the consolidated design and reduced breakdown. This consolidates all accepted answers in [the interview](design.md). It describes
-the replacement, not currently deployed behavior. Ticket 01 is implemented and
+the accepted replacement; current deployment/acceptance status is recorded below.
+Ticket 01 is implemented and
 verified on the opt-in single-reader path; see [verification](verification.md).
 Ticket 02 adds concurrency and retained follow-ups on the opt-in path; see
 [its verification](verification-02.md). Ticket 03 integrates the normal runtime and removes the old reader policy; see
