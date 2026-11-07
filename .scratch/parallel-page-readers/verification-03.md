@@ -9,7 +9,9 @@ ticket 03. Ticket 04 owns those steps and the exact-SHA GitHub activation gate.
 
 Review baseline: `80af6449de38c29a5721e2a1063bd706336798c5`, the clean current
 branch at task start. Initial implementation: `85c51c6672c71204639b4345b2bd5a1214e74f3c`.
-The final reviewed candidate and full-suite result will be recorded below.
+Reviewed source candidate: `aaef0149fa531ac6008b16dc5a15eadb2541a5e5`.
+The final full-suite result is recorded below. Completion documentation
+may use a later commit without changing this verified source.
 
 ## Implementation
 
@@ -78,7 +80,10 @@ are execution measurements and do not claim semantic verification.
 For the ticket 04 comparison, isolate the admitted message's trace interval from
 request_started through its final openwa_send_result. Count responses_request
 events for main calls and playwright_reader_request events for reader calls,
-grouping readers by assignment_id. Sum provider usage only when present. Reader
+grouping readers by assignment_id. These count logical model calls. Main SDK
+retries can produce additional HTTP attempts; inspect http_attempt_request and
+responses_raw_exchange.retries_taken separately. Reader SDK retries are disabled.
+Sum provider usage only when present. Reader
 wall time includes browser and model time; do not add nested model time again.
 Measure total admission-to-final-delivery wall time from timestamps, and retain
 tool timings for vault approval/edit/sync separately. The historical 458-second,
@@ -121,4 +126,40 @@ the fix and reported 0 remaining actionable Spec findings. No additional scope
 creep or omissions were found. This review is not live acceptance.
 
 Summary: Standards 0 findings; Spec 1 P1 found and resolved, 0 remaining.
-The final exact-source full suite and wheel record remain pending.
+The first complete suite on initial implementation 85c51c6 passed: **549 passed,
+9 skipped in 547.34 seconds**. It preceded the reviewed cancellation fix and is
+retained as [initial output](verification/full-suite-initial-03.log), not the
+final candidate result. Final manager/integration checks after the fix: **15
+passed in 159.06 seconds**.
+
+The wheel was rebuilt from a fresh tracked-source export of candidate aaef014,
+then all 31 packaged Python/skill files were compared byte-for-byte to that
+commit. Retired page_reader.py and stale build-only skills are absent.
+[Wheel record](verification/wheel-03.json) records the candidate and SHA-256
+`f66f9a93392e8ddb5d09b353c9cca63733b6eb0e8bd36aa14e66ba23d74792b2`.
+The artifact is local under artifacts/ and is not an activated release. Build
+from a clean checkout/export to avoid stale setuptools build-directory files.
+Final full suite on reviewed source **aaef0149fa531ac6008b16dc5a15eadb2541a5e5**:
+**551 passed, 9 skipped in 469.28 seconds**. See [saved output](verification/full-suite-03.log).
+The skips are the explicitly billed model screenshot fixture (1), native Ubuntu
+process-group test (1), a provisioned Chromium/ChromeDriver test (1), and POSIX
+installed-browser fixtures (6). No source or test changes followed this run.
+
+Final repository lint, formatting, focused typechecks and diff checks pass.
+Post-suite inventory found **zero Playwright browser/driver worker processes**;
+see [resource record](verification/resources-03.json). Real-browser tests also
+assert context-close events, driver exit and proxy-thread termination.
+
+A direct wheel import from an isolated working directory, with Python isolated
+mode and existing environment dependencies, passes the no-live smoke probe:
+[wheel import report](verification/wheel-import-probe-03.json). A separate fresh
+uv dependency installation was stopped while downloading the 35.1 MiB Playwright
+wheel; offline provisioning confirmed that archive was absent from cache. No
+isolated installation or Ubuntu installed-artifact pass is claimed. Ticket 04
+must provision the matching browser/system dependencies and run the staged
+installed-candidate checks under the service account before activation.
+
+The candidate is ready for ticket 04 staging and environment-specific checks.
+No candidate push, Ubuntu activation, live WhatsApp/Obsidian acceptance or
+under-two-minute performance attainment is claimed. The local completion commit
+records verification only; it does not alter the source candidate above.

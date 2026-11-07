@@ -1,0 +1,15 @@
+........................................................................ [ 12%]
+........................................................................ [ 25%]
+........................................................................ [ 38%]
+.................s...................................................... [ 51%]
+........................................................................ [ 64%]
+.........s.............................................................. [ 77%]
+....................................................s.......ssssss...... [ 90%]
+........................................................                 [100%]
+=========================== short test summary info ===========================
+SKIPPED [1] tests\personal_runtime\test_playwright_reader.py:482: Opt-in billed model screenshot capability check
+SKIPPED [1] tests\personal_runtime\test_terminal.py:568: native Ubuntu process-group test
+SKIPPED [1] tests\personal_runtime\test_web_browser.py:607: compatible Chromium and ChromeDriver paths were not provided
+SKIPPED [4] tests\personal_runtime\test_web_installed_browser.py:63: requires POSIX and explicitly provisioned Chromium/ChromeDriver
+SKIPPED [2] tests\personal_runtime\test_web_installed_browser.py:180: requires POSIX and explicitly provisioned Chromium/ChromeDriver
+551 passed, 9 skipped in 469.28s (0:07:49)

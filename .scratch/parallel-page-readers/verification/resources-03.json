@@ -1,0 +1,7 @@
+{
+  "candidate_sha": "aaef0149fa531ac6008b16dc5a15eadb2541a5e5",
+  "platform": "Windows",
+  "playwright_worker_count": 0,
+  "workers": [],
+  "note": "Post-suite process inventory; context/driver/proxy teardown also asserted by real-browser fixtures."
+}

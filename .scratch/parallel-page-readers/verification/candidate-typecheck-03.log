@@ -18,8 +18,8 @@ src\jarvis_personal_runtime\responses.py:892:13: error[invalid-assignment] Objec
 src\jarvis_personal_runtime\responses.py:894:17: error[invalid-argument-type] Argument to bound method `DirectResponsesRunner._continue_loop` is incorrect: Expected `list[dict[str, object]]`, found `list[dict[str, object] | dict[str, str]]`
 src\jarvis_personal_runtime\responses.py:984:17: error[invalid-argument-type] Argument to bound method `list.append` is incorrect: Expected `PreparedTools`, found `ReadVaultTool`
 src\jarvis_personal_runtime\responses.py:1006:17: error[invalid-argument-type] Argument to `RunTerminalTool.__init__` is incorrect: Expected `CommandExecutor`, found `NativeUbuntuExecutor`
-src\jarvis_personal_runtime\runtime.py:447:25: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
-src\jarvis_personal_runtime\runtime.py:448:29: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
-src\jarvis_personal_runtime\runtime.py:494:46: error[index-out-of-bounds] Index 2 is out of bounds for tuple `tuple[str, object]` with length 2
-src\jarvis_personal_runtime\runtime.py:926:9: error[invalid-argument-type] Argument to `PersonalRuntime.__init__` is incorrect: Expected `PermissionStore | None`, found `TomlPermissionStore`
+src\jarvis_personal_runtime\runtime.py:453:25: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
+src\jarvis_personal_runtime\runtime.py:454:29: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
+src\jarvis_personal_runtime\runtime.py:500:46: error[index-out-of-bounds] Index 2 is out of bounds for tuple `tuple[str, object]` with length 2
+src\jarvis_personal_runtime\runtime.py:934:9: error[invalid-argument-type] Argument to `PersonalRuntime.__init__` is incorrect: Expected `PermissionStore | None`, found `TomlPermissionStore`
 Found 24 diagnostics

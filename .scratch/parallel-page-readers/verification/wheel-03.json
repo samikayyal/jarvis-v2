@@ -1,0 +1,8 @@
+{
+  "candidate_sha": "aaef0149fa531ac6008b16dc5a15eadb2541a5e5",
+  "wheel_sha256": "f66f9a93392e8ddb5d09b353c9cca63733b6eb0e8bd36aa14e66ba23d74792b2",
+  "source_files_verified": 31,
+  "retired_reader_absent": true,
+  "stale_build_assets_absent": true,
+  "note": "Built from fresh tracked-source export; no install, activation, API requests or messages."
+}
