@@ -9,6 +9,9 @@ remain unchanged. Production integration and Ubuntu activation belong to tickets
 
 Review baseline, confirmed by the operator:
 `72cbb4f8372df4b49d67d7890c08793cd5429a8a`.
+Initial implementation: `66a701864c77460febaa0696f6b940a3eba186cf`.
+Reviewed source including deadline enforcement:
+`eab346805ae2f0ceedd6106e47b2556b1fffaf97`.
 
 Confirmed test seams: reader-manager prepared tools, main runtime/tool API, and
 Playwright reader/browser API. Real Chromium exercises browser work; scripted
@@ -42,8 +45,47 @@ collaborators with mocks.
 
 ## Validation
 
-Validation in progress. Focused typechecking of both Playwright modules passes.
+Focused typechecking of both Playwright modules passes.
 Checking `config.py` also reports a redundant-cast warning on an unchanged line;
 no repository-wide typecheck pass is claimed. Config/skill regression checks:
-110 passed. Combined browser/reader tests, full suite and both review axes will
-be recorded before completion.
+110 passed. All 12 initial concurrency/lifecycle tests passed in the combined
+browser/reader run. That run's only failure was an older test assuming one active
+reader by default. It now explicitly configures `max_active_readers=1`; the
+targeted capacity/cancellation regression passes. Repository lint/format and
+`git diff --check` pass.
+
+An additional real-browser regression first reproduced a provider returning a
+late answer after swallowing deadline cancellation. The manager now records each
+assignment's effective deadline and checks it before accepting results, returning
+`limit/time_limit` and preserving earlier completed findings. The regression
+passes. No provider requests or key access were needed.
+
+Final full suite on reviewed source `eab3468`: **664 passed, 11 skipped in
+560.60 seconds**. See [saved output](verification/full-suite-02.log). The skipped
+checks remain existing opt-in/provider/platform fixtures; this task did not run a
+billed model check or claim live WhatsApp acceptance. No source changes followed
+this full-suite run; the completion commit only records documentation and output.
+
+Final resource inspection after the suite found **0 Playwright Chromium/driver
+worker processes** (Windows process inventory matched Playwright browser and
+driver paths). The resource regression also observed all three context-close
+events, driver exit codes and stopped proxy threads after active release/reset.
+Final repository lint, formatting, focused typechecks and diff checks pass.
+
+## Standards
+
+Independent review of the full implementation against the confirmed baseline:
+0 hard violations and 0 actionable judgment calls. The reviewed changes follow
+issue-tracker conventions, domain vocabulary, ADR 0005 and the uv workflow, and
+distinguish the opt-in path from production/deployment. The reviewer also checked
+`66a7018...eab3468` and found no additional issue.
+
+## Spec
+
+Independent review found no additional mismatch across concurrency, independent
+collection, busy/capacity errors, retained conversations, fresh budgets, explicit
+release, idle reclamation, isolated contexts, cancellation/reset cleanup and
+sequential main tools. The review acknowledged the parent's reproduced deadline
+finding above, then checked `66a7018...eab3468` and confirmed it resolved: an
+expired assignment cannot accept a late provider answer. No remaining actionable
+Spec finding. Production integration and live acceptance remain tickets 03–04.

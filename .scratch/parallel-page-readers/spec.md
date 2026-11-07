@@ -1,6 +1,6 @@
 # Concurrent browser readers
 
-Status: design accepted; ticket 01 complete; ticket 02 implementation under verification; tickets 03–04 pending
+Status: design accepted; tickets 01–02 complete; tickets 03–04 pending
 Date: 2026-11-06 (Asia/Amman)
 
 The operator approved publication of the four implementation tickets after reviewing
