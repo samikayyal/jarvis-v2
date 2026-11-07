@@ -197,6 +197,7 @@ async def build_service_async(
         config_path=loaded.toml_path,
         trace=trace,
         additional_tools=additional_tools,
+        full_access=lambda: runtime.full_access,
     )
     runtime = build_runtime_from_loaded(
         loaded,

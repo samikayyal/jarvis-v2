@@ -33,6 +33,7 @@ CONTEXT_LIMIT_NOTICE = (
 APPROVAL_SUFFIX = "Reply 1 to approve once, 2 to save permission, or 9 to reject."
 HELP_TEXT = (
     "Commands: /help, /new, /status, /cancel, /model, /reasoning, "
+    "/full-access [off], "
     "/permissions, /forget-permission, /connections, /connect google, "
     "/disconnect google"
 )
@@ -234,6 +235,7 @@ class RuntimeStatus:
     permission_count: int
     context_used_tokens: int | None
     max_context_tokens: int
+    full_access: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +269,7 @@ class _Session:
     reasoning: str
     active: _Active | None = None
     pending: _Pending | None = None
+    full_access: bool = False
 
 
 class _SystemClock:
@@ -338,6 +341,10 @@ class PersonalRuntime:
         self._reasoning = self.config.reasoning_effort
 
     @property
+    def full_access(self) -> bool:
+        return bool(self._session and self._session.full_access)
+
+    @property
     def request_instructions(self) -> str:
         session = self._session
         facts = runtime_context(
@@ -384,6 +391,7 @@ class PersonalRuntime:
             permission_count=len(self.permission_store.list_rules()),
             context_used_tokens=context_used,
             max_context_tokens=self.config.max_context_tokens,
+            full_access=self.full_access,
         )
 
     async def receive(self, message: InboundText) -> RuntimeResult:
@@ -405,16 +413,31 @@ class PersonalRuntime:
                 ("Jarvis could not safely record this message. No work was started.",),
             )
 
+        mode_replies: tuple[str, ...] = ()
         async with self._lock:
             self._expire_idle_session(now)
-            connection_command = message.text.strip() in {
+            immediate_command = message.text.strip() in {
                 "/connections",
                 "/connect google",
                 "/disconnect google",
+                "/status",
+                "/new",
             }
-            if connection_command:
+            if immediate_command:
                 return await self._command(message.text, now)
-            if self._session and self._session.pending:
+            if message.text.strip().split()[:1] == ["/full-access"]:
+                result = await self._command(message.text, now)
+                if (
+                    result.disposition is RuntimeDisposition.COMMAND
+                    and self.full_access
+                    and self._session.pending
+                    and not self._session.pending.claimed
+                ):
+                    mode_replies = result.replies
+                    operation = self._claim_modal("1", now)
+                else:
+                    return result
+            elif self._session and self._session.pending:
                 operation = self._claim_modal(message.text, now)
             elif message.text.startswith("/"):
                 return await self._command(message.text, now)
@@ -441,9 +464,19 @@ class PersonalRuntime:
         if kind == "save":
             return await self._save_and_resume(operation[1])
         if kind == "resume":
-            return await self._resume(operation[1])
+            result = await self._resume(operation[1])
+            if (
+                self.full_access
+                and result.disposition is not RuntimeDisposition.IGNORED
+            ):
+                return RuntimeResult(
+                    result.disposition, mode_replies + result.replies, result.status
+                )
+            return result
         if kind == "cancel":
-            return self._result(RuntimeDisposition.CANCELLED, (CANCELLED_NOTICE,))
+            return self._result(
+                RuntimeDisposition.CANCELLED, (CANCELLED_NOTICE + " Full access: off.",)
+            )
         return await self._run(operation[1], operation[2])
 
     async def close(self) -> None:
@@ -630,11 +663,20 @@ class PersonalRuntime:
             "/connections",
             "/connect",
             "/disconnect",
+            "/full-access",
         }
         if command not in known:
             return self._result(RuntimeDisposition.UNKNOWN_COMMAND, (HELP_TEXT,))
         if command == "/help" and not args:
             return self._result(RuntimeDisposition.COMMAND, (HELP_TEXT,))
+        if command == "/full-access" and args in ([], ["off"]):
+            session = self._ensure_session(now)
+            session.full_access = not args
+            session.last_activity_at = now
+            return self._result(
+                RuntimeDisposition.COMMAND,
+                (f"Full access: {'on' if session.full_access else 'off'}.",),
+            )
         if command == "/status" and not args:
             return self._result(
                 RuntimeDisposition.COMMAND, (_status_text(self.status()),)
@@ -679,7 +721,10 @@ class PersonalRuntime:
                 RuntimeDisposition.CANCELLED
                 if had_work
                 else RuntimeDisposition.NOTHING_TO_CANCEL,
-                (CANCELLED_NOTICE if had_work else "There is no active request.",),
+                (
+                    (CANCELLED_NOTICE if had_work else "There is no active request.")
+                    + " Full access: off.",
+                ),
             )
         if command in {"/model", "/reasoning"}:
             return self._set_selection(command, args)
@@ -808,6 +853,7 @@ class PersonalRuntime:
         task = self._session.active.task if self._session.active else None
         self._session.active = None
         self._session.pending = None
+        self._session.full_access = False
         self._session.last_activity_at = now
         return task
 
@@ -900,6 +946,7 @@ def _status_text(status: RuntimeStatus) -> str:
         f"Active request: {active}; pending action: {pending}\n"
         "---\n"
         f"Saved permissions: {status.permission_count}\n"
+        f"Full access: {'on' if status.full_access else 'off'}\n"
         "---\n"
         f"Context: {context}"
     )

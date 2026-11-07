@@ -467,16 +467,18 @@ async def test_pending_modal_suspends_inactivity_and_new_starts_fresh_session() 
     assert ignored.replies == ()
     assert runtime.status().session_id == first_session
 
-    ignored_command = await runtime.receive(inbound("m3", "/new"))
+    ignored_command = await runtime.receive(inbound("m3", "/help"))
     assert ignored_command.replies == ()
     cancelled = await runtime.receive(inbound("m4", "/cancel"))
     assert cancelled.disposition == "cancelled"
     assert runner.cancelled_pending == ["continuation"]
     assert runtime.status().session_id == first_session
+    await runtime.receive(inbound("pending-again", "touch"))
     reset = await runtime.receive(inbound("m5", "/new"))
     assert reset.disposition == "new_session"
     assert runtime.status().session_id != first_session
     assert runtime.status().pending_action is None
+    assert runner.resumes == []
 
 
 @async_test

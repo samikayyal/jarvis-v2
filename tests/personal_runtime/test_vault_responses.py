@@ -19,9 +19,11 @@ from jarvis_personal_runtime.vault_git import VaultGitSettings, VaultTools
 
 
 @pytest.mark.parametrize("deleting", [False, True])
+@pytest.mark.parametrize("full_access", [False, True])
 def test_responses_approval_commits_exactly_once_and_returns_sync_result(
     tmp_path: Path,
     deleting: bool,
+    full_access: bool,
 ) -> None:
     def git(*args: str) -> str:
         result = subprocess.run(
@@ -101,6 +103,7 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
         provider,
         tools=PreparedToolCollection(tool),
         request_timeout_seconds=30,
+        full_access=lambda: full_access,
     )
 
     async def scenario() -> None:
@@ -110,17 +113,19 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
             reasoning="medium",
             system_prompt="Use the vault tool.",
         )
-        assert isinstance(step, ApprovalRequired)
-        assert not step.action.allow_save_permission
-        assert "Before." in step.action.display
-        assert (
-            "Delete this entire note:" if deleting else "After."
-        ) in step.action.display
-        assert (clone / "note.md").read_bytes() == b"# Note\n\nBefore.\n"
-        assert len(provider.calls) == 1
-        completed = await runner.resume(
-            ApprovalDecision.APPROVE_ONCE, step.continuation
-        )
+        completed = step
+        if not full_access:
+            assert isinstance(step, ApprovalRequired)
+            assert not step.action.allow_save_permission
+            assert "Before." in step.action.display
+            assert (
+                "Delete this entire note:" if deleting else "After."
+            ) in step.action.display
+            assert (clone / "note.md").read_bytes() == b"# Note\n\nBefore.\n"
+            assert len(provider.calls) == 1
+            completed = await runner.resume(
+                ApprovalDecision.APPROVE_ONCE, step.continuation
+            )
         assert completed.reply == "Note committed and synced."
 
     asyncio.run(scenario())
@@ -136,7 +141,7 @@ def test_responses_approval_commits_exactly_once_and_returns_sync_result(
     output = json.loads(transcript[-1]["output"])
     assert output["status"] == "synced"
     assert output["approval"] == {
-        "decision": "approved_once",
-        "preview_shown": True,
-        "source": "operator_reply",
+        "decision": "full_access" if full_access else "approved_once",
+        "preview_shown": not full_access,
+        "source": "full_access" if full_access else "operator_reply",
     }

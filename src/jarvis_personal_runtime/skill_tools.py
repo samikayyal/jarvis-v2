@@ -156,8 +156,14 @@ class SkillTools:
             raise ValueError(f"load the {owner} skill before calling {name}")
         return await self._tools.execute(name, arguments)
 
-    async def resume(self, continuation: object, *, approved: bool) -> str:
-        return await self._tools.resume(continuation, approved=approved)
+    async def resume(
+        self, continuation: object, *, approved: bool, full_access: bool = False
+    ) -> str:
+        return await self._tools.resume(
+            continuation,
+            approved=approved,
+            **({"full_access": True} if full_access else {}),
+        )
 
     def request_started(self) -> None:
         callback = getattr(self._tools, "request_started", None)

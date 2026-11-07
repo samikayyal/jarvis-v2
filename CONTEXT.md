@@ -52,8 +52,8 @@ _Avoid_: Any authenticated event, queued request
 **Deterministic command**:
 An exact slash-prefixed operator message handled by application code without
 asking the model to interpret it. The supported commands are `/help`, `/new`,
-`/status`, `/cancel`, `/model`, `/reasoning`, `/permissions`, and
-`/forget-permission`, plus `/connections`, `/connect google`, and
+`/status`, `/cancel`, `/full-access`, `/full-access off`, `/model`, `/reasoning`,
+`/permissions`, and `/forget-permission`, plus `/connections`, `/connect google`, and
 `/disconnect google` for the configured Google connection.
 _Avoid_: Prompt, prepared tool, ordinary request
 
@@ -112,6 +112,14 @@ The one ordinary request currently being processed. A concurrent ordinary
 message is refused rather than queued or joined.
 _Avoid_: Working session, pending action
 
+**Full access**:
+The authorized operator's working-session grant for Jarvis to perform actions
+needed to fulfill the operator's requests across available tools without
+individual approval prompts. It ends when disabled, when the operator cancels
+work, or when the working session ends, and retains existing tool boundaries,
+OS permissions, and connected-account limits.
+_Avoid_: Saved permission, permanent authorization, operating-system privilege
+
 **Model-and-tool loop**:
 The sequential direct OpenAI Responses cycle that sends the complete current
 working-session transcript, executes one prepared tool call at a time, returns
@@ -149,8 +157,9 @@ _Avoid_: Application checkout, runtime data directory, arbitrary filesystem
 One frozen batch of exact Markdown changes or a single-note deletion, its
 synchronized base revision, complete internal diff, and configured commit
 metadata. The operator reviews
-plain-language changes and can approve once or remember edit approval for exactly
-one file. Deletion always requires one-time approval. A proposal is never approved
+plain-language changes in normal mode and can approve once or remember edit
+approval for exactly one file. Deletion requires one-time approval in normal mode; full access
+authorizes edits and deletion without individual prompts. A proposal is never approved
 by a saved terminal permission.
 _Avoid_: Git command, saved permission, unreviewed file write
 
@@ -184,8 +193,9 @@ _Avoid_: Configured Google identity, OAuth token, configured MCP service
 The one exact terminal command, Google write, or vault edit proposal waiting for the
 authorized operator's deterministic choice. Terminal commands accept `1`, `2`,
 `9`, or `/cancel`; Google writes accept only `1`, `9`, or `/cancel`, and all other
-messages are silently ignored while one is pending except the exact Google
-connection controls. A vault edit proposal accepts `1`, `9`, or `/cancel`
+messages are silently ignored while one is pending except Google connection
+controls, `/status`, `/new`, and full-access controls. Enabling full access resumes
+the pending action. A vault edit proposal accepts `1`, `9`, or `/cancel`
 and also `2` for a single-file create/update proposal, saving edit approval for
 that exact note in its clone, remote, and branch. Reauthorization or disconnection invalidates a
 pending Google write created under the prior connection.
@@ -229,22 +239,23 @@ _Avoid_: Sanitized application log, hidden model reasoning
   the configured remote, branch, note directories, commit identity, SSH
   identity, and pinned known-hosts file govern vault Git operations.
 - Google API tools use only the exact configured Google account. Gmail and
-  Calendar writes require exact operator approval and one attempt; Drive tools
-  cannot mutate data.
+  Calendar writes require exact operator approval or full access and one attempt;
+  Drive tools cannot mutate data.
 - Git-backed vault reads synchronize a clean clone before a fresh result and
   disclose stale reads when synchronization is unavailable. Vault writes require
   a synchronized base and are limited to exact Markdown changes under the
   configured note directories.
 - Every vault write is one frozen `edit_vault` or `delete_vault` proposal.
-  Edits require one exact approval or a saved permission for every affected file.
-  Deletion removes one exact note and always requires one-time approval after
-  showing its full content; saved edit permissions never authorize deletion.
+  Edits require full access, one exact approval, or a saved permission for every
+  affected file.
+  Deletion removes one exact note and requires full access or one-time approval
+  after showing its full content; saved edit permissions never authorize deletion.
   The tool stages only approved paths, creates one normal commit, and reports
   commit and remote outcomes separately. It never merges, rebases, force-pushes,
   resolves conflicts, or blindly retries an uncertain push.
 - Configured simple read-only command prefixes may run automatically. Compound
   shell structure, scripts, unmatched commands, and mutating commands require
-  exact approval or a matching saved permission.
+  full access, exact approval, or a matching saved permission.
 - Ubuntu execution uses local subprocesses. Windows execution uses ordinary
   OpenSSH over Tailscale with a dedicated key and pinned host key. There are no
   custom workers.
