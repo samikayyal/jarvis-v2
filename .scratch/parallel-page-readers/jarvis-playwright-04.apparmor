@@ -1,0 +1,13 @@
+# Permit Chromium's own sandbox to create its user namespace on Ubuntu 26.04.
+# Keep the global AppArmor user-namespace restriction enabled. Paths name only
+# the pinned Playwright 1.58 / Chromium 1208 binaries installed for Jarvis.
+abi <abi/5.0>,
+include <tunables/global>
+
+profile jarvis-playwright-chromium-1208 /home/samik/Projects/Jarvis/other/runtime/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome flags=(unconfined) {
+  userns,
+}
+
+profile jarvis-playwright-headless-1208 /home/samik/Projects/Jarvis/other/runtime/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell flags=(unconfined) {
+  userns,
+}
