@@ -12,6 +12,15 @@ failures. Approval continuations preserve usage; a new ordinary request resets i
 Limits are ceilings: stop when the evidence is sufficient. Stable questions
 normally need no search. Google Workspace is separate from public web research.
 
+For a comparison with a requested saved document, reserve work for synthesis and
+the save from the beginning. Establish the current setup with one narrow snapshot
+of the active runtime and current workspace. Investigate further only when a
+specific missing fact could change the decision. Start the few independent source
+checks needed, then synthesize useful partial findings and name remaining gaps.
+A missing regional price can remain an explicit gap in the document. Save the
+requested result before optional further research, and verify the save/sync
+outcome before giving the short final reply.
+
 For selected primary sources, call `start_browser_reader(url, prompt)` with a
 focused self-contained task and only necessary context. Each reader receives the
 full readable starting page, its prompt and its own conversation. It investigates

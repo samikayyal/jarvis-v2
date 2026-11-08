@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — Integrate the complete workflow and remove the old machinery.
 
-**Status:** needs-triage
+**Status:** claimed
 
 - [x] Inspect current checkout, remote and live-release state. Commit and push intended candidate changes and verify that GitHub contains the exact candidate SHA before activation. Transferred source must match that verified commit; failed push or verification leaves the active release unchanged.
 - [x] Provision Playwright browser binaries and OS dependencies reproducibly on Ubuntu. Verify the staged exact-candidate package, configuration compatibility, browser startup, model screenshot capability and required tests before activation; retain a working rollback path.

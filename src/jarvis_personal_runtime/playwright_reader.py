@@ -506,6 +506,7 @@ class PlaywrightReaderTools:
         )
 
     def _observation(self, reader, observation):
+        observation = {"browser_state": "open", **observation}
         snapshot_id = uuid4().hex[:12]
         content = encode(observation)
         reader.snapshots[snapshot_id] = content
@@ -520,6 +521,7 @@ class PlaywrightReaderTools:
             "characters": len(content),
             "reason": "Full observation exceeds remaining context; retained completely for optional search_content and read_content.",
             "browser_state_notice": reader.browser_state_notice,
+            "browser_state": "open",
         }
 
     async def _action(self, reader, name, arguments):
@@ -595,6 +597,10 @@ class PlaywrightReaderTools:
                 if fresh:
                     initial = await browser.open(reader.url)
                     if reader.browser_state_notice:
+                        reader.browser_state_notice = (
+                            "Previous interactive state was lost. A new browser is open "
+                            "at the observed URL; earlier cookies, storage and tabs were not restored."
+                        )
                         initial["browser_state_notice"] = reader.browser_state_notice
                 else:
                     initial = await reader.browser.act("inspect", {})

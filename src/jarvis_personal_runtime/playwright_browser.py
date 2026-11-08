@@ -64,6 +64,26 @@ DESCRIBE = r"""e => {
     href:e.href || '', target:e.target || '', options:e.tagName === 'SELECT' ?
       [...e.options].map(o => ({label:o.text, value:o.value, disabled:o.disabled})) : []};
 }"""
+# Keep the nodes in a remote object handle, never a page-global registry that
+# page scripts could replace. Descriptions and node positions come from the same
+# synchronous snapshot. Only a chosen action needs an individual node handle.
+CONTROLS = (
+    """() => {
+  const describe = """
+    + DESCRIBE
+    + """;
+  const nodes = [], descriptions = [];
+  for (const node of document.querySelectorAll(
+      'a[href], button, input, select, textarea, summary, [role=button], [role=tab]')) {
+    const description = describe(node);
+    if (description.allowed) {
+      nodes.push(node);
+      descriptions.push(description);
+    }
+  }
+  return {nodes, descriptions};
+}"""
+)
 
 
 class BrowserStateLost(RuntimeError):
@@ -88,6 +108,7 @@ class PlaywrightBrowser:
         self._page = None
         self._proxy = PublicNetworkProxy()
         self._elements = {}
+        self._element_nodes = None
         self._tabs = {}
         self._post_permit = None
         self._blocked = []
@@ -195,21 +216,22 @@ class PlaywrightBrowser:
         validate_public_url(self._page.url)
         if self._proxy.blocked_url(self._page.url):
             raise PublicUrlError("Navigation was blocked by the public-network proxy")
-        for handle in self._elements.values():
-            await handle.dispose()
+        if self._element_nodes is not None:
+            await self._element_nodes.dispose()
+            self._element_nodes = None
         self._elements.clear()
         elements = []
-        handles = await self._page.query_selector_all(
-            "a[href], button, input, select, textarea, summary, [role=button], [role=tab]"
-        )
-        for handle in handles:
-            description = await handle.evaluate(DESCRIBE)
-            if not description.pop("allowed"):
-                await handle.dispose()
-                continue
+        snapshot = await self._page.evaluate_handle(CONTROLS)
+        try:
+            descriptions = await snapshot.evaluate("snapshot => snapshot.descriptions")
+            self._element_nodes = await snapshot.get_property("nodes")
+        finally:
+            await snapshot.dispose()
+        for index, description in enumerate(descriptions):
+            description.pop("allowed")
             description.pop("post")
             ref = uuid4().hex[:12]
-            self._elements[ref] = handle
+            self._elements[ref] = index
             elements.append({"ref": ref, **description})
         result = {
             "url": self._page.url,
@@ -238,6 +260,7 @@ class PlaywrightBrowser:
         self._check()
         assert self._page is not None and self._context is not None
         attempted = False
+        handle = None
         before = set(self._context.pages)
         try:
             if action == "inspect":
@@ -273,7 +296,10 @@ class PlaywrightBrowser:
                 else:
                     self._page = page
             elif action in {"click", "type", "select"}:
-                handle = self._elements.get(arguments["ref"])
+                index = self._elements.get(arguments["ref"])
+                if index is not None and self._element_nodes is not None:
+                    node = await self._element_nodes.get_property(str(index))
+                    handle = node.as_element()
                 if handle is None or not await handle.evaluate("e => e.isConnected"):
                     raise ValueError(
                         "Stale element reference; inspect and choose a fresh reference."
@@ -343,6 +369,8 @@ class PlaywrightBrowser:
             }
         finally:
             self._post_permit = None
+            if handle is not None:
+                await handle.dispose()
 
     async def close(self):
         self.closed = True
@@ -351,6 +379,8 @@ class PlaywrightBrowser:
         startup, self._startup = self._startup, None
         self._context = None
         self._page = None
+        self._element_nodes = None
+        self._elements.clear()
         try:
             if browser:
                 await browser.close()

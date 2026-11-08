@@ -129,6 +129,9 @@ def test_followups_retain_conversation_reject_busy_and_reset_turn_budget(monkeyp
             assert "lost" in follow["browser_state_notice"].lower()
             await model.arrived()
             assert "interactive state" in json.dumps(model.requests[-1]["input"])
+            observation = json.loads(model.requests[-1]["input"][-1]["content"])
+            assert observation["browser_state"] == "open"
+            assert "new browser is open" in observation["browser_state_notice"].lower()
             assert "Findings for second" in json.dumps(model.requests[-1]["input"])
             model.gates["third"].set()
             assert (

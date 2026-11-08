@@ -1,11 +1,16 @@
 # 05: Restore completion of the live hosting-and-note workflow
 
-**Status:** needs-triage
+**Status:** claimed
 
 **What to investigate:** Ticket 04's deployed candidate passed its Ubuntu suite
 but the original visible WhatsApp request timed out before saving a note. Resolve
 the demonstrated live failures before repeating ticket 04 acceptance. This is
 follow-up work to scope and triage, not part of the original four-ticket sign-off.
+
+2026-11-08: The operator requested continuing through the demonstrated blockers
+and completing ticket 04. This investigation is now included in that continuation;
+the agreed regression seams are the existing browser, reader-tool and main
+request-flow public interfaces. Vault-edit redesign remains excluded.
 
 ## Evidence
 

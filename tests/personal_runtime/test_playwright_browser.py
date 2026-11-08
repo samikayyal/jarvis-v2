@@ -55,6 +55,15 @@ def public_fixture(monkeypatch, *, slow_page=None):
                     + "<p>Preserved data row.</p>" * 5000
                     + "<p>Needle at the end.</p>"
                 )
+            if self.path == "/many-controls":
+                body = (
+                    "<h1>Large pricing controls</h1><p id='result'>Not selected</p>"
+                    + "".join(
+                        f"<button onclick=\"document.querySelector('#result').textContent='Choice {i}'\">Choice {i}</button>"
+                        for i in range(600)
+                    )
+                    + "<table><tr><th>Machine</th><th>Price</th></tr><tr><td>small</td><td>2</td></tr></table>"
+                )
             if self.path == "/visual":
                 body = """<h1>Visual fixture</h1><canvas width="900" height="250"></canvas>
                 <script>const c=document.querySelector('canvas').getContext('2d');
@@ -111,6 +120,33 @@ def public_fixture(monkeypatch, *, slow_page=None):
 
 def element(observation, label):
     return next(e["ref"] for e in observation["elements"] if e["label"] == label)
+
+
+def test_large_control_page_can_be_reinspected_and_used_within_operation_budget(
+    monkeypatch,
+):
+    async def scenario(url):
+        browser = PlaywrightBrowser(timeout_seconds=3)
+        try:
+            initial = await browser.open(url + "many-controls")
+            async with asyncio.timeout(3):
+                observation = await browser.act("inspect", {})
+            assert len(observation["elements"]) == 600
+            assert "| small | 2 |" in observation["text"]
+            assert "Choice 599" in observation["text"]
+            assert element(initial, "Choice 599") != element(observation, "Choice 599")
+            changed = await browser.act(
+                "click", {"ref": element(observation, "Choice 599")}
+            )
+            assert "Choice 599" in changed["text"]
+            assert "Not selected" not in changed["text"]
+            stale = await browser.act("click", {"ref": element(initial, "Choice 599")})
+            assert "Stale" in stale["error"]
+        finally:
+            await browser.close()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))
 
 
 def test_dynamic_controls_and_complete_readable_observations(monkeypatch):
