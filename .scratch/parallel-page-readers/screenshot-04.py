@@ -5,6 +5,7 @@ authorized reuse of the existing runtime key for ticket 04. No secret is printed
 or persisted by this helper.
 """
 
+import argparse
 import asyncio
 import json
 import sys
@@ -12,7 +13,14 @@ import time
 from pathlib import Path
 
 BASE = Path("/home/samik/Projects/Jarvis")
-CANDIDATE = BASE / "code/releases/551ed852b16f17f87e149feae1690da39114fc5b"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--sha", default="551ed852b16f17f87e149feae1690da39114fc5b")
+parser.add_argument(
+    "--tests", type=Path, default=BASE / "code/parallel-readers-test-551ed85"
+)
+args = parser.parse_args()
+assert len(args.sha) == 40 and all(c in "0123456789abcdef" for c in args.sha)
+CANDIDATE = BASE / "code/releases" / args.sha
 sys.path.insert(0, str(CANDIDATE / ".venv/lib/python3.14/site-packages"))
 
 import pytest
@@ -22,7 +30,7 @@ from jarvis_personal_runtime.config import WebReaderConfig, load_runtime_config
 from jarvis_personal_runtime.playwright_reader import PlaywrightReaderTools
 from jarvis_personal_runtime.responses import OpenAIRawResponsesAdapter
 
-sys.path.insert(0, str(BASE / "code/parallel-readers-test-551ed85"))
+sys.path.insert(0, str(args.tests))
 from tests.personal_runtime.test_playwright_browser import public_fixture
 
 assert Path(jarvis_personal_runtime.__file__).is_relative_to(CANDIDATE / ".venv")

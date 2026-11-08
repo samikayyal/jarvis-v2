@@ -1,5 +1,6 @@
 """Read-only installed-candidate and exact gateway-session checks; no secrets output."""
 
+import argparse
 import hashlib
 import json
 import tarfile
@@ -11,12 +12,21 @@ import jarvis_personal_runtime
 from jarvis_personal_runtime.config import load_runtime_config
 
 BASE = Path("/home/samik/Projects/Jarvis")
-SHA = "551ed852b16f17f87e149feae1690da39114fc5b"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--sha", default="551ed852b16f17f87e149feae1690da39114fc5b")
+parser.add_argument(
+    "--archive", type=Path, default=BASE / "code/parallel-readers-551ed85.tar.gz"
+)
+parser.add_argument("--config", type=Path, default=BASE / "other/config/jarvis.toml")
+parser.add_argument("--expected-active", type=Path)
+args = parser.parse_args()
+SHA = args.sha
+assert len(SHA) == 40 and all(c in "0123456789abcdef" for c in SHA)
 candidate = BASE / "code/releases" / SHA
 installed = Path(jarvis_personal_runtime.__file__).parent.resolve()
 assert installed.is_relative_to(candidate / ".venv"), installed
 verified = 0
-with tarfile.open(BASE / "code/parallel-readers-551ed85.tar.gz") as archive:
+with tarfile.open(args.archive) as archive:
     for member in archive.getmembers():
         if not member.isfile():
             continue
@@ -29,12 +39,12 @@ with tarfile.open(BASE / "code/parallel-readers-551ed85.tar.gz") as archive:
             assert (installed / relative).read_bytes() == data, relative
             verified += 1
 assert not (installed / "page_reader.py").exists()
-loaded = load_runtime_config(
-    BASE / "other/runtime", config_path=BASE / "other/config/jarvis.toml"
-)
+loaded = load_runtime_config(BASE / "other/runtime", config_path=args.config)
 cfg = loaded.config
 assert cfg.web_reader is not None
 assert cfg.openwa_api_base_url is not None
+if args.expected_active:
+    assert (BASE / "code/current").resolve() == args.expected_active.resolve()
 limits = {
     key: getattr(cfg.web_reader, key)
     for key in (
@@ -63,9 +73,7 @@ print(
             "main_model": cfg.model,
             "main_reasoning": cfg.reasoning_effort,
             "active_release": str((BASE / "code/current").resolve()),
-            "config_sha256": hashlib.sha256(
-                (BASE / "other/config/jarvis.toml").read_bytes()
-            ).hexdigest(),
+            "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
             "prompt_sha256": hashlib.sha256(
                 (BASE / "other/runtime/SYSTEM.md").read_bytes()
             ).hexdigest(),
