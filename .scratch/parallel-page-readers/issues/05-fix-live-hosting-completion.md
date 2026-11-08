@@ -1,6 +1,6 @@
 # 05: Restore completion of the live hosting-and-note workflow
 
-**Status:** claimed
+**Status:** needs-triage
 
 **What to investigate:** Ticket 04's deployed candidate passed its Ubuntu suite
 but the original visible WhatsApp request timed out before saving a note. Resolve
@@ -55,3 +55,35 @@ See [deployment and acceptance](../deployment-verification-04.md) and
   saved/synced note, concise final recommendation, claim-level inspection and
   measured completion/delivery. Record under-two-minute attainment separately
   from functional success; retain GitHub exact-candidate deployment gates.
+
+## 2026-11-08 outcome and remaining scope
+
+The operator-authorized continuation restored completion on `9c2f7d9`:
+the exact original request completed, saved and synced the note, and visibly
+delivered its concise recommendation. Claim-level inspection and cancellation
+cleanup passed. Ticket 04 is complete; see [corrective evidence](../continuation-verification-04.md).
+This resolves the original no-save timeout, but does not resolve every item here.
+
+Keep this follow-up open for these demonstrated residuals:
+
+- A timeout/close race logged `AttributeError exception in shielded future`:
+  `PlaywrightBrowser.observe()` read `self._page.url` after concurrent close
+  cleared the page. The action was drained and no browser/driver survived,
+  but exception handling is not clean. Add a deterministic cancellation-during-
+  observation regression at the already approved public browser seam, then fix
+  the race without weakening authority or resource cleanup.
+- Completion took 507.389 seconds (28 main, 8 reader calls), exceeding the old
+  completed 458.128-second baseline and the 120-second target. Main model time
+  was 361.649 seconds; reader waits 59.379 seconds and searches 34.057 seconds
+  were also material. The overview/calculator assignments' terminal intervals
+  were 233.694/154.671 seconds. Terminal events occur after cleanup, so isolate
+  research, deadline handling and teardown before attributing the overrun.
+- One visible progress update and the final reply had uncertain transport
+  acknowledgements. Read-only exact-body gateway history and the visible chat
+  confirmed the final was delivered. Preserve duplicate-send protection while
+  investigating this uncertainty; do not automatically resend a possibly sent
+  message.
+
+The batched observation fix, corrected reopened state and runtime working
+directory are deployed and verified. Vault-edit redesign remains excluded:
+the successful run's single edit took 11.909 seconds and synced normally.

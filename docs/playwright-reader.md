@@ -4,9 +4,13 @@ The normal Responses runner composes `WebTools` for main Google search and
 `PlaywrightReaderTools` for public-page investigations when web search is enabled.
 Loading the packaged web skill exposes all six reader lifecycle tools. The old
 reader and its quote, fallback, chunk and coverage policies are removed in ticket 03.
-Source `551ed85` was deployed to Ubuntu on 2026-11-07. The original hosting-and-note
-request timed out, so live end-to-end acceptance and the speed target remain
-unmet. See [deployment and acceptance](../.scratch/parallel-page-readers/deployment-verification-04.md)
+Corrective source `9c2f7d9` was deployed to Ubuntu on 2026-11-08 after exact-SHA
+GitHub verification. The original hosting-and-note request completed, saved and
+synced its note, and visibly delivered a concise final: 507.389 seconds to
+completion, 28 main and 8 reader calls. Functional acceptance passed; the
+under-two-minute target was missed. A timeout/close diagnostic and remaining
+latency stay open in ticket 05. See [current acceptance](../.scratch/parallel-page-readers/continuation-verification-04.md),
+[the failed first deployment](../.scratch/parallel-page-readers/deployment-verification-04.md)
 and [predeployment verification](../.scratch/parallel-page-readers/verification-03.md).
 
 ## Provision and run

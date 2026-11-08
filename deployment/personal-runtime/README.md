@@ -119,11 +119,15 @@ progress send drains before the final response. New ordinary messages receive a
 busy response; `/status` and `/cancel` remain deterministic. Final answers contain
 the model's concise uncertainty and citations, without code-owned source warnings.
 
-Source `551ed85` was committed, pushed and exact-SHA verified on GitHub before
-Ubuntu activation on 2026-11-07. The original visible hosting-and-note scenario
-timed out without saving its note; neither functional end-to-end acceptance nor
-the under-two-minute target passed. A separately corrected recovery note saved
-and synced. See [ticket 04's measured record](../../.scratch/parallel-page-readers/deployment-verification-04.md)
+Corrective source `9c2f7d9` was committed, pushed and exact-SHA verified on GitHub
+before Ubuntu activation on 2026-11-08. All installed source files matched the
+candidate, and the full current-runtime Ubuntu suite passed 560 tests with one
+skip. The original visible hosting-and-note scenario completed in 507.389
+seconds with 28 main and 8 reader calls, saved/synced its note, and visibly
+delivered a concise final. Functional acceptance passed; the under-two-minute
+target was missed. A timeout/close diagnostic and remaining latency are tracked
+in ticket 05. See [current measured acceptance](../../.scratch/parallel-page-readers/continuation-verification-04.md)
+and [the preserved failed first run](../../.scratch/parallel-page-readers/deployment-verification-04.md)
 for provisioning, rollback, installed-source checks and live outcomes. Vault edit
 approval, frozen proposals and synchronization behavior are unchanged.
 

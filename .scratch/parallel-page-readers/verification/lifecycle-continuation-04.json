@@ -1,0 +1,27 @@
+{
+  "candidate_sha": "9c2f7d90b867f63cdd536ac0970916ed8143e796",
+  "cancel_admitted": "2026-11-08T16:09:12.076962Z",
+  "cancel_runtime_result": "2026-11-08T16:09:12.145598Z",
+  "cancel_acknowledged_sent": "2026-11-08T16:09:14.487934Z",
+  "cancelled_request_final_send_attempts_results_or_errors_after_cancel": 0,
+  "active_readers_cancelled": [
+    {
+      "reader_id": "efdbeb38b480",
+      "state": "cancelled",
+      "browser_state": "closed",
+      "model_turns": 0
+    }
+  ],
+  "process_check_utc": "2026-11-08T16:13:02Z",
+  "reader_browser_or_driver_processes": 0,
+  "existing_openwa_process_excluded": "node dist/main",
+  "final_visible_status_captured_utc": "2026-11-08T16:15:52Z",
+  "no_late_reply_visible_through_final_observation": true,
+  "active_request_final": "none",
+  "pending_action_final": false,
+  "full_access_final": "off",
+  "saved_permissions_final": 15,
+  "provider_cancellation_confirmed": false,
+  "benchmark_timeout_close_diagnostic_count": 1,
+  "remaining_diagnostic": "AttributeError exception in shielded future: observe accessed page.url after concurrent close. Action drained and no surviving browser/driver; fix and deterministic regression remain in ticket05."
+}

@@ -1,6 +1,6 @@
 # Concurrent browser readers
 
-Status: design accepted; tickets 01–03 complete; ticket 04 deployed, live acceptance failed and remains open
+Status: tickets 01–04 complete; functional live acceptance passed; speed target missed
 Date: 2026-11-06 (Asia/Amman)
 
 The operator approved publication of the four implementation tickets after reviewing
@@ -11,9 +11,12 @@ verified on the opt-in single-reader path; see [verification](verification.md).
 Ticket 02 adds concurrency and retained follow-ups on the opt-in path; see
 [its verification](verification-02.md). Ticket 03 integrates the normal runtime and removes the old reader policy; see
 [predeployment verification](verification-03.md). Deployment and live acceptance
-are owned by ticket 04. Its [deployment/acceptance record](deployment-verification-04.md)
-reports the 2026-11-07 deployment and failed original hosting-and-note repeat;
-the under-two-minute target has not been met.
+are owned by ticket 04. The [historical record](deployment-verification-04.md)
+preserves the failed 2026-11-07 repeat. The [corrective acceptance](continuation-verification-04.md)
+records `9c2f7d9` deployed on 2026-11-08 and the successful original hosting-and-note
+workflow: 507.389 seconds to completion, 28 main and 8 reader calls. The note is
+saved/synced and its concise final visibly delivered. The under-two-minute target
+is missed; remaining latency and a timeout/close diagnostic stay open in ticket 05.
 
 ## Purpose and scope
 

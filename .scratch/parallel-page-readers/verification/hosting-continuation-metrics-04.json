@@ -1,0 +1,100 @@
+{
+  "candidate_sha": "9c2f7d90b867f63cdd536ac0970916ed8143e796",
+  "admission": "2026-11-08T15:58:01.958039Z",
+  "runtime_result": "2026-11-08T16:06:29.347275Z",
+  "gateway_outgoing_message_timestamp": "2026-11-08T16:06:33Z",
+  "gateway_message_created_at": "2026-11-08T16:06:46Z",
+  "gateway_message_status_when_checked": "delivered",
+  "delivery_evidence": "Final reply visibly verified in WhatsApp; exact-body gateway record currently delivered. Runtime send acknowledgement was unavailable/may_have_sent=true. Gateway outgoing timestamp and row creation are not recipient receipt timestamps.",
+  "disposition": "completed",
+  "admission_to_runtime_result_seconds": 507.38923597335815,
+  "admission_to_gateway_outgoing_timestamp_seconds": 511.04196095466614,
+  "admission_to_gateway_message_created_seconds": 524.0419609546661,
+  "admission_to_recipient_delivery_seconds": null,
+  "main_calls": 28,
+  "reader_calls": 8,
+  "main_completed_model_seconds": 361.6485040001571,
+  "reader_model_seconds_nested_within_reader_wall": 21.487678438425064,
+  "reader_assignment_union_seconds_overlapping_main_work": 321.9464056491852,
+  "main_tool_seconds": {
+    "load_skill": 0.0006108283996582031,
+    "run_terminal": 2.3568692207336426,
+    "search_web": 34.05665874481201,
+    "start_browser_reader": 0.16465973854064941,
+    "browser_reader_status": 0.002310037612915039,
+    "wait_browser_reader": 59.37918138504028,
+    "follow_up_browser_reader": 0.0008320808410644531,
+    "list_vault_tree": 2.3800909519195557,
+    "read_vault": 2.202599048614502,
+    "edit_vault": 11.909013986587524
+  },
+  "main_tool_counts": {
+    "load_skill": 2,
+    "run_terminal": 5,
+    "search_web": 3,
+    "start_browser_reader": 4,
+    "browser_reader_status": 4,
+    "wait_browser_reader": 5,
+    "follow_up_browser_reader": 1,
+    "list_vault_tree": 1,
+    "read_vault": 1,
+    "edit_vault": 1
+  },
+  "reader_assignments": [
+    {
+      "reader_id": "ce7fed1223cb",
+      "assignment_id": "4b33547f0c53",
+      "state": "completed",
+      "reason": "",
+      "url": "https://cloud.google.com/vpc/network-pricing",
+      "model_turns": 1,
+      "elapsed_seconds": 23.95686719380319
+    },
+    {
+      "reader_id": "1d80ac32da17",
+      "assignment_id": "8f34bfadc07d",
+      "state": "limit",
+      "reason": "time_limit",
+      "url": "https://cloud.google.com/products/compute/pricing",
+      "model_turns": 3,
+      "elapsed_seconds": 233.69361585751176
+    },
+    {
+      "reader_id": "58ba2a3554f1",
+      "assignment_id": "095c2ade7dba",
+      "state": "limit",
+      "reason": "time_limit",
+      "url": "https://cloud.google.com/products/calculator",
+      "model_turns": 0,
+      "elapsed_seconds": 154.67118070460856
+    },
+    {
+      "reader_id": "de4054f802ed",
+      "assignment_id": "313a04fa4b7d",
+      "state": "completed",
+      "reason": "",
+      "url": "https://cloud.google.com/products/compute/pricing/general-purpose",
+      "model_turns": 4,
+      "elapsed_seconds": 88.2502536661923
+    }
+  ],
+  "first_progress_after_admission_seconds": 27.32413387298584,
+  "progress_acknowledged": 1,
+  "progress_send_errors_or_uncertainty": 1,
+  "baseline": {
+    "before_completion_seconds": 458.128,
+    "through_delivery_seconds": 460.284,
+    "main_calls": 22,
+    "reader_calls": 27
+  },
+  "failed_initial_candidate": {
+    "through_delivery_seconds": 603.412089,
+    "main_calls": 49,
+    "reader_calls": 8
+  },
+  "target_seconds": 120,
+  "performance_target_met": false,
+  "functional_acceptance": true,
+  "vault_commit": "9005e0e1c6701aa1499baab0cf92a12742abcabb",
+  "vault_github_main_matches": true
+}

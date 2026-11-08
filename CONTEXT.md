@@ -312,8 +312,11 @@ private bridge listener, OpenWA is healthy with the configured named session
 produces one expected phone reply. A listener check or OpenWA `/ready` response
 alone is not end-to-end acceptance.
 
-The concurrent-reader source under ADR 0005 was deployed as `551ed85` on
-2026-11-07. The original live hosting-and-note request timed out; end-to-end
-acceptance and the speed target remain unmet. Ticket 04's deployment record
-distinguishes that failure from the separately saved recovery note and successful
-health, screenshot and lifecycle checks.
+The concurrent-reader source under ADR 0005 is deployed as `9c2f7d9` after
+GitHub verification on 2026-11-08. Ticket 04 functional acceptance passed: the
+original hosting-and-note request completed in 507.389 seconds with 28 main and
+8 reader calls, saved/synced the note and visibly delivered its concise final.
+The under-two-minute target was missed; a timeout/close diagnostic and remaining
+latency stay open in ticket 05. The corrective acceptance record preserves the
+failed first deployment separately and distinguishes verified cleanup from
+clean exception handling.
