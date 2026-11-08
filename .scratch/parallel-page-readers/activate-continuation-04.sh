@@ -15,9 +15,13 @@ cmp "$config" "$backup"
 cmp "$root/SYSTEM.md" "$candidate/deployment/personal-runtime/SYSTEM.md.example"
 sudo -n -H -u jarvis-personal-runtime "$candidate/.venv/bin/jarvis-personal-runtime" --root "$root" --config "$staged" --check
 verify_source() {
-  sudo -n -H -u jarvis-personal-runtime uv run --no-project --python "$candidate/.venv/bin/python" "$base/verify-04.py" --sha "$sha" --archive "$base/readers-continuation.tar.gz" --config "$1"
+  release=$1
+  archive=$2
+  checked_config=$3
+  release_sha=${release##*/}
+  sudo -n -H -u jarvis-personal-runtime uv run --no-project --python "$release/.venv/bin/python" "$base/verify-04.py" --sha "$release_sha" --archive "$archive" --config "$checked_config"
 }
-verify_source "$staged"
+verify_source "$candidate" "$base/readers-continuation.tar.gz" "$staged"
 systemd-analyze verify /etc/systemd/system/jarvis-personal-runtime.service
 verify_health() {
   expected=$1
@@ -32,7 +36,11 @@ verify_health() {
   test "$(readlink -f "$base/current")" = "$expected" || return 1
   test "$(systemctl show jarvis-personal-runtime -p NRestarts --value)" = 0 || return 1
   sudo -n -H -u jarvis-personal-runtime "$expected/.venv/bin/jarvis-personal-runtime" --root "$root" --config "$config" --check || return 1
-  verify_source "$config"
+  if test "$expected" = "$candidate"; then
+    verify_source "$expected" "$base/readers-continuation.tar.gz" "$config"
+  else
+    verify_source "$expected" "$base/parallel-readers-551ed85.tar.gz" "$config"
+  fi
 }
 rollback() {
   sudo -n systemctl stop jarvis-personal-runtime || return 1
