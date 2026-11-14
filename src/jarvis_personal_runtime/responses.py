@@ -244,15 +244,27 @@ class PreparedToolCollection:
         return None
 
 
-@dataclass(frozen=True, slots=True)
-class _ResponsesContinuation:
-    transcript: tuple[dict[str, object], ...]
+@dataclass(slots=True)
+class _BatchCall:
     call: dict[str, object]
-    tool_continuation: object
+    task: asyncio.Task[str | ApprovalRequired] | None = None
+    output: str | ApprovalRequired | None = None
+    attempted: bool = False
+
+
+@dataclass(slots=True)
+class _ToolBatch:
+    calls: list[_BatchCall]
     model: str
     reasoning: str
     system_prompt: str
     tool_rounds: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponsesContinuation:
+    batch: _ToolBatch
+    index: int
 
 
 class OpenAIRawResponsesAdapter:
@@ -376,6 +388,7 @@ class DirectResponsesRunner:
         trace: TraceSink | None = None,
         request_timeout_seconds: float,
         max_tool_rounds: int = 8,
+        max_parallel_tool_calls: int = 5,
         max_context_tokens: int = 100_000,
         max_output_chars: int = 65_536,
         context_counter: Callable[[dict[str, object]], int] = local_input_tokens,
@@ -390,6 +403,10 @@ class DirectResponsesRunner:
         if max_tool_rounds <= 0:
             raise ValueError("max_tool_rounds must be positive")
         self._max_tool_rounds = max_tool_rounds
+        if max_parallel_tool_calls <= 0:
+            raise ValueError("max_parallel_tool_calls must be positive")
+        self._max_parallel_tool_calls = max_parallel_tool_calls
+        self._batch: _ToolBatch | None = None
         if max_context_tokens <= 0:
             raise ValueError("max_context_tokens must be positive")
         self._max_context_tokens = max_context_tokens
@@ -423,6 +440,11 @@ class DirectResponsesRunner:
         extra = getattr(self._tools, "instructions", "")
         instructions = (
             f"{system_prompt.rstrip()}\n\n{extra}" if extra else system_prompt
+        )
+        instructions += (
+            f"\n\nRequest at most {self._max_parallel_tool_calls} independent tool calls "
+            "per response, including calls needing approval. They execute concurrently. "
+            "Calls that depend on another result must wait for a later model turn."
         )
         if self._full_access is not None:
             instructions += (
@@ -471,34 +493,34 @@ class DirectResponsesRunner:
     ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
         self._run_id = uuid4().hex
         self._model_calls = 0
+        result = None
         try:
             self._request_started()
-            return await self._run_loop(
+            result = await self._run_loop(
                 text,
                 model=model,
                 reasoning=reasoning,
                 system_prompt=system_prompt,
             )
+            return result
         except asyncio.CancelledError:
-            self._seal_pending_calls()
             self._trace_local_cancellation()
             raise
         except TimeoutError:
-            self._seal_pending_calls()
             self._trace.record(
                 "request_timeout",
                 {"timeout_seconds": self._request_timeout_seconds},
             )
             raise
         except Exception as exc:
-            self._seal_pending_calls()
             self._trace.record(
                 "request_error",
                 {"error": f"{type(exc).__name__}: {exc}"},
             )
             raise
         finally:
-            await self._close_request()
+            if not isinstance(result, ApprovalRequired):
+                await self._close_request()
 
     async def _run_loop(
         self,
@@ -526,7 +548,7 @@ class DirectResponsesRunner:
         system_prompt: str,
         tool_rounds: int,
     ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
-        summarize_only = False
+        summarize_only = tool_rounds > self._max_tool_rounds
         async with asyncio.timeout(self._request_timeout_seconds) as deadline:
             set_deadline = getattr(self._tools, "set_request_deadline", None)
             if callable(set_deadline):
@@ -579,7 +601,7 @@ class DirectResponsesRunner:
                     "input": list(transcript),
                     "tools": tools,
                     "reasoning": {"effort": reasoning},
-                    "parallel_tool_calls": False,
+                    "parallel_tool_calls": True,
                     "store": False,
                     "truncation": "disabled",
                 }
@@ -655,57 +677,46 @@ class DirectResponsesRunner:
                         )
                     self._transcript = transcript
                     return Completed(answer)
-                if len(calls) != 1:
-                    self._trace.record(
-                        "provider_protocol_error",
-                        {"function_call_count": len(calls)},
-                    )
-                    raise RuntimeError("provider returned multiple function calls")
                 self._transcript = transcript
                 if tool_rounds >= self._max_tool_rounds:
                     self._seal_pending_calls(not_attempted=True)
                     transcript = self._transcript
                     summarize_only = True
                     continue
-                call = calls[0]
-                output = await self._execute_tool(call)
-                if isinstance(output, ApprovalRequired):
-                    return ApprovalRequired(
-                        output.action,
-                        _ResponsesContinuation(
-                            transcript=tuple(transcript),
-                            call=call,
-                            tool_continuation=output.continuation,
-                            model=model,
-                            reasoning=reasoning,
-                            system_prompt=system_prompt,
-                            tool_rounds=tool_rounds,
-                        ),
-                    )
-                if not isinstance(output, str):
-                    raise TypeError("prepared tool output must be a string")
-                if len(output) > self._max_output_chars:
-                    raise RuntimeError(
-                        "prepared tool result exceeded configured output character limit"
-                    )
-                self._trace.record(
-                    "tool_result",
-                    {
-                        "name": str(call["name"]),
-                        "call_id": str(call["call_id"]),
-                        "output": output,
-                    },
+                remaining_calls = self._max_tool_rounds - tool_rounds
+                oversized = len(calls) > self._max_parallel_tool_calls
+                batch = _ToolBatch(
+                    [_BatchCall(call) for call in calls],
+                    model,
+                    reasoning,
+                    system_prompt,
+                    tool_rounds + len(calls),
                 )
-                transcript = [
-                    *transcript,
-                    {
-                        "type": "function_call_output",
-                        "call_id": str(call["call_id"]),
-                        "output": output,
-                    },
-                ]
-                self._transcript = transcript
-                tool_rounds += 1
+                self._batch = batch
+                for index, entry in enumerate(batch.calls):
+                    if oversized:
+                        entry.output = _tool_error(
+                            ValueError(
+                                f"Maximum {self._max_parallel_tool_calls} tool calls per response; "
+                                "no calls attempted. Submit a smaller batch."
+                            )
+                        )
+                    elif index >= remaining_calls:
+                        entry.output = json.dumps(
+                            {
+                                "outcome": "not_attempted",
+                                "reason": "Request tool-call allowance exhausted.",
+                            }
+                        )
+                    else:
+                        entry.task = asyncio.create_task(self._run_batch_call(entry))
+                pending = await self._resolve_batch(batch)
+                if pending is not None:
+                    return pending
+                transcript = self._transcript
+                tool_rounds = batch.tool_rounds
+                # Preserve the existing final model turn at the exact allowance.
+                summarize_only = tool_rounds > self._max_tool_rounds
 
     def _limit_result(self, answer: str = "") -> Incomplete:
         notice = f"I reached the limit of {self._max_tool_rounds} tool calls for this request."
@@ -800,31 +811,124 @@ class DirectResponsesRunner:
             },
         )
 
+    async def _run_batch_call(
+        self,
+        entry: _BatchCall,
+        *,
+        approved: bool | None = None,
+        full_access: bool = False,
+    ) -> str | ApprovalRequired:
+        proposal = entry.output
+        entry.output = None
+        entry.attempted = approved is not False
+        try:
+            # This bound survives the foreground returning an approval prompt.
+            # Approval waiting itself is outside this execution task.
+            async with asyncio.timeout(self._request_timeout_seconds):
+                if approved is None:
+                    output = await self._execute_tool(entry.call)
+                else:
+                    assert isinstance(proposal, ApprovalRequired)
+                    output = await self._tools.resume(
+                        proposal.continuation,
+                        approved=approved,
+                        **({"full_access": True} if full_access else {}),
+                    )
+        except Exception as exc:  # noqa: BLE001 - individual tool failures preserve siblings
+            self._trace.record(
+                "tool_error",
+                {
+                    "name": entry.call["name"],
+                    "call_id": entry.call["call_id"],
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            output = _tool_error(exc)
+        if isinstance(output, ApprovalRequired):
+            entry.attempted = False
+        else:
+            if not isinstance(output, str):
+                raise TypeError("prepared tool output must be a string")
+            if len(output) > self._max_output_chars:
+                raise RuntimeError(
+                    "prepared tool result exceeded configured output character limit"
+                )
+        entry.output = output
+        return output
+
+    async def _resolve_batch(self, batch: _ToolBatch) -> ApprovalRequired | None:
+        # Give every newly authorized task a chance to enter before a prompt returns.
+        await asyncio.sleep(0)
+        while True:
+            for index, entry in enumerate(batch.calls):
+                if entry.task is not None and entry.task.done():
+                    entry.task.result()
+                    entry.task = None
+                if isinstance(entry.output, ApprovalRequired):
+                    if self._full_access and self._full_access():
+                        entry.task = asyncio.create_task(
+                            self._run_batch_call(
+                                entry,
+                                approved=True,
+                                full_access=True,
+                            )
+                        )
+                        # Claim the proposal before inspecting it again.
+                        await asyncio.sleep(0)
+                    else:
+                        return ApprovalRequired(
+                            entry.output.action, _ResponsesContinuation(batch, index)
+                        )
+            tasks = [entry.task for entry in batch.calls if entry.task is not None]
+            if not tasks:
+                self._finish_batch(batch)
+                return None
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    def _finish_batch(self, batch: _ToolBatch) -> None:
+        for entry in batch.calls:
+            output = entry.output
+            if not isinstance(output, str):
+                output = json.dumps(
+                    {
+                        "outcome": "unknown" if entry.attempted else "not_attempted",
+                        "reason": "Request stopped; verify uncertain outcomes before retrying.",
+                    }
+                )
+            self._trace.record(
+                "tool_result",
+                {
+                    "name": entry.call["name"],
+                    "call_id": entry.call["call_id"],
+                    "output": output,
+                },
+            )
+            self._transcript.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": entry.call["call_id"],
+                    "output": output,
+                }
+            )
+        self._batch = None
+
     def cancel_pending(self, continuation: object) -> None:
         if not isinstance(continuation, _ResponsesContinuation):
             raise TypeError("invalid Responses approval continuation")
-        call = continuation.call
-        output = json.dumps({"cancelled": True}, sort_keys=True, separators=(",", ":"))
-        self._trace.record(
-            "pending_action_cancelled",
-            {"name": str(call["name"]), "call_id": str(call["call_id"])},
-        )
-        self._trace.record(
-            "tool_result",
-            {
-                "name": str(call["name"]),
-                "call_id": str(call["call_id"]),
-                "output": output,
-            },
-        )
-        self._transcript = [
-            *continuation.transcript,
-            {
-                "type": "function_call_output",
-                "call_id": str(call["call_id"]),
-                "output": output,
-            },
-        ]
+        if continuation.batch is self._batch:
+            for entry in continuation.batch.calls:
+                if (
+                    entry.task is not None
+                    and not entry.task.done()
+                    and not entry.task.cancelling()
+                ):
+                    entry.task.cancel()
+
+    async def cancel_request(self) -> None:
+        """Drain retained work even when no inbound-message task owns it."""
+        async with self._request_lock:
+            if self._batch is not None:
+                await self._close_request()
 
     async def resume(
         self, decision: ApprovalDecision, continuation: object
@@ -835,86 +939,52 @@ class DirectResponsesRunner:
     async def _resume_request(
         self, decision: ApprovalDecision, continuation: object
     ) -> Completed | ApprovalRequired | ContextLimitReached | Incomplete:
+        if (
+            not isinstance(continuation, _ResponsesContinuation)
+            or continuation.batch is not self._batch
+        ):
+            raise ValueError("stale Responses approval continuation")
+        batch = continuation.batch
+        entry = batch.calls[continuation.index]
+        if not isinstance(entry.output, ApprovalRequired) or entry.task is not None:
+            raise ValueError("Responses approval already resolved")
+        result = None
         try:
-            if not isinstance(continuation, _ResponsesContinuation):
-                raise TypeError("invalid Responses approval continuation")
-            call = continuation.call
-            if decision is ApprovalDecision.REJECT:
-                try:
-                    output = await self._tools.resume(
-                        continuation.tool_continuation, approved=False
+            async with asyncio.timeout(self._request_timeout_seconds):
+                entry.task = asyncio.create_task(
+                    self._run_batch_call(
+                        entry,
+                        approved=decision is not ApprovalDecision.REJECT,
+                        full_access=bool(self._full_access and self._full_access()),
                     )
-                except Exception as exc:  # noqa: BLE001 - errors continue via model
-                    self._trace.record(
-                        "tool_error",
-                        {
-                            "name": str(call["name"]),
-                            "call_id": str(call["call_id"]),
-                            "error": f"{type(exc).__name__}: {exc}",
-                        },
-                    )
-                    output = _tool_error(exc)
-            else:
-                try:
-                    output = await self._tools.resume(
-                        continuation.tool_continuation, approved=True
-                    )
-                except Exception as exc:  # noqa: BLE001 - errors continue via model
-                    self._trace.record(
-                        "tool_error",
-                        {
-                            "name": str(call["name"]),
-                            "call_id": str(call["call_id"]),
-                            "error": f"{type(exc).__name__}: {exc}",
-                        },
-                    )
-                    output = _tool_error(exc)
-            if len(output) > self._max_output_chars:
-                raise RuntimeError(
-                    "prepared tool result exceeded configured output character limit"
                 )
-            self._trace.record(
-                "tool_result",
-                {
-                    "name": str(call["name"]),
-                    "call_id": str(call["call_id"]),
-                    "output": output,
-                },
+                result = await self._resolve_batch(batch)
+            if result is not None:
+                return result
+            result = await self._continue_loop(
+                self._transcript,
+                model=batch.model,
+                reasoning=batch.reasoning,
+                system_prompt=batch.system_prompt,
+                tool_rounds=batch.tool_rounds,
             )
-            transcript = [
-                *continuation.transcript,
-                {
-                    "type": "function_call_output",
-                    "call_id": str(call["call_id"]),
-                    "output": output,
-                },
-            ]
-            self._transcript = transcript
-            return await self._continue_loop(
-                transcript,
-                model=continuation.model,
-                reasoning=continuation.reasoning,
-                system_prompt=continuation.system_prompt,
-                tool_rounds=continuation.tool_rounds + 1,
-            )
+            return result
         except asyncio.CancelledError:
-            self._seal_pending_calls()
             self._trace_local_cancellation()
             raise
         except TimeoutError:
-            self._seal_pending_calls()
             self._trace.record(
                 "request_timeout", {"timeout_seconds": self._request_timeout_seconds}
             )
             raise
         except Exception as exc:
-            self._seal_pending_calls()
             self._trace.record(
                 "request_error", {"error": f"{type(exc).__name__}: {exc}"}
             )
             raise
         finally:
-            await self._close_request()
+            if not isinstance(result, ApprovalRequired):
+                await self._close_request()
 
     def _request_started(self) -> None:
         callback = getattr(self._tools, "request_started", None)
@@ -922,6 +992,29 @@ class DirectResponsesRunner:
             callback()
 
     async def _close_request(self) -> None:
+        # A slash command can cancel the foreground again during timeout cleanup.
+        # Keep that second cancellation from interrupting a tool's resource drain.
+        cleanup = asyncio.create_task(self._drain_request())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _drain_request(self) -> None:
+        batch = self._batch
+        if batch is not None:
+            tasks = [entry.task for entry in batch.calls if entry.task is not None]
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._finish_batch(batch)
+        self._seal_pending_calls()
         callback = getattr(self._tools, "close_request", None)
         if not callable(callback):
             return
@@ -1043,6 +1136,7 @@ def build_direct_responses_runner(
         trace=sink,
         request_timeout_seconds=config.request_timeout_seconds,
         max_tool_rounds=config.max_tool_rounds,
+        max_parallel_tool_calls=config.max_parallel_tool_calls,
         max_context_tokens=config.max_context_tokens,
         max_output_chars=config.max_output_chars,
         full_access=full_access,

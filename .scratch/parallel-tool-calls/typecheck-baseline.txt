@@ -1,0 +1,49 @@
+<baseline>\src\jarvis_personal_runtime\config.py:758:16: warning[redundant-cast] Value is already of type `WebSearchConfig`
+<baseline>\src\jarvis_personal_runtime\google.py:802:24: error[unresolved-attribute] Attribute `casefold` is not defined on `None` in union `str | None`
+<baseline>\src\jarvis_personal_runtime\google.py:808:37: error[invalid-argument-type] Argument to function `_header_addresses` is incorrect: Expected `str`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\google.py:1117:17: error[invalid-argument-type] Argument to bound method `AsyncClient.request` is incorrect: Expected `Mapping[str, Sequence[str | float | None] | float | None] | list[tuple[str, str | float | None]] | tuple[tuple[str, str | float | None], ...] | ... omitted 3 union elements`, found `Mapping[str, object] | None`
+<baseline>\src\jarvis_personal_runtime\google.py:1137:21: error[invalid-argument-type] Argument to bound method `AsyncClient.request` is incorrect: Expected `Mapping[str, Sequence[str | float | None] | float | None] | list[tuple[str, str | float | None]] | tuple[tuple[str, str | float | None], ...] | ... omitted 3 union elements`, found `Mapping[str, object] | None`
+<baseline>\src\jarvis_personal_runtime\mcp.py:772:69: error[invalid-argument-type] Argument to function `sorted` is incorrect: Argument type `object` does not satisfy upper bound `SupportsDunderLT[Any] | SupportsDunderGT[Any]` of type variable `SupportsRichComparisonT`
+<baseline>\src\jarvis_personal_runtime\mcp.py:783:29: error[unsupported-operator] Operator `not in` is not supported between two objects of type `object`
+<baseline>\src\jarvis_personal_runtime\mcp.py:788:17: error[unsupported-operator] Operator `<` is not supported between objects of type `int` and `object`
+<baseline>\src\jarvis_personal_runtime\mcp.py:793:17: error[unsupported-operator] Operator `>` is not supported between objects of type `int` and `object`
+<baseline>\src\jarvis_personal_runtime\mcp.py:797:55: error[unsupported-operator] Operator `<` is not supported between objects of type `int & ~bool` and `object`
+<baseline>\src\jarvis_personal_runtime\mcp.py:799:55: error[unsupported-operator] Operator `>` is not supported between objects of type `int & ~bool` and `object`
+<baseline>\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `int`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\openwa.py:75:20: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `str | None`
+<baseline>\src\jarvis_personal_runtime\responses.py:58:9: error[invalid-argument-type] Argument to function `canonical_context` is incorrect: Expected `tuple[dict[str, object], ...] | list[dict[str, object]]`, found `object`
+<baseline>\src\jarvis_personal_runtime\responses.py:59:9: error[invalid-argument-type] Argument to function `canonical_context` is incorrect: Expected `tuple[dict[str, object], ...] | list[dict[str, object]]`, found `object`
+<baseline>\src\jarvis_personal_runtime\responses.py:327:25: error[no-matching-overload] No overload matches arguments
+<baseline>\src\jarvis_personal_runtime\responses.py:513:13: error[invalid-argument-type] Argument to bound method `DirectResponsesRunner._continue_loop` is incorrect: Expected `list[dict[str, object]]`, found `list[dict[str, object] | dict[str, str]]`
+<baseline>\src\jarvis_personal_runtime\responses.py:556:58: error[invalid-argument-type] Argument is incorrect: Expected `dict[str, object]`, found `dict[str, str | list[dict[str, object]]]`
+<baseline>\src\jarvis_personal_runtime\responses.py:598:29: error[unsupported-operator] Operator `-` is not supported between objects of type `float | None` and `float`
+<baseline>\src\jarvis_personal_runtime\responses.py:762:45: error[invalid-argument-type] Argument to bound method `TraceSink.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str]`
+<baseline>\src\jarvis_personal_runtime\responses.py:774:41: error[invalid-argument-type] Argument to bound method `TraceSink.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str | (Any & dict[Unknown, Unknown])]`
+<baseline>\src\jarvis_personal_runtime\responses.py:782:60: error[invalid-argument-type] Argument to bound method `TraceSink.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str | (Any & dict[Unknown, Unknown])]`
+<baseline>\src\jarvis_personal_runtime\responses.py:892:13: error[invalid-assignment] Object of type `list[dict[str, object] | dict[str, str]]` is not assignable to attribute `_transcript` of type `list[dict[str, object]]`
+<baseline>\src\jarvis_personal_runtime\responses.py:894:17: error[invalid-argument-type] Argument to bound method `DirectResponsesRunner._continue_loop` is incorrect: Expected `list[dict[str, object]]`, found `list[dict[str, object] | dict[str, str]]`
+<baseline>\src\jarvis_personal_runtime\responses.py:984:17: error[invalid-argument-type] Argument to bound method `list.append` is incorrect: Expected `PreparedTools`, found `ReadVaultTool`
+<baseline>\src\jarvis_personal_runtime\responses.py:1006:17: error[invalid-argument-type] Argument to `RunTerminalTool.__init__` is incorrect: Expected `CommandExecutor`, found `NativeUbuntuExecutor`
+<baseline>\src\jarvis_personal_runtime\runtime.py:453:25: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
+<baseline>\src\jarvis_personal_runtime\runtime.py:454:29: error[unresolved-attribute] Attribute `pending` is not defined on `None` in union `_Session | None`
+<baseline>\src\jarvis_personal_runtime\runtime.py:500:46: error[index-out-of-bounds] Index 2 is out of bounds for tuple `tuple[str, object]` with length 2
+<baseline>\src\jarvis_personal_runtime\runtime.py:934:9: error[invalid-argument-type] Argument to `PersonalRuntime.__init__` is incorrect: Expected `PermissionStore | None`, found `TomlPermissionStore`
+<baseline>\src\jarvis_personal_runtime\service.py:199:9: error[invalid-argument-type] Argument to function `build_direct_responses_runner` is incorrect: Expected `tuple[PreparedTools, ...]`, found `tuple[ReminderTools, *tuple[ConfiguredMcpService, ...]] | tuple[ReminderTools, GoogleApiTools]`
+<baseline>\src\jarvis_personal_runtime\terminal.py:205:22: error[no-matching-overload] No overload of `dict.__init__` matches arguments
+<baseline>\src\jarvis_personal_runtime\terminal.py:228:48: error[invalid-argument-type] Argument to bound method `CommandPermissions.matches` is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\terminal.py:265:31: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\terminal.py:266:38: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\terminal.py:268:40: error[invalid-argument-type] Argument to bound method `RunTerminalTool.run_approved` is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\terminal.py:285:58: error[invalid-argument-type] Argument to bound method `TerminalTrace.record` is incorrect: Expected `dict[str, object]`, found `dict[str, str | float]`
+<baseline>\src\jarvis_personal_runtime\terminal.py:299:17: error[invalid-argument-type] Argument to bound method `TerminalTrace.record` is incorrect: Expected `dict[str, object]`, found `dict[str, float | str]`
+<baseline>\src\jarvis_personal_runtime\vault_git.py:739:42: error[invalid-argument-type] Argument to function `_encode_note` is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\vault_git.py:763:21: error[invalid-argument-type] Argument is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\vault_git.py:768:53: error[invalid-argument-type] Argument to function `_display_diff` is incorrect: Expected `str`, found `object`
+<baseline>\src\jarvis_personal_runtime\web_worker.py:166:5: error[invalid-mutable-override] Invalid override of attribute `server`: Override does not accept writes of type `BaseServer`
+<baseline>\src\jarvis_personal_runtime\web_worker.py:748:13: error[unresolved-attribute] Attribute `execute_script` is not defined on `None` in union `Any | None`
+<baseline>\src\jarvis_personal_runtime\web_worker.py:756:16: error[unresolved-attribute] Attribute `execute_script` is not defined on `None` in union `Any | None`
+Found 48 diagnostics

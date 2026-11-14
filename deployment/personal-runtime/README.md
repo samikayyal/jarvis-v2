@@ -553,3 +553,20 @@ preserve evidence and do not repeatedly recreate or re-pair OpenWA.
 The runtime trace is verbatim and may contain message text, tool payloads,
 terminal output, and credentials supplied in conversation. Keep the runtime root
 private and exclude it from ordinary source-control and log collection.
+
+## Parallel tool calls candidate
+
+Ticket 01 adds `runtime.max_parallel_tool_calls` (positive integer, default 5).
+It counts every call requested in a main-model response, including approval
+proposals. Keep `max_tool_rounds` as the cumulative individual-call allowance.
+The runtime supplies the configured limit and independence rule to the model;
+no copied numeric limit is needed in the editable SYSTEM.md.
+
+Approval waiting now retains running sibling calls and reader resources. Cancel,
+new session and shutdown drain them. Human waiting does not consume the model-loop
+timeout; each active call retains execution bounds. Inspect individual call IDs
+and results before retrying an uncertain action.
+
+This documents candidate source, not a deployment. Ticket 02 must commit/push,
+verify the exact candidate SHA on GitHub, deploy that source, and perform visible
+WhatsApp acceptance before recording the new behavior as active.

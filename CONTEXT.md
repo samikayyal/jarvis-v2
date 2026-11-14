@@ -58,7 +58,7 @@ asking the model to interpret it. The supported commands are `/help`, `/new`,
 _Avoid_: Prompt, prepared tool, ordinary request
 
 **Ordinary request**:
-Admitted text that is not a deterministic command and enters the sequential
+Admitted text that is not a deterministic command and enters the
 model-and-tool loop.
 _Avoid_: Background task, queued request
 
@@ -128,11 +128,18 @@ OS permissions, and connected-account limits.
 _Avoid_: Saved permission, permanent authorization, operating-system privilege
 
 **Model-and-tool loop**:
-The sequential direct OpenAI Responses cycle that sends the complete current
-working-session transcript, executes one prepared tool call at a time, returns
-tool results, and ends with operator-facing text. Parallel tool calling is
-disabled.
+The direct OpenAI Responses cycle that sends the complete current working-session
+transcript, executes a bounded batch of independent prepared calls concurrently,
+returns their results together in call order, and ends with operator-facing text.
+Calls depending on another result wait for a later model turn.
 _Avoid_: Deterministic command, provider conversation object
+
+**Tool batch**:
+All prepared calls requested in one main-model response, including approval
+proposals. The configurable maximum defaults to five; an oversized batch executes
+nothing and returns an error for every call. One retained batch owns running work
+and results while a single pending action is displayed.
+_Avoid_: Request queue, dependency scheduler, reader assignment
 
 **Prepared tool**:
 One deliberately implemented operation exposed to the model-and-tool loop. The
@@ -232,7 +239,8 @@ _Avoid_: Sanitized application log, hidden model reasoning
 - The webhook authenticates the exact raw body and acknowledges promptly.
   Excluded or malformed traffic is ignored before runtime work.
 - There is one working session, at most one active request, and at most one
-  pending action. There is no request queue or parallel main-tool execution. Delegated reader assignments can run concurrently while the main loop continues sequentially.
+  pending action. There is no request queue. Independent main calls run concurrently
+  within one retained batch; each page reader keeps its sequential browser-action loop.
 - Runtime sessions are memory-only. Restart discards the working session, active
   request, and pending action; nothing resumes or replays.
 - The seven-day OpenWA message-ID cache prevents duplicate admission. It is not
@@ -281,8 +289,10 @@ _Avoid_: Sanitized application log, hidden model reasoning
   through address checks before connections, including redirects, without
   Workspace or OpenWA credentials. Findings and material uncertainty are assessed
   by the agents; execution completion does not establish semantic verification.
-- Main-request completion, suspension, timeout and cancellation stop reader work
-  and close its browsers. Completed findings survive in the working session.
+- Main-request completion, timeout and cancellation stop reader work
+  and close its browsers. Approval waiting retains the batch and readers; active
+  calls and reader assignments keep their execution limits. Human waiting does not
+  consume the model-loop timeout. Completed findings survive in the working session.
   Session reset discards all reader state; release explicitly frees retention
   capacity. Browser reclamation preserves conversations and discloses lost state.
 - Lengthy active requests receive factual progress after roughly 20 seconds, then
@@ -303,6 +313,20 @@ _Avoid_: Sanitized application log, hidden model reasoning
 | `SYSTEM.md` | Editable assistant instruction | Credentials, saved permissions |
 | Dedicated vault clone | Configured Markdown notes and the exact Git history used for vault reads and writes | Application checkout, OpenWA data, arbitrary terminal writes |
 | Runtime data directory | Reminder SQLite database, seven-day deduplication cache, and verbatim rotating trace | OpenWA data or pairing state |
+
+## Main-tool concurrency source and deployment
+
+The 2026-11-09 design interview selected concurrent execution of independent
+main-tool calls with a configurable maximum of five requested calls per model
+response, including calls needing approval. Authorized work continues while one
+pending action is shown. See [ADR 0006](docs/adr/0006-parallel-main-tool-calls.md)
+and the [consolidated design](.scratch/parallel-tool-calls/spec.md).
+Ticket 01 implements this behavior in source. Every requested call counts toward
+the request allowance, including rejected oversized batches. Approval decisions
+start exact actions once, without waiting for siblings; cancel, reset and shutdown
+drain retained work. Known results survive cancellation and uncertain effects are
+never replayed automatically. Deployment and visible WhatsApp acceptance remain
+separate work in ticket 02; this source change does not establish a new active release.
 
 ## Operational definition of active
 

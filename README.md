@@ -4,7 +4,7 @@ Jarvis is a single-operator personal assistant that runs as one native Python
 service on Ubuntu. A separately operated OpenWA messaging gateway hands direct
 WhatsApp messages to the runtime, which admits only text from the configured
 authorized operator. Deterministic slash commands are handled locally; other
-admitted text becomes an ordinary request in a sequential OpenAI Responses
+admitted text becomes an ordinary request in a direct OpenAI Responses
 model-and-tool loop.
 
 Send `/status` to see the working session, model, active work, saved permission
@@ -97,3 +97,23 @@ database, seven-day message-ID cache, saved permissions, and rotating verbatim
 JSON Lines trace are the runtime-owned durable state.
 
 Canonical domain language and trust boundaries live in [`CONTEXT.md`](CONTEXT.md).
+
+## Parallel main-tool calls
+
+Source supports concurrent independent prepared calls, including authorized terminal
+commands and writes. `[runtime].max_parallel_tool_calls` defaults to 5 and counts
+all requested calls, including approvals. Oversized responses execute nothing and
+return an error per call. Each requested call also spends the cumulative
+`max_tool_rounds` allowance, bounding correction attempts. Dependent work waits for
+a later model turn; results return together in original call order.
+
+One approval remains visible while authorized siblings continue. Approval starts
+that exact action once and can immediately reveal the next proposal. Human waiting
+has no expiry; active calls keep their tool limits and a request-timeout execution
+bound. Cancel, session reset and shutdown drain retained tasks and readers. Search
+serializes its shared browser and allowance accounting; vault operations retain
+their existing clone lock. Reader browser actions and capacity limits are unchanged.
+
+This is source behavior from [ticket 01](.scratch/parallel-tool-calls/issues/01-execute-parallel-tools-through-approvals.md).
+Deployment and live WhatsApp measurements belong to ticket 02; local tests do not
+establish that the active Ubuntu release has this behavior.

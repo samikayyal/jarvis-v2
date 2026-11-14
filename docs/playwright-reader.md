@@ -31,7 +31,8 @@ blocked service workers, downloads and WebSockets, and no operator profile.
 
 Normal service assembly uses the configured independent reader model through the
 same provider adapter with automatic retries disabled. No additional-tools setup
-is needed. Main tool calls stay sequential while reader tasks run independently.
+is needed. Independent main tool calls can run concurrently within the configured batch
+limit, while each reader retains its sequential browser-action loop.
 The default-assembly integration fixture starts two readers, reads vault context
 while they work, synthesizes a concise answer, releases one conversation, and
 checks that remaining browsers close while completed findings survive.
@@ -81,8 +82,9 @@ Retired reader configuration keys are rejected explicitly; remove them before
 activating a replacement release, as described in the deployment runbook.
 
 Completed browsers remain open through the containing request. Main completion,
-timeout, approval suspension or cancellation cancels unfinished work and closes all
-reader resources. Completed findings and conversations remain collectable across
+timeout or cancellation cancels unfinished work and closes all
+reader resources. Approval waiting retains readers and their browsers; assignments
+keep their existing execution deadlines. Completed findings and conversations remain collectable across
 ordinary requests in the working session; later follow-ups explicitly reopen a
 fresh browser. `/cancel` retains completed findings. `/new`, inactivity reset,
 main-context reset and restart discard all readers and close resources. Cleanup

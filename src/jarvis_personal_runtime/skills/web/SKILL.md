@@ -29,8 +29,9 @@ no private tools, recursive delegation, arbitrary code or web-search tool.
 Public website search, filters and calculators are available within its browser.
 
 Start returns immediately with a reader_id. Start independent investigations up
-to the returned capacity and continue useful main work while they run. Main tool
-calls remain sequential. `browser_reader_status(reader_id)` collects the current
+to the returned capacity and continue useful main work while they run. Independent main tool
+calls can share a response within the runtime-provided batch limit. Calls needing
+another result belong in a later turn; each reader keeps sequential browser actions. `browser_reader_status(reader_id)` collects the current
 state and available findings independently of other readers. When there is no
 other useful work, use `wait_browser_reader(reader_id, seconds)` for up to 30
 seconds; avoid rapid status polling. Collect completed readers without waiting
@@ -48,7 +49,8 @@ Use `cancel_browser_reader(reader_id)` to stop unnecessary work. Use
 retention capacity; released IDs expire. At capacity, explicitly release a reader
 or collect existing work; there is no hidden queue or silent conversation eviction.
 The runtime cancels remaining assignments and closes browsers at main-request
-completion, approval suspension or cancellation. Completed findings survive in the
+completion, timeout or cancellation. Approval waiting keeps readers alive within
+their execution limits. Completed findings survive in the
 working session. Later follow-ups reopen a browser and disclose lost interactive
 state. `/new`, expiry, context reset and restart discard reader conversations.
 

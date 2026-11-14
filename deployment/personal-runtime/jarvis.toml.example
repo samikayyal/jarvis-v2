@@ -7,6 +7,8 @@ inactivity_minutes = 60
 max_context_tokens = 100000
 request_timeout_seconds = 600
 max_tool_rounds = 8
+# Maximum requested calls per model response, including approvals.
+max_parallel_tool_calls = 5
 command_timeout_seconds = 300
 max_output_chars = 65536
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from functools import wraps
 
 import httpx
@@ -172,9 +173,11 @@ async def test_exact_context_limit_ends_session_before_initial_provider_call() -
 
     assert isinstance(result, ContextLimitReached)
     assert responses.calls == []
+    assert str(observed[0]["instructions"]).startswith("Help.\n")
+    assert "at most 5" in str(observed[0]["instructions"])
     assert observed == [
         {
-            "instructions": "Help.",
+            "instructions": observed[0]["instructions"],
             "tools": [],
             "input": [{"role": "user", "content": "Hi"}],
         }
@@ -252,7 +255,11 @@ async def test_oversized_final_text_is_rejected_without_entering_transcript() ->
     request, _ = responses.calls[-1]
     assert request["input"] == [{"role": "user", "content": "Second"}]
     assert runner.context_tokens(system_prompt="Help.") == local_input_tokens(
-        {"instructions": "Help.", "tools": [], "input": request["input"]}
+        {
+            "instructions": request["instructions"],
+            "tools": [],
+            "input": request["input"],
+        }
     )
 
 
@@ -298,13 +305,14 @@ async def test_final_text_uses_the_direct_stateless_responses_contract() -> None
 
     assert result.reply == "Hello"
     request, timeout = responses.calls[0]
+    assert str(request["instructions"]).startswith("Be useful.\n")
     assert request == {
         "model": "gpt-6-luna",
-        "instructions": "Be useful.",
+        "instructions": request["instructions"],
         "input": [{"role": "user", "content": "Hi"}],
         "tools": [],
         "reasoning": {"effort": "medium"},
-        "parallel_tool_calls": False,
+        "parallel_tool_calls": True,
         "store": False,
         "truncation": "disabled",
     }
@@ -350,7 +358,7 @@ async def test_one_tool_call_replays_complete_output_before_exact_result() -> No
     assert result.reply == "I found it."
     assert tools.calls == [("read_vault", {"query": "roadmap"})]
     continuation, _ = responses.calls[1]
-    assert continuation["instructions"] == "Use tools."
+    assert str(continuation["instructions"]).startswith("Use tools.\n")
     assert continuation["input"] == [
         {"role": "user", "content": "Find it"},
         reasoning_item,
@@ -460,7 +468,7 @@ async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -
     assert isinstance(pending, ApprovalRequired)
     assert runner.context_tokens(system_prompt="Use tools.") == local_input_tokens(
         {
-            "instructions": "Use tools.",
+            "instructions": responses.calls[0][0]["instructions"],
             "tools": list(ApprovalTools.definitions),
             "input": responses.calls[0][0]["input"]
             + [responses_module._replay_output_item(function_call)],
@@ -468,6 +476,7 @@ async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -
     )
 
     runner.cancel_pending(pending.continuation)
+    await runner.cancel_request()
     result = await runner.run(
         "Continue", model="gpt-6-astra", reasoning="high", system_prompt="Use tools."
     )
@@ -486,13 +495,18 @@ async def test_cancelling_pending_action_keeps_next_request_transcript_valid() -
         {
             "type": "function_call_output",
             "call_id": "call_pending",
-            "output": '{"cancelled":true}',
+            "output": json.dumps(
+                {
+                    "outcome": "not_attempted",
+                    "reason": "Request stopped; verify uncertain outcomes before retrying.",
+                }
+            ),
         },
         {"role": "user", "content": "Continue"},
     ]
     assert runner.context_tokens(system_prompt="Use tools.") == local_input_tokens(
         {
-            "instructions": "Use tools.",
+            "instructions": responses.calls[0][0]["instructions"],
             "tools": list(ApprovalTools.definitions),
             "input": continuation["input"],
         }
@@ -619,39 +633,34 @@ async def test_response_without_tool_call_or_final_text_is_rejected() -> None:
 
 
 @async_test
-async def test_multiple_function_calls_are_traced_and_rejected_without_execution() -> (
-    None
-):
+async def test_multiple_function_calls_preserve_complete_provider_output() -> None:
+    reasoning = {
+        "type": "reasoning",
+        "id": "reason",
+        "encrypted_content": "opaque",
+        "summary": [],
+    }
     calls = tuple(
         {
             "type": "function_call",
-            "call_id": f"call_{index}",
+            "call_id": f"call_{i}",
             "name": "read_vault",
             "arguments": "{}",
         }
-        for index in range(2)
+        for i in range(2)
     )
-    responses = FakeResponses(ResponsesResult(output=calls, output_text=""))
+    responses = FakeResponses(
+        ResponsesResult(output=(reasoning, *calls), output_text=""),
+        ResponsesResult(output=(), output_text="Done"),
+    )
     tools = FakeTools()
-    trace = MemoryTrace()
-    runner = DirectResponsesRunner(
-        responses,
-        tools=tools,
-        trace=trace,
-        request_timeout_seconds=30,
-        max_tool_rounds=2,
+    runner = DirectResponsesRunner(responses, tools=tools, request_timeout_seconds=30)
+    result = await runner.run(
+        "Read twice", model="gpt-6-luna", reasoning="medium", system_prompt="Help."
     )
-
-    with pytest.raises(RuntimeError, match="multiple function calls"):
-        await runner.run(
-            "Read twice",
-            model="gpt-6-luna",
-            reasoning="medium",
-            system_prompt="Help.",
-        )
-
-    assert tools.calls == []
-    assert ("provider_protocol_error", {"function_call_count": 2}) in trace.events
+    assert result.reply == "Done"
+    assert len(tools.calls) == 2
+    assert responses.calls[1][0]["input"][1:4] == [reasoning, *calls]
 
 
 @async_test
@@ -713,7 +722,7 @@ async def test_current_session_history_and_each_turns_overrides_are_replayed() -
     request, _ = responses.calls[1]
     assert request["model"] == "gpt-6-astra"
     assert request["reasoning"] == {"effort": "max"}
-    assert request["instructions"] == "Always."
+    assert str(request["instructions"]).startswith("Always.\n")
     assert request["input"] == [
         {"role": "user", "content": "One"},
         first_message,

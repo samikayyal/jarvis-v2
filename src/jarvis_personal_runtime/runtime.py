@@ -442,6 +442,7 @@ class PersonalRuntime:
                 "/disconnect google",
                 "/status",
                 "/new",
+                "/cancel",
             }
             if immediate_command:
                 return await self._command(message.text, now)
@@ -501,8 +502,19 @@ class PersonalRuntime:
 
     async def close(self) -> None:
         async with self._lock:
-            task = self._clear_session()
+            await self._stop_request()
+            self._clear_session()
+
+    async def _stop_request(self) -> None:
+        task = (
+            self._session.active.task
+            if self._session and self._session.active
+            else None
+        )
         await _cancel_task(task)
+        cancel_request = getattr(self.request_runner, "cancel_request", None)
+        if callable(cancel_request):
+            await cancel_request()
 
     def _claim_modal(self, text: str, now: datetime) -> tuple[str, object] | None:
         assert self._session is not None and self._session.pending is not None
@@ -719,10 +731,9 @@ class PersonalRuntime:
                 RuntimeDisposition.COMMAND, (self.connections.disconnect(),)
             )
         if command == "/new" and not args:
-            task = self._clear_session()
+            await self._stop_request()
+            self._clear_session()
             self._ensure_session(now)
-            if task and task is not asyncio.current_task():
-                task.cancel()
             return self._result(
                 RuntimeDisposition.NEW_SESSION, ("Started a new working session.",)
             )
@@ -734,9 +745,10 @@ class PersonalRuntime:
                     or self._session.pending is not None
                 )
             )
-            task = self._cancel_work(now)
-            if task and task is not asyncio.current_task():
-                task.cancel()
+            if self._session and self._session.pending:
+                self.request_runner.cancel_pending(self._session.pending.continuation)
+            await self._stop_request()
+            self._cancel_work(now)
             return self._result(
                 RuntimeDisposition.CANCELLED
                 if had_work

@@ -32,6 +32,7 @@ def runtime_context(
         "ubuntu_working_directory": str(config.ubuntu_working_directory),
         "windows_terminal_configured": config.windows_ssh_host is not None,
         "max_tool_calls_per_request": config.max_tool_rounds,
+        "max_parallel_tool_calls": config.max_parallel_tool_calls,
         "max_context_tokens": config.max_context_tokens,
     }
     return (

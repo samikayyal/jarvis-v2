@@ -3,8 +3,8 @@
 The normal web skill combines the existing Selenium-backed Google organic search
 with concurrent Playwright page readers. Search discovery stays in the main
 assistant; full page investigation stays in isolated reader conversations. The
-main Responses loop executes tools sequentially while delegated readers work
-concurrently. OpenWA remains the messaging gateway.
+main Responses loop executes independent prepared calls concurrently within its
+configured batch limit. Each reader keeps sequential browser actions. OpenWA remains the messaging gateway.
 
 ## Search contract
 
@@ -23,7 +23,9 @@ sources/text do not spend evidence allowance. JSON output stays bounded by the
 runtime output limit. Results report remaining query/text allowances and precise
 failure or limit outcomes. No_results, blocking, extraction failure, unavailable
 workers and allowance exhaustion remain distinct. Quick-to-moderate upgrades and
-approval continuations preserve consumption. New ordinary requests reset usage.
+approval continuations preserve consumption. A tool-owned lock serializes whole
+searches so shared browser, block state and evidence accounting stay consistent.
+New ordinary requests reset usage.
 Legacy quick/moderate max_pages settings remain accepted, but do not constrain
 reader navigation or introduce a reader page counter.
 
@@ -44,8 +46,9 @@ public URL/DNS/redirect proxy, fresh HOME/profile, download restrictions, Google
 script policy and challenge checks remain. Missing binaries fail explicitly;
 the runtime never installs a browser or driver during a request.
 
-Completion, suspension, failure, timeout and cancellation close search workers;
-cleanup is drained before a new request can acquire resources. No operator
+Completion, failure, timeout and cancellation close search workers;
+approval waiting retains workers and readers while active execution limits remain
+in force. Cleanup is drained before a new request can acquire resources. No operator
 browser profile, Workspace token or OpenWA pairing state is reused. Direct page
 reading is handled by [concurrent readers](page-reader.md), which have their own
 assignment, browser-context and conversation limits. They retain browser actions

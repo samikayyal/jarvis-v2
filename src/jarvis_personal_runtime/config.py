@@ -173,6 +173,7 @@ class _RuntimeDefaults(TypedDict):
     max_context_tokens: int
     request_timeout_seconds: float
     max_tool_rounds: int
+    max_parallel_tool_calls: int
     command_timeout_seconds: float
     max_output_chars: int
     ubuntu_working_directory: str
@@ -215,6 +216,7 @@ DEFAULTS: _RuntimeDefaults = cast(
             "max_context_tokens": 100_000,
             "request_timeout_seconds": 600,
             "max_tool_rounds": 8,
+            "max_parallel_tool_calls": 5,
             "command_timeout_seconds": 300,
             "max_output_chars": 65_536,
             "ubuntu_working_directory": ".",
@@ -378,6 +380,7 @@ class RuntimeConfig:
     max_context_tokens: int = DEFAULTS["max_context_tokens"]
     request_timeout_seconds: float = DEFAULTS["request_timeout_seconds"]
     max_tool_rounds: int = DEFAULTS["max_tool_rounds"]
+    max_parallel_tool_calls: int = DEFAULTS["max_parallel_tool_calls"]
     command_timeout_seconds: float = DEFAULTS["command_timeout_seconds"]
     max_output_chars: int = DEFAULTS["max_output_chars"]
     ubuntu_working_directory: Path = Path(DEFAULTS["ubuntu_working_directory"])
@@ -496,6 +499,7 @@ _RUNTIME_KEYS = {
     "request_timeout_seconds",
     "request_timeout",
     "max_tool_rounds",
+    "max_parallel_tool_calls",
     "command_timeout_seconds",
     "command_timeout",
     "max_output_chars",
@@ -1161,6 +1165,11 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_tool_rounds = _setting(
             values, "max_tool_rounds", default=DEFAULTS["max_tool_rounds"]
         )
+        max_parallel_tool_calls = _setting(
+            values,
+            "max_parallel_tool_calls",
+            default=DEFAULTS["max_parallel_tool_calls"],
+        )
         cache_path_value = _setting(
             values, "message_cache_path", default=DEFAULTS["message_cache_path"]
         )
@@ -1251,6 +1260,9 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
             command_timeout, path, "command_timeout_seconds"
         )
         max_tool_rounds = _positive_int(max_tool_rounds, path, "max_tool_rounds")
+        max_parallel_tool_calls = _positive_int(
+            max_parallel_tool_calls, path, "max_parallel_tool_calls"
+        )
         output_limit = _positive_int(output_limit, path, "max_output_chars")
         retention = _positive_int(retention, path, "message_cache_retention_days")
         operator_timezone = _string(operator_timezone_value, path, "operator_timezone")
@@ -1372,6 +1384,7 @@ def _build_config(raw: Mapping[str, Any], root: Path, path: Path) -> RuntimeConf
         max_context_tokens=context_limit,
         request_timeout_seconds=request_timeout,
         max_tool_rounds=max_tool_rounds,
+        max_parallel_tool_calls=max_parallel_tool_calls,
         command_timeout_seconds=command_timeout,
         max_output_chars=output_limit,
         ubuntu_working_directory=ubuntu_working_directory,

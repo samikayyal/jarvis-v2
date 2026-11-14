@@ -36,6 +36,38 @@ class Browser:
         }
 
 
+def test_concurrent_searches_share_block_state_before_next_browser_attempt(tmp_path):
+    class BlockedBrowser(Browser):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        async def search(self, query, limit):
+            self.attempts += 1
+            await asyncio.sleep(0)
+            return {"outcome": "blocked", "results": []}
+
+    async def scenario():
+        browser = BlockedBrowser()
+        tools = WebTools(
+            WebSearchConfig(enabled=True),
+            runtime_dir=tmp_path,
+            max_output_chars=4096,
+            browser_factory=lambda *args: browser,
+        )
+        outputs = await asyncio.gather(
+            *(
+                tools.execute("search_web", {"query": query, "depth": "moderate"})
+                for query in ("first", "second")
+            )
+        )
+        assert browser.attempts == 1
+        assert all(json.loads(output)["outcome"] == "blocked" for output in outputs)
+        await tools.close_request()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "outcome", ["blocked", "unavailable", "extraction_failed", "no_results"]
 )

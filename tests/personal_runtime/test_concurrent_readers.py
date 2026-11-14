@@ -490,7 +490,7 @@ def test_parallel_contexts_isolate_state_and_followups_keep_surviving_tabs(monke
         asyncio.run(scenario(url))
 
 
-def test_main_runtime_keeps_tools_sequential_and_cancel_stops_readers(monkeypatch):
+def test_main_runtime_single_call_turns_and_cancel_stops_readers(monkeypatch):
     from jarvis_personal_runtime.responses import (
         DirectResponsesRunner,
         PreparedToolCollection,
@@ -532,7 +532,7 @@ def test_main_runtime_keeps_tools_sequential_and_cancel_stops_readers(monkeypatc
             step = 0
 
             async def create(self, request, *, timeout):
-                assert request["parallel_tool_calls"] is False
+                assert request["parallel_tool_calls"] is True
                 self.step += 1
                 if self.step == 1:
                     return call("load_skill", name="web")

@@ -123,9 +123,11 @@ async def test_status_reports_retained_context_and_resets_after_new_and_expiry()
 ):
     class Responses:
         calls = 0
+        instructions = ""
 
         async def create(self, request, *, timeout):
             self.calls += 1
+            self.instructions = request["instructions"]
             return ResponsesResult(
                 output=({"type": "message", "role": "assistant", "content": "Done."},),
                 output_text="Done.",
@@ -150,7 +152,7 @@ async def test_status_reports_retained_context_and_resets_after_new_and_expiry()
     assert used > baseline
     assert used == local_input_tokens(
         {
-            "instructions": runtime.request_instructions,
+            "instructions": responses.instructions,
             "tools": [],
             "input": [
                 {"role": "user", "content": "Remember this conversation."},

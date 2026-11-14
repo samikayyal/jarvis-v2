@@ -27,7 +27,9 @@ from .test_terminal import FakeExecutor
 DONE = ResponsesResult(output=(), output_text="Done.")
 
 
-def setup_runtime(tmp_path, provider, executor=None, **limits):
+def setup_runtime(
+    tmp_path, provider, executor=None, request_timeout_seconds=10, **limits
+):
     executor = executor or FakeExecutor()
     permissions = TomlPermissionStore(tmp_path / "jarvis.toml")
     tools = SkillTools(
@@ -45,7 +47,7 @@ def setup_runtime(tmp_path, provider, executor=None, **limits):
     runner = DirectResponsesRunner(
         provider,
         tools=tools,
-        request_timeout_seconds=10,
+        request_timeout_seconds=request_timeout_seconds,
         full_access=lambda: runtime.full_access,
         **limits,
     )

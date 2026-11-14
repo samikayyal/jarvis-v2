@@ -66,6 +66,7 @@ class WebTools:
             _browser, headed=config.browser_mode == "headed"
         )
         self._browser: PageBrowser | None = None
+        self._search_lock = asyncio.Lock()
         self.request_started()
         self.definitions: tuple[dict[str, object], ...] = (
             (
@@ -178,7 +179,9 @@ class WebTools:
     async def execute(self, name: str, arguments: dict[str, object]) -> str:
         if name != "search_web" or not self.config.enabled:
             raise ValueError("unavailable web tool")
-        return await self._search(arguments)
+        # One shared browser, block state and evidence allowance per request.
+        async with self._search_lock:
+            return await self._search(arguments)
 
     async def _search(self, arguments: dict[str, object]) -> str:
         from .web_browser import PublicUrlError, validate_public_url

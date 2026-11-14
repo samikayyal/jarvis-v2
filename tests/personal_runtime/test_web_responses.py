@@ -128,7 +128,7 @@ def test_approval_continuation_keeps_consumed_request_state_without_reset() -> N
         )
         assert isinstance(pending, ApprovalRequired)
         assert tools.started == 1
-        assert tools.closed == 1
+        assert tools.closed == 0
 
         completed = await runner.resume(
             ApprovalDecision.APPROVE_ONCE,
@@ -136,7 +136,7 @@ def test_approval_continuation_keeps_consumed_request_state_without_reset() -> N
         )
         assert completed.reply == "Approved."
         assert tools.started == 1
-        assert tools.closed == 2
+        assert tools.closed == 1
 
     run(scenario())
 
