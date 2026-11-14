@@ -1,7 +1,7 @@
 # Ticket 02 deployment and measurement
 
 Date: 2026-11-14 (Asia/Amman).
-Status: candidate staged; activation and live acceptance pending.
+Status: deployed; visible post-activation acceptance and benchmark pending.
 
 ## Source and preflight
 
@@ -45,7 +45,7 @@ development environment, existing Playwright cache and explicit Chrome/driver.
   fixture readiness failures recorded in ticket 01.
 - Unchanged focused rerun: **21 passed in 30.95 seconds**. No source, timeout,
   environment, or browser setting was changed between the runs.
-- Full suite: pending. The initial staging exit remains 1; activation requires
+- Full Ubuntu suite: **584 passed, 1 skipped in 523.74 seconds**, exit 0. The initial staging exit remains 1; activation requires
   the separately recorded focused rerun and full-suite exit codes to be zero.
 
 ## Planned live evidence
@@ -74,5 +74,31 @@ include cleanup. Nested/overlapping spans are not summed into elapsed time.
 Gateway acknowledgements and timestamps do not establish recipient receipt time.
 Raw trace bodies, message identifiers and note contents remain private.
 
-Activation, functional acceptance, benchmark, final cleanup and two-axis review
+Functional acceptance, benchmark, final cleanup and final evidence review
 remain pending; no completed ticket or latency improvement is claimed here.
+
+## Activation and procedure review
+
+Activation completed with exit code 0 on 2026-11-14. The active symlink resolves
+exactly to `releases/fe70273c5551b2214443d1812365bfa160bc86aa`. Post-start
+installed-source verification passed, the configured session was ready with
+HTTP 200 gateway readiness, and the service was enabled/active/running with
+`NRestarts=0`. Configuration and prompt were unchanged. The prior release remains
+available as the verified rollback target.
+
+Operational commits `b8b479c` and `b40ddcb` were pushed; GitHub main was checked
+as `b40ddcbc9f5591887cd241313fe4160d2cbe5a49`, containing the immutable runtime
+candidate, before activation. The existing systemd world-writable-unit warning
+and unrelated obsolete CPUAccounting warnings were recorded, not changed.
+
+Independent Standards and Spec procedure reviews each found one issue in the
+measurement helper: raw control/reason text could escape sanitization, and
+identical concurrent terminal commands could receive guessed FIFO attribution.
+The helper now allowlists exact controls, omits reader exception reasons, and
+marks repeated overlapping command attribution ambiguous. Both reviewers
+confirmed their findings resolved. No runtime source changed after the full suite.
+
+The first post-activation UI attempt stopped because Computer Use could not
+confidently determine Chrome's URL. The operator requested the in-app browser;
+WhatsApp opened there but redirected to a logged-out page. No post-activation
+ordinary request, concurrency acceptance, or benchmark is claimed yet.
