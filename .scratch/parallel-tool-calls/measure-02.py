@@ -40,6 +40,7 @@ rows.sort(key=lambda row: row["timestamp"])
 counts = Counter(row["event"] for row in rows)
 batches = []
 terminal_starts = defaultdict(deque)
+ambiguous_commands = set()
 terminals = []
 readers = []
 results = []
@@ -47,15 +48,29 @@ transport = []
 tool_results = []
 admissions = []
 call_labels = {}
+message_labels = {}
 for row in rows:
     event, payload, at = row["event"], row["payload"], row["timestamp"]
     if event == "authorized_message":
         text = payload["text"]
+        label = message_labels.setdefault(
+            payload["message_id"], f"message_{len(message_labels) + 1}"
+        )
         admissions.append(
             {
                 "at": at,
+                "message": label,
                 "control": text
-                if text.startswith("/") or text in {"1", "9"}
+                if text
+                in {
+                    "/status",
+                    "/cancel",
+                    "/new",
+                    "/full-access",
+                    "/full-access off",
+                    "1",
+                    "9",
+                }
                 else "ordinary_request",
             }
         )
@@ -76,7 +91,10 @@ for row in rows:
                 }
             )
     elif event == "terminal_execution_started":
-        terminal_starts[(payload["host"], payload["command"])].append(at)
+        key = (payload["host"], payload["command"])
+        if terminal_starts[key]:
+            ambiguous_commands.add(hashlib.sha256(key[1].encode()).hexdigest())
+        terminal_starts[key].append(at)
     elif event in {
         "terminal_execution_finished",
         "terminal_execution_cancelled",
@@ -106,9 +124,8 @@ for row in rows:
                     for key in (
                         "state",
                         "browser_state",
-                        "model_calls",
+                        "model_turns",
                         "elapsed_seconds",
-                        "reason",
                     )
                 },
             }
@@ -131,9 +148,18 @@ for row in rows:
             {
                 "at": at,
                 "event": event,
+                "message": message_labels.get(
+                    payload.get("message_id"), "outside_interval"
+                ),
                 **{
                     key: payload[key]
-                    for key in ("status", "may_have_sent", "reason", "chunk_index")
+                    for key in (
+                        "disposition",
+                        "code",
+                        "may_have_sent",
+                        "reason",
+                        "chunk_index",
+                    )
                     if key in payload
                 },
             }
@@ -151,6 +177,11 @@ for row in rows:
         )
 
 overlaps = []
+for interval in terminals:
+    if interval["command_sha256"] in ambiguous_commands:
+        interval["start"] = None
+        interval["seconds"] = None
+        interval["attribution"] = "ambiguous_concurrent_identical_commands"
 for index, left in enumerate(terminals):
     for right_index, right in enumerate(terminals[index + 1 :], index + 1):
         if not left["start"] or not right["start"]:
