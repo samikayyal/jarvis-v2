@@ -7,7 +7,7 @@ baseline with its saved result and answer quality intact.
 
 **Blocked by:** 01 — Execute parallel tools while approvals remain interactive.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Commit and push the exact intended candidate and verify that GitHub
   contains that SHA before activation. Stage/build that source, verify installed
