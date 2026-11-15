@@ -264,3 +264,18 @@ unrelated conversation details.
 Functional deployment and acceptance passed. The 120-second target remains
 unmet; the reader-limit/cleanup observations above are residual performance work,
 not authorization to expand this deployment ticket.
+
+## Final review and publication
+
+Independent Standards and Spec reviewers checked `fe70273...02e921b` against the
+repository standards and ticket/spec. Standards: zero documented violations and
+zero heuristic findings. Spec: zero actionable findings. Both confirmed the
+metrics/narrative agree and that the earlier sanitizer/attribution findings remain
+resolved. JSON parsing, `git diff --check`, and measurement-helper Ruff lint and
+format checks passed. No runtime source changed after the recorded Ubuntu suite.
+
+Acceptance commit `02e921b9f026c32246a9c8626de8e56405a94aad` was pushed to GitHub
+`main`; `git ls-remote origin refs/heads/main` returned that exact SHA on
+2026-11-15. This published the deployment record, sanitized evidence and updated
+operational/domain documentation. Ticket closure records this completed
+verification; the active runtime remains `fe70273`, not the documentation commit.
