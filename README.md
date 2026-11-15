@@ -114,6 +114,8 @@ bound. Cancel, session reset and shutdown drain retained tasks and readers. Sear
 serializes its shared browser and allowance accounting; vault operations retain
 their existing clone lock. Reader browser actions and capacity limits are unchanged.
 
-This is source behavior from [ticket 01](.scratch/parallel-tool-calls/issues/01-execute-parallel-tools-through-approvals.md).
-Deployment and live WhatsApp measurements belong to ticket 02; local tests do not
-establish that the active Ubuntu release has this behavior.
+This behavior from [ticket 01](.scratch/parallel-tool-calls/issues/01-execute-parallel-tools-through-approvals.md)
+is deployed as `fe70273` after exact-SHA GitHub verification on 2026-11-14.
+Visible WhatsApp checks demonstrated overlap, interactive approvals and cleanup
+on cancellation and session reset. See the [ticket 02 deployment and measurements](.scratch/parallel-tool-calls/deployment-verification-02.md)
+for functional evidence and the separate latency result.

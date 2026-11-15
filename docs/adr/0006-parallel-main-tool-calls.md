@@ -32,3 +32,7 @@ The operator advanced the [consolidated specification](../../.scratch/parallel-t
 to ticketing on 2026-11-10 after the [design interview](../../.scratch/parallel-tool-calls/design.md).
 Ticket 01 implements this decision in source. Ticket 02 owns deployment and
 visible WhatsApp acceptance; source implementation does not establish activation.
+The [ticket 02 acceptance record](../../.scratch/parallel-tool-calls/deployment-verification-02.md)
+records activation of GitHub-verified `fe70273` on 2026-11-14, successful live
+approval/lifecycle checks, and a 393.361-second hosting benchmark that missed
+the two-minute target. The accepted concurrency decision is unchanged.

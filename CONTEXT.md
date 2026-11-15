@@ -325,8 +325,12 @@ Ticket 01 implements this behavior in source. Every requested call counts toward
 the request allowance, including rejected oversized batches. Approval decisions
 start exact actions once, without waiting for siblings; cancel, reset and shutdown
 drain retained work. Known results survive cancellation and uncertain effects are
-never replayed automatically. Deployment and visible WhatsApp acceptance remain
-separate work in ticket 02; this source change does not establish a new active release.
+never replayed automatically. The source was deployed as `fe70273` on 2026-11-14
+after exact-SHA GitHub verification. Visible WhatsApp checks demonstrated
+concurrent authorized work, approvals while siblings ran, retained results,
+and cancellation/session-reset cleanup without duplicate execution. See the
+[ticket 02 acceptance record](.scratch/parallel-tool-calls/deployment-verification-02.md)
+for measured workflow and delivery evidence, including performance limitations.
 
 ## Operational definition of active
 
@@ -336,8 +340,14 @@ private bridge listener, OpenWA is healthy with the configured named session
 produces one expected phone reply. A listener check or OpenWA `/ready` response
 alone is not end-to-end acceptance.
 
-The concurrent-reader source under ADR 0005 is deployed as `9c2f7d9` after
-GitHub verification on 2026-11-08. Ticket 04 functional acceptance passed: the
+The active release is `fe70273`, with a configured main-tool batch maximum of
+five; the full Ubuntu suite passed 584 tests with one skip before activation.
+Ticket 02's hosting-and-note benchmark completed in 393.361 seconds with 15 main
+and 5 reader calls, saved/synced its note and visibly delivered the final. That is
+22.47% faster than the preceding single-run baseline, but still misses 120 seconds;
+reader-limit/cleanup waits and remaining latency are separate follow-up work.
+The preceding concurrent-reader release under ADR 0005 was `9c2f7d9`, deployed
+after GitHub verification on 2026-11-08. Ticket 04 functional acceptance passed: the
 original hosting-and-note request completed in 507.389 seconds with 28 main and
 8 reader calls, saved/synced the note and visibly delivered its concise final.
 The under-two-minute target was missed; a timeout/close diagnostic and remaining

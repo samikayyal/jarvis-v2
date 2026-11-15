@@ -74,7 +74,9 @@ The `web` skill exposes main `search_web` and reader start/status/wait/follow-up
 cancel/release operations. Main search stays Selenium-backed with quick/moderate
 query and snippet-text allowances. Browser readers use asynchronous Playwright,
 with three active assignments, three isolated browser contexts and eight retained
-conversations by default. Main tools remain sequential. See [reader operations](../../docs/playwright-reader.md).
+conversations by default. Independent main calls run concurrently within the
+configured batch maximum; each reader's browser-action loop remains sequential.
+See [reader operations](../../docs/playwright-reader.md).
 
 Web access is off when `[web_search]` is absent or disabled. Configure
 `[web_reader]` with an explicit model (`gpt-6-luna`) and reasoning effort (`low`).
@@ -106,7 +108,8 @@ or CAPTCHA stops further searches in the request; readers can still investigate
 appropriate known direct sources. No challenge-solving or automatic retry occurs.
 
 Reader findings and conversations survive ordinary requests. Browsers close on
-completion, approval suspension, timeout or cancellation; later follow-ups reopen
+completion, timeout or cancellation; approval waiting retains readers and running
+siblings. Later follow-ups reopen
 with explicit loss-of-state disclosure. Release discards a retained conversation;
 session reset, expiry and restart discard all readers. Public site research
 controls are allowed; account actions, purchases, uploads and resource creation
@@ -554,7 +557,7 @@ The runtime trace is verbatim and may contain message text, tool payloads,
 terminal output, and credentials supplied in conversation. Keep the runtime root
 private and exclude it from ordinary source-control and log collection.
 
-## Parallel tool calls candidate
+## Parallel tool calls deployment
 
 Ticket 01 adds `runtime.max_parallel_tool_calls` (positive integer, default 5).
 It counts every call requested in a main-model response, including approval
@@ -567,6 +570,12 @@ new session and shutdown drain them. Human waiting does not consume the model-lo
 timeout; each active call retains execution bounds. Inspect individual call IDs
 and results before retrying an uncertain action.
 
-This documents candidate source, not a deployment. Ticket 02 must commit/push,
-verify the exact candidate SHA on GitHub, deploy that source, and perform visible
-WhatsApp acceptance before recording the new behavior as active.
+Source `fe70273` was committed, pushed and exact-SHA verified on GitHub before
+activation on 2026-11-14. Installed source matched its verified archive, and
+the full Ubuntu suite passed 584 tests with one skip. The configured batch
+maximum is five. Visible WhatsApp checks demonstrated concurrent authorized
+commands, successive approvals while work ran, retained sibling results and
+cleanup on cancellation/reset. The prior `9c2f7d9` release remains the verified
+rollback target; configuration, prompt and browser installations are unchanged.
+See [ticket 02 deployment and measurement](../../.scratch/parallel-tool-calls/deployment-verification-02.md)
+for the functional and performance outcomes and delivery limitations.

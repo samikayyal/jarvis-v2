@@ -12,6 +12,10 @@ under-two-minute target was missed. A timeout/close diagnostic and remaining
 latency stay open in ticket 05. See [current acceptance](../.scratch/parallel-page-readers/continuation-verification-04.md),
 [the failed first deployment](../.scratch/parallel-page-readers/deployment-verification-04.md)
 and [predeployment verification](../.scratch/parallel-page-readers/verification-03.md).
+The subsequent active release is `fe70273` (2026-11-14), adding parallel main-tool
+batches while retaining the reader implementation and browser provisioning.
+See [the parallel-tool deployment record](../.scratch/parallel-tool-calls/deployment-verification-02.md)
+for the newer workflow measurement and approval/cancellation evidence.
 
 ## Provision and run
 

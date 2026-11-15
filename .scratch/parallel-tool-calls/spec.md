@@ -1,6 +1,6 @@
 # General parallel main-tool calls
 
-Status: accepted design; source implementation in ticket 01, deployment and acceptance in ticket 02. See [verification](verification-01.md).
+Status: accepted design; source implemented in ticket 01 and deployed/accepted in ticket 02. See [source verification](verification-01.md) and [deployment acceptance](deployment-verification-02.md). The 393.361-second hosting benchmark still misses the two-minute target.
 Date: 2026-11-09 (Asia/Amman).
 
 ## Outcome

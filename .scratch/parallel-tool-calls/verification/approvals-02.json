@@ -1,0 +1,264 @@
+{
+  "since": "2026-11-14T14:47:00Z",
+  "until": "2026-11-14T14:50:00Z",
+  "event_counts": {
+    "openwa_typing_result": 8,
+    "authorized_message": 4,
+    "runtime_result": 4,
+    "openwa_send_attempt": 4,
+    "openwa_send_error": 1,
+    "request_started": 1,
+    "context_estimate": 2,
+    "responses_request": 2,
+    "http_attempt_request": 2,
+    "http_attempt_response": 2,
+    "responses_raw_exchange": 2,
+    "responses_parsed": 2,
+    "responses_output": 2,
+    "tool_call": 4,
+    "terminal_execution_started": 4,
+    "terminal_proposal": 2,
+    "openwa_send_result": 3,
+    "approval_choice": 2,
+    "terminal_execution_finished": 4,
+    "openwa_progress": 1,
+    "tool_result": 4
+  },
+  "admissions": [
+    {
+      "at": "2026-11-14T14:47:29.069643Z",
+      "message": "message_1",
+      "control": "/status"
+    },
+    {
+      "at": "2026-11-14T14:48:00.977668Z",
+      "message": "message_2",
+      "control": "ordinary_request"
+    },
+    {
+      "at": "2026-11-14T14:48:29.600335Z",
+      "message": "message_3",
+      "control": "1"
+    },
+    {
+      "at": "2026-11-14T14:48:47.576090Z",
+      "message": "message_4",
+      "control": "1"
+    }
+  ],
+  "main_model_calls": 2,
+  "reader_model_calls": 0,
+  "main_model_seconds": 18.04611213505268,
+  "batches": [
+    {
+      "at": "2026-11-14T14:48:13.628146Z",
+      "calls": [
+        {
+          "id": "call_1",
+          "tool": "run_terminal"
+        },
+        {
+          "id": "call_2",
+          "tool": "run_terminal"
+        },
+        {
+          "id": "call_3",
+          "tool": "run_terminal"
+        },
+        {
+          "id": "call_4",
+          "tool": "run_terminal"
+        }
+      ]
+    }
+  ],
+  "parallel_batch_count": 1,
+  "terminal_intervals": [
+    {
+      "command_sha256": "c7d1f2a1e6419cb83cf1de38c3680d98a0af5062fb246b5a7624d19841e8849e",
+      "start": "2026-11-14T14:48:47.625471Z",
+      "end": "2026-11-14T14:48:47.636131Z",
+      "event": "terminal_execution_finished",
+      "seconds": 0.01066,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    },
+    {
+      "command_sha256": "5a154823550d8f80c13be11e12caf400663e74230f3c8cfe42348854ff133c08",
+      "start": "2026-11-14T14:48:13.640584Z",
+      "end": "2026-11-14T14:49:41.706814Z",
+      "event": "terminal_execution_finished",
+      "seconds": 88.06623,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    },
+    {
+      "command_sha256": "602fc1b1dc65ea95649313fb9581909bedaed3511a0b487322d67b1415069d9b",
+      "start": "2026-11-14T14:48:13.633142Z",
+      "end": "2026-11-14T14:49:42.750553Z",
+      "event": "terminal_execution_finished",
+      "seconds": 89.117411,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    },
+    {
+      "command_sha256": "72ad202b371d044bd403c3d857fa5fffcbcfaa81ec88cdfafe2a865f39449f4f",
+      "start": "2026-11-14T14:48:29.659527Z",
+      "end": "2026-11-14T14:49:44.679469Z",
+      "event": "terminal_execution_finished",
+      "seconds": 75.019942,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    }
+  ],
+  "terminal_pair_overlaps": [
+    {
+      "terminal_indices": [
+        0,
+        1
+      ],
+      "seconds": 0.01066
+    },
+    {
+      "terminal_indices": [
+        0,
+        2
+      ],
+      "seconds": 0.01066
+    },
+    {
+      "terminal_indices": [
+        0,
+        3
+      ],
+      "seconds": 0.01066
+    },
+    {
+      "terminal_indices": [
+        1,
+        2
+      ],
+      "seconds": 88.06623
+    },
+    {
+      "terminal_indices": [
+        1,
+        3
+      ],
+      "seconds": 72.047287
+    },
+    {
+      "terminal_indices": [
+        2,
+        3
+      ],
+      "seconds": 73.091026
+    }
+  ],
+  "unmatched_terminal_starts": 0,
+  "reader_terminal_events_including_cleanup": [],
+  "tool_results": [
+    {
+      "at": "2026-11-14T14:49:44.680111Z",
+      "id": "call_1",
+      "tool": "run_terminal",
+      "characters": 19192,
+      "output_sha256": "32b6f5aea96a30fb704b948e5fb0a2601d69ae4affc89534f1c34e1da8f28cb2"
+    },
+    {
+      "at": "2026-11-14T14:49:44.680916Z",
+      "id": "call_2",
+      "tool": "run_terminal",
+      "characters": 9652,
+      "output_sha256": "4fd91c886917987693221e5ae5d485bd5dd7ff7a5a4ef02605bed0907dd80b44"
+    },
+    {
+      "at": "2026-11-14T14:49:44.681487Z",
+      "id": "call_3",
+      "tool": "run_terminal",
+      "characters": 135,
+      "output_sha256": "4a4dc69580c02d4eb6414cd2eada7d63a7fd9e98dee0707eff793b3a194a0d9b"
+    },
+    {
+      "at": "2026-11-14T14:49:44.681793Z",
+      "id": "call_4",
+      "tool": "run_terminal",
+      "characters": 133,
+      "output_sha256": "86afdf1e85f9a7c35f2b52b4d3e25effbdf0f398fa63f580ca64e84e09851772"
+    }
+  ],
+  "runtime_results": [
+    {
+      "at": "2026-11-14T14:47:29.166510Z",
+      "disposition": "command",
+      "reply_characters": 175
+    },
+    {
+      "at": "2026-11-14T14:48:13.652754Z",
+      "disposition": "approval_required",
+      "reply_characters": 370
+    },
+    {
+      "at": "2026-11-14T14:48:29.664753Z",
+      "disposition": "approval_required",
+      "reply_characters": 346
+    },
+    {
+      "at": "2026-11-14T14:49:50.190749Z",
+      "disposition": "completed",
+      "reply_characters": 320
+    }
+  ],
+  "transport": [
+    {
+      "at": "2026-11-14T14:47:29.341517Z",
+      "event": "openwa_send_attempt",
+      "message": "message_1"
+    },
+    {
+      "at": "2026-11-14T14:47:34.352892Z",
+      "event": "openwa_send_error",
+      "message": "message_1",
+      "code": "unavailable",
+      "may_have_sent": true
+    },
+    {
+      "at": "2026-11-14T14:48:13.712207Z",
+      "event": "openwa_send_attempt",
+      "message": "message_2"
+    },
+    {
+      "at": "2026-11-14T14:48:16.099376Z",
+      "event": "openwa_send_result",
+      "message": "message_2",
+      "disposition": "sent"
+    },
+    {
+      "at": "2026-11-14T14:48:29.779190Z",
+      "event": "openwa_send_attempt",
+      "message": "message_3"
+    },
+    {
+      "at": "2026-11-14T14:48:31.841103Z",
+      "event": "openwa_send_result",
+      "message": "message_3",
+      "disposition": "sent"
+    },
+    {
+      "at": "2026-11-14T14:49:50.684310Z",
+      "event": "openwa_send_attempt",
+      "message": "message_4"
+    },
+    {
+      "at": "2026-11-14T14:49:52.641579Z",
+      "event": "openwa_send_result",
+      "message": "message_4",
+      "disposition": "sent"
+    }
+  ],
+  "recipient_receipt_time": null
+}

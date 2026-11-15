@@ -1,0 +1,508 @@
+{
+  "since": "2026-11-14T19:39:20Z",
+  "until": "2026-11-14T19:46:20Z",
+  "event_counts": {
+    "openwa_typing_result": 2,
+    "authorized_message": 1,
+    "request_started": 1,
+    "context_estimate": 15,
+    "responses_request": 15,
+    "http_attempt_request": 20,
+    "http_attempt_response": 20,
+    "responses_raw_exchange": 20,
+    "responses_parsed": 20,
+    "responses_output": 15,
+    "tool_call": 27,
+    "terminal_proposal": 4,
+    "full_access_approval": 5,
+    "terminal_execution_started": 4,
+    "terminal_execution_finished": 4,
+    "tool_result": 27,
+    "openwa_progress": 1,
+    "playwright_reader_request": 5,
+    "openwa_progress_error": 1,
+    "playwright_reader_output": 5,
+    "playwright_reader_finished": 4,
+    "vault_edit_outcome": 1,
+    "runtime_result": 1,
+    "openwa_send_attempt": 1,
+    "openwa_send_result": 1
+  },
+  "admissions": [
+    {
+      "at": "2026-11-14T19:39:30.009518Z",
+      "message": "message_1",
+      "control": "ordinary_request"
+    }
+  ],
+  "main_model_calls": 15,
+  "reader_model_calls": 5,
+  "main_model_seconds": 109.00739236176014,
+  "batches": [
+    {
+      "at": "2026-11-14T19:39:35.593263Z",
+      "calls": [
+        {
+          "id": "call_1",
+          "tool": "load_skill"
+        },
+        {
+          "id": "call_2",
+          "tool": "load_skill"
+        },
+        {
+          "id": "call_3",
+          "tool": "run_terminal"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:39:41.870599Z",
+      "calls": [
+        {
+          "id": "call_4",
+          "tool": "run_terminal"
+        },
+        {
+          "id": "call_5",
+          "tool": "list_vault_tree"
+        },
+        {
+          "id": "call_6",
+          "tool": "search_web"
+        },
+        {
+          "id": "call_7",
+          "tool": "search_web"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:40:19.035473Z",
+      "calls": [
+        {
+          "id": "call_8",
+          "tool": "read_vault"
+        },
+        {
+          "id": "call_9",
+          "tool": "read_vault"
+        },
+        {
+          "id": "call_10",
+          "tool": "run_terminal"
+        },
+        {
+          "id": "call_11",
+          "tool": "start_browser_reader"
+        },
+        {
+          "id": "call_12",
+          "tool": "start_browser_reader"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:40:34.459549Z",
+      "calls": [
+        {
+          "id": "call_13",
+          "tool": "start_browser_reader"
+        },
+        {
+          "id": "call_14",
+          "tool": "run_terminal"
+        },
+        {
+          "id": "call_15",
+          "tool": "read_vault"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:40:55.692790Z",
+      "calls": [
+        {
+          "id": "call_16",
+          "tool": "browser_reader_status"
+        },
+        {
+          "id": "call_17",
+          "tool": "browser_reader_status"
+        },
+        {
+          "id": "call_18",
+          "tool": "browser_reader_status"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:40:58.306539Z",
+      "calls": [
+        {
+          "id": "call_19",
+          "tool": "wait_browser_reader"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:41:39.056121Z",
+      "calls": [
+        {
+          "id": "call_20",
+          "tool": "browser_reader_status"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:41:50.828654Z",
+      "calls": [
+        {
+          "id": "call_21",
+          "tool": "release_browser_reader"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:43:41.995962Z",
+      "calls": [
+        {
+          "id": "call_22",
+          "tool": "wait_browser_reader"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:43:45.439134Z",
+      "calls": [
+        {
+          "id": "call_23",
+          "tool": "start_browser_reader"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:43:59.303611Z",
+      "calls": [
+        {
+          "id": "call_24",
+          "tool": "browser_reader_status"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:44:24.877717Z",
+      "calls": [
+        {
+          "id": "call_25",
+          "tool": "edit_vault"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:44:38.330624Z",
+      "calls": [
+        {
+          "id": "call_26",
+          "tool": "wait_browser_reader"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-14T19:45:58.597859Z",
+      "calls": [
+        {
+          "id": "call_27",
+          "tool": "cancel_browser_reader"
+        }
+      ]
+    }
+  ],
+  "parallel_batch_count": 5,
+  "terminal_intervals": [
+    {
+      "command_sha256": "9ddc58ac10f86066d2dfd952a8e39606377e303d24d1c4ba15fcd854e515fffc",
+      "start": "2026-11-14T19:39:35.612173Z",
+      "end": "2026-11-14T19:39:35.764696Z",
+      "event": "terminal_execution_finished",
+      "seconds": 0.152523,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    },
+    {
+      "command_sha256": "88c27e087edc313162eca3e797ff2ba5dd1c97db704530624a3667b84d5ca721",
+      "start": "2026-11-14T19:39:41.876486Z",
+      "end": "2026-11-14T19:39:43.556796Z",
+      "event": "terminal_execution_finished",
+      "seconds": 1.68031,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    },
+    {
+      "command_sha256": "7c178bbcadc5a80f6e2a64d808a90dc4167d3077fb34d01c226149200018fe11",
+      "start": "2026-11-14T19:40:19.047197Z",
+      "end": "2026-11-14T19:40:20.493011Z",
+      "event": "terminal_execution_finished",
+      "seconds": 1.445814,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    },
+    {
+      "command_sha256": "69eb6d08149970e216a13a38dba4eab37dee9dd45610504874ee7c7ee15a0271",
+      "start": "2026-11-14T19:40:34.914960Z",
+      "end": "2026-11-14T19:40:40.390196Z",
+      "event": "terminal_execution_finished",
+      "seconds": 5.475236,
+      "exit_code": 0,
+      "timed_out": false,
+      "remote_effect_uncertain": false
+    }
+  ],
+  "terminal_pair_overlaps": [],
+  "unmatched_terminal_starts": 0,
+  "reader_terminal_events_including_cleanup": [
+    {
+      "end": "2026-11-14T19:40:50.696377Z",
+      "state": "completed",
+      "browser_state": "open",
+      "model_turns": 1,
+      "elapsed_seconds": 31.638179713860154
+    },
+    {
+      "end": "2026-11-14T19:43:30.655343Z",
+      "state": "limit",
+      "browser_state": "closed",
+      "model_turns": 4,
+      "elapsed_seconds": 191.60271313413978
+    },
+    {
+      "end": "2026-11-14T19:43:42.966318Z",
+      "state": "limit",
+      "browser_state": "closed",
+      "model_turns": 0,
+      "elapsed_seconds": 187.53597960062325
+    },
+    {
+      "end": "2026-11-14T19:45:56.317524Z",
+      "state": "limit",
+      "browser_state": "closed",
+      "model_turns": 0,
+      "elapsed_seconds": 130.43483252637088
+    }
+  ],
+  "tool_results": [
+    {
+      "at": "2026-11-14T19:39:35.766904Z",
+      "id": "call_1",
+      "tool": "load_skill",
+      "characters": 22,
+      "output_sha256": "5f8cf0b0770f461f3bf41f4268be19b63ba35f87d6a965962c96f67082c70927"
+    },
+    {
+      "at": "2026-11-14T19:39:35.767966Z",
+      "id": "call_2",
+      "tool": "load_skill",
+      "characters": 17,
+      "output_sha256": "dd5d23fbbbd959171ac09464a50737f79730e219b364ed657f513648b01a0342"
+    },
+    {
+      "at": "2026-11-14T19:39:35.769052Z",
+      "id": "call_3",
+      "tool": "run_terminal",
+      "characters": 2115,
+      "output_sha256": "1da08f79d6d8ea13406c9edeb2bc6914b77b0ebf4f52519df6cbea44e0a8f378"
+    },
+    {
+      "at": "2026-11-14T19:40:11.365992Z",
+      "id": "call_4",
+      "tool": "run_terminal",
+      "characters": 12731,
+      "output_sha256": "bd28f44ca2af8ecee5aa999e0f109d3cf4c5d19db99b1d90bcc5041e42972587"
+    },
+    {
+      "at": "2026-11-14T19:40:11.366639Z",
+      "id": "call_5",
+      "tool": "list_vault_tree",
+      "characters": 1041,
+      "output_sha256": "ded6918e935dc7ab6d5be58c43c61270108eb2d0ab9947f43011af20d29237d9"
+    },
+    {
+      "at": "2026-11-14T19:40:11.367039Z",
+      "id": "call_6",
+      "tool": "search_web",
+      "characters": 280,
+      "output_sha256": "bbce61bdf38fb82c38a0d823dcaf1de1f9ef0e9a129315157f4ff7db6514543d"
+    },
+    {
+      "at": "2026-11-14T19:40:11.367460Z",
+      "id": "call_7",
+      "tool": "search_web",
+      "characters": 121,
+      "output_sha256": "44d699f691447ad00194f4502911f7123f1aa927c9699754af17e972f578c013"
+    },
+    {
+      "at": "2026-11-14T19:40:24.314397Z",
+      "id": "call_8",
+      "tool": "read_vault",
+      "characters": 17992,
+      "output_sha256": "b64d184e547534426946dfd7827f9ca80fc1f2ee328d034a8428855c96a4d38a"
+    },
+    {
+      "at": "2026-11-14T19:40:24.316515Z",
+      "id": "call_9",
+      "tool": "read_vault",
+      "characters": 2899,
+      "output_sha256": "caba2a2bd5d694292e21166419952295057a5ebae364b4de684a0bea11506414"
+    },
+    {
+      "at": "2026-11-14T19:40:24.317526Z",
+      "id": "call_10",
+      "tool": "run_terminal",
+      "characters": 20420,
+      "output_sha256": "bbea140326b02e08a2a1c2df17c89e2cdec646481f74278e187097010801212d"
+    },
+    {
+      "at": "2026-11-14T19:40:24.319142Z",
+      "id": "call_11",
+      "tool": "start_browser_reader",
+      "characters": 231,
+      "output_sha256": "68836978775aeec52a67dbb9be80974c35125622253bed4dca74563086b65869"
+    },
+    {
+      "at": "2026-11-14T19:40:24.319904Z",
+      "id": "call_12",
+      "tool": "start_browser_reader",
+      "characters": 215,
+      "output_sha256": "343c0fced6c41f77f4e5f39b8e03641ece811d6dd6de9d8ab028b3e66a3cca0b"
+    },
+    {
+      "at": "2026-11-14T19:40:50.421577Z",
+      "id": "call_13",
+      "tool": "start_browser_reader",
+      "characters": 244,
+      "output_sha256": "96d5cb65ff231b0e68cd13f2303a6a9aa2cc9e390506ed3e1cce23ce58e4c138"
+    },
+    {
+      "at": "2026-11-14T19:40:50.422817Z",
+      "id": "call_14",
+      "tool": "run_terminal",
+      "characters": 1341,
+      "output_sha256": "f36a6eb6f690469d8234be09f078317becf277ef85e7a7b322e4a50ff00afee7"
+    },
+    {
+      "at": "2026-11-14T19:40:50.424063Z",
+      "id": "call_15",
+      "tool": "read_vault",
+      "characters": 147,
+      "output_sha256": "fba64671fdb1a3b44adde34db465c2e723f7799d2dba09b5f4932a3a72fbd20c"
+    },
+    {
+      "at": "2026-11-14T19:40:55.695504Z",
+      "id": "call_16",
+      "tool": "browser_reader_status",
+      "characters": 226,
+      "output_sha256": "c16eac763a485616ff240aa19e3c78d5dbfacbb3422ca3fcff43022f679cb520"
+    },
+    {
+      "at": "2026-11-14T19:40:55.695870Z",
+      "id": "call_17",
+      "tool": "browser_reader_status",
+      "characters": 6109,
+      "output_sha256": "442e8db39fe31af5e95ecd315fce0548d65cd41ead713b38ec553777767856fc"
+    },
+    {
+      "at": "2026-11-14T19:40:55.696399Z",
+      "id": "call_18",
+      "tool": "browser_reader_status",
+      "characters": 242,
+      "output_sha256": "244b41fcbb669133845ba25141ae3fc1b4be720d8a6049f3343874f0c658dae7"
+    },
+    {
+      "at": "2026-11-14T19:41:30.360406Z",
+      "id": "call_19",
+      "tool": "wait_browser_reader",
+      "characters": 242,
+      "output_sha256": "244b41fcbb669133845ba25141ae3fc1b4be720d8a6049f3343874f0c658dae7"
+    },
+    {
+      "at": "2026-11-14T19:41:39.486384Z",
+      "id": "call_20",
+      "tool": "browser_reader_status",
+      "characters": 226,
+      "output_sha256": "c16eac763a485616ff240aa19e3c78d5dbfacbb3422ca3fcff43022f679cb520"
+    },
+    {
+      "at": "2026-11-14T19:43:30.759139Z",
+      "id": "call_21",
+      "tool": "release_browser_reader",
+      "characters": 47,
+      "output_sha256": "1495563e3ca645c86b3add6956d1402bf1bb106a59d48d94acdadbd506ae08fe"
+    },
+    {
+      "at": "2026-11-14T19:43:42.000884Z",
+      "id": "call_22",
+      "tool": "wait_browser_reader",
+      "characters": 279,
+      "output_sha256": "6561dfa45eaa6ae9226e02572a63fa005f1fbe1293f0bef514fca8bbdc5ec548"
+    },
+    {
+      "at": "2026-11-14T19:43:45.440788Z",
+      "id": "call_23",
+      "tool": "start_browser_reader",
+      "characters": 244,
+      "output_sha256": "f95d081efa11b173d0aa17a0cb34380568f7adb2bf70476e46c98aaf0223a19a"
+    },
+    {
+      "at": "2026-11-14T19:43:59.307464Z",
+      "id": "call_24",
+      "tool": "browser_reader_status",
+      "characters": 242,
+      "output_sha256": "47556138b2c5dd81f46e27c459921023e5bf2a2e1b08158b8293498ae49809a8"
+    },
+    {
+      "at": "2026-11-14T19:44:35.584114Z",
+      "id": "call_25",
+      "tool": "edit_vault",
+      "characters": 153,
+      "output_sha256": "3594b89e1d7dfe8adc5a50ff60fa06535945ace626af58c7ad7c94204a1dc33d"
+    },
+    {
+      "at": "2026-11-14T19:45:55.402848Z",
+      "id": "call_26",
+      "tool": "wait_browser_reader",
+      "characters": 242,
+      "output_sha256": "47556138b2c5dd81f46e27c459921023e5bf2a2e1b08158b8293498ae49809a8"
+    },
+    {
+      "at": "2026-11-14T19:45:58.600591Z",
+      "id": "call_27",
+      "tool": "cancel_browser_reader",
+      "characters": 295,
+      "output_sha256": "7030c21db1fb0c40423250501cb16838d33df11e411e1b3230741e0922d4baec"
+    }
+  ],
+  "runtime_results": [
+    {
+      "at": "2026-11-14T19:46:03.370538Z",
+      "disposition": "completed",
+      "reply_characters": 408
+    }
+  ],
+  "transport": [
+    {
+      "at": "2026-11-14T19:46:04.192500Z",
+      "event": "openwa_send_attempt",
+      "message": "message_1"
+    },
+    {
+      "at": "2026-11-14T19:46:06.540409Z",
+      "event": "openwa_send_result",
+      "message": "message_1",
+      "disposition": "sent"
+    }
+  ],
+  "recipient_receipt_time": null
+}
