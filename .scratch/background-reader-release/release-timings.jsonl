@@ -1,0 +1,10 @@
+{"sha": "fe70273c5551b2214443d1812365bfa160bc86aa", "trial": 1, "release_ms": 1049.115708, "release_through_drain_ms": 1050.264714}
+{"sha": "2a350f406f653fa359796184a14f81c1a178371c", "trial": 1, "release_ms": 0.131063, "release_through_drain_ms": 116.568465}
+{"sha": "2a350f406f653fa359796184a14f81c1a178371c", "trial": 2, "release_ms": 0.163187, "release_through_drain_ms": 613.372339}
+{"sha": "fe70273c5551b2214443d1812365bfa160bc86aa", "trial": 2, "release_ms": 605.886553, "release_through_drain_ms": 606.194567}
+{"sha": "fe70273c5551b2214443d1812365bfa160bc86aa", "trial": 3, "release_ms": 465.588511, "release_through_drain_ms": 466.365182}
+{"sha": "2a350f406f653fa359796184a14f81c1a178371c", "trial": 3, "release_ms": 0.136583, "release_through_drain_ms": 595.735186}
+{"sha": "2a350f406f653fa359796184a14f81c1a178371c", "trial": 4, "release_ms": 0.138839, "release_through_drain_ms": 598.232373}
+{"sha": "fe70273c5551b2214443d1812365bfa160bc86aa", "trial": 4, "release_ms": 612.4338, "release_through_drain_ms": 612.918249}
+{"sha": "fe70273c5551b2214443d1812365bfa160bc86aa", "trial": 5, "release_ms": 498.894834, "release_through_drain_ms": 499.934124}
+{"sha": "2a350f406f653fa359796184a14f81c1a178371c", "trial": 5, "release_ms": 0.129083, "release_through_drain_ms": 534.255334}

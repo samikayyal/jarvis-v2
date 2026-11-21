@@ -340,8 +340,12 @@ private bridge listener, OpenWA is healthy with the configured named session
 produces one expected phone reply. A listener check or OpenWA `/ready` response
 alone is not end-to-end acceptance.
 
-The active release is `fe70273`, with a configured main-tool batch maximum of
-five; the full Ubuntu suite passed 584 tests with one skip before activation.
+The active release is `2a350f4`, deployed on 2026-11-21 after exact GitHub
+verification and 586 Ubuntu test passes with one skip. Release expires the reader
+ID immediately and holds its browser slot until shutdown finishes. See the
+[deployment and timings](.scratch/background-reader-release/deployment.md).
+The preceding `fe70273` release introduced parallel tool calls with a configured
+maximum of five and passed 584 Ubuntu tests with one skip.
 Ticket 02's hosting-and-note benchmark completed in 393.361 seconds with 15 main
 and 5 reader calls, saved/synced its note and visibly delivered the final. That is
 22.47% faster than the preceding single-run baseline, but still misses 120 seconds;

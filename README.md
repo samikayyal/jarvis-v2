@@ -115,7 +115,9 @@ serializes its shared browser and allowance accounting; vault operations retain
 their existing clone lock. Reader browser actions and capacity limits are unchanged.
 
 This behavior from [ticket 01](.scratch/parallel-tool-calls/issues/01-execute-parallel-tools-through-approvals.md)
-is deployed as `fe70273` after exact-SHA GitHub verification on 2026-11-14.
+was deployed as `fe70273` after exact-SHA GitHub verification on 2026-11-14.
 Visible WhatsApp checks demonstrated overlap, interactive approvals and cleanup
 on cancellation and session reset. See the [ticket 02 deployment and measurements](.scratch/parallel-tool-calls/deployment-verification-02.md)
 for functional evidence and the separate latency result.
+Release `2a350f4` subsequently moved reader shutdown into the background.
+See the [Ubuntu deployment and timings](.scratch/background-reader-release/deployment.md).

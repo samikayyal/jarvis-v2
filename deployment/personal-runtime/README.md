@@ -576,6 +576,10 @@ the full Ubuntu suite passed 584 tests with one skip. The configured batch
 maximum is five. Visible WhatsApp checks demonstrated concurrent authorized
 commands, successive approvals while work ran, retained sibling results and
 cleanup on cancellation/reset. The prior `9c2f7d9` release remains the verified
-rollback target; configuration, prompt and browser installations are unchanged.
+rollback target for that deployment.
 See [ticket 02 deployment and measurement](../../.scratch/parallel-tool-calls/deployment-verification-02.md)
 for the functional and performance outcomes and delivery limitations.
+
+On 2026-11-21, GitHub-verified `2a350f4` added background reader release.
+`fe70273` is its verified rollback target. See the
+[deployment and timings](../../.scratch/background-reader-release/deployment.md).
