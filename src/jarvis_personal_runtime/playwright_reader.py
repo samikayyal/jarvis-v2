@@ -151,6 +151,8 @@ class PlaywrightReaderTools:
         self.readers: dict[str, BrowserReader] = {}
         self._deadline = None
         self._cleanup_tasks = set()
+        self._release_tasks = set()
+        self._releasing_browsers: set[PlaywrightBrowser] = set()
         self._browser_lock = asyncio.Lock()
         self._request_readers: set[str] = set()
         self.definitions = (
@@ -184,7 +186,7 @@ class PlaywrightReaderTools:
             ),
             tool(
                 "release_browser_reader",
-                "Stop and discard a retained reader, closing its browser and freeing conversation capacity. The ID expires.",
+                "Discard a reader and expire its ID immediately. Its browser closes in the background and occupies a slot until closed.",
                 {"reader_id": STRING},
             ),
         )
@@ -227,8 +229,10 @@ class PlaywrightReaderTools:
         self._deadline = deadline
 
     async def close_request(self):
-        await self._finish_cleanup(list(self.readers.values()))
-        await self._drain_cleanup()
+        try:
+            await self._finish_cleanup(list(self.readers.values()))
+        finally:
+            await self._drain_cleanup(include_releases=True)
 
     async def _finish_cleanup(self, readers):
         cleanup = asyncio.create_task(self._dispose(readers))
@@ -269,21 +273,29 @@ class PlaywrightReaderTools:
             if isinstance(result, BaseException):
                 raise result
 
-    async def _drain_cleanup(self):
+    async def _drain_cleanup(self, *, include_releases=False):
         tasks = set(self._cleanup_tasks)
+        if include_releases:
+            tasks.update(self._release_tasks)
         if tasks:
             results = await asyncio.gather(
                 *(asyncio.shield(t) for t in tasks), return_exceptions=True
             )
             self._cleanup_tasks.difference_update(tasks)
+            self._release_tasks.difference_update(tasks)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
 
     async def _close_browser(self, reader, notice):
-        if reader.browser:
+        browser = reader.browser
+        if browser:
             reader.browser_state_notice = notice
-            await reader.browser.close()
+            try:
+                await browser.close()
+            finally:
+                if browser.shutdown_complete:
+                    self._releasing_browsers.discard(browser)
 
     def _check_assignment(self, reader):
         if reader.state != "running":
@@ -300,8 +312,11 @@ class PlaywrightReaderTools:
         )
 
     def _at_active_capacity(self):
-        return sum(self._busy(r) for r in self.readers.values()) >= min(
-            self.config.max_active_readers, self.config.max_browser_contexts
+        active = sum(self._busy(r) for r in self.readers.values())
+        return (
+            active >= self.config.max_active_readers
+            or active + len(self._releasing_browsers)
+            >= self.config.max_browser_contexts
         )
 
     async def resume(
@@ -336,7 +351,7 @@ class PlaywrightReaderTools:
                 return encode(
                     {
                         "error": "reader_capacity",
-                        "reason": "Active reader capacity reached; no queue.",
+                        "reason": "Active reader or browser capacity reached; no queue.",
                     }
                 )
             if len(self.readers) >= self.config.max_readers:
@@ -369,7 +384,7 @@ class PlaywrightReaderTools:
                 return encode(
                     {
                         "error": "reader_capacity",
-                        "reason": "Active reader capacity reached; no queue.",
+                        "reason": "Active reader or browser capacity reached; no queue.",
                     }
                 )
             reader.prompt = arguments["prompt"]
@@ -384,11 +399,15 @@ class PlaywrightReaderTools:
                 return encode({"error": "Wait seconds must be between 0 and 30"})
             if reader.task:
                 await asyncio.wait({reader.task}, timeout=seconds)
-        elif name in {"cancel_browser_reader", "release_browser_reader"}:
+        elif name == "cancel_browser_reader":
             await self._finish_cleanup([reader])
-            if name == "release_browser_reader":
-                del self.readers[reader.reader_id]
-                return encode({"reader_id": reader.reader_id, "state": "released"})
+        elif name == "release_browser_reader":
+            self._interrupt(reader, "Reader released.")
+            del self.readers[reader.reader_id]
+            if reader.browser and not reader.browser.shutdown_complete:
+                self._releasing_browsers.add(reader.browser)
+            self._release_tasks.add(asyncio.create_task(self._dispose([reader])))
+            return encode({"reader_id": reader.reader_id, "state": "released"})
         return encode(self._result(reader))
 
     async def _browser_for(self, reader):
@@ -400,7 +419,10 @@ class PlaywrightReaderTools:
             opened = [
                 r for r in self.readers.values() if r.browser and not r.browser.closed
             ]
-            if len(opened) >= self.config.max_browser_contexts:
+            if (
+                len(opened) + len(self._releasing_browsers)
+                >= self.config.max_browser_contexts
+            ):
                 idle = [r for r in opened if not self._busy(r)]
                 if not idle:
                     raise RuntimeError("No idle browser context available; no queue.")

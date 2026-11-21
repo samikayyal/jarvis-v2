@@ -45,8 +45,9 @@ and verify the particular claims afresh. Preserve the distinction between old
 findings and fresh observations when a recheck fails.
 
 Use `cancel_browser_reader(reader_id)` to stop unnecessary work. Use
-`release_browser_reader(reader_id)` to discard an unneeded conversation and free
-retention capacity; released IDs expire. At capacity, explicitly release a reader
+`release_browser_reader(reader_id)` to discard an unneeded conversation. Its ID
+expires immediately. Continue other work while the browser closes. New readers
+can use a spare slot during shutdown. At capacity, explicitly release a reader
 or collect existing work; there is no hidden queue or silent conversation eviction.
 The runtime cancels remaining assignments and closes browsers at main-request
 completion, timeout or cancellation. Approval waiting keeps readers alive within

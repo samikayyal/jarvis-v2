@@ -52,8 +52,10 @@ cancelling the reader when that wait ends. `cancel_browser_reader(reader_id)` st
 work and closes its browser. `follow_up_browser_reader(reader_id, prompt)` starts
 another assignment using the retained conversation and surviving browser state;
 a busy reader returns `reader_busy` without queuing the prompt.
-`release_browser_reader(reader_id)` cancels work, closes the browser and discards
-the conversation/findings. Released and reset IDs return `expired_reader_id`.
+`release_browser_reader(reader_id)` requests cancellation, discards the conversation
+and returns immediately. Released and reset IDs return `expired_reader_id`.
+Shutdown continues in the background and holds the browser slot until it finishes.
+Other assignments can use spare slots. Request completion waits for cleanup.
 
 `WebReaderConfig` exposes three independent positive integer limits, also accepted
 in `[web_reader]`: `max_active_readers = 3`, `max_browser_contexts = 3`, and

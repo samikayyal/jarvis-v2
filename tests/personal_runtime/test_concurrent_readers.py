@@ -4,6 +4,8 @@ import asyncio
 import copy
 import json
 
+import pytest
+
 from jarvis_personal_runtime.config import WebReaderConfig
 from jarvis_personal_runtime.playwright_reader import PlaywrightReaderTools
 from jarvis_personal_runtime.responses import ResponsesResult
@@ -668,6 +670,92 @@ def test_runtime_inactivity_context_reset_and_restart_discard_reader_state(monke
             asyncio.run(scenario(url, reset))
 
 
+def test_release_frees_conversation_while_shutdown_holds_only_its_browser_slot(
+    monkeypatch,
+):
+    async def scenario(url):
+        model = AssignmentModel()
+        tools = PlaywrightReaderTools(
+            WebReaderConfig(max_readers=1, max_browser_contexts=2), model
+        )
+        closing, allow_close = asyncio.Event(), asyncio.Event()
+
+        async def start(prompt):
+            return await invoke(tools, "start_browser_reader", url=url, prompt=prompt)
+
+        try:
+            first = await start("first")
+            assert await model.arrived() == ["first"]
+            reader_id = first["reader_id"]
+            browser = tools.readers[reader_id].browser
+            shutdown = browser._shutdown
+
+            async def slow_shutdown():
+                closing.set()
+                await allow_close.wait()
+                await shutdown()
+
+            monkeypatch.setattr(browser, "_shutdown", slow_shutdown)
+            release = asyncio.create_task(
+                invoke(tools, "release_browser_reader", reader_id=reader_id)
+            )
+            done, _ = await asyncio.wait({release}, timeout=2)
+            assert release in done
+            assert release.result() == {"reader_id": reader_id, "state": "released"}
+            assert await invoke(
+                tools, "release_browser_reader", reader_id=reader_id
+            ) == {"error": "expired_reader_id"}
+            await asyncio.wait_for(closing.wait(), 2)
+            second = await start("spare slot")
+            assert second["state"] == "running"
+            assert await model.arrived() == ["spare slot"]
+            full = await start("no slot")
+            assert full["error"] == "reader_capacity" and "Active" in full["reason"]
+            await invoke(tools, "cancel_browser_reader", reader_id=second["reader_id"])
+            drain = asyncio.create_task(tools.close_request())
+            done, _ = await asyncio.wait({drain}, timeout=0.1)
+            assert not done
+            allow_close.set()
+            await drain
+        finally:
+            allow_close.set()
+            await tools.close_request()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))
+
+
+def test_release_reports_cleanup_error_and_recovers_slot_after_driver_stops(
+    monkeypatch,
+):
+    async def scenario(url):
+        model = AssignmentModel()
+        tools = PlaywrightReaderTools(WebReaderConfig(max_browser_contexts=1), model)
+        try:
+            start = await invoke(tools, "start_browser_reader", url=url, prompt="first")
+            reader_id = start["reader_id"]
+            await model.arrived()
+            model.gates["first"].set()
+            await invoke(tools, "wait_browser_reader", reader_id=reader_id, seconds=10)
+            chromium = tools.readers[reader_id].browser._browser
+
+            async def failed_close():
+                raise RuntimeError("Chromium close failed")
+
+            monkeypatch.setattr(chromium, "close", failed_close)
+            result = await invoke(tools, "release_browser_reader", reader_id=reader_id)
+            assert result["state"] == "released"
+            with pytest.raises(RuntimeError, match="Chromium close failed"):
+                await tools.close_request()
+            await invoke(tools, "start_browser_reader", url=url, prompt="next")
+            assert await model.arrived() == ["next"]
+        finally:
+            await tools.close_request()
+
+    with public_fixture(monkeypatch) as url:
+        asyncio.run(scenario(url))
+
+
 def test_release_active_and_session_reset_reap_driver_processes_and_contexts(
     monkeypatch,
 ):
@@ -693,7 +781,11 @@ def test_release_active_and_session_reset_reap_driver_processes_and_contexts(
             await invoke(
                 tools, "release_browser_reader", reader_id=starts[0]["reader_id"]
             )
-            assert drivers[0].returncode is not None
+            assert (
+                await invoke(
+                    tools, "browser_reader_status", reader_id=starts[0]["reader_id"]
+                )
+            )["error"] == "expired_reader_id"
             tools.start_session()
             await tools.close_request()
             assert len(closed) == 3

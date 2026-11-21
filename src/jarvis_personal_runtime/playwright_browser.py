@@ -100,6 +100,8 @@ class PlaywrightBrowser:
         self.timeout_seconds = timeout_seconds
         self._on_state_lost = on_state_lost
         self.closed = False
+        self.shutdown_complete = False
+        self._close_task: asyncio.Task[None] | None = None
         self._lost = False
         self._playwright = None
         self._startup = None
@@ -373,7 +375,14 @@ class PlaywrightBrowser:
                 await handle.dispose()
 
     async def close(self):
-        self.closed = True
+        # Release, crash handling and request cleanup can reach the same browser.
+        # Every owner must see actual shutdown before it frees the browser slot.
+        if self._close_task is None:
+            self.closed = True
+            self._close_task = asyncio.create_task(self._shutdown())
+        await asyncio.shield(self._close_task)
+
+    async def _shutdown(self):
         browser, self._browser = self._browser, None
         playwright, self._playwright = self._playwright, None
         startup, self._startup = self._startup, None
@@ -395,3 +404,6 @@ class PlaywrightBrowser:
                     await playwright.stop()
             finally:
                 await asyncio.to_thread(self._proxy.close)
+            # A failed Chromium close is still reported to the caller. Once its
+            # driver and proxy have stopped, the browser no longer holds a slot.
+            self.shutdown_complete = True
